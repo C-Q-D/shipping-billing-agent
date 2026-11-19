@@ -2,8 +2,8 @@
 schema_version: 1
 mode: tracked
 docs_root: docs/workflow
-current_node: "b02-review"
-next_action: "执行 B02 独立代码审查并收口归档，准备开启 B03"
+current_node: "b02-t06"
+next_action: "执行 B02 审查返工 T06~T07 并派发 B02 r2 复审"
 check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contracts.py && uv run pytest tests/unit -q && npm --prefix frontend run typecheck"
 ---
 
@@ -40,7 +40,7 @@ check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contract
 | 编号 | 目录路径（相对项目根） | 大功能名称与包含小功能 | 依赖 | 关联锚点（PRD / 接口 / 表） | 状态 |
 | :--- | :--- | :--- | :---: | :--- | :---: |
 | B01 | `docs/workflow/features/B01-多格式解析与OCR网关` | 多格式文档解包、Excel/Word/EML/PDF解析、SSRF防护与OCR/LLM网关适配 | B00 | PRD F-01/F-02, arch §1.4/§2, schema.sql source_documents | `已完成` |
-| B02 | `docs/workflow/features/B02-智能抽取匹配与校验门禁` | 航运账单LangGraph编排、AR/AP与贷项判定、四级匹配继承、确定性校验与1轮自修复 | B01 | PRD F-02~F-05, billing-output.schema.json | `开发中(T01-T05)` |
+| B02 | `docs/workflow/features/B02-智能抽取匹配与校验门禁` | 航运账单LangGraph编排、AR/AP与贷项判定、四级匹配继承、确定性校验与1轮自修复 | B01 | PRD F-02~F-05, billing-output.schema.json | `开发中(T06-T07)` |
 | B03 | `docs/workflow/features/B03-持久层API与CLI复核包` | SQLite 8表仓储、批处理分阶段服务、FastAPI全路由与Origin防护、Typer CLI与复核包互通 | B02 | PRD F-06/F-07, schema.sql 全表, openapi.yaml 全路由 | `待规划` |
 | B04 | `docs/workflow/features/B04-财务复核工作台前端` | Lumno B2三栏/移动双视口React工作台、全字段复核、三口径导出与评测看板 | B00, B03 | PRD F-06, prototypes/workbench/README.md, openapi.yaml | `待规划` |
 | B05 | `docs/workflow/features/B05-Harness评测与交付文档` | >=10组真值与对抗样本Harness评测套件、Harness与深度思考报告、README与交付ZIP打包验收 | B03 | PRD F-07, 题面 §8.8/§8.9, eval_runs | `待规划` |
