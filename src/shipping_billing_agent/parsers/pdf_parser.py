@@ -272,8 +272,10 @@ def _process_curve(
     added = 0
     filled = bool(curve.get("fill"))
     for points, closed in _straight_subpaths(path):
-        if not closed and filled and len(points) >= 4 and _same_vertex(points[0], points[-1]):
-            points.pop()
+        if not closed and filled and len(points) >= 3:
+            # PDF fills implicitly close open subpaths.
+            if _same_vertex(points[0], points[-1]):
+                points.pop()
             closed = True
         if len(points) == 1:
             added += 1
@@ -314,13 +316,26 @@ def _is_long_rule(merged: list[tuple[float, float]]) -> bool:
 
     lengths = [hi - lo for lo, hi in merged]
     gaps = [next_lo - hi for (_, hi), (next_lo, _) in pairwise(merged)]
-    shortest, longest = min(lengths), max(lengths)
     widest_gap = max(gaps)
+    if widest_gap - min(gaps) > _RULE_INTERVAL_TOL_PT:
+        return False
+    if len(merged) == 2:
+        shortest, longest = min(lengths), max(lengths)
+        return (
+            shortest >= 3.0
+            and longest - shortest <= _RULE_INTERVAL_TOL_PT
+            and widest_gap <= longest * 2.5 + 2.0
+        )
+
+    core = lengths[1:-1]
+    shortest_core, longest_core = min(core), max(core)
+    max_end_length = longest_core + _RULE_INTERVAL_TOL_PT
     return (
-        shortest >= 3.0
-        and longest - shortest <= _RULE_INTERVAL_TOL_PT
-        and widest_gap - min(gaps) <= _RULE_INTERVAL_TOL_PT
-        and widest_gap <= longest * 2.5 + 2.0
+        shortest_core >= 3.0
+        and longest_core - shortest_core <= _RULE_INTERVAL_TOL_PT
+        and 1.0 <= lengths[0] <= max_end_length
+        and 1.0 <= lengths[-1] <= max_end_length
+        and widest_gap <= longest_core * 2.5 + 2.0
     )
 
 

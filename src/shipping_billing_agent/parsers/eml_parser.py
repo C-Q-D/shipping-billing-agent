@@ -28,9 +28,10 @@ _BILL_TAG_WORDS = re.compile(
     re.I,
 )
 _ISO_CODES = "|".join(sorted((*ACTIVE_ISO4217_CODES, "RMB")))
+_SIGN = r"[+\-\u2212]"
 _BILL_AMOUNT_HINT = re.compile(
-    rf"(?:(?:\b(?:{_ISO_CODES})|(?:US|HK|CA|AU)?\$|[€£¥])\s*\d[\d,]*(?:\.\d+)?)"
-    rf"|(?:\d[\d,]*(?:\.\d+)?\s*(?:(?:{_ISO_CODES})\b|元))"
+    rf"(?:(?:\b(?:{_ISO_CODES})|(?:US|HK|CA|AU)?\$|[€£¥])\s*(?:{_SIGN}\s*)?\d[\d,]*(?:\.\d+)?)"
+    rf"|(?:(?:{_SIGN}\s*)?\d[\d,]*(?:\.\d+)?\s*(?:(?:{_ISO_CODES})\b|元))"
 )
 _CONTENT_LANDMARKS = {"article", "aside", "footer", "header", "main", "section"}
 _FOOTER_CONTAINERS = {
@@ -295,15 +296,6 @@ def _nearest_container(node: Tag | NavigableString, footer: Tag) -> Tag:
     return footer
 
 
-def _non_empty_children(tag: Tag) -> list[Tag | NavigableString]:
-    return [
-        child
-        for child in tag.children
-        if (isinstance(child, Tag) and child.name != "br")
-        or (isinstance(child, NavigableString) and not isinstance(child, Comment) and child.strip())
-    ]
-
-
 def _direct_child_containing(parent: Tag, node: Tag) -> Tag | None:
     child = node
     while child.parent is not None:
@@ -320,6 +312,18 @@ def _has_text(slot: Tag | NavigableString) -> bool:
         isinstance(node, NavigableString) and not isinstance(node, Comment) and node.strip()
         for node in slot.descendants
     )
+
+
+def _is_significant_child(child: Tag | NavigableString) -> bool:
+    if isinstance(child, NavigableString):
+        return _has_text(child)
+    if child.name == "br":
+        return False
+    return child.name in {"img", "hr"} or _has_text(child) or child.find(["img", "hr"]) is not None
+
+
+def _non_empty_children(tag: Tag) -> list[Tag | NavigableString]:
+    return [child for child in tag.children if _is_significant_child(child)]
 
 
 def _ends_footer_context(marker: _HtmlMarker, footer: Tag, body_scope: Tag) -> bool:
@@ -360,6 +364,29 @@ def _minimal_signature_boxes(
     for box_id, candidate in candidates.items():
         if box_id not in non_minimal:
             yield candidate
+
+
+def _preceded_by_bill_caption(slot: Tag, footer: Tag) -> bool:
+    current = slot
+    while isinstance(parent := current.parent, Tag) and (
+        parent is footer or any(ancestor is footer for ancestor in parent.parents)
+    ):
+        siblings = _non_empty_children(parent)
+        position = next(idx for idx, sibling in enumerate(siblings) if sibling is current)
+        if position > 0:
+            previous = siblings[position - 1]
+            if isinstance(previous, Tag):
+                caption_boundaries = ["img", "hr", "figure"]
+                if previous.name in caption_boundaries or previous.find(caption_boundaries):
+                    return False
+                text = previous.get_text(" ", strip=True)
+            else:
+                text = previous.strip()
+            return bool(_BILL_TAG_WORDS.search(text) or _BILL_AMOUNT_HINT.search(text))
+        if parent is footer:
+            break
+        current = parent
+    return False
 
 
 def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool:
@@ -403,6 +430,7 @@ def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool
             img is img_slot or any(ancestor is img_slot for ancestor in img.parents)
             for img in parent.find_all("img")
         )
+        and not _preceded_by_bill_caption(img_slot, footer)
     )
 
 

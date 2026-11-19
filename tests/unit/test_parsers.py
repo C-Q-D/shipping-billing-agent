@@ -744,6 +744,35 @@ def test_r8_5_pdf_keeps_electronic_text_with_closed_polyline_bars(local_ocr):
     _assert_decorated_pdf_keeps_electronic_text(data, local_ocr)
 
 
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+def test_r9_f3_pdf_keeps_electronic_text_with_a_clipped_final_dash(local_ocr):
+    rule = b"".join(
+        b"%d 144 m %d 144 l S\n" % (left, min(left + 20, 264))
+        for left in range(24, 264, 28)
+    )
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE, rule + b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n"
+    )
+
+    _assert_decorated_pdf_keeps_electronic_text(data, local_ocr)
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+def test_r9_f4_pdf_keeps_electronic_text_with_implicitly_closed_bars(local_ocr):
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE,
+        b"24 120 m 264 120 l 264 124 l 24 124 l f\n"
+        b"144 86 m 204 86 l 264 86 l 264 90 l 144 90 l 24 90 l 24 86 l f\n"
+        b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n",
+    )
+    with BytesIO(data) as stream, pdfplumber.open(stream) as pdf:
+        page = pdf.pages[1]
+        assert len(page.curves) == 2
+        assert not page.rects
+
+    _assert_decorated_pdf_keeps_electronic_text(data, local_ocr)
+
+
 def test_pdf_without_local_ocr_reads_the_complete_short_text_page():
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
@@ -1301,6 +1330,112 @@ def test_r8_3_eml_skips_logos_with_company_names_or_bare_currency_labels(label, 
 def test_r8_6_eml_skips_logos_after_a_wrapped_paragraph_signoff(image_slot, r8_eml_ocr):
     data = _mail_with_inline_png(
         f"<footer><div><p>Best regards<br>ACME<br>Tel: 123456</p></div>{image_slot}</footer>",
+        image_name="logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE, logo.raw_text
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    recognize_image.assert_not_called()
+
+
+def test_r9_f1_eml_reads_a_scan_with_a_caption_outside_the_signoff_wrapper(r8_eml_ocr):
+    data = _mail_with_inline_png(
+        '<footer><p>Invoice scan</p><div><div><img src="cid:scan"></div>'
+        '<div><p>Best regards<br>ACME<br>Tel: 123456</p></div></div></footer>',
+        image_name="scan",
+        text="USD 310.42",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert scan.status is DocumentStatus.PARSED, scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "USD 310.42" in scan.raw_text, scan.raw_text
+    recognize_image.assert_called_once()
+
+
+def test_r9_f2_eml_reads_a_negative_amount_and_skips_bare_currency_logos(r8_eml_ocr):
+    dispatcher, recognize_image = r8_eml_ocr
+    logo_labels = {
+        "hyphen.eml": "ACME Freight logo - USD",
+        "parentheses.eml": "ACME Freight logo (USD)",
+    }
+    logo_mails = [
+        (
+            filename,
+            _mail_with_inline_png(
+                f'<div class="signature"><img src="cid:logo" alt="{label}"></div>',
+                image_name="logo",
+                text="ACME",
+            ),
+        )
+        for filename, label in logo_labels.items()
+    ]
+
+    _, _, hyphen_logo, _, _, parentheses_logo = dispatcher.parse_batch(logo_mails)
+
+    assert hyphen_logo.status is DocumentStatus.SKIPPED_NOISE, hyphen_logo.raw_text
+    assert hyphen_logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    assert parentheses_logo.status is DocumentStatus.SKIPPED_NOISE, parentheses_logo.raw_text
+    assert parentheses_logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    recognize_image.assert_not_called()
+
+    data = _mail_with_inline_png(
+        '<div class="signature"><img src="cid:scan" alt="Ocean freight USD -310.42"></div>',
+        image_name="scan",
+        text="USD -310.42",
+    )
+
+    _, _, scan = dispatcher.parse_batch([("credit.eml", data)])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert scan.status is DocumentStatus.PARSED, scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "-310.42" in scan.raw_text, scan.raw_text
+    recognize_image.assert_called_once()
+
+
+def test_r9_f5_eml_skips_a_logo_before_signoff_with_an_empty_sibling(r8_eml_ocr):
+    message = _mail("Body")
+    message.add_alternative(
+        '<footer><div><figure><img src="cid:scan"><figcaption>Invoice scan</figcaption>'
+        '</figure></div><div><span></span><div><img src="cid:logo"></div>'
+        '<div>Best regards<br>ACME<br>Tel: 123456</div></div></footer>',
+        subtype="html",
+    )
+    html = message.get_payload()[-1]
+    html.add_related(
+        _png_with_text("USD 310.42"), maintype="image", subtype="png",
+        cid="<scan>", filename="scan.png",
+    )
+    html.add_related(
+        _png_with_text("ACME"), maintype="image", subtype="png", cid="<logo>", filename="logo.png"
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan, logo = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert scan.status is DocumentStatus.PARSED, scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "USD 310.42" in scan.raw_text, scan.raw_text
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE, logo.raw_text
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    recognize_image.assert_called_once()
+
+
+def test_r9_f5_eml_skips_a_logo_after_signoff_with_an_empty_sibling(r8_eml_ocr):
+    data = _mail_with_inline_png(
+        '<footer><div><p>Best regards<br>ACME<br>Tel: 123456</p><span></span></div>'
+        '<img src="cid:logo"></footer>',
         image_name="logo",
         text="ACME",
     )
