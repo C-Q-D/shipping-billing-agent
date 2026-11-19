@@ -1,22 +1,38 @@
-"""B00 smoke tests for /api/v1/health and credential isolation."""
+"""Smoke tests for the health response and runtime configuration."""
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
+import pytest
 from fastapi.testclient import TestClient
 
 from shipping_billing_agent.api.app import create_app
 
 
-def test_health_endpoint_contract(monkeypatch) -> None:
-    """Health endpoint returns all 6 required HealthStatus fields and types."""
-    monkeypatch.delenv("LLM_API_KEY", raising=False)
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    monkeypatch.delenv("LLM_BASE_URL", raising=False)
-    monkeypatch.delenv("OCR_PROXY_URL", raising=False)
-    monkeypatch.setenv("OCR_TRUST_ENV", "false")
+@pytest.fixture
+def health_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    settings_prefixes = (
+        "APP_",
+        "ALLOW_REMOTE_BIND",
+        "DEEPSEEK_",
+        "LLM_",
+        "OCR_",
+        "PUBLIC_RELAY_",
+        "RELAY_PRESIGN_",
+        "SQLITE_",
+    )
+    for name in tuple(os.environ):
+        if name.upper().startswith(settings_prefixes):
+            monkeypatch.delenv(name)
+    with TestClient(create_app()) as client:
+        yield client
 
-    client = TestClient(create_app())
-    response = client.get("/api/v1/health")
+
+def test_health_endpoint_contract(health_client: TestClient) -> None:
+    response = health_client.get("/api/v1/health")
     assert response.status_code == 200
     payload = response.json()
 
@@ -30,24 +46,60 @@ def test_health_endpoint_contract(monkeypatch) -> None:
     }
     assert set(payload.keys()) == expected_keys
     assert payload["status"] == "ok"
-    assert isinstance(payload["llm_configured"], bool)
     assert payload["llm_configured"] is False
-    assert isinstance(payload["llm_model"], str)
+    assert payload["llm_model"] == "deepseek-flash"
     assert payload["ocr_gateway_url"] == "https://gateway.pltplt.com/ai/process"
     assert payload["ocr_direct_mode"] is True
     assert payload["public_relay_configured"] is False
 
 
-def test_health_credential_isolation_custom_base_url(monkeypatch) -> None:
-    """DEEPSEEK_API_KEY must NOT mark custom third-party LLM_BASE_URL as configured."""
-    monkeypatch.delenv("LLM_API_KEY", raising=False)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-secret")
-    monkeypatch.setenv("LLM_BASE_URL", "https://example.com/v1")
+@pytest.mark.parametrize("base_url", ["https://example.com/v1", "http://api.deepseek.com/v1"])
+def test_health_deepseek_key_requires_https_and_exact_host(
+    health_client: TestClient, monkeypatch: pytest.MonkeyPatch, base_url: str
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-deepseek-key")
+    monkeypatch.setenv("LLM_BASE_URL", base_url)
 
-    client = TestClient(create_app())
-    payload = client.get("/api/v1/health").json()
+    payload = health_client.get("/api/v1/health").json()
     assert payload["llm_configured"] is False
 
     monkeypatch.setenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
-    payload_deepseek = client.get("/api/v1/health").json()
+    payload_deepseek = health_client.get("/api/v1/health").json()
     assert payload_deepseek["llm_configured"] is True
+
+
+def test_health_reads_dotenv_and_observes_environment_override(
+    health_client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / ".env").write_text(
+        "LLM_MODEL=快照模型\n"
+        "DEEPSEEK_API_KEY=test-deepseek-key\n"
+        "OCR_GATEWAY_URL=https://ocr.example.com/process\n"
+        "OCR_PROXY_URL=http://ocr-proxy.example.com:8080\n"
+        "UNRELATED_FLAG=ignored\n",
+        encoding="utf-8",
+    )
+
+    response = health_client.get("/api/v1/health")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["llm_model"] == "快照模型"
+    assert payload["llm_configured"] is True
+    assert payload["ocr_gateway_url"] == "https://ocr.example.com/process"
+    assert payload["ocr_direct_mode"] is False
+
+    monkeypatch.setenv("LLM_MODEL", "override-model")
+    monkeypatch.setenv("OCR_PROXY_URL", "")
+    overridden = health_client.get("/api/v1/health").json()
+    assert overridden["llm_model"] == "override-model"
+    assert overridden["ocr_direct_mode"] is True
+
+
+def test_health_relay_url_alone_does_not_advertise_ready(
+    health_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PUBLIC_RELAY_BASE_URL", "https://relay.example.com")
+
+    payload = health_client.get("/api/v1/health").json()
+
+    assert payload["public_relay_configured"] is False
