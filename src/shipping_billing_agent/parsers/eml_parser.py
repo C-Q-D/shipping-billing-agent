@@ -13,6 +13,8 @@ from urllib.parse import unquote
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
+from shipping_billing_agent.domain.currency import ACTIVE_ISO4217_CODES
+
 from .filename_sanitizer import sanitize_filename
 
 _HEADERS = ("Subject", "From", "To", "Cc", "Date", "Message-ID")
@@ -21,10 +23,15 @@ _BILL_WORDS = re.compile(
     r"invoice|bill|charge|statement|freight|账单|帳單|发票|發票|费用|費用", re.I
 )
 _BILL_TAG_WORDS = re.compile(
-    r"invoice|bill|debit\s*note|credit\s*note|charge|statement|账单|帳單|发票|發票|费用|費用",
+    r"\b(?:invoice|invoices|bill|bills|billing|debit\s*note|credit\s*note|charges?"
+    r"|statement|statements)\b|账单|帳單|发票|發票|费用|費用",
     re.I,
 )
-_BILL_AMOUNT_HINT = re.compile(r"\b(?:USD|EUR|GBP|CNY|RMB|HKD|JPY)\b|[$€£¥]\s*\d", re.I)
+_ISO_CODES = "|".join(sorted((*ACTIVE_ISO4217_CODES, "RMB")))
+_BILL_AMOUNT_HINT = re.compile(
+    rf"(?:(?:\b(?:{_ISO_CODES})|(?:US|HK|CA|AU)?\$|[€£¥])\s*\d[\d,]*(?:\.\d+)?)"
+    rf"|(?:\d[\d,]*(?:\.\d+)?\s*(?:(?:{_ISO_CODES})\b|元))"
+)
 _CONTENT_LANDMARKS = {"article", "aside", "footer", "header", "main", "section"}
 _FOOTER_CONTAINERS = {
     "div", "p", "section", "article", "aside", "table", "tr", "td", "th", "li", "address", "footer",
@@ -356,7 +363,18 @@ def _minimal_signature_boxes(
 
 
 def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool:
-    parent = box.parent
+    if box.find(["img", "figure"]) is not None:
+        return False
+
+    slot_b = box
+    while (
+        isinstance(slot_b.parent, Tag)
+        and slot_b.parent is not footer
+        and len(_non_empty_children(slot_b.parent)) == 1
+        and slot_b.parent.find(["img", "figure"]) is None
+    ):
+        slot_b = slot_b.parent
+    parent = slot_b.parent
     if not isinstance(parent, Tag) or (
         parent is not footer and not any(ancestor is footer for ancestor in parent.parents)
     ):
@@ -364,22 +382,22 @@ def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool
     img_slot = _direct_child_containing(parent, image)
     if (
         img_slot is None
-        or img_slot is box
+        or img_slot is slot_b
         or img_slot.name == "figure"
         or img_slot.find("figure") is not None
         or _has_text(img_slot)
-        or box.find(["img", "figure"]) is not None
     ):
         return False
 
     siblings = _non_empty_children(parent)
-    pos_b = next(idx for idx, sibling in enumerate(siblings) if sibling is box)
+    pos_b = next(idx for idx, sibling in enumerate(siblings) if sibling is slot_b)
     pos_img = next(idx for idx, sibling in enumerate(siblings) if sibling is img_slot)
     if pos_img == pos_b + 1:
         return True
     return (
         pos_img == pos_b - 1
         and parent is not footer
+        and pos_img == 0
         and parent.find("figure") is None
         and all(
             img is img_slot or any(ancestor is img_slot for ancestor in img.parents)

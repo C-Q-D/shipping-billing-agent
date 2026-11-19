@@ -553,6 +553,59 @@ def test_r6_2_pdf_with_wide_filled_rectangles_requires_ocr(r6_filled_rectangle_p
     assert document.error_message == "第 2 页为扫描图像页，未配置本地 OCR 引擎"
 
 
+@pytest.fixture
+def r8_stroked_amount_pdf(r6_filled_rectangle_pdf) -> bytes:
+    paths = bytearray(b"BT /F1 18 Tf 720 30 Td (2) Tj ET\n9 w 0 J\n")
+    with BytesIO(r6_filled_rectangle_pdf) as stream, pdfplumber.open(stream) as pdf:
+        page = pdf.pages[1]
+        page_size = int(page.width), int(page.height)
+        for rect in page.rects:
+            y = (rect["y0"] + rect["y1"]) / 2
+            paths.extend(b"%g %g m %g %g l S\n" % (rect["x0"], y, rect["x1"], y))
+
+    data = _two_page_pdf(_PAYMENT_TERMS_PAGE, bytes(paths), page_size=page_size)
+    with BytesIO(data) as stream, pdfplumber.open(stream) as pdf:
+        page = pdf.pages[1]
+        assert page.extract_text() == "2"
+        assert len(page.lines) > 100
+        assert not (page.rects or page.curves or page.images)
+        assert all(
+            line["linewidth"] == 9 and 32 <= line["width"] <= 168 and line["height"] == 0
+            for line in page.lines
+        )
+        rows = sorted({line["top"] for line in page.lines})
+        assert {end - start for start, end in pairwise(rows)} == {9}
+    return data
+
+
+def test_r8_1_pdf_reads_amount_drawn_as_wide_horizontal_strokes(r8_stroked_amount_pdf):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
+    )
+    (document,) = dispatcher.parse_batch([("stroked-amount.pdf", r8_stroked_amount_pdf)])
+
+    assert document.status is DocumentStatus.PARSED, document.error_message
+    _, ocr_source, ocr_text = document.raw_text.partition("[Page 2 | OCR]\n")
+    assert ocr_source, document.raw_text
+    assert document.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "USD" in ocr_text, ocr_text
+    assert "77.77" in ocr_text, ocr_text
+
+
+def test_r8_1_pdf_with_wide_horizontal_strokes_requires_ocr(r8_stroked_amount_pdf):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=None
+    )
+    (document,) = dispatcher.parse_batch([("stroked-amount.pdf", r8_stroked_amount_pdf)])
+
+    assert document.status is DocumentStatus.FAILED, document.raw_text
+    assert document.error_message == "第 2 页为扫描图像页，未配置本地 OCR 引擎"
+
+
 @pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
 @pytest.mark.parametrize(
     "segments",
@@ -637,6 +690,58 @@ def test_t10_pdf_keeps_short_electronic_text_with_decorative_rules(t10_decorated
     recognize_page.assert_not_called()
     assert document.extraction_channel is ExtractionChannel.LOCAL_PDF_TEXT_FALLBACK
     assert document.raw_text.endswith("[Page 2 | Text]\nUSD 245.00"), document.raw_text
+
+
+def _assert_decorated_pdf_keeps_electronic_text(
+    data: bytes, local_ocr: RapidOcrFallback | None
+) -> None:
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=local_ocr
+    )
+    with patch.object(
+        RapidOcrFallback,
+        "recognize_pil_image",
+        autospec=True,
+        side_effect=RapidOcrFallback.recognize_pil_image,
+    ) as recognize_page:
+        (document,) = dispatcher.parse_batch([("electronic.pdf", data)])
+
+    assert document.status is DocumentStatus.PARSED, document.error_message
+    recognize_page.assert_not_called()
+    assert document.extraction_channel is ExtractionChannel.LOCAL_PDF_TEXT_FALLBACK
+    assert document.raw_text.endswith("[Page 2 | Text]\nUSD 245.00"), document.raw_text
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+def test_r8_4_pdf_keeps_electronic_text_with_repeated_collinear_vertices(local_ocr):
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE,
+        b"24 144 m 48 144 l 72 144 l 96 144 l 96 144 l 120 144 l 144 144 l "
+        b"168 144 l 192 144 l 192 144 l 216 144 l 240 144 l 264 144 l S\n"
+        b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n",
+    )
+    with BytesIO(data) as stream, pdfplumber.open(stream) as pdf:
+        assert len(pdf.pages[1].curves) == 1
+
+    _assert_decorated_pdf_keeps_electronic_text(data, local_ocr)
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+def test_r8_5_pdf_keeps_electronic_text_with_closed_polyline_bars(local_ocr):
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE,
+        b"24 120 m 144 120 l 264 120 l 264 124 l 144 124 l 24 124 l h f\n"
+        b"24 86 m 144 86 l 264 86 l 264 90 l 144 90 l 24 90 l 24 86 l h f\n"
+        b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n",
+    )
+    with BytesIO(data) as stream, pdfplumber.open(stream) as pdf:
+        page = pdf.pages[1]
+        assert len(page.curves) == 2
+        assert not page.rects
+
+    _assert_decorated_pdf_keeps_electronic_text(data, local_ocr)
 
 
 def test_pdf_without_local_ocr_reads_the_complete_short_text_page():
@@ -1104,6 +1209,109 @@ def _png_with_text(text: str) -> bytes:
         ImageDraw.Draw(image).text((24, 28), text, font=font, fill="black")
         image.save(buffer, format="PNG")
         return buffer.getvalue()
+
+
+def _mail_with_inline_png(html_body: str, *, image_name: str, text: str) -> bytes:
+    message = _mail("Body")
+    message.add_alternative(html_body, subtype="html")
+    message.get_payload()[-1].add_related(
+        _png_with_text(text),
+        maintype="image",
+        subtype="png",
+        cid=f"<{image_name}>",
+        filename=f"{image_name}.png",
+    )
+    return message.as_bytes()
+
+
+@pytest.fixture
+def r8_eml_ocr():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
+    )
+    with patch.object(
+        RapidOcrFallback,
+        "recognize_image_bytes",
+        autospec=True,
+        side_effect=RapidOcrFallback.recognize_image_bytes,
+    ) as recognize_image:
+        yield dispatcher, recognize_image
+
+
+def test_r8_2_eml_reads_scan_with_a_caption_before_the_signoff(r8_eml_ocr):
+    data = _mail_with_inline_png(
+        '<footer><div><p>Invoice scan</p><div><img src="cid:scan"></div>'
+        '<p>Best regards<br>ACME<br>Tel: 123456</p></div></footer>',
+        image_name="scan",
+        text="USD 310.42",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert scan.status is DocumentStatus.PARSED, scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "USD 310.42" in scan.raw_text, scan.raw_text
+    recognize_image.assert_called_once()
+
+
+@pytest.mark.parametrize("label", ["Ocean freight USD310.42", "Ocean freight CAD 310.42"])
+def test_r8_3_eml_reads_images_with_amount_labels_inside_a_signature(label, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        f'<div class="signature"><img src="cid:scan" alt="{label}"></div>',
+        image_name="scan",
+        text="USD 310.42",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert scan.status is DocumentStatus.PARSED, scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "USD 310.42" in scan.raw_text, scan.raw_text
+    recognize_image.assert_called_once()
+
+
+@pytest.mark.parametrize("label", ["Billund Freight logo", "ACME Freight logo (USD)"])
+def test_r8_3_eml_skips_logos_with_company_names_or_bare_currency_labels(label, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        f'<div class="signature"><img src="cid:logo" alt="{label}"></div>',
+        image_name="logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE, logo.raw_text
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    recognize_image.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "image_slot",
+    ['<img src="cid:logo">', '<div><img src="cid:logo"></div>'],
+    ids=["direct-logo", "wrapped-logo"],
+)
+def test_r8_6_eml_skips_logos_after_a_wrapped_paragraph_signoff(image_slot, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        f"<footer><div><p>Best regards<br>ACME<br>Tel: 123456</p></div>{image_slot}</footer>",
+        image_name="logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE, logo.raw_text
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    recognize_image.assert_not_called()
 
 
 @pytest.mark.parametrize(

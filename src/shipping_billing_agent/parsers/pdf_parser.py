@@ -1,5 +1,6 @@
 """Extract PDF text and tables, with optional page-level OCR."""
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from io import BytesIO
 from itertools import chain, pairwise
@@ -15,8 +16,12 @@ from shipping_billing_agent.domain.models import ExtractionChannel, ParsedTable
 
 _MIN_TEXT_CHARACTERS = 15
 _OCR_RESOLUTION_DPI = 200
+_AXIS_TOL_PT = 0.5
+_DUPLICATE_VERTEX_TOL_PT = 1e-4
 _COLLINEAR_TOL_PT = 1.0
+_RULE_INTERVAL_TOL_PT = 1.0
 _LONG_RULE_SPAN_PT = 40.0
+_THIN_RULE_MAX_THICKNESS_PT = 3.0
 _BAR_RULE_MAX_THICKNESS_PT = 6.0
 _BAR_RULE_MIN_ASPECT = 15.0
 _SCANLINE_MAX_GAP_PT = 6.0
@@ -59,9 +64,9 @@ def _is_table_segment(
 ) -> bool:
     (x1, y1), (x2, y2) = p1, p2
     dx, dy = abs(x1 - x2), abs(y1 - y2)
-    if dx <= 0.5 and dy <= 0.5:
+    if dx <= _AXIS_TOL_PT and dy <= _AXIS_TOL_PT:
         return False
-    if dy <= 0.5:
+    if dy <= _AXIS_TOL_PT:
         x_lo, x_hi = min(x1, x2), max(x1, x2)
         y = (y1 + y2) / 2
         return any(
@@ -70,7 +75,7 @@ def _is_table_segment(
             and any(abs(y - gy) <= tol for gy in grid.ys)
             for grid in table_grids
         )
-    if dx <= 0.5:
+    if dx <= _AXIS_TOL_PT:
         y_lo, y_hi = min(y1, y2), max(y1, y2)
         x = (x1 + x2) / 2
         return any(
@@ -82,26 +87,166 @@ def _is_table_segment(
     return False
 
 
+def _classify_rect(
+    x0: float,
+    top: float,
+    x1: float,
+    bottom: float,
+    *,
+    filled: bool,
+    table_grids: list[_TableGrid],
+    horiz_segments: list[_RuleSegment],
+    vert_segments: list[_RuleSegment],
+) -> int:
+    width, height = abs(x1 - x0), abs(bottom - top)
+    if width <= 4.0 and height <= 4.0:
+        return 1
+    if width <= _THIN_RULE_MAX_THICKNESS_PT or (
+        width <= _BAR_RULE_MAX_THICKNESS_PT
+        and height > _LONG_RULE_SPAN_PT
+        and height / max(width, 1e-6) >= _BAR_RULE_MIN_ASPECT
+    ):
+        x = (x0 + x1) / 2
+        if not _is_table_segment((x, top), (x, bottom), table_grids):
+            vert_segments.append((x, min(top, bottom), max(top, bottom)))
+        return 0
+    if height <= _THIN_RULE_MAX_THICKNESS_PT or (
+        height <= _BAR_RULE_MAX_THICKNESS_PT
+        and width > _LONG_RULE_SPAN_PT
+        and width / max(height, 1e-6) >= _BAR_RULE_MIN_ASPECT
+    ):
+        y = (top + bottom) / 2
+        if not _is_table_segment((x0, y), (x1, y), table_grids):
+            horiz_segments.append((y, min(x0, x1), max(x0, x1)))
+        return 0
+
+    corners = ((x0, top), (x1, top), (x1, bottom), (x0, bottom), (x0, top))
+    if all(_is_table_segment(p1, p2, table_grids) for p1, p2 in pairwise(corners)):
+        return 0
+    if not filled and min(width, height) > _LONG_RULE_SPAN_PT:
+        return 0
+    return 1
+
+
+def _line_width(obj: dict[str, Any]) -> float:
+    linewidth = float(obj.get("linewidth") or 1.0)
+    return linewidth if linewidth >= 0 else 1.0
+
+
 def _classify_straight_segment(
     p1: _Point,
     p2: _Point,
     table_grids: list[_TableGrid],
     horiz_segments: list[_RuleSegment],
     vert_segments: list[_RuleSegment],
+    *,
+    linewidth: float = 1.0,
 ) -> int:
     if _is_table_segment(p1, p2, table_grids):
         return 0
     (x0, y0), (x1, y1) = p1, p2
     dx, dy = abs(x1 - x0), abs(y1 - y0)
-    if dx <= 0.5 and dy <= 0.5:
+    if dx <= _AXIS_TOL_PT and dy <= _AXIS_TOL_PT:
         return 1
-    if dy <= 0.5:
-        horiz_segments.append(((y0 + y1) / 2, min(x0, x1), max(x0, x1)))
+    if dy <= _AXIS_TOL_PT:
+        y = (y0 + y1) / 2
+        left, right = min(x0, x1), max(x0, x1)
+        if linewidth > _THIN_RULE_MAX_THICKNESS_PT:
+            return _classify_rect(
+                left,
+                y - linewidth / 2,
+                right,
+                y + linewidth / 2,
+                filled=True,
+                table_grids=table_grids,
+                horiz_segments=horiz_segments,
+                vert_segments=vert_segments,
+            )
+        horiz_segments.append((y, left, right))
         return 0
-    if dx <= 0.5:
-        vert_segments.append(((x0 + x1) / 2, min(y0, y1), max(y0, y1)))
+    if dx <= _AXIS_TOL_PT:
+        x = (x0 + x1) / 2
+        top, bottom = min(y0, y1), max(y0, y1)
+        if linewidth > _THIN_RULE_MAX_THICKNESS_PT:
+            return _classify_rect(
+                x - linewidth / 2,
+                top,
+                x + linewidth / 2,
+                bottom,
+                filled=True,
+                table_grids=table_grids,
+                horiz_segments=horiz_segments,
+                vert_segments=vert_segments,
+            )
+        vert_segments.append((x, top, bottom))
         return 0
     return 1
+
+
+def _same_vertex(p1: _Point, p2: _Point) -> bool:
+    return (
+        abs(p1[0] - p2[0]) <= _DUPLICATE_VERTEX_TOL_PT
+        and abs(p1[1] - p2[1]) <= _DUPLICATE_VERTEX_TOL_PT
+    )
+
+
+def _straight_subpaths(path: list[tuple[Any, ...]]) -> Iterator[tuple[list[_Point], bool]]:
+    points: list[_Point] = []
+    closed_start: _Point | None = None
+    for operator, *vertices in path:
+        if operator == "m":
+            if points:
+                yield points, False
+            points = [vertices[0]]
+            closed_start = None
+        elif operator == "h" and points:
+            closed_start = points[0]
+            if len(points) > 1 and _same_vertex(closed_start, points[-1]):
+                points.pop()
+            yield points, True
+            points = []
+        elif operator == "l":
+            if not points:
+                if closed_start is None:
+                    continue
+                # A line after closepath starts from the closed subpath's first vertex.
+                points = [closed_start]
+            if not _same_vertex(points[-1], vertices[0]):
+                points.append(vertices[0])
+
+    if points:
+        yield points, False
+
+
+def _rectangle_bounds(points: list[_Point]) -> tuple[float, float, float, float] | None:
+    corners = points
+    while len(corners) >= 4:
+        reduced = []
+        for idx, (x, y) in enumerate(corners):
+            prev_x, prev_y = corners[idx - 1]
+            next_x, next_y = corners[(idx + 1) % len(corners)]
+            same_x = abs(prev_x - x) <= _AXIS_TOL_PT and abs(x - next_x) <= _AXIS_TOL_PT
+            same_y = abs(prev_y - y) <= _AXIS_TOL_PT and abs(y - next_y) <= _AXIS_TOL_PT
+            if not (same_x or same_y):
+                reduced.append((x, y))
+        if len(reduced) == len(corners):
+            break
+        corners = reduced
+
+    if len(corners) != 4:
+        return None
+    xs, ys = zip(*corners, strict=True)
+    x0, top, x1, bottom = min(xs), min(ys), max(xs), max(ys)
+    if x1 - x0 <= _AXIS_TOL_PT or bottom - top <= _AXIS_TOL_PT:
+        return None
+    if set(corners) != {(x0, top), (x1, top), (x1, bottom), (x0, bottom)}:
+        return None
+    if any(
+        start[0] != end[0] and start[1] != end[1]
+        for start, end in pairwise(chain(corners, corners[:1]))
+    ):
+        return None
+    return x0, top, x1, bottom
 
 
 def _process_curve(
@@ -111,58 +256,89 @@ def _process_curve(
     vert_segments: list[_RuleSegment],
 ) -> tuple[bool, int]:
     path = curve.get("path")
+    if path is not None and any(operator not in {"m", "l", "h"} for operator, *_ in path):
+        return True, 0
+
+    linewidth = _line_width(curve)
     if path is None:
         added = sum(
-            _classify_straight_segment(p1, p2, table_grids, horiz_segments, vert_segments)
+            _classify_straight_segment(
+                p1, p2, table_grids, horiz_segments, vert_segments, linewidth=linewidth
+            )
             for p1, p2 in pairwise(curve.get("pts") or ())
         )
         return False, added
 
     added = 0
-    subpath_start: _Point | None = None
-    current: _Point | None = None
-    for operator, *points in path:
-        if operator == "m":
-            subpath_start = current = points[0]
+    filled = bool(curve.get("fill"))
+    for points, closed in _straight_subpaths(path):
+        if not closed and filled and len(points) >= 4 and _same_vertex(points[0], points[-1]):
+            points.pop()
+            closed = True
+        if len(points) == 1:
+            added += 1
             continue
-        if operator == "l":
-            end = points[0]
-        elif operator == "h":
-            end = subpath_start
-            if current == end:
-                continue
-        else:
-            return True, 0
-        if current is not None and end is not None:
-            added += _classify_straight_segment(
-                current, end, table_grids, horiz_segments, vert_segments
+        if closed and len(points) >= 4 and (bounds := _rectangle_bounds(points)) is not None:
+            added += _classify_rect(
+                *bounds,
+                filled=filled,
+                table_grids=table_grids,
+                horiz_segments=horiz_segments,
+                vert_segments=vert_segments,
             )
-        current = end
+            continue
+        vertices = chain(points, points[:1]) if closed else points
+        for p1, p2 in pairwise(vertices):
+            added += _classify_straight_segment(
+                p1, p2, table_grids, horiz_segments, vert_segments, linewidth=linewidth
+            )
     return False, added
 
 
-def _count_rule_clusters(segments: list[_RuleSegment]) -> tuple[int, list[float]]:
-    if not segments:
-        return 0, []
+def _merge_rule_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
+    for lo, hi in sorted(intervals):
+        if merged and lo <= merged[-1][1] + _RULE_INTERVAL_TOL_PT:
+            prev_lo, prev_hi = merged[-1]
+            merged[-1] = (prev_lo, max(prev_hi, hi))
+        else:
+            merged.append((lo, hi))
+    return merged
 
-    ordered = iter(sorted(segments, key=lambda segment: segment[0]))
-    anchor_coord, min_pos, max_pos = next(ordered)
+
+def _is_long_rule(merged: list[tuple[float, float]]) -> bool:
+    if merged[-1][1] - merged[0][0] <= _LONG_RULE_SPAN_PT:
+        return False
+    if len(merged) == 1:
+        return True
+
+    lengths = [hi - lo for lo, hi in merged]
+    gaps = [next_lo - hi for (_, hi), (next_lo, _) in pairwise(merged)]
+    shortest, longest = min(lengths), max(lengths)
+    widest_gap = max(gaps)
+    return (
+        shortest >= 3.0
+        and longest - shortest <= _RULE_INTERVAL_TOL_PT
+        and widest_gap - min(gaps) <= _RULE_INTERVAL_TOL_PT
+        and widest_gap <= longest * 2.5 + 2.0
+    )
+
+
+def _count_rule_clusters(segments: list[_RuleSegment]) -> tuple[int, list[float]]:
+    clusters: list[tuple[float, list[tuple[float, float]]]] = []
+    for coord, lo, hi in sorted(segments, key=lambda segment: segment[0]):
+        if not clusters or coord - clusters[-1][0] > _COLLINEAR_TOL_PT:
+            clusters.append((coord, []))
+        clusters[-1][1].append((lo, hi))
+
     short_rules = 0
     long_coords: list[float] = []
-    for coord, lo, hi in ordered:
-        if abs(coord - anchor_coord) <= _COLLINEAR_TOL_PT:
-            min_pos, max_pos = min(min_pos, lo), max(max_pos, hi)
-            continue
-        if max_pos - min_pos > _LONG_RULE_SPAN_PT:
+    for anchor_coord, intervals in clusters:
+        merged = _merge_rule_intervals(intervals)
+        if _is_long_rule(merged):
             long_coords.append(anchor_coord)
         else:
-            short_rules += 1
-        anchor_coord, min_pos, max_pos = coord, lo, hi
-
-    if max_pos - min_pos > _LONG_RULE_SPAN_PT:
-        long_coords.append(anchor_coord)
-    else:
-        short_rules += 1
+            short_rules += len(merged)
     return short_rules, long_coords
 
 
@@ -187,37 +363,20 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
         else:
             p1, p2 = (line["x0"], line["top"]), (line["x1"], line["bottom"])
         glyph_elements += _classify_straight_segment(
-            p1, p2, table_grids, horiz_segments, vert_segments
+            p1, p2, table_grids, horiz_segments, vert_segments, linewidth=_line_width(line)
         )
 
     for rect in page.rects:
-        x0, top, x1, bottom = rect["x0"], rect["top"], rect["x1"], rect["bottom"]
-        width, height = abs(x1 - x0), abs(bottom - top)
-        if width <= 4.0 and height <= 4.0:
-            glyph_elements += 1
-        elif width <= 3.0 or (
-            width <= _BAR_RULE_MAX_THICKNESS_PT
-            and height > _LONG_RULE_SPAN_PT
-            and height / max(width, 1e-6) >= _BAR_RULE_MIN_ASPECT
-        ):
-            x = (x0 + x1) / 2
-            if not _is_table_segment((x, top), (x, bottom), table_grids):
-                vert_segments.append((x, min(top, bottom), max(top, bottom)))
-        elif height <= 3.0 or (
-            height <= _BAR_RULE_MAX_THICKNESS_PT
-            and width > _LONG_RULE_SPAN_PT
-            and width / max(height, 1e-6) >= _BAR_RULE_MIN_ASPECT
-        ):
-            y = (top + bottom) / 2
-            if not _is_table_segment((x0, y), (x1, y), table_grids):
-                horiz_segments.append((y, min(x0, x1), max(x0, x1)))
-        else:
-            corners = ((x0, top), (x1, top), (x1, bottom), (x0, bottom), (x0, top))
-            if all(_is_table_segment(p1, p2, table_grids) for p1, p2 in pairwise(corners)):
-                continue
-            if not rect.get("fill") and min(width, height) > _LONG_RULE_SPAN_PT:
-                continue
-            glyph_elements += 1
+        glyph_elements += _classify_rect(
+            rect["x0"],
+            rect["top"],
+            rect["x1"],
+            rect["bottom"],
+            filled=bool(rect.get("fill")),
+            table_grids=table_grids,
+            horiz_segments=horiz_segments,
+            vert_segments=vert_segments,
+        )
 
     has_bezier_curve = False
     for curve in page.curves:
