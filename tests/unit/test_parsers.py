@@ -3120,6 +3120,56 @@ def test_r19_a6_nested_figure_inside_figcaption_does_not_leak(r8_eml_ocr):
     _assert_invoice_and_skipped_logo(scan, logo, recognize_image)
 
 
+@pytest.mark.parametrize("extra_lines", [0, 10], ids=["inside-tail", "outside-tail"])
+def test_r20_f1_main_scan_before_trailing_signoff_keeps_scan_and_skips_logo(
+    extra_lines, r8_eml_ocr
+):
+    details = "<p>Shipment received</p>" * extra_lines
+    html = (
+        '<main><hr><p>Delivery Tel: 123456</p><img src="cid:scan">'
+        f'{details}<p>Best regards</p><p>Sender Tel: 999</p><img src="cid:logo"></main>'
+    )
+    if extra_lines:
+        # The body reference must override the signature copy outside the tail window.
+        html += '<div class="signature"><img src="cid:scan"></div>'
+    data = _mail_with_scan_and_logo(html)
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_invoice_and_skipped_logo(scan, logo, recognize_image)
+
+
+@pytest.mark.parametrize(
+    ("html_body", "expected_text"),
+    [
+        pytest.param(
+            '<main>-- \n<img src="cid:InsertPic_001">'
+            "<p>Delivery appointment Tel: 123456</p></main>",
+            "USD 310.42",
+            id="delivery-contact",
+        ),
+        pytest.param(
+            "<main>-- \n<p>Best regards</p><p>ACME</p><p>Tel: 123456</p>"
+            '<img src="cid:InsertPic_001"></main>',
+            None,
+            id="sender-signature",
+        ),
+    ],
+)
+def test_r20_f2_main_insertpic_respects_signoff_requirement(html_body, expected_text, r8_eml_ocr):
+    message = _mail("Body")
+    message.add_alternative(html_body, subtype="html")
+    _add_related_png(
+        message.get_payload()[-1], filename="scan.png", text="USD 310.42", cid="<InsertPic_001>"
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=expected_text)
+
+
 @pytest.mark.parametrize(
     "html_body",
     [

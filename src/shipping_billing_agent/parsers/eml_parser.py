@@ -457,6 +457,7 @@ def _in_post_separator_signature(
         return False
 
     segment = [separator_text] if separator_text else []
+    preceding_segment = segment.copy()
     for next_index in range(boundary + 1, len(markers)):
         node, node_scope = markers[next_index]
         if node_scope is None:
@@ -466,6 +467,8 @@ def _in_post_separator_signature(
         if isinstance(node, NavigableString):
             parts = _SIGNATURE_SEPARATOR.split(node, maxsplit=1)
             segment.append(parts[0])
+            if next_index < index:
+                preceding_segment.append(parts[0])
             if len(parts) > 1:
                 break
         elif node.name == "hr":
@@ -473,7 +476,8 @@ def _in_post_separator_signature(
 
     context = "\n".join(segment)
     return _SIGNATURE_CONTACT.search(context) is not None and (
-        (separator_kind == "dash" and scope.name != "main") or _SIGNOFF.search(context) is not None
+        (separator_kind == "dash" and scope.name != "main")
+        or _SIGNOFF.search("\n".join(preceding_segment)) is not None
     )
 
 
@@ -482,7 +486,7 @@ def _signature_context(
     index: int,
     scope: Tag,
     body_scope: Tag,
-) -> tuple[str, _SeparatorKind | None]:
+) -> tuple[str, str, _SeparatorKind | None]:
     start = max(0, index - _SIGNATURE_TAIL_SIZE)
     boundary, separator_kind, separator_text = _preceding_signature_boundary(
         markers, index, scope, body_scope
@@ -512,15 +516,22 @@ def _signature_context(
     else:
         next_index = len(markers)
 
-    text = [separator_text] if separator_text else []
+    preceding = [separator_text] if separator_text else []
+    preceding.extend(
+        node
+        for node, node_scope in markers[start:index]
+        if node_scope is scope and isinstance(node, NavigableString)
+    )
+    preceding_context = "\n".join(preceding)
+    text = preceding.copy()
     text.extend(
         node
-        for node, node_scope in markers[start:next_index]
+        for node, node_scope in markers[index + 1 : next_index]
         if node_scope is scope and isinstance(node, NavigableString)
     )
     if trailing_text:
         text.append(trailing_text)
-    return "\n".join(text), separator_kind
+    return "\n".join(text), preceding_context, separator_kind
 
 
 def _nearest_container(node: Tag | NavigableString, footer: Tag) -> Tag:
@@ -1096,7 +1107,9 @@ def _html_text(
         elif not in_footer and _has_signature_figure_caption(image, figure_captions):
             classification = "signature"
         elif len(markers) - index <= _SIGNATURE_TAIL_SIZE:
-            context, separator_kind = _signature_context(markers, index, scope, body)
+            context, preceding_context, separator_kind = _signature_context(
+                markers, index, scope, body
+            )
             if in_footer:
                 context = _footer_signature_context(
                     markers,
@@ -1109,13 +1122,23 @@ def _html_text(
                 )
             has_contact = _SIGNATURE_CONTACT.search(context) is not None
             has_signoff = _SIGNOFF.search(context) is not None
+            has_signoff_before = _SIGNOFF.search(preceding_context) is not None
             after_signoff = has_contact and separator_kind is not None and (
-                in_footer or has_signoff or (separator_kind == "dash" and scope.name != "main")
+                in_footer
+                or has_signoff_before
+                or (separator_kind == "dash" and scope.name != "main")
             )
             footer_signature = in_footer and has_contact and has_signoff
-            decorative = (
-                _DECORATIVE_IMAGE.search(source) is not None and (has_contact or has_signoff)
-            )
+            if not in_footer and scope.name == "main":
+                decorative = (
+                    _DECORATIVE_IMAGE.search(source) is not None
+                    and has_contact
+                    and has_signoff_before
+                )
+            else:
+                decorative = (
+                    _DECORATIVE_IMAGE.search(source) is not None and (has_contact or has_signoff)
+                )
             if after_signoff or footer_signature or decorative:
                 classification = "signature"
             elif not in_footer and (
