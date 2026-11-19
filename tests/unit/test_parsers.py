@@ -1,3 +1,4 @@
+import re
 from base64 import b64encode
 from email import policy
 from email.message import EmailMessage
@@ -7,7 +8,9 @@ from itertools import pairwise
 from pathlib import Path
 from struct import pack_into, unpack_from
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import pdfplumber
 import pytest
 from docx import Document
 from openpyxl import Workbook
@@ -288,9 +291,11 @@ def test_doc_rejects_encrypted_flag():
         parse_word(bytes(data), "encrypted.doc")
 
 
-def _two_page_pdf(first_page: bytes, second_page: bytes) -> bytes:
+def _two_page_pdf(
+    first_page: bytes, second_page: bytes, *, page_size: tuple[int, int] = (300, 200)
+) -> bytes:
     page = (
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] "
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] "
         b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>"
     )
     objects = [
@@ -299,7 +304,7 @@ def _two_page_pdf(first_page: bytes, second_page: bytes) -> bytes:
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
     for stream in (first_page, second_page):
-        objects.append(page % (len(objects) + 2))
+        objects.append(page % (*page_size, len(objects) + 2))
         objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"endstream")
 
     pdf = bytearray(b"%PDF-1.4\n")
@@ -480,6 +485,103 @@ def test_r5_f2_pdf_with_long_rule_keeps_short_electronic_text():
     (document,) = dispatcher.parse_batch([("electronic.pdf", data)])
 
     assert document.status is DocumentStatus.PARSED, document.error_message
+    assert document.extraction_channel is ExtractionChannel.LOCAL_PDF_TEXT_FALLBACK
+    assert document.raw_text.endswith("[Page 2 | Text]\nUSD 245.00"), document.raw_text
+
+
+@pytest.fixture
+def r6_filled_rectangle_pdf() -> bytes:
+    page_width, page_height = 1460, 410
+    strip_height = 9
+    with Image.new("L", (page_width, page_height), 255) as mask:
+        font = ImageFont.load_default(size=230)
+        draw = ImageDraw.Draw(mask)
+        draw.text((60, 35), "USD 77.77", font=font, fill=0, stroke_width=5)
+        pixels = mask.tobytes()
+
+    paths = bytearray(b"BT /F1 18 Tf 720 30 Td (2) Tj ET\n")
+    for top in range(0, page_height - strip_height + 1, strip_height):
+        start = (top + strip_height // 2) * page_width
+        row = pixels[start : start + page_width]
+        y = page_height - top - strip_height
+        for run in re.finditer(rb"\x00+", row):
+            width = max(32, run.end() - run.start())
+            x = (run.start() + run.end() - width) // 2
+            paths.extend(b"%d %d %d %d re f\n" % (x, y, width, strip_height))
+
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE, bytes(paths), page_size=(page_width, page_height)
+    )
+    with BytesIO(data) as stream, pdfplumber.open(stream) as pdf:
+        assert len(pdf.pages) == 2
+        page = pdf.pages[1]
+        assert page.extract_text() == "2"
+        assert not (page.lines or page.curves or page.images)
+        assert len(page.rects) > 100
+        assert all(
+            rect["fill"] and 32 <= rect["width"] <= 168 and rect["height"] == strip_height
+            for rect in page.rects
+        )
+    return data
+
+
+def test_r6_2_pdf_reads_amount_drawn_as_wide_filled_rectangles(r6_filled_rectangle_pdf):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
+    )
+    (document,) = dispatcher.parse_batch([("filled-strips.pdf", r6_filled_rectangle_pdf)])
+
+    assert document.status is DocumentStatus.PARSED, document.error_message
+    _, ocr_source, ocr_text = document.raw_text.partition("[Page 2 | OCR]\n")
+    assert ocr_source, document.raw_text
+    assert document.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "USD" in ocr_text, ocr_text
+    assert "77.77" in ocr_text, ocr_text
+
+
+def test_r6_2_pdf_with_wide_filled_rectangles_requires_ocr(r6_filled_rectangle_pdf):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=None
+    )
+    (document,) = dispatcher.parse_batch([("filled-strips.pdf", r6_filled_rectangle_pdf)])
+
+    assert document.status is DocumentStatus.FAILED, document.raw_text
+    assert document.error_message == "第 2 页为扫描图像页，未配置本地 OCR 引擎"
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+@pytest.mark.parametrize(
+    "segments",
+    [
+        pytest.param([(24, 264)], id="single-segment"),
+        pytest.param([(x, x + 24) for x in range(24, 264, 24)], id="continuous-10-segments"),
+        pytest.param([(x, x + 15) for x in range(24, 264, 25)], id="dashed-10-segments"),
+    ],
+)
+def test_r6_3_pdf_keeps_short_electronic_text_with_a_segmented_rule(segments, local_ocr):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    rule = b"".join(b"%d 144 m %d 144 l S\n" % (left, right) for left, right in segments)
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE, rule + b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n"
+    )
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=local_ocr
+    )
+    with patch.object(
+        RapidOcrFallback,
+        "recognize_pil_image",
+        autospec=True,
+        side_effect=RapidOcrFallback.recognize_pil_image,
+    ) as recognize_page:
+        (document,) = dispatcher.parse_batch([("electronic.pdf", data)])
+
+    assert document.status is DocumentStatus.PARSED, document.error_message
+    recognize_page.assert_not_called()
     assert document.extraction_channel is ExtractionChannel.LOCAL_PDF_TEXT_FALLBACK
     assert document.raw_text.endswith("[Page 2 | Text]\nUSD 245.00"), document.raw_text
 
@@ -929,6 +1031,91 @@ def test_r5_f3_eml_keeps_the_footer_scan_and_skips_the_signature_logo(scan_block
     assert "USD 310.42" in scan.raw_text, scan.raw_text
     assert logo.sanitized_filename == "logo.png"
     assert logo.status is DocumentStatus.SKIPPED_NOISE
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+
+
+def _png_with_text(text: str) -> bytes:
+    with Image.new("RGB", (460, 140), "white") as image, BytesIO() as buffer:
+        font = ImageFont.load_default(size=58)
+        ImageDraw.Draw(image).text((24, 28), text, font=font, fill="black")
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
+@pytest.mark.parametrize(
+    "html_body",
+    [
+        pytest.param(
+            '<footer><div>Best regards<br>ACME<br>Tel: 123456<img src="cid:logo"></div>'
+            '<div><img src="cid:scan"></div></footer>',
+            id="r6-1a-scan-after-complete-signature",
+        ),
+        pytest.param(
+            '<footer><div><img src="cid:scan"><br>Best regards<br>ACME<br>Tel: 123456'
+            '<img src="cid:logo"></div></footer>',
+            id="r6-1b-scan-before-signoff-in-same-unit",
+        ),
+        pytest.param(
+            '<footer><div><figure><img src="cid:scan"><figcaption>Invoice scan</figcaption>'
+            '</figure></div><div><div><img src="cid:logo"></div>'
+            '<div>Best regards<br>ACME<br>Tel: 123456</div></div></footer>',
+            id="r6-4-logo-before-signoff-in-sibling-div",
+        ),
+        pytest.param(
+            '<p>Charges attached</p><img src="cid:scan">'
+            '<div class="signature"><img src="cid:logo" alt="ACME Freight logo"></div>',
+            id="r6-5-freight-company-logo",
+        ),
+    ],
+)
+def test_r6_eml_reads_the_bill_scan_and_skips_the_signature_logo(html_body):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    message = _mail("Charges attached")
+    message.add_alternative(html_body, subtype="html")
+    html = message.get_payload()[-1]
+    scan_data = _png_with_text("USD 310.42")
+    html.add_related(
+        scan_data, maintype="image", subtype="png", cid="<scan>", filename="scan.png"
+    )
+    html.add_related(
+        _png_with_text("ACME"), maintype="image", subtype="png", cid="<logo>", filename="logo.png"
+    )
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
+    )
+
+    _, _, scan, logo = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert scan.status is DocumentStatus.PARSED, scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "USD 310.42" in scan.raw_text, scan.raw_text
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE, logo.raw_text
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+
+
+def test_r6_5_eml_skips_logo_after_text_only_footer_signature():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    message = _mail("Body")
+    message.add_alternative(
+        '<footer><div>Best regards<br>ACME<br>Tel: 123456</div>'
+        '<div><img src="cid:logo"></div></footer>',
+        subtype="html",
+    )
+    message.get_payload()[-1].add_related(
+        _png_with_text("ACME"), maintype="image", subtype="png", cid="<logo>", filename="logo.png"
+    )
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
+    )
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE, logo.raw_text
     assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
 
 

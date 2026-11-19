@@ -7,6 +7,7 @@ from typing import Any, Protocol
 
 import pdfplumber
 from pdfminer.pdfdocument import PDFEncryptionError
+from pdfplumber.page import Page
 from pdfplumber.utils.exceptions import PdfminerException
 from PIL import Image
 
@@ -14,7 +15,9 @@ from shipping_billing_agent.domain.models import ExtractionChannel, ParsedTable
 
 _MIN_TEXT_CHARACTERS = 15
 _OCR_RESOLUTION_DPI = 200
-_MAX_GLYPH_STROKE_PT = 30.0
+_COLLINEAR_TOL_PT = 1.0
+_LONG_RULE_SPAN_PT = 40.0
+_MAX_DECORATIVE_RULES = 3
 _Point = tuple[float, float]
 
 
@@ -107,33 +110,84 @@ def _is_non_table_curve(curve: dict[str, Any], table_grids: list[_TableGrid]) ->
     return False
 
 
-def _line_is_glyph_stroke(line: dict[str, Any], table_grids: list[_TableGrid]) -> bool:
-    points = line.get("pts")
-    if points is None:
-        p1, p2 = (line["x0"], line["top"]), (line["x1"], line["bottom"])
+def _count_rule_clusters(segments: list[tuple[float, float, float]]) -> tuple[int, int]:
+    if not segments:
+        return 0, 0
+
+    ordered = iter(sorted(segments, key=lambda segment: segment[0]))
+    anchor_coord, min_pos, max_pos = next(ordered)
+    short_rules = long_rules = 0
+    for coord, lo, hi in ordered:
+        if abs(coord - anchor_coord) <= _COLLINEAR_TOL_PT:
+            min_pos, max_pos = min(min_pos, lo), max(max_pos, hi)
+            continue
+        if max_pos - min_pos > _LONG_RULE_SPAN_PT:
+            long_rules += 1
+        else:
+            short_rules += 1
+        anchor_coord, min_pos, max_pos = coord, lo, hi
+
+    if max_pos - min_pos > _LONG_RULE_SPAN_PT:
+        long_rules += 1
     else:
-        p1, p2 = points[0], points[1]
-    if _is_table_segment(p1, p2, table_grids):
-        return False
-    dx, dy = abs(p1[0] - p2[0]), abs(p1[1] - p2[1])
-    return (dx > 0.5 and dy > 0.5) or max(dx, dy) <= _MAX_GLYPH_STROKE_PT
+        short_rules += 1
+    return short_rules, long_rules
 
 
-def _rect_is_glyph_stroke(rect: dict[str, Any], table_grids: list[_TableGrid]) -> bool:
-    x0, top, x1, bottom = rect["x0"], rect["top"], rect["x1"], rect["bottom"]
-    width, height = abs(x1 - x0), abs(bottom - top)
-    if width <= 4.0 and height <= 4.0:
-        return True
-    if width <= 3.0:
-        x = (x0 + x1) / 2
-        points = ((x, top), (x, bottom))
-    elif height <= 3.0:
-        y = (top + bottom) / 2
-        points = ((x0, y), (x1, y))
-    else:
-        points = ((x0, top), (x1, top), (x1, bottom), (x0, bottom), (x0, top))
-    return max(width, height) <= _MAX_GLYPH_STROKE_PT and any(
-        not _is_table_segment(p1, p2, table_grids) for p1, p2 in pairwise(points)
+def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
+    glyph_elements = 0
+    horiz_segments: list[tuple[float, float, float]] = []
+    vert_segments: list[tuple[float, float, float]] = []
+
+    for line in page.lines:
+        points = line.get("pts") or ()
+        if len(points) >= 2:
+            p1, p2 = points[0], points[1]
+        else:
+            p1, p2 = (line["x0"], line["top"]), (line["x1"], line["bottom"])
+        if _is_table_segment(p1, p2, table_grids):
+            continue
+        (x0, y0), (x1, y1) = p1, p2
+        dx, dy = abs(x1 - x0), abs(y1 - y0)
+        if dx <= 0.5 and dy <= 0.5:
+            glyph_elements += 1
+        elif dy <= 0.5:
+            horiz_segments.append(((y0 + y1) / 2, min(x0, x1), max(x0, x1)))
+        elif dx <= 0.5:
+            vert_segments.append(((x0 + x1) / 2, min(y0, y1), max(y0, y1)))
+        else:
+            glyph_elements += 1
+
+    for rect in page.rects:
+        x0, top, x1, bottom = rect["x0"], rect["top"], rect["x1"], rect["bottom"]
+        width, height = abs(x1 - x0), abs(bottom - top)
+        if width <= 4.0 and height <= 4.0:
+            glyph_elements += 1
+        elif width <= 3.0:
+            x = (x0 + x1) / 2
+            if not _is_table_segment((x, top), (x, bottom), table_grids):
+                vert_segments.append((x, min(top, bottom), max(top, bottom)))
+        elif height <= 3.0:
+            y = (top + bottom) / 2
+            if not _is_table_segment((x0, y), (x1, y), table_grids):
+                horiz_segments.append((y, min(x0, x1), max(x0, x1)))
+        else:
+            corners = ((x0, top), (x1, top), (x1, bottom), (x0, bottom), (x0, top))
+            if all(_is_table_segment(p1, p2, table_grids) for p1, p2 in pairwise(corners)):
+                continue
+            if not rect.get("fill") and min(width, height) > _LONG_RULE_SPAN_PT:
+                continue
+            glyph_elements += 1
+
+    short_h, long_h = _count_rule_clusters(horiz_segments)
+    short_v, long_v = _count_rule_clusters(vert_segments)
+    glyph_elements += short_h + short_v
+    has_non_table_curve = any(_is_non_table_curve(curve, table_grids) for curve in page.curves)
+    return (
+        has_non_table_curve
+        or glyph_elements >= 2
+        or long_h > _MAX_DECORATIVE_RULES
+        or long_v > _MAX_DECORATIVE_RULES
     )
 
 
@@ -160,15 +214,7 @@ def parse_pdf(
                         valid_tables.append((table, grid))
                 table_grids = [_table_grid(table) for table, _ in valid_tables]
 
-                has_non_table_curve = any(
-                    _is_non_table_curve(curve, table_grids) for curve in page.curves
-                )
-                non_table_glyph_strokes = sum(
-                    _line_is_glyph_stroke(line, table_grids) for line in page.lines
-                ) + sum(
-                    _rect_is_glyph_stroke(rect, table_grids) for rect in page.rects
-                )
-                has_glyph_strokes = has_non_table_curve or non_table_glyph_strokes >= 2
+                has_glyph_strokes = _has_glyph_strokes(page, table_grids)
                 has_visual_objects = bool(page.images or page.curves or page.rects or page.lines)
                 needs_ocr = sparse_text and (
                     bool(page.images)
