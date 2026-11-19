@@ -694,7 +694,10 @@ def test_t10_pdf_keeps_short_electronic_text_with_decorative_rules(t10_decorated
 
 
 def _assert_decorated_pdf_keeps_electronic_text(
-    data: bytes, local_ocr: RapidOcrFallback | None
+    data: bytes,
+    local_ocr: RapidOcrFallback | None,
+    *,
+    expected_suffix: str = "[Page 2 | Text]\nUSD 245.00",
 ) -> None:
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
@@ -712,7 +715,7 @@ def _assert_decorated_pdf_keeps_electronic_text(
     assert document.status is DocumentStatus.PARSED, document.error_message
     recognize_page.assert_not_called()
     assert document.extraction_channel is ExtractionChannel.LOCAL_PDF_TEXT_FALLBACK
-    assert document.raw_text.endswith("[Page 2 | Text]\nUSD 245.00"), document.raw_text
+    assert document.raw_text.endswith(expected_suffix), document.raw_text
 
 
 @pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
@@ -920,11 +923,17 @@ def test_r15_a2_pdf_keeps_electronic_text_with_degenerate_fill(drawing, local_oc
     ],
 )
 def test_r15_a2_pdf_still_requires_ocr_for_visible_short_shapes(drawing, local_ocr):
-    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
-
     data = _two_page_pdf(
         _PAYMENT_TERMS_PAGE, drawing + b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n"
     )
+    _assert_pdf_requires_ocr_on_second_page(data, local_ocr)
+
+
+def _assert_pdf_requires_ocr_on_second_page(
+    data: bytes, local_ocr: RapidOcrFallback | None
+) -> None:
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
     dispatcher = DocumentParserDispatcher(
         ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=local_ocr
     )
@@ -947,6 +956,57 @@ def test_r15_a2_pdf_still_requires_ocr_for_visible_short_shapes(drawing, local_o
         recognize_page.assert_called_once()
         assert recognize_page.call_args.kwargs["page"] == 2
         assert document.raw_text.endswith("[Page 2 | OCR]\n[Page 2]\nUSD 245.00"), document.raw_text
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+@pytest.mark.parametrize(
+    "drawing",
+    [
+        pytest.param(b"24 115 m f\n", id="move-only"),
+        pytest.param(b"24 115 m 24 115 l 24 125 l 24 125 l f\n", id="zero-width-fill"),
+    ],
+)
+def test_r16_f3_pdf_keeps_an_empty_page_with_invisible_paths(drawing, local_ocr):
+    data = _two_page_pdf(b"BT /F1 12 Tf 24 160 Td (Invoice total USD 245.00) Tj ET\n", drawing)
+
+    _assert_decorated_pdf_keeps_electronic_text(
+        data,
+        local_ocr,
+        expected_suffix="[Page 1 | Text]\nInvoice total USD 245.00\n\n[Page 2 | Text]",
+    )
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+@pytest.mark.parametrize(
+    "drawing",
+    [
+        pytest.param(b"24 115 m 29 120 34 125 39 130 c f\n", id="c"),
+        pytest.param(b"24 115 m 34 125 39 130 v h f\n", id="v"),
+        pytest.param(b"24 115 m 29 120 39 130 y f\n", id="y"),
+    ],
+)
+def test_r16_f3_pdf_keeps_electronic_text_with_collinear_bezier_fill(drawing, local_ocr):
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE, drawing + b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n"
+    )
+
+    _assert_decorated_pdf_keeps_electronic_text(data, local_ocr)
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+@pytest.mark.parametrize(
+    "drawing",
+    [
+        pytest.param(b"24 115 m 29 120 34 125 39 130 c S\n", id="stroked-collinear-bezier"),
+        pytest.param(b"24 115 m 24 135 39 135 39 115 c h f\n", id="filled-noncollinear-bezier"),
+    ],
+)
+def test_r16_f3_pdf_still_requires_ocr_for_visible_bezier_paths(drawing, local_ocr):
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE, drawing + b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n"
+    )
+
+    _assert_pdf_requires_ocr_on_second_page(data, local_ocr)
 
 
 @pytest.mark.parametrize(
@@ -2242,6 +2302,158 @@ def test_r15_a4_eml_footer_inherits_white_space_from_ancestors(
 
     assert logo.sanitized_filename == "logo.png"
     _assert_inline_image_ocr(logo, recognize_image, expected_text=expected_text)
+
+
+@pytest.mark.parametrize(
+    ("caption", "expected_text"),
+    [
+        pytest.param("Invoice scan", "USD 310.42", id="bill"),
+        pytest.param("Company logo", None, id="logo"),
+    ],
+)
+def test_r16_f1_eml_keeps_caption_in_the_signoff_text_node(caption, expected_text, r8_eml_ocr):
+    html = (
+        '<body style="white-space:pre-line"><footer><div><img src="cid:scan">'
+        f"{caption}\nBest regards\nACME\nTel: 123456</div></footer></body>"
+    )
+    data = _mail_with_inline_png(html, image_name="scan", text=expected_text or "ACME")
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=expected_text)
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        pytest.param("<div>{contact}<br>{image}</div>", id="inside"),
+        pytest.param("<div>{contact}</div>{image}", id="adjacent"),
+        pytest.param("<div><div>{contact}</div></div>{image}", id="wrapped-adjacent"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("tail", "expected_text"),
+    [
+        pytest.param("Invoice inquiries<br>Company logo", None, id="logo"),
+        pytest.param("Invoice scan<br>Attached", "USD 310.42", id="bill"),
+    ],
+)
+def test_r16_f2_eml_uses_the_same_caption_rule_for_signature_layouts(
+    layout, tail, expected_text, r8_eml_ocr
+):
+    html = layout.format(
+        contact=f"<hr>ACME<br>Tel: 123456<br>{tail}", image='<img src="cid:scan">'
+    )
+    data = _mail_with_inline_png(
+        f"<footer>{html}</footer>", image_name="scan", text=expected_text or "ACME"
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=expected_text)
+
+
+@pytest.mark.parametrize("container", ["footer", "div"])
+def test_r16_f4_eml_skips_a_logo_repeated_before_the_signature_tail(container, r8_eml_ocr):
+    logo_ref = '<img src="cid:logo">'
+    details = "".join(f"<br>Contact line {number}" for number in range(1, 10))
+    html = (
+        f"<{container}><hr><div>Best regards<br>Tel: 123456<br>{logo_ref}"
+        f"{details}<br>Tel: 123456<br>{logo_ref}</div></{container}>"
+    )
+    data = _mail_with_inline_png(html, image_name="logo", text="ACME")
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(logo, recognize_image, expected_text=None)
+
+
+def test_r16_f4_eml_keeps_a_shared_cid_with_an_early_body_reference(r8_eml_ocr):
+    scan_ref = '<img src="cid:scan">'
+    details = "".join(f"<p>Shipment details {number}</p>" for number in range(1, 10))
+    data = _mail_with_inline_png(
+        f'<main>{scan_ref}{details}</main><div class="signature">{scan_ref}</div>',
+        image_name="scan",
+        text="USD 310.42",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text="USD 310.42")
+
+
+@pytest.mark.parametrize(
+    ("location", "content_base", "expected_text"),
+    [
+        pytest.param("https://example.com/signature/scan.png", None, None, id="different-url"),
+        pytest.param("/signature/scan.png", None, None, id="root-relative-location"),
+        pytest.param(None, None, None, id="no-location"),
+        pytest.param("https://example.com/bills/scan.png", None, "USD 310.42", id="same-url"),
+        pytest.param(
+            "bills/%73can.png", "https://EXAMPLE.COM/mail.eml", "USD 310.42", id="content-base"
+        ),
+        pytest.param(
+            "https://example.com/bills/scan.png?size=large", None, None, id="different-query"
+        ),
+        pytest.param("https://example.com/Bills/scan.png", None, None, id="different-path-case"),
+        pytest.param("https://[invalid/signature/scan.png", None, None, id="malformed-location"),
+    ],
+)
+def test_r16_f5_eml_matches_bill_images_by_location(
+    location, content_base, expected_text, r8_eml_ocr
+):
+    message = _mail("Body")
+    message.add_alternative(
+        '<figure><img src="https://example.com/bills/scan.png">'
+        '<figcaption>Invoice scan</figcaption></figure>'
+        '<div class="signature"><img src="cid:logo"></div>',
+        subtype="html",
+    )
+    html_part = message.get_payload()[-1]
+    html_part.add_related(
+        _png_with_text(expected_text or "ACME"),
+        maintype="image",
+        subtype="png",
+        cid="<logo>",
+        filename="scan.png",
+    )
+    attachment = html_part.get_payload()[-1]
+    if location is not None:
+        attachment["Content-Location"] = location
+    if content_base is not None:
+        attachment["Content-Base"] = content_base
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert scan.sanitized_filename == "scan.png"
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=expected_text)
+
+
+@pytest.mark.parametrize(
+    "bill_src",
+    [
+        pytest.param("/bills/scan.png", id="root-relative"),
+        pytest.param("//example.com/bills/scan.png", id="protocol-relative"),
+        pytest.param("https://[invalid/bills/scan.png", id="malformed-url"),
+    ],
+)
+def test_r16_f5_eml_does_not_use_url_basename_for_attachment_matching(bill_src, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        f'<figure><img src="{bill_src}"><figcaption>Invoice scan</figcaption></figure>'
+        '<div class="signature"><img src="cid:scan"></div>',
+        image_name="scan",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=None)
 
 
 @pytest.mark.parametrize(

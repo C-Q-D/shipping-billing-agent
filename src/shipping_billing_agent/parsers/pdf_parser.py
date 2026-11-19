@@ -211,21 +211,31 @@ def _same_vertex(p1: _Point, p2: _Point) -> bool:
     )
 
 
-def _straight_subpaths(path: list[tuple[Any, ...]]) -> Iterator[tuple[list[_Point], bool]]:
+def _iter_curve_subpaths(
+    path: list[tuple[Any, ...]],
+) -> Iterator[tuple[list[_Point], bool, bool, bool]]:
     points: list[_Point] = []
     closed_start: _Point | None = None
+    has_bezier = False
+    has_unknown_op = False
     for operator, *vertices in path:
         if operator == "m":
-            if points:
-                yield points, False
+            if points or has_unknown_op:
+                yield points, False, has_bezier, has_unknown_op
             points = [vertices[0]]
             closed_start = None
-        elif operator == "h" and points:
+            has_bezier = False
+            has_unknown_op = False
+        elif operator == "h":
+            if not points:
+                continue
             closed_start = points[0]
-            if len(points) > 1 and _same_vertex(closed_start, points[-1]):
+            if not has_bezier and len(points) > 1 and _same_vertex(closed_start, points[-1]):
                 points.pop()
-            yield points, True
+            yield points, True, has_bezier, has_unknown_op
             points = []
+            has_bezier = False
+            has_unknown_op = False
         elif operator == "l":
             if not points:
                 if closed_start is None:
@@ -234,9 +244,16 @@ def _straight_subpaths(path: list[tuple[Any, ...]]) -> Iterator[tuple[list[_Poin
                 points = [closed_start]
             if not _same_vertex(points[-1], vertices[0]):
                 points.append(vertices[0])
+        elif operator in {"c", "v", "y"}:
+            if not points and closed_start is not None:
+                points = [closed_start]
+            has_bezier = True
+            points.extend(vertices)
+        else:
+            has_unknown_op = True
 
-    if points:
-        yield points, False
+    if points or has_unknown_op:
+        yield points, False, has_bezier, has_unknown_op
 
 
 def _rectangle_bounds(points: list[_Point]) -> tuple[float, float, float, float] | None:
@@ -292,31 +309,35 @@ def _process_curve(
     horiz_segments: list[_RuleSegment],
     vert_segments: list[_RuleSegment],
     tiny_rects: list[tuple[float, float, float, float]],
-) -> tuple[bool, int]:
+) -> tuple[bool, int, bool]:
     stroked = bool(curve.get("stroke"))
     filled = bool(curve.get("fill"))
     if not stroked and not filled:
-        return False, 0
+        return False, 0, False
 
     path = curve.get("path")
-    if path is not None and any(operator not in {"m", "l", "h"} for operator, *_ in path):
-        return True, 0
-
     linewidth = _line_width(curve)
     if path is None:
         points = list(curve.get("pts") or ())
         if not stroked and _is_collinear_subpath(points):
-            return False, 0
+            return False, 0, False
         added = sum(
             _classify_straight_segment(
                 p1, p2, table_grids, horiz_segments, vert_segments, tiny_rects, linewidth=linewidth
             )
             for p1, p2 in pairwise(points)
         )
-        return False, added
+        return False, added, bool(points)
 
     added = 0
-    for points, closed in _straight_subpaths(path):
+    visible = False
+    for points, closed, has_bezier, has_unknown_op in _iter_curve_subpaths(path):
+        if has_unknown_op:
+            return True, 0, True
+        if has_bezier:
+            if not stroked and _is_collinear_subpath(points):
+                continue
+            return True, 0, True
         if not closed and filled and len(points) >= 3:
             # PDF fills implicitly close open subpaths.
             if _same_vertex(points[0], points[-1]):
@@ -324,6 +345,7 @@ def _process_curve(
             closed = True
         if not stroked and _is_collinear_subpath(points):
             continue
+        visible = True
         if len(points) == 1:
             added += 1
             continue
@@ -342,7 +364,7 @@ def _process_curve(
             added += _classify_straight_segment(
                 p1, p2, table_grids, horiz_segments, vert_segments, tiny_rects, linewidth=linewidth
             )
-    return False, added
+    return False, added, visible
 
 
 def _merge_rule_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -484,8 +506,9 @@ def _has_dense_parallel_rules(long_coords: list[float]) -> bool:
     return False
 
 
-def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
+def _analyze_page_vectors(page: Page, table_grids: list[_TableGrid]) -> tuple[bool, bool]:
     glyph_elements = 0
+    has_visible_vectors = False
     horiz_segments: list[_RuleSegment] = []
     vert_segments: list[_RuleSegment] = []
     tiny_rects: list[tuple[float, float, float, float]] = []
@@ -493,6 +516,7 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
     for line in page.lines:
         if not line.get("stroke"):
             continue
+        has_visible_vectors = True
         points = line.get("pts") or ()
         if len(points) >= 2:
             p1, p2 = points[0], points[1]
@@ -518,6 +542,7 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
             or abs(rect["bottom"] - rect["top"]) <= _DUPLICATE_VERTEX_TOL_PT
         ):
             continue
+        has_visible_vectors = True
         glyph_elements += _classify_rect(
             rect["x0"],
             rect["top"],
@@ -532,10 +557,11 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
 
     has_bezier_curve = False
     for curve in page.curves:
-        has_bezier_curve, added = _process_curve(
+        has_bezier_curve, added, visible = _process_curve(
             curve, table_grids, horiz_segments, vert_segments, tiny_rects
         )
         glyph_elements += added
+        has_visible_vectors = has_visible_vectors or visible
         if has_bezier_curve:
             break
 
@@ -560,12 +586,13 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
 
     short_h, long_h_coords = _count_rule_clusters(horiz_segments)
     short_v, long_v_coords = _count_rule_clusters(vert_segments)
-    return (
+    has_glyph_strokes = (
         has_bezier_curve
         or glyph_elements + short_h + short_v >= 2
         or _has_dense_parallel_rules(long_h_coords)
         or _has_dense_parallel_rules(long_v_coords)
     )
+    return has_glyph_strokes, has_visible_vectors
 
 
 def parse_pdf(
@@ -591,8 +618,8 @@ def parse_pdf(
                         valid_tables.append((table, grid))
                 table_grids = [_table_grid(table) for table, _ in valid_tables]
 
-                has_glyph_strokes = _has_glyph_strokes(page, table_grids)
-                has_visual_objects = bool(page.images or page.curves or page.rects or page.lines)
+                has_glyph_strokes, has_visible_vectors = _analyze_page_vectors(page, table_grids)
+                has_visual_objects = bool(page.images) or has_visible_vectors
                 needs_ocr = sparse_text and (
                     bool(page.images)
                     or has_glyph_strokes

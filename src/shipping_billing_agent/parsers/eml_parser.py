@@ -9,7 +9,7 @@ from email.message import Message
 from email.parser import BytesHeaderParser
 from mimetypes import guess_extension
 from quopri import decodestring
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
@@ -25,6 +25,11 @@ _BILL_WORDS = re.compile(
 _BILL_TAG_WORDS = re.compile(
     r"\b(?:invoice|invoices|bill|bills|billing|debit\s*note|credit\s*note|charges?"
     r"|statement|statements)\b|账单|帳單|发票|發票|费用|費用",
+    re.I,
+)
+_CAPTION_CONTINUATION = re.compile(
+    r"^(?:(?:please\s+)?(?:see\s+)?(?:attached|below|enclosed)"
+    r"|attached\s+below|see\s+details|附件|见附件|详见附件|见下图|附图)[\s:：.!！]*$",
     re.I,
 )
 _ISO_CODES = "|".join(sorted((*ACTIVE_ISO4217_CODES, "RMB")))
@@ -63,6 +68,43 @@ class EmlParseError(ValueError):
 
 def _content_id(value: str) -> str:
     return unquote(value).strip().strip("<>").casefold()
+
+
+def _normalize_location(value: str, *, base: str = "") -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    base = base.strip()
+    try:
+        if base:
+            value = urljoin(base, value)
+        parsed = urlsplit(value)
+    except ValueError:
+        # A malformed URL cannot identify an attachment by location.
+        return ""
+
+    path = unquote(parsed.path)
+    if parsed.scheme or parsed.netloc:
+        location = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+    else:
+        location = path.strip().casefold()
+        if not location:
+            return ""
+    return f"{location}?{parsed.query}" if parsed.query else location
+
+
+def _classify_non_cid_source(source: str) -> tuple[str, str | None]:
+    try:
+        parsed = urlsplit(source.strip())
+    except ValueError:
+        return "", None
+
+    location = _normalize_location(source)
+    unquoted_path = unquote(parsed.path).strip()
+    if parsed.scheme or parsed.netloc or unquoted_path.startswith("/"):
+        return location, None
+    filename = sanitize_filename(unquoted_path).casefold() if unquoted_path else None
+    return location, filename
 
 
 def _is_attachment(message: Message) -> bool:
@@ -115,6 +157,13 @@ class _MimePart:
     def content_id(self) -> str:
         return _content_id(self.headers.get("Content-ID", ""))
 
+    @property
+    def content_location(self) -> str:
+        raw = self.headers.get("Content-Location", "")
+        if not raw:
+            return ""
+        return _normalize_location(raw, base=self.headers.get("Content-Base", ""))
+
     def iter_parts(self) -> Iterator["_MimePart"]:
         default_type = "message/rfc822" if self.media_type == "multipart/digest" else "text/plain"
         for start, end in _wire_parts(self):
@@ -161,21 +210,26 @@ class ParsedEmail:
     truncated: bool = False
     non_signature_cids: set[str] = field(default_factory=set)
     non_signature_filenames: set[str] = field(default_factory=set)
+    signature_locations: set[str] = field(default_factory=set)
+    non_signature_locations: set[str] = field(default_factory=set)
 
     def is_signature_image(self, attachment: _MimePart, filename: str) -> bool:
         if _BILL_WORDS.search(filename):
             return False
         cid = attachment.content_id
+        location = attachment.content_location
         normalized_name = sanitize_filename(filename).casefold()
-        if (
-            (cid and cid in self.non_signature_cids)
-            or normalized_name in self.non_signature_filenames
-        ):
+        if cid and cid in self.non_signature_cids:
             return False
-        return (
-            (bool(cid) and cid in self.signature_cids)
-            or normalized_name in self.signature_filenames
-        )
+        if location and location in self.non_signature_locations:
+            return False
+        if not location and normalized_name in self.non_signature_filenames:
+            return False
+        if cid and cid in self.signature_cids:
+            return True
+        if location and location in self.signature_locations:
+            return True
+        return not location and normalized_name in self.signature_filenames
 
 
 def _wire_parts(part: _MimePart) -> Iterator[tuple[int, int]]:
@@ -223,6 +277,18 @@ def _is_bill_caption_text(text: str) -> bool:
     return bool(_BILL_TAG_WORDS.search(text) or _BILL_AMOUNT_HINT.search(text))
 
 
+def _lines_end_with_bill_caption(lines: list[str]) -> bool:
+    if not lines:
+        return False
+    if _is_bill_caption_text(lines[-1]):
+        return True
+    return (
+        len(lines) >= 2
+        and _CAPTION_CONTINUATION.fullmatch(lines[-1]) is not None
+        and _is_bill_caption_text(lines[-2])
+    )
+
+
 def _is_bill_image_tag(image: Tag) -> bool:
     labels = [image.get(attribute) for attribute in ("alt", "title", "aria-label")]
     if (figure := image.find_parent("figure")) is not None:
@@ -250,6 +316,22 @@ def _signature_scope(node: Tag | NavigableString, body: Tag) -> Tag | None:
         if scope is body and parent.name in _CONTENT_LANDMARKS:
             scope = parent
     return scope
+
+
+def _has_preceding_separator(
+    markers: list[_HtmlMarker], index: int, scope: Tag, body_scope: Tag
+) -> bool:
+    for previous_index in range(index - 1, -1, -1):
+        node, node_scope = markers[previous_index]
+        if node_scope is None:
+            continue
+        if node_scope is not scope and node_scope is not body_scope:
+            return False
+        if isinstance(node, NavigableString) and _SIGNATURE_SEPARATOR.search(node):
+            return True
+        if isinstance(node, Tag) and node.name == "hr":
+            return True
+    return False
 
 
 def _signature_context(
@@ -441,6 +523,7 @@ def _visual_lines(
     *,
     start_after: Tag | NavigableString | None = None,
     stop_at: Tag | NavigableString | None = None,
+    stop_offset: int | None = None,
     reset_on_media: bool = True,
 ) -> list[str]:
     lines: list[str] = []
@@ -465,12 +548,33 @@ def _visual_lines(
         current_line.clear()
         lines.clear()
 
+    def _append_text(raw: str, preformatted: bool) -> None:
+        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+        parts = _SIGNATURE_SEPARATOR.split(raw)
+        if len(parts) > 1:
+            reset()
+            raw = parts[-1]
+        if preformatted:
+            *head_lines, raw = raw.split("\n")
+            for line in head_lines:
+                current_line.append(line)
+                flush()
+        if raw:
+            current_line.append(raw)
+
     def walk(node: Tag, preformatted: bool) -> None:
         nonlocal started, stopped
         preformatted = _node_preformatted(node, preformatted)
 
         for child in node.children:
             if stop_at is not None and child is stop_at:
+                if (
+                    stop_offset is not None
+                    and stop_offset > 0
+                    and started
+                    and isinstance(child, NavigableString)
+                ):
+                    _append_text(str(child)[:stop_offset], preformatted)
                 stopped = True
                 return
             if isinstance(child, Comment):
@@ -480,22 +584,8 @@ def _visual_lines(
                 reset()
                 continue
             if isinstance(child, NavigableString):
-                if not started:
-                    continue
-                raw = str(child)
-                if preformatted:
-                    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-                parts = _SIGNATURE_SEPARATOR.split(raw)
-                if len(parts) > 1:
-                    reset()
-                    raw = parts[-1]
-                if preformatted:
-                    *head_lines, raw = raw.split("\n")
-                    for line in head_lines:
-                        current_line.append(line)
-                        flush()
-                if raw:
-                    current_line.append(raw)
+                if started:
+                    _append_text(str(child), preformatted)
             elif isinstance(child, Tag):
                 if (
                     reset_on_media
@@ -524,21 +614,7 @@ def _visual_lines(
 
 
 def _preceded_by_bill_caption(image: Tag, scope: Tag) -> bool:
-    lines = _visual_lines(scope, stop_at=image)
-    return bool(lines) and _is_bill_caption_text(lines[-1])
-
-
-def _last_hr(tag: Tag) -> Tag | None:
-    last_hr = None
-    for node in tag.descendants:
-        if isinstance(node, Tag) and node.name == "hr":
-            last_hr = node
-    return last_hr
-
-
-def _box_tail_has_bill_caption(container: Tag) -> bool:
-    lines = _visual_lines(container, start_after=_last_hr(container))
-    return any(_is_bill_caption_text(line) for line in lines)
+    return _lines_end_with_bill_caption(_visual_lines(scope, stop_at=image))
 
 
 def _can_climb_signature_wrapper(parent: Tag, box: Tag) -> bool:
@@ -570,7 +646,7 @@ def _can_climb_signature_wrapper(parent: Tag, box: Tag) -> bool:
     last_hr_tag = descendants[last_hr] if last_hr != -1 else None
     tail_lines = _visual_lines(parent, start_after=last_hr_tag)
     tail_text = "\n".join(tail_lines)
-    return not any(_is_bill_caption_text(line) for line in tail_lines) and (
+    return not _lines_end_with_bill_caption(tail_lines) and (
         box_after_hr or _SIGNATURE_CONTACT.search(tail_text) is not None
     )
 
@@ -605,10 +681,7 @@ def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool
     pos_b = next(idx for idx, sibling in enumerate(siblings) if sibling is slot_b)
     pos_img = next(idx for idx, sibling in enumerate(siblings) if sibling is img_slot)
     if pos_img == pos_b + 1:
-        return (
-            not _preceded_by_bill_caption(image, footer)
-            and not _box_tail_has_bill_caption(slot_b)
-        )
+        return not _preceded_by_bill_caption(image, footer)
     return (
         pos_img == pos_b - 1
         and parent is not footer
@@ -681,10 +754,22 @@ def _footer_signature_context(
         if id(box) in image_parent_ids:
             if _preceded_by_bill_caption(image, footer_tag):
                 return ""
-            first_sig_marker = next((idx for idx, text in box_texts if _SIGNOFF.search(text)), None)
+            first_sig_marker, sig_offset = next(
+                (
+                    (idx, match.start())
+                    for idx, text in box_texts
+                    if (match := _SIGNOFF.search(text))
+                ),
+                (None, None),
+            )
             if first_sig_marker is None and not require_signoff:
-                first_sig_marker = next(
-                    (idx for idx, text in box_texts if _SIGNATURE_CONTACT.search(text)), None
+                first_sig_marker, sig_offset = next(
+                    (
+                        (idx, match.start())
+                        for idx, text in box_texts
+                        if (match := _SIGNATURE_CONTACT.search(text))
+                    ),
+                    (None, None),
                 )
             if first_sig_marker is not None and index < first_sig_marker:
                 has_img_after = any(
@@ -692,7 +777,10 @@ def _footer_signature_context(
                     for idx, img in images
                 )
                 between_lines = _visual_lines(
-                    box, start_after=image, stop_at=markers[first_sig_marker][0]
+                    box,
+                    start_after=image,
+                    stop_at=markers[first_sig_marker][0],
+                    stop_offset=sig_offset,
                 )
                 if has_img_after or any(_is_bill_caption_text(line) for line in between_lines):
                     return ""
@@ -728,12 +816,12 @@ def _html_text(html: str, email: ParsedEmail) -> str:
             continue
         source = str(src).strip()
         if _is_bill_image_tag(image):
-            is_signature = False
+            classification = "body"
         elif scope is None:
-            is_signature = True
-        elif len(markers) - index <= _SIGNATURE_TAIL_SIZE and not _preceded_by_bill_caption(
-            image, scope
-        ):
+            classification = "signature"
+        elif _preceded_by_bill_caption(image, scope):
+            classification = "body"
+        elif len(markers) - index <= _SIGNATURE_TAIL_SIZE:
             context, has_separator = _signature_context(markers, index, scope, body)
             if scope.name == "footer":
                 context = _footer_signature_context(
@@ -746,17 +834,33 @@ def _html_text(html: str, email: ParsedEmail) -> str:
             decorative = (
                 _DECORATIVE_IMAGE.search(source) is not None and (has_contact or has_signoff)
             )
-            is_signature = after_signoff or footer_signature or decorative
+            if after_signoff or footer_signature or decorative:
+                classification = "signature"
+            elif scope.name != "footer" and not has_separator:
+                classification = "body"
+            else:
+                classification = "undetermined"
+        elif scope.name != "footer" and not _has_preceding_separator(markers, index, scope, body):
+            classification = "body"
         else:
-            is_signature = False
+            classification = "undetermined"
 
+        if classification == "undetermined":
+            continue
+        is_signature = classification == "signature"
         if source.lower().startswith("cid:"):
             if cid := _content_id(source[4:]):
                 cids = email.signature_cids if is_signature else email.non_signature_cids
                 cids.add(cid)
-        elif name := source.split("?", 1)[0].strip():
+            continue
+
+        location, filename = _classify_non_cid_source(source)
+        if location:
+            locations = email.signature_locations if is_signature else email.non_signature_locations
+            locations.add(location)
+        if filename:
             filenames = email.signature_filenames if is_signature else email.non_signature_filenames
-            filenames.add(sanitize_filename(unquote(name)).casefold())
+            filenames.add(filename)
     return soup.get_text("\n", strip=True)
 
 
@@ -836,4 +940,5 @@ def parse_eml(data: bytes, *, max_children: int) -> ParsedEmail:
         )
     email.signature_cids.difference_update(email.non_signature_cids)
     email.signature_filenames.difference_update(email.non_signature_filenames)
+    email.signature_locations.difference_update(email.non_signature_locations)
     return email
