@@ -2,8 +2,8 @@
 schema_version: 1
 mode: tracked
 docs_root: docs/workflow
-current_node: "arch-finalized"
-next_action: "进入 Phase 3：B00 骨架基线验证 + UI 规格与原型设计（ui-prototype / lumno-ui-style）+ 功能切片规划"
+current_node: "b00-scaffold-and-sliced"
+next_action: "编写 B01-多格式解析与OCR网关 实现方案并执行异构模型审查"
 check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contracts.py && uv run pytest tests/unit -q && npm --prefix frontend run typecheck"
 ---
 
@@ -32,12 +32,18 @@ check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contract
 | 决策与门禁流程图 | `docs/workflow/diagrams/operation-decision-flow.html` | `F-03`~`F-05` 校验门禁与四级匹配四态决策流程 | 实现核心判定引擎或复核规则时查看 |
 | 系统架构总图 | `docs/workflow/diagrams/architecture.html` | 调用方、四层模块依赖边界、本机存储与外部服务调用方向 | 核对模块职责与单向依赖边界时查看 |
 | 核心处理时序图 | `docs/workflow/diagrams/pipeline-sequence.html` | 投递拆包、OCR/LLM、匹配校验、1 轮自修复与人工修订锁定 | 核对 LangGraph 编排与失败边界时查看 |
+| 前端界面规格指令（Lumno B2） | `docs/workflow/prototypes/workbench/README.md` | 财务复核工作台（桌面 1280×800 & 移动 390×844） | 开发 `B04` 前端工作台与 `browser_tester` 盲盒验收时读 |
 
 ## 3. 大功能目录索引（features/）
 > 状态枚举：`待规划` | `方案中` | `开发中(...)` | `待实连` | `待验收` | `受阻` | `已完成`（禁读） | `已搁置`（禁读）
 
 | 编号 | 目录路径（相对项目根） | 大功能名称与包含小功能 | 依赖 | 关联锚点（PRD / 接口 / 表） | 状态 |
 | :--- | :--- | :--- | :---: | :--- | :---: |
+| B01 | `docs/workflow/features/B01-多格式解析与OCR网关` | 多格式文档解包、Excel/Word/EML/PDF解析、SSRF防护与OCR/LLM网关适配 | B00 | PRD F-01/F-02, arch §1.4/§2, schema.sql source_documents | `待规划` |
+| B02 | `docs/workflow/features/B02-智能抽取匹配与校验门禁` | 航运账单LangGraph编排、AR/AP与贷项判定、四级匹配继承、确定性校验与1轮自修复 | B01 | PRD F-02~F-05, billing-output.schema.json | `待规划` |
+| B03 | `docs/workflow/features/B03-持久层API与CLI复核包` | SQLite 8表仓储、批处理分阶段服务、FastAPI全路由与Origin防护、Typer CLI与复核包互通 | B02 | PRD F-06/F-07, schema.sql 全表, openapi.yaml 全路由 | `待规划` |
+| B04 | `docs/workflow/features/B04-财务复核工作台前端` | Lumno B2三栏/移动双视口React工作台、全字段复核、三口径导出与评测看板 | B00, B03 | PRD F-06, prototypes/workbench/README.md, openapi.yaml | `待规划` |
+| B05 | `docs/workflow/features/B05-Harness评测与交付文档` | >=10组真值与对抗样本Harness评测套件、Harness与深度思考报告、README与交付ZIP打包验收 | B03 | PRD F-07, 题面 §8.8/§8.9, eval_runs | `待规划` |
 
 ## 4. 发版与交付归档（releases/）
 | 版本/批次 | 路径（相对项目根） | 交付范围与回滚基线摘要 |
