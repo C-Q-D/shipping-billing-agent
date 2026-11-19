@@ -57,6 +57,14 @@ from .serializer import (
     serialize_records,
     serialize_records_json,
 )
+from .validators import (
+    compute_iso6346_check_digit,
+    deduplicate_same_source_documents,
+    validate_batch,
+    validate_container_number,
+    validate_record,
+    validate_records,
+)
 
 __all__ = [
     "ALERT_SEVERITY_MAP",
@@ -91,7 +99,9 @@ __all__ = [
     "SourceEvidence",
     "SourceRefValue",
     "ValidationAlert",
+    "compute_iso6346_check_digit",
     "decimal_to_db_text",
+    "deduplicate_same_source_documents",
     "dumps_decimal_json",
     "entity_matches",
     "inherit_existing_bill",
@@ -111,4 +121,8 @@ __all__ = [
     "serialize_export_bundle",
     "serialize_records",
     "serialize_records_json",
+    "validate_batch",
+    "validate_container_number",
+    "validate_record",
+    "validate_records",
 ]
