@@ -159,13 +159,22 @@ class ParsedEmail:
     signature_cids: set[str] = field(default_factory=set)
     signature_filenames: set[str] = field(default_factory=set)
     truncated: bool = False
+    non_signature_cids: set[str] = field(default_factory=set)
+    non_signature_filenames: set[str] = field(default_factory=set)
 
     def is_signature_image(self, attachment: _MimePart, filename: str) -> bool:
         if _BILL_WORDS.search(filename):
             return False
+        cid = attachment.content_id
+        normalized_name = sanitize_filename(filename).casefold()
+        if (
+            (cid and cid in self.non_signature_cids)
+            or normalized_name in self.non_signature_filenames
+        ):
+            return False
         return (
-            attachment.content_id in self.signature_cids
-            or sanitize_filename(filename).casefold() in self.signature_filenames
+            (bool(cid) and cid in self.signature_cids)
+            or normalized_name in self.signature_filenames
         )
 
 
@@ -219,7 +228,7 @@ def _is_bill_image_tag(image: Tag) -> bool:
     if (figure := image.find_parent("figure")) is not None:
         labels.append(figure.get("aria-label"))
         labels.extend(
-            caption.get_text(" ", strip=True)
+            " ".join(_visual_lines(caption, reset_on_media=False))
             for caption in figure.find_all("figcaption")
             if caption.find_parent("figure") is figure
         )
@@ -411,38 +420,68 @@ def _is_inline_element(tag: Tag) -> bool:
     return tag.name in _INLINE_TAGS
 
 
-def _preceded_by_bill_caption(image: Tag, footer: Tag) -> bool:
+def _node_preformatted(tag: Tag, inherited: bool) -> bool:
+    white_space = _inline_style_value(tag, "white-space")
+    if white_space in {"normal", "nowrap", "initial"}:
+        return False
+    if tag.name in {"pre", "textarea"} or white_space in _PREFORMATTED_WHITE_SPACE:
+        return True
+    return inherited
+
+
+def _initial_preformatted(root: Tag) -> bool:
+    preformatted = False
+    for ancestor in reversed([parent for parent in root.parents if isinstance(parent, Tag)]):
+        preformatted = _node_preformatted(ancestor, preformatted)
+    return preformatted
+
+
+def _visual_lines(
+    root: Tag,
+    *,
+    start_after: Tag | NavigableString | None = None,
+    stop_at: Tag | NavigableString | None = None,
+    reset_on_media: bool = True,
+) -> list[str]:
+    lines: list[str] = []
     current_line: list[str] = []
-    last_line = ""
+    started = start_after is None
     stopped = False
+    stop_ancestors = (
+        {id(ancestor) for ancestor in stop_at.parents} if stop_at is not None else set()
+    )
+    start_ancestors = (
+        {id(ancestor) for ancestor in start_after.parents} if start_after is not None else set()
+    )
+    boundary_ancestors = stop_ancestors | start_ancestors
 
     def flush() -> None:
-        nonlocal last_line
         normalized = " ".join("".join(current_line).split())
         if normalized:
-            last_line = normalized
+            lines.append(normalized)
         current_line.clear()
 
     def reset() -> None:
-        nonlocal last_line
         current_line.clear()
-        last_line = ""
+        lines.clear()
 
-    def walk(node: Tag, preformatted: bool = False) -> None:
-        nonlocal stopped
-        white_space = _inline_style_value(node, "white-space")
-        if white_space in {"normal", "nowrap"}:
-            preformatted = False
-        elif node.name in {"pre", "textarea"} or white_space in _PREFORMATTED_WHITE_SPACE:
-            preformatted = True
+    def walk(node: Tag, preformatted: bool) -> None:
+        nonlocal started, stopped
+        preformatted = _node_preformatted(node, preformatted)
 
         for child in node.children:
-            if child is image:
+            if stop_at is not None and child is stop_at:
                 stopped = True
                 return
             if isinstance(child, Comment):
                 continue
+            if start_after is not None and child is start_after:
+                started = True
+                reset()
+                continue
             if isinstance(child, NavigableString):
+                if not started:
+                    continue
                 raw = str(child)
                 if preformatted:
                     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
@@ -451,31 +490,55 @@ def _preceded_by_bill_caption(image: Tag, footer: Tag) -> bool:
                     reset()
                     raw = parts[-1]
                 if preformatted:
-                    *lines, raw = raw.split("\n")
-                    for line in lines:
+                    *head_lines, raw = raw.split("\n")
+                    for line in head_lines:
                         current_line.append(line)
                         flush()
                 if raw:
                     current_line.append(raw)
             elif isinstance(child, Tag):
-                if child.name in {"hr", "img", "figure"}:
-                    reset()
+                if (
+                    reset_on_media
+                    and child.name in {"hr", "img", "figure"}
+                    and not (child.name == "figure" and id(child) in boundary_ancestors)
+                ):
+                    if started:
+                        reset()
                     continue
                 if child.name == "br":
-                    flush()
+                    if started:
+                        flush()
                     continue
                 is_block = not _is_inline_element(child)
-                if is_block:
+                if is_block and started:
                     flush()
                 walk(child, preformatted)
                 if stopped:
                     return
-                if is_block:
+                if is_block and started:
                     flush()
 
-    walk(footer)
-    caption = " ".join("".join(current_line).split()) or last_line
-    return _is_bill_caption_text(caption)
+    walk(root, _initial_preformatted(root))
+    flush()
+    return lines
+
+
+def _preceded_by_bill_caption(image: Tag, scope: Tag) -> bool:
+    lines = _visual_lines(scope, stop_at=image)
+    return bool(lines) and _is_bill_caption_text(lines[-1])
+
+
+def _last_hr(tag: Tag) -> Tag | None:
+    last_hr = None
+    for node in tag.descendants:
+        if isinstance(node, Tag) and node.name == "hr":
+            last_hr = node
+    return last_hr
+
+
+def _box_tail_has_bill_caption(container: Tag) -> bool:
+    lines = _visual_lines(container, start_after=_last_hr(container))
+    return any(_is_bill_caption_text(line) for line in lines)
 
 
 def _can_climb_signature_wrapper(parent: Tag, box: Tag) -> bool:
@@ -504,8 +567,10 @@ def _can_climb_signature_wrapper(parent: Tag, box: Tag) -> bool:
         if any(not any(ancestor is box for ancestor in node.parents) for node in tail_text_nodes):
             return False
 
-    tail_text = " ".join(node.strip() for node in tail_text_nodes)
-    return not _is_bill_caption_text(tail_text) and (
+    last_hr_tag = descendants[last_hr] if last_hr != -1 else None
+    tail_lines = _visual_lines(parent, start_after=last_hr_tag)
+    tail_text = "\n".join(tail_lines)
+    return not any(_is_bill_caption_text(line) for line in tail_lines) and (
         box_after_hr or _SIGNATURE_CONTACT.search(tail_text) is not None
     )
 
@@ -540,7 +605,10 @@ def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool
     pos_b = next(idx for idx, sibling in enumerate(siblings) if sibling is slot_b)
     pos_img = next(idx for idx, sibling in enumerate(siblings) if sibling is img_slot)
     if pos_img == pos_b + 1:
-        return True
+        return (
+            not _preceded_by_bill_caption(image, footer)
+            and not _box_tail_has_bill_caption(slot_b)
+        )
     return (
         pos_img == pos_b - 1
         and parent is not footer
@@ -611,6 +679,8 @@ def _footer_signature_context(
         footer_tag, text_nodes, require_signoff=require_signoff
     ):
         if id(box) in image_parent_ids:
+            if _preceded_by_bill_caption(image, footer_tag):
+                return ""
             first_sig_marker = next((idx for idx, text in box_texts if _SIGNOFF.search(text)), None)
             if first_sig_marker is None and not require_signoff:
                 first_sig_marker = next(
@@ -621,14 +691,10 @@ def _footer_signature_context(
                     idx > first_sig_marker and any(parent is box for parent in img.parents)
                     for idx, img in images
                 )
-                between_text = "\n".join(
-                    text for idx, text in box_texts if index < idx < first_sig_marker
+                between_lines = _visual_lines(
+                    box, start_after=image, stop_at=markers[first_sig_marker][0]
                 )
-                if (
-                    has_img_after
-                    or _is_bill_caption_text(between_text)
-                    or _preceded_by_bill_caption(image, footer_tag)
-                ):
+                if has_img_after or any(_is_bill_caption_text(line) for line in between_lines):
                     return ""
         elif not _image_in_adjacent_signature_slot(box, image, footer_tag):
             continue
@@ -655,14 +721,19 @@ def _html_text(html: str, email: ParsedEmail) -> str:
     ]
 
     for index, (image, scope) in enumerate(markers):
-        if not isinstance(image, Tag) or image.name != "img" or not image.get("src"):
+        if not isinstance(image, Tag) or image.name != "img":
             continue
+        src = image.get("src")
+        if src is None:
+            continue
+        source = str(src).strip()
         if _is_bill_image_tag(image):
-            continue
-        source = str(image["src"]).strip()
-        if scope is not None:
-            if len(markers) - index > _SIGNATURE_TAIL_SIZE:
-                continue
+            is_signature = False
+        elif scope is None:
+            is_signature = True
+        elif len(markers) - index <= _SIGNATURE_TAIL_SIZE and not _preceded_by_bill_caption(
+            image, scope
+        ):
             context, has_separator = _signature_context(markers, index, scope, body)
             if scope.name == "footer":
                 context = _footer_signature_context(
@@ -672,15 +743,20 @@ def _html_text(html: str, email: ParsedEmail) -> str:
             has_signoff = _SIGNOFF.search(context) is not None
             after_signoff = has_separator and has_contact
             footer_signature = scope.name == "footer" and has_contact and has_signoff
-            decorative = _DECORATIVE_IMAGE.search(source) and (has_contact or has_signoff)
-            if not (after_signoff or footer_signature or decorative):
-                continue
+            decorative = (
+                _DECORATIVE_IMAGE.search(source) is not None and (has_contact or has_signoff)
+            )
+            is_signature = after_signoff or footer_signature or decorative
+        else:
+            is_signature = False
+
         if source.lower().startswith("cid:"):
             if cid := _content_id(source[4:]):
-                email.signature_cids.add(cid)
-        else:
-            name = source.split("?", 1)[0]
-            email.signature_filenames.add(sanitize_filename(unquote(name)).casefold())
+                cids = email.signature_cids if is_signature else email.non_signature_cids
+                cids.add(cid)
+        elif name := source.split("?", 1)[0].strip():
+            filenames = email.signature_filenames if is_signature else email.non_signature_filenames
+            filenames.add(sanitize_filename(unquote(name)).casefold())
     return soup.get_text("\n", strip=True)
 
 
@@ -758,4 +834,6 @@ def parse_eml(data: bytes, *, max_children: int) -> ParsedEmail:
             b"\n\n".join(body.data for body in bodies),
             "text/plain",
         )
+    email.signature_cids.difference_update(email.non_signature_cids)
+    email.signature_filenames.difference_update(email.non_signature_filenames)
     return email

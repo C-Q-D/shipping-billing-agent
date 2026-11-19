@@ -273,6 +273,19 @@ def _rectangle_bounds(points: list[_Point]) -> tuple[float, float, float, float]
     return x0, top, x1, bottom
 
 
+def _is_collinear_subpath(points: list[_Point]) -> bool:
+    if len(points) < 3:
+        return True
+    x0, y0 = points[0]
+    x1, y1 = max(points[1:], key=lambda point: (point[0] - x0) ** 2 + (point[1] - y0) ** 2)
+    dx, dy = x1 - x0, y1 - y0
+    length = (dx * dx + dy * dy) ** 0.5
+    if length <= _DUPLICATE_VERTEX_TOL_PT:
+        return True
+    tolerance = _DUPLICATE_VERTEX_TOL_PT * length
+    return all(abs(dx * (y - y0) - dy * (x - x0)) <= tolerance for x, y in points)
+
+
 def _process_curve(
     curve: dict[str, Any],
     table_grids: list[_TableGrid],
@@ -280,28 +293,37 @@ def _process_curve(
     vert_segments: list[_RuleSegment],
     tiny_rects: list[tuple[float, float, float, float]],
 ) -> tuple[bool, int]:
+    stroked = bool(curve.get("stroke"))
+    filled = bool(curve.get("fill"))
+    if not stroked and not filled:
+        return False, 0
+
     path = curve.get("path")
     if path is not None and any(operator not in {"m", "l", "h"} for operator, *_ in path):
         return True, 0
 
     linewidth = _line_width(curve)
     if path is None:
+        points = list(curve.get("pts") or ())
+        if not stroked and _is_collinear_subpath(points):
+            return False, 0
         added = sum(
             _classify_straight_segment(
                 p1, p2, table_grids, horiz_segments, vert_segments, tiny_rects, linewidth=linewidth
             )
-            for p1, p2 in pairwise(curve.get("pts") or ())
+            for p1, p2 in pairwise(points)
         )
         return False, added
 
     added = 0
-    filled = bool(curve.get("fill"))
     for points, closed in _straight_subpaths(path):
         if not closed and filled and len(points) >= 3:
             # PDF fills implicitly close open subpaths.
             if _same_vertex(points[0], points[-1]):
                 points.pop()
             closed = True
+        if not stroked and _is_collinear_subpath(points):
+            continue
         if len(points) == 1:
             added += 1
             continue
@@ -469,6 +491,8 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
     tiny_rects: list[tuple[float, float, float, float]] = []
 
     for line in page.lines:
+        if not line.get("stroke"):
+            continue
         points = line.get("pts") or ()
         if len(points) >= 2:
             p1, p2 = points[0], points[1]
@@ -485,12 +509,21 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
         )
 
     for rect in page.rects:
+        stroked = bool(rect.get("stroke"))
+        filled = bool(rect.get("fill"))
+        if not stroked and not filled:
+            continue
+        if not stroked and (
+            abs(rect["x1"] - rect["x0"]) <= _DUPLICATE_VERTEX_TOL_PT
+            or abs(rect["bottom"] - rect["top"]) <= _DUPLICATE_VERTEX_TOL_PT
+        ):
+            continue
         glyph_elements += _classify_rect(
             rect["x0"],
             rect["top"],
             rect["x1"],
             rect["bottom"],
-            filled=bool(rect.get("fill")),
+            filled=filled,
             table_grids=table_grids,
             horiz_segments=horiz_segments,
             vert_segments=vert_segments,
