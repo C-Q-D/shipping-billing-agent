@@ -2,8 +2,8 @@
 schema_version: 1
 mode: tracked
 docs_root: docs/workflow
-current_node: "b02-t01"
-next_action: "顺序实现 B02 T01~T05 并派发 B02 独立审查"
+current_node: "b02-review"
+next_action: "执行 B02 独立代码审查并收口归档，准备开启 B03"
 check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contracts.py && uv run pytest tests/unit -q && npm --prefix frontend run typecheck"
 ---
 
