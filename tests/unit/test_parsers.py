@@ -3283,6 +3283,186 @@ def test_r22_f1_eml_still_skips_logos_after_true_signoffs(signoff, r8_eml_ocr):
     "html_body",
     [
         pytest.param(
+            '<footer><div><img src="cid:scan"><br>Invoice scan<br>'
+            'Best <span>regards&nbsp;</span><br>Tel: 123456</div></footer>',
+            id="br",
+        ),
+        pytest.param(
+            '<body style="white-space:pre-line"><footer><div><img src="cid:scan">'
+            'Invoice scan\nBest <span>regards&nbsp;</span>\nTel: 123456</div></footer></body>',
+            id="pre-line-lf",
+        ),
+        pytest.param(
+            '<body style="white-space:pre-line"><footer><div><img src="cid:scan">'
+            'Invoice scan&#13;&#10;Best <span>regards&nbsp;</span>'
+            '&#13;&#10;Tel: 123456</div></footer></body>',
+            id="pre-line-crlf",
+        ),
+    ],
+)
+def test_r23_f1_eml_preserves_the_caption_before_a_split_signoff(html_body, r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(html_body, image_name="scan", text=amount)
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert scan.sanitized_filename == "scan.png"
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=amount)
+
+
+@pytest.mark.parametrize(
+    ("html_body", "image_name"),
+    [
+        pytest.param(
+            '<footer><p>We <em>sincerely</em> apologize for the delay.</p>'
+            '<p>Tel: 123456</p><img src="cid:quote_001"></footer>',
+            "quote_001",
+            id="footer-emphasis",
+        ),
+        pytest.param(
+            '<footer><p>The carrier <span>regards</span> this shipment as urgent.</p>'
+            '<p>Tel: 123456</p><img src="cid:quote_001"></footer>',
+            "quote_001",
+            id="footer-span",
+        ),
+        pytest.param(
+            '<footer><p><span>The carrier</span>\n<span>regards</span>\n'
+            '<span>this shipment as urgent.</span></p>'
+            '<p>Tel: 123456</p><img src="cid:quote_001"></footer>',
+            "quote_001",
+            id="footer-space-between-spans",
+        ),
+        pytest.param(
+            '<main><p>The carrier\nregards\nthis shipment as urgent.</p><p>Tel: 123456</p>'
+            '<img src="cid:quote_001">-- \n<p>Sender info</p></main>',
+            "quote_001",
+            id="main-source-newlines",
+        ),
+        pytest.param(
+            '<main><p>The carrier\nregards\nthis shipment as urgent.</p><p>Tel: 123456</p>'
+            '<img src="cid:InsertPic_001">-- \n<p>Sender info</p></main>',
+            "InsertPic_001",
+            id="main-source-newlines-insertpic",
+        ),
+        pytest.param(
+            '<body style="white-space:pre-line"><main>-- &#13;&#10;'
+            'We thank you <em>sincerely</em>, and we will send the quote today.<br>'
+            'Tel: 123456<img src="cid:quote_001"></main></body>',
+            "quote_001",
+            id="main-after-dash-crlf",
+        ),
+        pytest.param(
+            '<main><hr><p>We <em>sincerely</em> apologize for the delay.</p><p>Tel: 123456</p>'
+            '<img src="cid:quote_001">'
+            + "<p>Shipment update</p>" * 8
+            + '</main><div class="signature"><img src="cid:quote_001"></div>',
+            "quote_001",
+            id="main-after-hr-outside-tail",
+        ),
+        pytest.param(
+            '<main><p>We thank you <em>sincerely</em>, and will send the quote today.</p>'
+            '<p>Tel: 123456</p>'
+            + "<p>Shipment update</p>" * 5
+            + '<img src="cid:InsertPic_001"></main>',
+            "InsertPic_001",
+            id="main-tail-starts-inside-a-line",
+        ),
+        pytest.param(
+            '<footer><figure><img src="cid:quote_001">'
+            '<figcaption>We <em>sincerely</em> apologize for the delay.<br>Tel: 123456</figcaption>'
+            '</figure></footer>',
+            "quote_001",
+            id="footer-figure",
+        ),
+    ],
+)
+def test_r23_f2_eml_preserves_body_prose_on_one_visual_line(html_body, image_name, r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(html_body, image_name=image_name, text=amount)
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, quote = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert quote.sanitized_filename == f"{image_name}.png"
+    _assert_inline_image_ocr(quote, recognize_image, expected_text=amount)
+
+
+@pytest.mark.parametrize(
+    "html_body",
+    [
+        pytest.param(
+            '<footer><p>With regards to your booking, see below.</p><p>Tel: 123456</p>'
+            '<img src="cid:quote_001"></footer>',
+            id="footer",
+        ),
+        pytest.param(
+            '<figure><figcaption>With regards to your booking, see below.<br>Tel: 123456'
+            '</figcaption><img src="cid:quote_001"></figure>',
+            id="figure",
+        ),
+        pytest.param(
+            '<footer><figure><figcaption>With regards to your booking, see below.<br>Tel: 123456'
+            '</figcaption><img src="cid:quote_001"></figure></footer>',
+            id="footer-figure",
+        ),
+    ],
+)
+def test_r23_f3_eml_keeps_quotes_after_with_regards_to(html_body, r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(html_body, image_name="quote_001", text=amount)
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, quote = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert quote.sanitized_filename == "quote_001.png"
+    _assert_inline_image_ocr(quote, recognize_image, expected_text=amount)
+
+
+@pytest.mark.parametrize("signoff", ["With regards,", "With regards"], ids=["comma", "end-of-line"])
+def test_r23_f3_eml_skips_logo_after_with_regards_signoff(signoff, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        f'<footer><div>{signoff}<br>ACME<br>Tel: 123456<img src="cid:sig_logo"></div></footer>',
+        image_name="sig_logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(logo, recognize_image, expected_text=None)
+
+
+@pytest.mark.parametrize(
+    "signoff",
+    [
+        pytest.param("Thanks and best regards,", id="thanks-and-best"),
+        pytest.param("Thanks &amp; best regards,", id="thanks-ampersand-best"),
+        pytest.param("Many thanks and best regards,", id="many-thanks-and-best"),
+        pytest.param("Kindest regards,", id="kindest"),
+        pytest.param("Warmest regards,", id="warmest"),
+        pytest.param("&nbsp;Best regards,", id="leading-nbsp"),
+        pytest.param("<span>Best</span> <span>regards</span>", id="space-between-spans"),
+        pytest.param("Best <span>regards&nbsp;</span>", id="trailing-nbsp-in-span"),
+    ],
+)
+def test_r23_f4_eml_skips_logos_after_common_signoffs(signoff, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        f'<footer><div>{signoff}<br>ACME<br>Tel: 123456<img src="cid:sig_logo"></div></footer>',
+        image_name="sig_logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(logo, recognize_image, expected_text=None)
+
+
+@pytest.mark.parametrize(
+    "html_body",
+    [
+        pytest.param(
             '<footer><div>Best regards<br>ACME<br>Tel: 123456<img src="cid:logo"></div>'
             '<div><img src="cid:scan"></div></footer>',
             id="r6-1a-scan-after-complete-signature",
