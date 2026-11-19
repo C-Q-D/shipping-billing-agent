@@ -21,6 +21,7 @@ _BILL_WORDS = re.compile(
     r"invoice|bill|charge|statement|freight|账单|帳單|发票|發票|费用|費用", re.I
 )
 _CONTENT_LANDMARKS = {"article", "aside", "footer", "header", "main", "section"}
+_FOOTER_BLOCKS = {"div", "p", "figure", "td", "th", "li", "section", "article", "aside"}
 _SIGNATURE_BLOCK = re.compile(r"signature|foxmail", re.I)
 _SIGNATURE_SEPARATOR = re.compile(r"^[ \t]*--[ \t]+\r?$", re.MULTILINE)
 _SIGNATURE_CONTACT = re.compile(r"\b(?:tl|tel|web|email|fax)\s*[:：]", re.I)
@@ -181,8 +182,21 @@ def _related_root_start(part: _MimePart) -> int | None:
     return first.start
 
 
-def _signature_scope(node: Tag | NavigableString, body: Tag) -> tuple[int, str] | None:
-    """Return the content block ID and tag name, or None inside an explicit signature."""
+_HtmlMarker = tuple[Tag | NavigableString, Tag | None]
+
+
+def _is_bill_image_tag(image: Tag) -> bool:
+    labels = [image.get(attribute) for attribute in ("alt", "title", "aria-label")]
+    if (figure := image.find_parent("figure")) is not None:
+        labels.append(figure.get("aria-label"))
+        labels.extend(
+            caption.get_text(" ", strip=True) for caption in figure.find_all("figcaption")
+        )
+    return any(label and _BILL_WORDS.search(str(label)) for label in labels)
+
+
+def _signature_scope(node: Tag | NavigableString, body: Tag) -> Tag | None:
+    """Return the nearest content landmark, or None inside an explicit signature."""
     scope = body
     for parent in node.parents:
         if any(
@@ -194,14 +208,14 @@ def _signature_scope(node: Tag | NavigableString, body: Tag) -> tuple[int, str] 
             break
         if scope is body and parent.name in _CONTENT_LANDMARKS:
             scope = parent
-    return id(scope), scope.name
+    return scope
 
 
 def _signature_context(
-    markers: list[tuple[Tag | NavigableString, tuple[int, str] | None]],
+    markers: list[_HtmlMarker],
     index: int,
-    scope: tuple[int, str],
-    body_scope: tuple[int, str],
+    scope: Tag,
+    body_scope: Tag,
 ) -> tuple[str, bool]:
     start = max(0, index - _SIGNATURE_TAIL_SIZE)
     separator_text = ""
@@ -210,7 +224,7 @@ def _signature_context(
         node, node_scope = markers[previous_index]
         if node_scope is None:
             continue
-        if node_scope not in (scope, body_scope):
+        if node_scope is not scope and node_scope is not body_scope:
             # An intervening landmark bounds the preceding signature context.
             start = max(start, previous_index + 1)
             break
@@ -218,7 +232,7 @@ def _signature_context(
             parts = _SIGNATURE_SEPARATOR.split(node)
             if len(parts) == 1:
                 continue
-            if node_scope == scope and previous_index >= start:
+            if node_scope is scope and previous_index >= start:
                 separator_text = parts[-1]
         elif node.name != "hr":
             continue
@@ -229,13 +243,13 @@ def _signature_context(
     trailing_text = ""
     for next_index in range(index + 1, len(markers)):
         node, node_scope = markers[next_index]
-        if node_scope is not None and node_scope not in (scope, body_scope):
+        if node_scope is not None and node_scope is not scope and node_scope is not body_scope:
             break
         if isinstance(node, NavigableString):
             parts = _SIGNATURE_SEPARATOR.split(node, maxsplit=1)
             if len(parts) == 1:
                 continue
-            if node_scope == scope:
+            if node_scope is scope:
                 trailing_text = parts[0]
         elif node.name != "hr":
             continue
@@ -247,11 +261,70 @@ def _signature_context(
     text.extend(
         node
         for node, node_scope in markers[start:next_index]
-        if node_scope == scope and isinstance(node, NavigableString)
+        if node_scope is scope and isinstance(node, NavigableString)
     )
     if trailing_text:
         text.append(trailing_text)
     return "\n".join(text), has_separator
+
+
+def _nearest_footer_block(node: Tag | NavigableString, footer: Tag) -> Tag | None:
+    for parent in node.parents:
+        if parent is footer:
+            break
+        if parent.name in _FOOTER_BLOCKS:
+            return parent
+    return None
+
+
+def _ends_footer_context(marker: _HtmlMarker, footer: Tag, body_scope: Tag) -> bool:
+    node, scope = marker
+    other_landmark = scope is not None and scope is not footer and scope is not body_scope
+    return other_landmark or (isinstance(node, Tag) and node.name == "hr")
+
+
+def _footer_signature_context(
+    markers: list[_HtmlMarker], index: int, body_scope: Tag, footer_tag: Tag, image: Tag
+) -> str:
+    image_block = _nearest_footer_block(image, footer_tag)
+    in_figure = image.find_parent("figure") is not None
+    start = max(0, index - _SIGNATURE_TAIL_SIZE)
+
+    block_before: list[str] = []
+    footer_before: list[str] = []
+    for marker in reversed(markers[start:index]):
+        if _ends_footer_context(marker, footer_tag, body_scope):
+            break
+        node, scope = marker
+        if not isinstance(node, NavigableString):
+            continue
+        if _SIGNATURE_SEPARATOR.search(node):
+            break
+        if scope is not footer_tag:
+            continue
+        if _nearest_footer_block(node, footer_tag) is image_block:
+            block_before.append(node)
+        if not in_figure and node.find_parent("figure") is None:
+            footer_before.append(node)
+
+    block_after: list[str] = []
+    for marker in markers[index + 1 :]:
+        if _ends_footer_context(marker, footer_tag, body_scope):
+            break
+        node, scope = marker
+        if not isinstance(node, NavigableString):
+            continue
+        separator = _SIGNATURE_SEPARATOR.search(node)
+        if scope is footer_tag and _nearest_footer_block(node, footer_tag) is image_block:
+            block_after.append(node[:separator.start()] if separator else node)
+        if separator:
+            break
+
+    block_context = "\n".join([*reversed(block_before), *block_after])
+    if in_figure or _BILL_WORDS.search(block_context):
+        return block_context
+    # A signoff may precede a logo in a separate block of the same footer.
+    return "\n".join([*reversed(footer_before), *block_after])
 
 
 def _html_text(html: str, email: ParsedEmail) -> str:
@@ -259,7 +332,6 @@ def _html_text(html: str, email: ParsedEmail) -> str:
     for tag in soup.find_all(["script", "style", "head"]):
         tag.decompose()
     body = soup.body or soup
-    body_scope = (id(body), body.name)
     markers = [
         (node, _signature_scope(node, body))
         for node in soup.descendants
@@ -270,16 +342,19 @@ def _html_text(html: str, email: ParsedEmail) -> str:
     for index, (image, scope) in enumerate(markers):
         if not isinstance(image, Tag) or image.name != "img" or not image.get("src"):
             continue
+        if _is_bill_image_tag(image):
+            continue
         source = str(image["src"]).strip()
         if scope is not None:
             if len(markers) - index > _SIGNATURE_TAIL_SIZE:
                 continue
-            _, scope_name = scope
-            context, has_separator = _signature_context(markers, index, scope, body_scope)
+            context, has_separator = _signature_context(markers, index, scope, body)
+            if scope.name == "footer" and not has_separator:
+                context = _footer_signature_context(markers, index, body, scope, image)
             has_contact = _SIGNATURE_CONTACT.search(context) is not None
             has_signoff = _SIGNOFF.search(context) is not None
             after_signoff = has_separator and has_contact
-            footer_signature = scope_name == "footer" and has_contact and has_signoff
+            footer_signature = scope.name == "footer" and has_contact and has_signoff
             decorative = _DECORATIVE_IMAGE.search(source) and (has_contact or has_signoff)
             if not (after_signoff or footer_signature or decorative):
                 continue

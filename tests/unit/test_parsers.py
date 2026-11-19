@@ -3,6 +3,7 @@ from email import policy
 from email.message import EmailMessage
 from hashlib import sha256
 from io import BytesIO
+from itertools import pairwise
 from pathlib import Path
 from struct import pack_into, unpack_from
 from types import SimpleNamespace
@@ -350,6 +351,139 @@ def _vector_fee_pdf() -> bytes:
     )
 
 
+_PAYMENT_TERMS_PAGE = b"BT /F1 12 Tf 24 160 Td (Payment terms: net thirty days.) Tj ET\n"
+
+
+def _mixed_table_vector_fee_pdf() -> bytes:
+    glyphs = {
+        "F": [[(0, 0), (0, 23), (12, 23)], [(0, 12), (10, 12)]],
+        "R": [[(0, 0), (0, 23), (8, 23), (13, 19), (13, 16), (8, 12), (0, 12)],
+              [(6, 12), (12, 0)]],
+        "E": [[(12, 23), (0, 23), (0, 0), (12, 0)], [(0, 12), (10, 12)]],
+        "I": [[(0, 0), (5, 0)], [(2.5, 0), (2.5, 23)], [(0, 23), (5, 23)]],
+        "G": [[(12, 20), (8, 23), (4, 23), (0, 19), (0, 4), (4, 0), (12, 0),
+               (12, 10), (7, 10)]],
+        "H": [[(0, 0), (0, 23)], [(12, 0), (12, 23)], [(0, 12), (12, 12)]],
+        "T": [[(0, 23), (12, 23)], [(6, 23), (6, 0)]],
+        "U": [[(0, 23), (0, 5), (3, 0), (9, 0), (12, 5), (12, 23)]],
+        "S": [[(12, 20), (9, 23), (3, 23), (0, 19), (0, 15), (4, 12), (8, 11),
+               (12, 8), (12, 4), (9, 0), (3, 0), (0, 3)]],
+        "D": [[(0, 0), (0, 23), (6, 23), (12, 19), (12, 4), (6, 0), (0, 0)]],
+        "3": [[(0, 21), (4, 23), (9, 23), (12, 19), (12, 16), (8, 12), (5, 12),
+               (9, 12), (13, 8), (13, 4), (9, 0), (4, 0), (0, 2)]],
+        "1": [[(0, 18), (4, 23), (4, 0)], [(0, 0), (8, 0)]],
+        "0": [[(6, 23), (10, 22), (13, 18), (13, 5), (10, 1), (6, 0), (2, 1),
+               (0, 5), (0, 18), (2, 22), (6, 23)]],
+        "4": [[(9, 0), (9, 23), (0, 8), (13, 8)]],
+        "2": [[(0, 18), (2, 22), (7, 23), (12, 20), (12, 16), (9, 12), (0, 0), (12, 0)]],
+    }
+    paths = bytearray(
+        b"24 144 150 36 re S\n99 144 m 99 180 l S\n"
+        b"BT /F1 12 Tf 36 158 Td (Fee) Tj ET\nBT /F1 18 Tf 146 34 Td (2) Tj ET\n"
+        b"2.3 w 1 J\n"
+    )
+    x = 24
+    for char in "FREIGHT USD 310.42":
+        if char == " ":
+            x += 8
+            continue
+        if char == ".":
+            paths.extend(b"%d 85 2.3 2.3 re f\n" % x)
+        else:
+            # Stroke each segment separately so the PDF contains lines instead of curves.
+            for stroke in glyphs[char]:
+                for (x1, y1), (x2, y2) in pairwise(stroke):
+                    paths.extend(b"%g %g m %g %g l S\n" % (x + x1, 85 + y1, x + x2, 85 + y2))
+        x += {"I": 9, "1": 12, ".": 7}.get(char, 16)
+    return _two_page_pdf(_PAYMENT_TERMS_PAGE, bytes(paths))
+
+
+def _short_vector_amount_pdf() -> bytes:
+    paths = bytearray(
+        b"BT /F1 30 Tf 24 105 Td (USD) Tj ET\nBT /F1 18 Tf 146 34 Td (2) Tj ET\n"
+        b"2.3 w 1 J\n"
+    )
+    for x in (93, 109, 131, 147):
+        paths.extend(b"%d 128 m %d 128 l S\n%d 128 m %d 105 l S\n" % (x, x + 12, x + 12, x + 3))
+    paths.extend(b"124 105 2.3 2.3 re f\n")
+    return _two_page_pdf(_PAYMENT_TERMS_PAGE, bytes(paths))
+
+
+def test_r5_f1_pdf_keeps_the_electronic_table_on_the_ocr_page():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
+    )
+    (document,) = dispatcher.parse_batch([("mixed-vector.pdf", _mixed_table_vector_fee_pdf())])
+
+    assert document.status is DocumentStatus.PARSED, document.error_message
+    assert document.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    _, ocr_source, ocr_text = document.raw_text.partition("[Page 2 | OCR]\n")
+    assert ocr_source, document.raw_text
+    assert "FREIGHT USD 310.42" in ocr_text, ocr_text
+    (table,) = document.tables
+    assert table.source == "[Page 2 | Text]"
+    assert table.rows == [["Fee", ""]]
+
+
+def test_r5_f1_pdf_with_table_and_vector_fee_requires_ocr():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=None
+    )
+    (document,) = dispatcher.parse_batch([("mixed-vector.pdf", _mixed_table_vector_fee_pdf())])
+
+    assert document.status is DocumentStatus.FAILED, document.raw_text
+    assert document.error_message == "第 2 页为扫描图像页，未配置本地 OCR 引擎"
+
+
+def test_r5_f2_pdf_reads_amount_drawn_with_nine_vector_objects():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
+    )
+    (document,) = dispatcher.parse_batch([("short-vector.pdf", _short_vector_amount_pdf())])
+
+    assert document.status is DocumentStatus.PARSED, document.error_message
+    assert document.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    _, ocr_source, ocr_text = document.raw_text.partition("[Page 2 | OCR]\n")
+    assert ocr_source, document.raw_text
+    assert "USD" in ocr_text, ocr_text
+    assert "77.77" in ocr_text, ocr_text
+
+
+def test_r5_f2_pdf_short_vector_amount_requires_ocr():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=None
+    )
+    (document,) = dispatcher.parse_batch([("short-vector.pdf", _short_vector_amount_pdf())])
+
+    assert document.status is DocumentStatus.FAILED, document.raw_text
+    assert document.error_message == "第 2 页为扫描图像页，未配置本地 OCR 引擎"
+
+
+def test_r5_f2_pdf_with_long_rule_keeps_short_electronic_text():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE,
+        b"24 144 m 264 144 l S\nBT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n",
+    )
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
+    )
+    (document,) = dispatcher.parse_batch([("electronic.pdf", data)])
+
+    assert document.status is DocumentStatus.PARSED, document.error_message
+    assert document.extraction_channel is ExtractionChannel.LOCAL_PDF_TEXT_FALLBACK
+    assert document.raw_text.endswith("[Page 2 | Text]\nUSD 245.00"), document.raw_text
+
+
 def test_pdf_without_local_ocr_reads_the_complete_short_text_page():
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
@@ -370,14 +504,21 @@ def test_pdf_without_local_ocr_reads_the_complete_short_text_page():
 
 
 @pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
-def test_pdf_keeps_the_sparse_electronic_table_page_as_text(local_ocr):
+@pytest.mark.parametrize(
+    "top_and_left",
+    [
+        pytest.param(b"24 96 m 24 152 l S\n24 152 m 264 152 l S\n", id="separate-borders"),
+        pytest.param(b"24 96 m 24 152 l 264 152 l S\n", id="r5-f4-l-shaped-border"),
+    ],
+)
+def test_pdf_keeps_the_sparse_electronic_table_page_as_text(local_ocr, top_and_left):
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
     data = _two_page_pdf(
         b"BT /F1 12 Tf 24 160 Td (Payment terms: net thirty days.) Tj ET\n",
-        b"24 96 m 24 152 l S\n72 96 m 72 152 l S\n120 96 m 120 152 l S\n"
+        top_and_left + b"72 96 m 72 152 l S\n120 96 m 120 152 l S\n"
         b"168 96 m 168 152 l S\n264 96 m 264 152 l S\n"
-        b"24 96 m 264 96 l S\n24 124 m 264 124 l S\n24 152 m 264 152 l S\n"
+        b"24 96 m 264 96 l S\n24 124 m 264 124 l S\n"
         b"BT /F1 12 Tf 30 134 Td (Fee) Tj ET\n"
         b"BT /F1 12 Tf 176 106 Td (USD 245.00) Tj ET\n",
     )
@@ -714,6 +855,52 @@ def test_eml_keeps_the_body_scan_before_the_next_signature_separator():
     message.add_alternative(
         '<body><div>Charges attached<hr><img src="cid:scan"></div>'
         '<hr><div>Best regards<br>ACME<br>Tel: 123456<img src="cid:logo"></div></body>',
+        subtype="html",
+    )
+    with Image.new("RGB", (460, 140), "white") as image, BytesIO() as buffer:
+        font = ImageFont.load_default(size=58)
+        ImageDraw.Draw(image).text((24, 28), "USD 310.42", font=font, fill="black")
+        image.save(buffer, format="PNG")
+        scan_data = buffer.getvalue()
+    html = message.get_payload()[-1]
+    html.add_related(scan_data, maintype="image", subtype="png", cid="<scan>", filename="scan.png")
+    html.add_related(
+        b"synthetic signature logo",
+        maintype="image",
+        subtype="png",
+        cid="<logo>",
+        filename="logo.png",
+    )
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
+    )
+
+    _, _, scan, logo = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert scan.status is DocumentStatus.PARSED, scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "USD 310.42" in scan.raw_text, scan.raw_text
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+
+
+@pytest.mark.parametrize(
+    "scan_block",
+    [
+        '<div><figure><img src="cid:scan"><figcaption>Invoice scan</figcaption></figure></div>',
+        '<div><img src="cid:scan"></div>',
+    ],
+    ids=["invoice-figure", "unlabelled-scan"],
+)
+def test_r5_f3_eml_keeps_the_footer_scan_and_skips_the_signature_logo(scan_block):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    message = _mail("Charges attached")
+    message.add_alternative(
+        f'<footer>{scan_block}<div>Best regards<br>ACME<br>Tel: 123456'
+        '<img src="cid:logo"></div></footer>',
         subtype="html",
     )
     with Image.new("RGB", (460, 140), "white") as image, BytesIO() as buffer:
