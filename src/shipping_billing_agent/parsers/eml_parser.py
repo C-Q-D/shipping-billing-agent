@@ -37,6 +37,11 @@ _CONTENT_LANDMARKS = {"article", "aside", "footer", "header", "main", "section"}
 _FOOTER_CONTAINERS = {
     "div", "p", "section", "article", "aside", "table", "tr", "td", "th", "li", "address", "footer",
 }
+_INLINE_TAGS = frozenset({
+    "a", "abbr", "b", "bdi", "bdo", "br", "cite", "code", "data", "del",
+    "dfn", "em", "font", "i", "ins", "kbd", "label", "mark", "q", "s",
+    "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var", "wbr",
+})
 _SIGNATURE_BLOCK = re.compile(r"signature|foxmail", re.I)
 _SIGNATURE_SEPARATOR = re.compile(r"^[ \t]*--[ \t]+\r?$", re.MULTILINE)
 _SIGNATURE_CONTACT = re.compile(r"\b(?:tl|tel|web|email|fax)\s*[:：]", re.I)
@@ -200,6 +205,10 @@ def _related_root_start(part: _MimePart) -> int | None:
 _HtmlMarker = tuple[Tag | NavigableString, Tag | None]
 
 
+def _is_bill_caption_text(text: str) -> bool:
+    return bool(_BILL_TAG_WORDS.search(text) or _BILL_AMOUNT_HINT.search(text))
+
+
 def _is_bill_image_tag(image: Tag) -> bool:
     labels = [image.get(attribute) for attribute in ("alt", "title", "aria-label")]
     if (figure := image.find_parent("figure")) is not None:
@@ -210,9 +219,7 @@ def _is_bill_image_tag(image: Tag) -> bool:
             if caption.find_parent("figure") is figure
         )
     label_texts = [str(label) for label in labels if label]
-    return any(
-        _BILL_TAG_WORDS.search(label) or _BILL_AMOUNT_HINT.search(label) for label in label_texts
-    )
+    return any(_is_bill_caption_text(label) for label in label_texts)
 
 
 def _signature_scope(node: Tag | NavigableString, body: Tag) -> Tag | None:
@@ -334,14 +341,9 @@ def _last_significant_leaf(node: Tag | NavigableString) -> Tag | NavigableString
         children = _non_empty_children(current)
         if not children:
             return current
-        if all(
-            isinstance(child, NavigableString)
-            or (
-                child.name not in _FOOTER_CONTAINERS
-                and child.name not in {"img", "hr", "figure"}
-                and child.find(["img", "hr", "figure"]) is None
-            )
-            for child in children
+        if not any(
+            isinstance(descendant, Tag) and descendant.name not in _INLINE_TAGS
+            for descendant in current.descendants
         ):
             return current
         current = children[-1]
@@ -406,7 +408,7 @@ def _preceded_by_bill_caption(slot: Tag, footer: Tag) -> bool:
                 text = leaf.get_text(" ", strip=True)
             else:
                 text = leaf.strip()
-            return bool(_BILL_TAG_WORDS.search(text) or _BILL_AMOUNT_HINT.search(text))
+            return _is_bill_caption_text(text)
         if parent is footer:
             break
         current = parent
@@ -421,8 +423,8 @@ def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool
     while (
         isinstance(slot_b.parent, Tag)
         and slot_b.parent is not footer
-        and len(_non_empty_children(slot_b.parent)) == 1
-        and slot_b.parent.find(["img", "figure"]) is None
+        and slot_b.parent.find(["img", "figure", "hr"]) is None
+        and not _is_bill_caption_text(slot_b.parent.get_text(" ", strip=True))
     ):
         slot_b = slot_b.parent
     parent = slot_b.parent
@@ -514,17 +516,21 @@ def _footer_signature_context(
         footer_tag, text_nodes, require_signoff=require_signoff
     ):
         if id(box) in image_parent_ids:
-            first_signoff = next((idx for idx, text in box_texts if _SIGNOFF.search(text)), None)
-            if first_signoff is not None and index < first_signoff:
+            first_sig_marker = next((idx for idx, text in box_texts if _SIGNOFF.search(text)), None)
+            if first_sig_marker is None and not require_signoff:
+                first_sig_marker = next(
+                    (idx for idx, text in box_texts if _SIGNATURE_CONTACT.search(text)), None
+                )
+            if first_sig_marker is not None and index < first_sig_marker:
                 has_img_after = any(
-                    idx > first_signoff and any(parent is box for parent in img.parents)
+                    idx > first_sig_marker and any(parent is box for parent in img.parents)
                     for idx, img in images
                 )
-                pre_text = "\n".join(text for idx, text in box_texts if idx < first_signoff)
+                pre_text = "\n".join(text for idx, text in box_texts if idx < first_sig_marker)
                 if (
                     has_img_after
-                    or _BILL_TAG_WORDS.search(pre_text)
-                    or _BILL_AMOUNT_HINT.search(pre_text)
+                    or _is_bill_caption_text(pre_text)
+                    or (not pre_text.strip() and _preceded_by_bill_caption(image, footer_tag))
                 ):
                     return pre_text
         elif not _image_in_adjacent_signature_slot(box, image, footer_tag):

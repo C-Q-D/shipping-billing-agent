@@ -4,7 +4,7 @@ from email import policy
 from email.message import EmailMessage
 from hashlib import sha256
 from io import BytesIO
-from itertools import pairwise
+from itertools import accumulate, pairwise
 from pathlib import Path
 from struct import pack_into, unpack_from
 from types import SimpleNamespace
@@ -774,6 +774,30 @@ def test_r10_f3_sub_point_trailing_dash(local_ocr):
 
 
 @pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+@pytest.mark.parametrize(
+    ("dash_lengths", "rows"),
+    [
+        pytest.param([0.5] + [20.875] * 8 + [0.5], (144,), id="0.5pt-both-ends"),
+        pytest.param([21.95] * 8 + [0.4], (144, 120), id="0.4pt-two-trailing-ends"),
+    ],
+)
+def test_r11_f3_sub_half_point_dashed_rule_endpoints(dash_lengths, rows, local_ocr):
+    # Each rule runs from x=24 to x=264 with 8 pt gaps.
+    dash_starts = accumulate((length + 8 for length in dash_lengths[:-1]), initial=24.0)
+    segments = tuple(zip(dash_starts, dash_lengths, strict=True))
+    drawing = b"".join(
+        b"%.3f %d m %.3f %d l S\n" % (left, y, left + length, y)
+        for y in rows
+        for left, length in segments
+    )
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE, drawing + b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n"
+    )
+
+    _assert_decorated_pdf_keeps_electronic_text(data, local_ocr)
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
 def test_r9_f4_pdf_keeps_electronic_text_with_implicitly_closed_bars(local_ocr):
     data = _two_page_pdf(
         _PAYMENT_TERMS_PAGE,
@@ -1436,6 +1460,46 @@ def test_r10_f1_hr_before_footer_caption(r8_eml_ocr):
     recognize_image.assert_called_once()
 
 
+def test_r11_f1_shared_outer_div_after_hr_caption(r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(
+        '<footer><hr><p>Invoice scan</p><div><div><img src="cid:scan"></div>'
+        'Best regards<br>ACME<br>Tel: 123456</div></footer>',
+        image_name="scan",
+        text=amount,
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert (scan.status, recognize_image.call_count) == (
+        DocumentStatus.PARSED,
+        1,
+    ), scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert amount in scan.raw_text, scan.raw_text
+
+
+def test_r11_f1_segmented_contact_paragraphs_after_hr(r8_eml_ocr):
+    data = _mail_with_inline_png(
+        '<footer><hr><div><p>ACME</p><p>Tel: 123456</p></div>'
+        '<div><img src="cid:logo"></div></footer>',
+        image_name="logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert (logo.status, recognize_image.call_count) == (
+        DocumentStatus.SKIPPED_NOISE,
+        0,
+    ), logo.raw_text
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+
+
 def test_r9_f2_eml_reads_a_negative_amount_and_skips_bare_currency_logos(r8_eml_ocr):
     dispatcher, recognize_image = r8_eml_ocr
     logo_labels = {
@@ -1541,6 +1605,26 @@ def test_r10_f5_wrapped_earlier_invoice_notice_before_company_logo(empty_span, r
     assert logo.status is DocumentStatus.SKIPPED_NOISE, logo.raw_text
     assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
     recognize_image.assert_not_called()
+
+
+def test_r11_f5_table_with_explicit_tbody_before_logo(r8_eml_ocr):
+    data = _mail_with_inline_png(
+        '<footer><table><tbody><tr><td><p>For invoice inquiries, please contact Accounts.</p>'
+        '<p>Company logo</p></td></tr></tbody></table><div><div><img src="cid:logo"></div>'
+        '<div><p>Best regards<br>ACME<br>Tel: 123456</p></div></div></footer>',
+        image_name="logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert (logo.status, recognize_image.call_count) == (
+        DocumentStatus.SKIPPED_NOISE,
+        0,
+    ), logo.raw_text
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
 
 
 @pytest.mark.parametrize(

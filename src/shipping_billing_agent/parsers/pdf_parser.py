@@ -146,9 +146,13 @@ def _classify_straight_segment(
         return 0
     (x0, y0), (x1, y1) = p1, p2
     dx, dy = abs(x1 - x0), abs(y1 - y0)
-    if dx <= _AXIS_TOL_PT and dy <= _AXIS_TOL_PT:
-        return 1
-    if dy <= _AXIS_TOL_PT:
+    is_horizontal = (dy <= _AXIS_TOL_PT and dx > _AXIS_TOL_PT) or (
+        dy <= 0.05 and dx > _DUPLICATE_VERTEX_TOL_PT
+    )
+    is_vertical = (dx <= _AXIS_TOL_PT and dy > _AXIS_TOL_PT) or (
+        dx <= 0.05 and dy > _DUPLICATE_VERTEX_TOL_PT
+    )
+    if is_horizontal:
         y = (y0 + y1) / 2
         left, right = min(x0, x1), max(x0, x1)
         if linewidth > _THIN_RULE_MAX_THICKNESS_PT:
@@ -164,7 +168,7 @@ def _classify_straight_segment(
             )
         horiz_segments.append((y, left, right))
         return 0
-    if dx <= _AXIS_TOL_PT:
+    if is_vertical:
         x = (x0 + x1) / 2
         top, bottom = min(y0, y1), max(y0, y1)
         if linewidth > _THIN_RULE_MAX_THICKNESS_PT:
