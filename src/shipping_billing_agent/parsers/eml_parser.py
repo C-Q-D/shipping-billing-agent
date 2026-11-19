@@ -63,7 +63,7 @@ _SIGNOFF_THANKS = rf"(?:(?:many{_HWS}+)?thanks|thank{_HWS}+you)"
 _SIGNOFF_CONJ = rf"(?:{_HWS}*,)?(?:{_HWS}+(?:and|&))?{_HWS}+"
 _SIGNOFF_PREFIX = rf"(?:^{_HWS}*|{_HWS}*(?:[,;!，；！]{_HWS}+|[–—]{_HWS}*|(?:^|(?<=\s)|-)-{_HWS}*))"
 _SIGNER_NAME = rf"(?-i:[A-Z][A-Za-z.']*(?:{_HWS}+[A-Z][A-Za-z.']*){{0,2}})"
-_ZH_PREFIX = rf"(?:^{_HWS}*|[\s，；。！：,;—–-]{_HWS}*)"
+_ZH_PREFIX = rf"(?:^{_HWS}*|{_HWS}*[，；。！：,;—–-]{_HWS}*|{_HWS}+)"
 _ZH_END = rf"(?={_HWS}*(?:[,!.:;，！。：]{_HWS}*)?\r?$)"
 _SIGNOFF = re.compile(
     rf"{_SIGNOFF_PREFIX}"
@@ -479,14 +479,10 @@ def _preceding_signature_boundary(
         if node_scope is None:
             continue
         other_landmark = node_scope is not scope and node_scope is not body_scope
-        if isolate_figures:
-            node_figure = node.find_parent("figure")
-            if node_figure is not None and node_figure is not figure and (
-                not other_landmark or any(parent is scope for parent in node_figure.parents)
-            ):
-                continue
         if other_landmark:
             return previous_index, None, None
+        if isolate_figures and node.find_parent("figure") is not figure:
+            continue
         if isinstance(node, NavigableString):
             matches = list(_SIGNATURE_SEPARATOR.finditer(node))
             if matches:
@@ -867,6 +863,8 @@ def _locate_visual_offset(
         return None
 
     char_index = min(max(0, char_index), len(text) - 1)
+    while char_index < len(text) and text[char_index] == "\n":
+        char_index += 1
     line_no = text.count("\n", 0, char_index)
     line_start = text.rfind("\n", 0, char_index) + 1
     col = char_index - line_start
@@ -901,7 +899,6 @@ def _locate_visual_offset(
                 return marker_idx, offset
             emitted += 1
             last_pos = (marker_idx, offset)
-    # A synthesized newline maps to the last character on its line.
     return last_pos
 
 
@@ -1016,15 +1013,32 @@ def _visual_lines(
 
 def _collect_preceding_bill_captions(
     body: Tag, target_image_ids: set[int], *, figure_captions: dict[int, list[Tag]]
-) -> tuple[dict[int, bool], dict[int, _TextLayout], set[int]]:
+) -> tuple[dict[int, bool], dict[int, bool], dict[int, _TextLayout], set[int]]:
     if not target_image_ids:
-        return {}, {}, set()
+        return {}, {}, {}, set()
     result: dict[int, bool] = {}
+    followed_bill: dict[int, bool] = {}
+    pending_after: tuple[int, _VisualLineBuffer] | None = None
     text_layout: dict[int, _TextLayout] = {}
     inline_tag_ids: set[int] = set()
     line_id = 0
     pending_space = False
     line_has_text = False
+
+    def finalize_after() -> None:
+        nonlocal pending_after
+        if pending_after is not None:
+            img_id, after_buf = pending_after
+            after_buf.flush()
+            followed_bill[img_id] = _lines_start_with_bill_caption(list(after_buf.lines))
+            pending_after = None
+
+    def flush_after() -> None:
+        if pending_after is not None:
+            after_buf = pending_after[1]
+            after_buf.flush()
+            if len(after_buf.lines) >= 2:
+                finalize_after()
 
     def break_line() -> None:
         nonlocal line_id, pending_space, line_has_text
@@ -1035,7 +1049,7 @@ def _collect_preceding_bill_captions(
     def walk(
         node: Tag, preformatted: bool, buffer: _VisualLineBuffer, *, in_figure: bool = False
     ) -> tuple[bool, bool]:
-        nonlocal line_id, pending_space, line_has_text
+        nonlocal line_id, pending_space, line_has_text, pending_after
         preformatted = _node_preformatted(node, preformatted)
         had_reset = had_img = False
         for child in node.children:
@@ -1043,6 +1057,23 @@ def _collect_preceding_bill_captions(
                 continue
             if isinstance(child, NavigableString):
                 raw = str(child)
+                if pending_after is not None:
+                    sep = _SIGNATURE_SEPARATOR.search(raw)
+                    text_part = raw[:sep.start()] if sep is not None else raw
+                    if text_part:
+                        after_buf = pending_after[1]
+                        normalized = text_part.replace("\r\n", "\n").replace("\r", "\n")
+                        if preformatted:
+                            *head_lines, normalized = normalized.split("\n")
+                            for line in head_lines:
+                                after_buf.current_line.append(line)
+                                flush_after()
+                                if pending_after is None:
+                                    break
+                        if pending_after is not None and normalized:
+                            after_buf.current_line.append(normalized)
+                    if sep is not None:
+                        finalize_after()
                 has_text = bool(raw.strip())
                 breaks = _count_line_breaks(raw) if preformatted else 0
                 if has_text:
@@ -1069,23 +1100,28 @@ def _collect_preceding_bill_captions(
                 had_reset |= buffer.append_text(raw, preformatted)
                 continue
             if child.name == "img":
+                finalize_after()
                 break_line()
                 if id(child) in target_image_ids:
                     buffer.flush()
                     result[id(child)] = _lines_end_with_bill_caption(list(buffer.lines))
+                    pending_after = (id(child), _VisualLineBuffer())
                 buffer.reset()
                 had_reset = had_img = True
                 continue
             if child.name == "hr":
+                finalize_after()
                 break_line()
                 buffer.reset()
                 had_reset = True
                 continue
             if child.name == "br":
+                flush_after()
                 break_line()
                 buffer.flush()
                 continue
             if child.name == "figure":
+                finalize_after()
                 break_line()
                 if in_figure or id(child) in figure_captions:
                     figure_buffer = _VisualLineBuffer(max_lines=2)
@@ -1093,18 +1129,21 @@ def _collect_preceding_bill_captions(
                     buffer.flush()
                     figure_buffer = buffer
                 _, child_img = walk(child, preformatted, figure_buffer, in_figure=True)
+                finalize_after()
                 break_line()
                 buffer.reset()
                 had_reset = True
                 had_img |= child_img
                 continue
             if child.name in _CONTENT_LANDMARKS:
+                finalize_after()
                 break_line()
                 buffer.flush()
                 child_buffer = _VisualLineBuffer(max_lines=2)
                 child_reset, child_img = walk(
                     child, preformatted, child_buffer, in_figure=in_figure
                 )
+                finalize_after()
                 break_line()
                 child_buffer.flush()
                 if child_reset:
@@ -1115,12 +1154,14 @@ def _collect_preceding_bill_captions(
                 continue
             is_block = not _is_inline_element(child)
             if is_block:
+                flush_after()
                 break_line()
                 buffer.flush()
             else:
                 inline_tag_ids.add(id(child))
             child_reset, child_img = walk(child, preformatted, buffer, in_figure=in_figure)
             if is_block:
+                flush_after()
                 break_line()
             had_reset |= child_reset
             had_img |= child_img
@@ -1132,7 +1173,8 @@ def _collect_preceding_bill_captions(
         return had_reset, had_img
 
     walk(body, _initial_preformatted(body), _VisualLineBuffer(max_lines=2))
-    return result, text_layout, inline_tag_ids
+    finalize_after()
+    return result, followed_bill, text_layout, inline_tag_ids
 
 
 def _preceded_by_bill_caption(
@@ -1301,7 +1343,13 @@ def _footer_signature_context(
     sep_start_offset = 0
     for idx in range(index - 1, -1, -1):
         marker = markers[idx]
-        node, _ = marker
+        node, node_scope = marker
+        other_landmark = (
+            node_scope is not None and node_scope is not footer_tag and node_scope is not body_scope
+        )
+        if other_landmark:
+            sep_start = idx + 1
+            break
         if node.find_parent("figure") is not figure:
             if figure is None or any(parent is figure for parent in node.parents):
                 continue
@@ -1320,7 +1368,12 @@ def _footer_signature_context(
     separator = None
     for sep_end in range(index + 1, len(markers)):
         marker = markers[sep_end]
-        node, _ = marker
+        node, node_scope = marker
+        other_landmark = (
+            node_scope is not None and node_scope is not footer_tag and node_scope is not body_scope
+        )
+        if other_landmark:
+            break
         if node.find_parent("figure") is not figure:
             if figure is None or any(parent is figure for parent in node.parents):
                 continue
@@ -1405,20 +1458,10 @@ def _footer_signature_context(
             adjacent_context = visual_text
             break
 
-    image_container = _nearest_container(image, footer_tag, inline_tag_ids)
-    after_lines = _visual_lines(
-        image_container,
-        start_after=image,
-        stop_at=sep_stop_node,
-        stop_offset=sep_stop_offset,
-        stop_on_media=True,
-        skip_figures=True,
-    )
-    if _lines_start_with_bill_caption(after_lines):
-        return "", True
     if adjacent_context is not None:
         return adjacent_context, False
 
+    image_container = _nearest_container(image, footer_tag, inline_tag_ids)
     container_chunks = [
         chunk
         for chunk in text_chunks
@@ -1461,7 +1504,7 @@ def _html_text(
         and node.name == "img"
         and node.has_attr("src")
     }
-    preceded_bill, text_layout, inline_tag_ids = _collect_preceding_bill_captions(
+    preceded_bill, followed_bill, text_layout, inline_tag_ids = _collect_preceding_bill_captions(
         body, target_image_ids, figure_captions=figure_captions
     )
 
@@ -1477,7 +1520,9 @@ def _html_text(
             classification = "body"
         elif scope is None:
             classification = "signature"
-        elif preceded_bill.get(id(image), False):
+        elif preceded_bill.get(id(image), False) or (
+            in_footer and followed_bill.get(id(image), False)
+        ):
             classification = "body"
         elif not in_footer and _has_signature_figure_caption(image, figure_captions):
             classification = "signature"

@@ -3875,6 +3875,128 @@ def test_r25_b_pre_many_short_lines_memory():
 
 
 @pytest.mark.parametrize(
+    ("caption", "expect_ocr"),
+    [
+        pytest.param("账单", True, id="chinese-caption"),
+        pytest.param("Invoice", True, id="english-caption"),
+        pytest.param("Company logo", False, id="company-logo"),
+    ],
+)
+def test_r26_f1_eml_keeps_the_full_caption_before_a_chinese_signoff(
+    caption, expect_ocr, r8_eml_ocr
+):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(
+        f'<footer><figure><img src="cid:scan"><br>{caption}<br>此致敬礼<br>Tel: 123456'
+        '</figure></footer>',
+        image_name="scan",
+        text=amount,
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=amount if expect_ocr else None)
+
+
+@pytest.mark.parametrize(
+    "preceding_section",
+    [
+        pytest.param(
+            "<hr><section><figure>Forwarded note</figure></section>", id="hr-before-figure"
+        ),
+        pytest.param("-- \n<section><div>Forwarded note</div></section>", id="dash-before-div"),
+    ],
+)
+def test_r26_f2_eml_stops_looking_for_separators_at_a_landmark(preceding_section, r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(
+        f'<footer>{preceding_section}<figure>Tel: 123456<img src="cid:scan"></figure></footer>',
+        image_name="scan",
+        text=amount,
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=amount)
+
+
+@pytest.mark.parametrize(
+    ("caption", "expect_ocr"),
+    [
+        pytest.param("Invoice scan", True, id="plain-caption"),
+        pytest.param("<div>Invoice scan</div>", True, id="wrapped-caption"),
+        pytest.param("Company logo", False, id="company-logo"),
+    ],
+)
+def test_r26_f3_eml_keeps_a_bill_caption_after_the_image_wrapper(caption, expect_ocr, r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(
+        f'<footer><div><img src="cid:scan"></div>{caption}</footer>'
+        '<div class="signature"><img src="cid:scan"></div>',
+        image_name="scan",
+        text=amount,
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=amount if expect_ocr else None)
+
+
+@pytest.mark.parametrize(
+    "footer_tail",
+    [
+        pytest.param("<p>Shipment update</p>" * 6, id="shipment-updates"),
+        pytest.param(
+            "<p>Best regards,</p><p>Alice Chen</p><p>Operations</p><p>ACME Logistics</p>"
+            "<p>Tel: 123456</p><p>Web: example.com</p>",
+            id="signoff-lines",
+        ),
+    ],
+)
+def test_r26_f4_eml_keeps_a_captioned_cid_outside_the_signature_tail(footer_tail, r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(
+        f'<footer><img src="cid:scan">Invoice scan{footer_tail}</footer>'
+        '<div class="signature"><img src="cid:scan"></div>',
+        image_name="scan",
+        text=amount,
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=amount)
+
+
+def test_r26_footer_linear_inline_calls(r8_eml_ocr):
+    from shipping_billing_agent.parsers import eml_parser
+
+    dispatcher, recognize_image = r8_eml_ocr
+    amount = "USD 310.42"
+    call_counts = []
+    for count in (12, 24, 48):
+        image_groups = '<p>Shipment details</p><img src="cid:scan">' * count
+        data = _mail_with_inline_png(
+            f"<footer>{image_groups}</footer>", image_name="scan", text=amount
+        )
+        with patch.object(
+            eml_parser, "_is_inline_element", wraps=eml_parser._is_inline_element
+        ) as is_inline:
+            root, body, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+        assert root.status is body.status is scan.status is DocumentStatus.PARSED
+        assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+        assert amount in scan.raw_text, scan.raw_text
+        call_counts.append(is_inline.call_count)
+
+    assert recognize_image.call_count == 3
+    assert call_counts == [12, 24, 48]
+
+
+@pytest.mark.parametrize(
     "html_body",
     [
         pytest.param(
