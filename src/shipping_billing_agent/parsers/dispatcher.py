@@ -27,9 +27,7 @@ from .filename_sanitizer import detect_source_kind, sanitize_filename
 from .pdf_parser import PdfPageOcr, PdfParseError, parse_pdf
 from .word_parser import WordParseError, parse_word
 
-_RELAY_TTL_SECONDS = 300
 _DEFAULT_LIMITS = ResourceLimits()
-_URL_AUTHORITY = re.compile(r"(?:\[[^\[\]]+\]|[^:\[\]]+)(?::[0-9]+)?")
 
 
 class _RemoteOcrResult(Protocol):
@@ -60,29 +58,10 @@ class _DocumentError(ValueError):
     pass
 
 
-def _check_url(url: str, validator: UrlValidatorProtocol | None) -> str:
-    clean_url = url.strip()
-    try:
-        parts = urlsplit(clean_url)
-        port = parts.port
-    except ValueError as exc:
-        raise ValueError("文件 URL 格式无效") from exc
-    if (
-        parts.scheme not in {"http", "https"}
-        or not parts.hostname
-        or "%" in parts.hostname
-        or parts.username is not None
-        or port == 0
-        or not _URL_AUTHORITY.fullmatch(parts.netloc)
-        or "\\" in clean_url
-        or any(c.isspace() or ord(c) < 32 or c == "\x7f" for c in clean_url)
-    ):
-        raise ValueError("文件 URL 必须为有效且不含登录信息的 HTTP 或 HTTPS 地址")
+def _require_url_validator(validator: UrlValidatorProtocol | None) -> UrlValidatorProtocol:
     if validator is None:
-        from shipping_billing_agent.gateways.url_guard import validate_public_url
-
-        validator = validate_public_url
-    return validator(clean_url)
+        raise ValueError("必须注入 url_validator")
+    return validator
 
 
 def _url_issue(url: str, error: ValueError) -> InputValidationIssue:
@@ -121,10 +100,9 @@ def validate_batch_inputs(
     limits: ResourceLimits = _DEFAULT_LIMITS,
     url_validator: UrlValidatorProtocol | None = None,
 ) -> list[InputValidationIssue]:
-    """Check (original filename, bytes) pairs and URLs before creating the batch.
-
-    A None validator uses the project's public URL guard, including its DNS checks.
-    """
+    """Check uploads and use the injected validator for any public URLs."""
+    if public_urls:
+        url_validator = _require_url_validator(url_validator)
     total = len(files) + len(public_urls)
     if total == 0:
         return [
@@ -143,11 +121,12 @@ def validate_batch_inputs(
         issue = _file_issue(name, data, detect_source_kind(sanitize_filename(name)), limits)
         if issue:
             issues.append(issue)
-    for url in public_urls:
-        try:
-            _check_url(url, url_validator)
-        except ValueError as exc:
-            issues.append(_url_issue(url, exc))
+    if url_validator is not None:
+        for url in public_urls:
+            try:
+                url_validator(url)
+            except ValueError as exc:
+                issues.append(_url_issue(url, exc))
     return issues
 
 
@@ -193,12 +172,7 @@ def _parsed(document: ParsedDocument, channel: ExtractionChannel) -> None:
 
 
 class DocumentParserDispatcher:
-    """Route bytes without constructing or managing OCR clients.
-
-    Missing remote OCR or relay disables the remote path for local documents. With
-    local fallback permitted, a missing local OCR client allows PDF text only.
-    A missing URL validator selects the same lazy default as validate_batch_inputs.
-    """
+    """Route local files and public URLs through their injected OCR and URL validators."""
 
     def __init__(
         self,
@@ -210,18 +184,26 @@ class DocumentParserDispatcher:
         url_validator: UrlValidatorProtocol | None = None,
         relay_publisher: RelayPublisherProtocol | None = None,
         public_relay_base_url: str = "",
+        relay_presign_ttl_seconds: int = 300,
     ) -> None:
+        if relay_publisher is not None:
+            _require_url_validator(url_validator)
+        if not 1 <= relay_presign_ttl_seconds <= 300:
+            raise ValueError("relay_presign_ttl_seconds 必须在 1 到 300 秒之间")
         self._ocr_mode = ocr_mode
         self._limits = limits
         self._remote_ocr = remote_ocr
         self._local_ocr = local_ocr
         self._url_validator = url_validator
         self._relay_publisher = relay_publisher if public_relay_base_url.strip() else None
+        self._relay_presign_ttl_seconds = relay_presign_ttl_seconds
 
     def parse_batch(
         self, files: Sequence[tuple[str, bytes]], public_urls: Sequence[str] = ()
     ) -> list[ParsedDocument]:
         """Parse validated top-level inputs in order, with email descendants after each parent."""
+        if public_urls:
+            _require_url_validator(self._url_validator)
         top_level = len(files) + len(public_urls)
         if top_level > min(self._limits.max_batch_files, self._limits.max_expanded_documents):
             raise ValueError("顶层输入数量超过单批上限")
@@ -240,8 +222,10 @@ class DocumentParserDispatcher:
         parent_doc_id: str | None = None,
         media_type: str | None = None,
         public_url: str | None = None,
+        depth: int = 1,
+        remaining_expanded_slots: int | None = None,
     ) -> list[ParsedDocument]:
-        """Reparse one source. Retried emails can return a new subtree under the same root ID."""
+        """Reparse in place, using the given depth and remaining slots for new child nodes."""
         if public_url is not None:
             return [
                 self._parse_url(
@@ -253,7 +237,14 @@ class DocumentParserDispatcher:
             ]
         if data is None:
             raise ValueError("重试本地文件需要原始字节")
-        batch = _Batch(max(0, self._limits.max_expanded_documents - 1))
+        if depth < 1:
+            raise ValueError("depth 必须从 1 开始")
+        child_slots = max(0, self._limits.max_expanded_documents - 1)
+        if remaining_expanded_slots is not None:
+            if remaining_expanded_slots < 0:
+                raise ValueError("remaining_expanded_slots 不能为负数")
+            child_slots = min(child_slots, remaining_expanded_slots)
+        batch = _Batch(child_slots)
         document = _new_file(
             filename,
             data,
@@ -261,7 +252,7 @@ class DocumentParserDispatcher:
             parent_doc_id=parent_doc_id,
             media_type=media_type,
         )
-        self._parse_file(document, data, batch, depth=1)
+        self._parse_file(document, data, batch, depth=depth)
         return batch.documents
 
     def force_parse_skipped_document(
@@ -290,18 +281,16 @@ class DocumentParserDispatcher:
             return
         try:
             if doc.source_kind is SourceKind.EML:
-                email = parse_eml(data)
+                if depth > self._limits.max_eml_recursion_depth:
+                    raise _DocumentError(
+                        f"邮件嵌套深度超过 {self._limits.max_eml_recursion_depth} 层"
+                    )
+                email = parse_eml(data, max_children=batch.child_slots)
                 doc.metadata = email.headers.copy()
                 self._expand_eml(doc, email, batch, depth)
                 _parsed(doc, ExtractionChannel.EML_TEXT_PARSER)
-            elif doc.source_kind is SourceKind.EXCEL:
-                doc.raw_text, doc.tables = parse_excel(data, doc.sanitized_filename)
-                _parsed(doc, ExtractionChannel.EXCEL_PARSER)
-            elif doc.source_kind is SourceKind.WORD:
-                doc.raw_text, doc.tables = parse_word(
-                    data, doc.sanitized_filename, max_file_bytes=self._limits.max_file_bytes
-                )
-                _parsed(doc, ExtractionChannel.WORD_PARSER)
+            elif doc.source_kind in {SourceKind.EXCEL, SourceKind.WORD}:
+                self._parse_office(doc, data)
             else:
                 self._parse_pdf_or_image(doc, data)
         except (EmlParseError, WordParseError, PdfParseError, _DocumentError) as exc:
@@ -309,22 +298,36 @@ class DocumentParserDispatcher:
         except Exception as exc:
             doc.error_message = f"无法解析文件（{type(exc).__name__}）"
 
-    def _take_child_slot(self, batch: _Batch, child: ParsedDocument) -> bool:
+    def _parse_office(self, doc: ParsedDocument, data: bytes) -> None:
+        if doc.source_kind is SourceKind.EXCEL:
+            doc.raw_text, doc.tables = parse_excel(data, doc.sanitized_filename)
+            channel = ExtractionChannel.EXCEL_PARSER
+        else:
+            doc.raw_text, doc.tables = parse_word(
+                data, doc.sanitized_filename, max_file_bytes=self._limits.max_file_bytes
+            )
+            channel = ExtractionChannel.WORD_PARSER
+        if not doc.raw_text.strip() and not any(
+            cell.strip() for table in doc.tables for row in table.rows for cell in row
+        ):
+            raise _DocumentError("文档内容为空，未提取到任何文本或表格")
+        _parsed(doc, channel)
+
+    def _expansion_limit_error(self) -> _DocumentError:
+        return _DocumentError(
+            f"单批展开文档数超过 {self._limits.max_expanded_documents} 项上限，部分子件已截断"
+        )
+
+    def _take_child_slot(self, batch: _Batch) -> None:
+        if batch.child_slots <= 0:
+            raise self._expansion_limit_error()
         batch.child_slots -= 1
-        if batch.child_slots == 0:
-            # Top-level slots are reserved separately. The final expansion slot records truncation.
-            limit = self._limits.max_expanded_documents
-            child.error_message = f"单批展开文档数达到 {limit} 项上限"
-            batch.documents.append(child)
-            return False
-        return True
 
     def _expand_eml(
         self, parent: ParsedDocument, email: ParsedEmail, batch: _Batch, depth: int
     ) -> None:
-        if batch.child_slots == 0:
-            return
         if email.body is not None:
+            self._take_child_slot(batch)
             name = f"{PurePath(parent.sanitized_filename).stem}.body.txt"
             body = _new_file(
                 name,
@@ -333,16 +336,13 @@ class DocumentParserDispatcher:
                 media_type=email.body.media_type,
                 body=True,
             )
-            if not self._take_child_slot(batch, body):
-                return
             body.metadata = email.headers.copy()
             body.raw_text = email.body.text
             _parsed(body, ExtractionChannel.EML_TEXT_PARSER)
             batch.documents.append(body)
 
-        for index, attachment in enumerate(email.attachments(), 1):
-            if batch.child_slots == 0:
-                return
+        for index, attachment in enumerate(email.attachments, 1):
+            self._take_child_slot(batch)
             name = f"attachment-{index}.bin"
             media_type = None
             decode_error = None
@@ -351,22 +351,13 @@ class DocumentParserDispatcher:
                 media_type = attachment.media_type
                 data = attachment.read_bytes()
             except Exception as exc:
-                data = attachment.source
-                if data is None:
-                    data = attachment.message.as_bytes()
+                data = attachment.wire_bytes()
                 decode_error = f"邮件附件编码无效（{type(exc).__name__}）"
             child = _new_file(name, data, parent_doc_id=parent.doc_id, media_type=media_type)
-            if not self._take_child_slot(batch, child):
-                return
             if decode_error:
                 child.error_message = decode_error
-            elif (
-                child.source_kind is SourceKind.EML
-                and depth >= self._limits.max_eml_recursion_depth
-            ):
-                child.error_message = f"邮件嵌套深度超过 {self._limits.max_eml_recursion_depth} 层"
             elif child.source_kind is SourceKind.IMAGE and email.is_signature_image(
-                attachment, child.sanitized_filename
+                attachment, name
             ):
                 child.status = DocumentStatus.SKIPPED_NOISE
                 child.extraction_channel = ExtractionChannel.SKIPPED_SIGNATURE
@@ -374,6 +365,8 @@ class DocumentParserDispatcher:
                 self._parse_file(child, data, batch, depth=depth + 1)
                 continue
             batch.documents.append(child)
+        if email.truncated:
+            raise self._expansion_limit_error()
 
     def _parse_url(
         self,
@@ -383,6 +376,7 @@ class DocumentParserDispatcher:
         parent_doc_id: str | None = None,
         filename: str | None = None,
     ) -> ParsedDocument:
+        url_validator = _require_url_validator(self._url_validator)
         if filename is None:
             try:
                 filename = unquote(urlsplit(url).path.rsplit("/", 1)[-1]) or "download"
@@ -394,12 +388,11 @@ class DocumentParserDispatcher:
             original_filename=filename,
             sanitized_filename=sanitize_filename(filename),
             source_kind=SourceKind.URL,
-            public_url=url,
             extraction_channel=ExtractionChannel.FAILED,
             status=DocumentStatus.FAILED,
         )
         try:
-            clean_url = _check_url(url, self._url_validator)
+            clean_url = url_validator(url)
         except ValueError as exc:
             doc.error_message = _url_issue(url, exc).message
             return doc
@@ -427,11 +420,12 @@ class DocumentParserDispatcher:
 
     def _parse_pdf_or_image(self, doc: ParsedDocument, data: bytes) -> None:
         if self._relay_publisher is not None and self._remote_ocr is not None:
+            url_validator = _require_url_validator(self._url_validator)
             try:
                 signed_url = self._relay_publisher.publish(
-                    data, doc.sanitized_filename, ttl_seconds=_RELAY_TTL_SECONDS
+                    data, doc.sanitized_filename, ttl_seconds=self._relay_presign_ttl_seconds
                 )
-                self._recognize_url(doc, _check_url(signed_url, self._url_validator))
+                self._recognize_url(doc, url_validator(signed_url))
                 return
             except Exception as exc:
                 if self._ocr_mode is not OcrMode.REMOTE_WITH_LOCAL_FALLBACK:

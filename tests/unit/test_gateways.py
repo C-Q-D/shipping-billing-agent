@@ -12,6 +12,9 @@ from threading import Thread
 
 import httpx
 import pytest
+from langchain_core.tracers.langchain import wait_for_all_tracers
+from langsmith.run_trees import RunTree
+from langsmith.utils import get_env_var
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 
@@ -27,6 +30,13 @@ from shipping_billing_agent.gateways.url_guard import (
 PUBLIC_FILE = "https://93.184.216.34/invoice.pdf?Signature=test-signature-value"
 LLM_KEY = "synthetic-gateway-test-key"
 DEEPSEEK_KEY = "synthetic-deepseek-fallback-key"
+OCR_BANK_FIELDS = {
+    "accountNo": "123456789012",
+    "routing_number": "021000021",
+    "ach": "026009593",
+    "swiftCode": "BOFAUS3NXXX",
+    "iban": "GB82WEST12345698765432",
+}
 
 
 def _unexpected_dns(host: str, port: int) -> list[tuple]:
@@ -61,7 +71,8 @@ def _unexpected_dns(host: str, port: int) -> list[tuple]:
         "http://[fec0::1]/",
         "http://[ff02::1]/",
         "http://[::ffff:192.168.1.1]/",
-        "http://[::ffff:93.184.216.34]/",
+        "http://[::ffff:127.0.0.1]/",
+        "http://[::ffff:10.0.0.1]/",
     ],
 )
 def test_public_url_rejects_disallowed_schemes_hosts_and_addresses(url: str) -> None:
@@ -95,7 +106,14 @@ def test_public_url_preserves_public_presigned_url() -> None:
     assert validate_public_url(f"  {url}  ", resolver=resolve) == url
 
 
-@pytest.mark.parametrize("url", ["http://93.184.216.34/a.pdf", "https://[2606:4700::1111]/a.pdf"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://93.184.216.34/a.pdf",
+        "https://[2606:4700::1111]/a.pdf",
+        "http://[::ffff:93.184.216.34]/a.pdf",
+    ],
+)
 def test_public_ip_literal_needs_no_dns_lookup(url: str) -> None:
     assert validate_public_url(url, resolver=_unexpected_dns) == url
 
@@ -150,6 +168,61 @@ def test_sanitizer_hides_presigned_credentials_and_keeps_invoice_query() -> None
     assert "secret-signature" not in sanitized
     assert "secret-token" not in sanitized
     assert "invoice=DC-108478" in sanitized
+    assert sanitize_for_llm(sanitized) == sanitized
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "ABA #",
+        "ABA/ROUTING WIRE#:",
+        "ACH:",
+        "WIRE / ACH ##:",
+        "ACCT / ACCOUNT #:",
+        "Account Number",
+        "ROUTING: / WIRE #",
+    ],
+)
+def test_sanitizer_masks_pdf_remittance_label_variations(label: str) -> None:
+    text = f"{label} 012345678\n245.0000 USD  CMDUCHN4053601"
+
+    assert sanitize_for_llm(text) == f"{label} [REDACTED_BANK_ACCT]\n245.0000 USD  CMDUCHN4053601"
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("accountNo", "000987654321"),
+        ("accountNumber", "000987654321"),
+        ("bankAccount", "000987654321"),
+        ("bank_account", "000987654321"),
+        ("account_number", "000987654321"),
+        ("accountno", "000987654321"),
+        ("routing", "021000021"),
+        ("routingNumber", "021000021"),
+        ("aba", "021000021"),
+        ("abaRouting", "021000021"),
+        ("aba_routing", 21000021),
+        ("ach", "026009593"),
+        ("swift", "BOFAUS3NXXX"),
+        ("swiftCode", "BOFAUS3NXXX"),
+        ("swift_code", "BOFAUS3NXXX"),
+        ("bic", "BOFAUS3NXXX"),
+        ("iban", "GB82WEST12345698765432"),
+    ],
+)
+def test_sanitizer_preserves_json_and_masks_bank_fields(key: str, value: int | str) -> None:
+    charges = {"amount": "1310.40", "unitPrice": "655.20", "quantity": 2, "currency": "USD"}
+    business = {"invoiceNumber": "DC-108478", "mblNumber": "ORFR1618731", "total": "1310.40"}
+    wire = json.dumps({**business, "other": {key: value}, "chargeList": [charges]}, indent=2)
+
+    sanitized = sanitize_for_llm(wire)
+
+    assert json.loads(sanitized) == {
+        **business,
+        "other": {key: "[REDACTED_BANK_ACCT]"},
+        "chargeList": [charges],
+    }
     assert sanitize_for_llm(sanitized) == sanitized
 
 
@@ -273,6 +346,27 @@ def test_ocr_rejects_blocked_file_before_gateway_post() -> None:
         client.recognize_url("http://169.254.169.254/latest/")
 
 
+@pytest.mark.parametrize("query", ["", "?Signature=synthetic-signed-file"])
+def test_batch_and_ocr_reject_url_credentials_with_the_same_code(query: str) -> None:
+    from shipping_billing_agent.parsers.dispatcher import validate_batch_inputs
+
+    url = f"http://user:pass@example.com/a.pdf{query}"
+    client = ocr_client.PltPltOcrClient(
+        _ocr_settings(), transport=httpx.MockTransport(lambda _: pytest.fail("Unexpected POST"))
+    )
+
+    (issue,) = validate_batch_inputs([], [url], url_validator=validate_public_url)
+    with pytest.raises(SsrfBlockedError) as error:
+        client.recognize_url(url)
+
+    assert issue.code == error.value.code == "SSRF_BLOCKED"
+    assert issue.filename_or_url == "http://[REDACTED]@example.com/a.pdf" + (
+        "?[REDACTED]" if query else ""
+    )
+    assert "user:pass" not in str(error.value)
+    assert "synthetic-signed-file" not in str(error.value)
+
+
 def test_ocr_masks_presigned_query_in_request_errors() -> None:
     def fail(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout(f"Timed out while processing {PUBLIC_FILE}", request=request)
@@ -367,9 +461,26 @@ def loopback_gateway(monkeypatch: pytest.MonkeyPatch):
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append((self.path, body, self.headers.get("Authorization")))
-            if self.path == "/ai/process":
+            if self.path.partition("?")[0] == "/ai/process":
                 response = {"data": {"list": [{"invoiceNumber": "DC-108478"}]}}
                 self._reply(response)
+                return
+
+            if self.path == "/ocr-bank-fields":
+                self._reply(
+                    {
+                        "data": {
+                            "list": [
+                                {
+                                    **OCR_BANK_FIELDS,
+                                    "invoiceNumber": "DC-108478",
+                                    "mblNumber": "ORFR1618731",
+                                    "chargeList": [{"amount": "1310.40", "currency": "USD"}],
+                                }
+                            ]
+                        }
+                    }
+                )
                 return
 
             if self.path == "/error/chat/completions":
@@ -379,6 +490,8 @@ def loopback_gateway(monkeypatch: pytest.MonkeyPatch):
             content = '{"invoice_number":"DC-108478"}'
             if self.path == "/bad-json/chat/completions":
                 content = "not a JSON invoice"
+            if self.path == "/signed-bad-json/chat/completions":
+                content = f"not a JSON invoice: {PUBLIC_FILE} and {LLM_KEY}"
 
             self._reply(
                 {
@@ -472,6 +585,23 @@ def test_bad_env_proxy_actually_prevents_loopback_connection(loopback_gateway) -
     assert requests == []
 
 
+@pytest.mark.asyncio
+async def test_ocr_keeps_token_on_wire_but_masks_it_in_http_debug_logs(
+    loopback_gateway, caplog: pytest.LogCaptureFixture
+) -> None:
+    origin, requests = loopback_gateway
+    target = "/ai/process?token=synthetic-ocr-token"
+    caplog.set_level(logging.DEBUG)
+    settings = _ocr_settings(ocr_gateway_url=origin + target)
+
+    ocr_client.PltPltOcrClient(settings).recognize_url(PUBLIC_FILE)
+    await ocr_client.PltPltOcrClient(settings).arecognize_url(PUBLIC_FILE)
+
+    assert [path for path, _, _ in requests] == [target, target]
+    assert caplog.text.count(f"{origin}/ai/process?[REDACTED]") == 2
+    assert "synthetic-ocr-token" not in caplog.text
+
+
 def _llm_settings(base_url: str, **overrides) -> AppSettings:
     options = dict(
         llm_base_url=base_url,
@@ -536,6 +666,72 @@ async def test_llm_sync_and_async_bypass_env_proxy_and_sanitize_outgoing_message
     assert sync_result.usage["total_tokens"] == 17
 
 
+@pytest.mark.asyncio
+async def test_ocr_formatted_invoice_is_sanitized_at_both_llm_receivers(loopback_gateway) -> None:
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    origin, requests = loopback_gateway
+    ocr = ocr_client.PltPltOcrClient(_ocr_settings(ocr_gateway_url=f"{origin}/ocr-bank-fields"))
+    dispatcher = DocumentParserDispatcher(remote_ocr=ocr, url_validator=validate_public_url)
+    (document,) = dispatcher.parse_batch([], [PUBLIC_FILE])
+    raw_fields = json.loads(document.raw_text)
+    assert {key: raw_fields[key] for key in OCR_BANK_FIELDS} == OCR_BANK_FIELDS
+
+    client = llm_client.OpenAICompatibleLlmClient(_llm_settings(f"{origin}/v1"))
+    try:
+        sync = client.invoke_structured(document.raw_text, _ExtractedInvoice)
+        async_ = await client.ainvoke_structured(document.raw_text, _ExtractedInvoice)
+    finally:
+        await client.aclose()
+
+    expected_invoice = _ExtractedInvoice(invoice_number="DC-108478")
+    assert sync.parsed == async_.parsed == expected_invoice
+    assert [path for path, _, _ in requests] == [
+        "/ocr-bank-fields",
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+    ]
+    for mode, (_, request, _) in zip(("sync", "async"), requests[1:], strict=True):
+        (message,) = request["messages"]
+        content = message["content"]
+        assert all(value not in content for value in OCR_BANK_FIELDS.values()), mode
+        assert json.loads(content) == {
+            **dict.fromkeys(OCR_BANK_FIELDS, "[REDACTED_BANK_ACCT]"),
+            "invoiceNumber": "DC-108478",
+            "mblNumber": "ORFR1618731",
+            "chargeList": [{"amount": "1310.40", "currency": "USD"}],
+        }, mode
+
+
+@pytest.mark.asyncio
+async def test_structured_llm_blocks_host_langsmith_tracing_on_both_paths(
+    loopback_gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    origin, requests = loopback_gateway
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "true")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "ls-fake")
+    monkeypatch.setenv("LANGSMITH_ENDPOINT", f"{origin}/telemetry")
+    posts = []
+    patches = []
+    monkeypatch.setattr(RunTree, "post", lambda run, **_: posts.append(run.run_type))
+    monkeypatch.setattr(RunTree, "patch", lambda run, **_: patches.append(run.run_type))
+    client = llm_client.OpenAICompatibleLlmClient(_llm_settings(f"{origin}/v1"))
+    get_env_var.cache_clear()
+    try:
+        sync = client.invoke_structured("Extract DC-108478", _ExtractedInvoice)
+        async_ = await client.ainvoke_structured("Extract DC-108478", _ExtractedInvoice)
+        wait_for_all_tracers()
+    finally:
+        get_env_var.cache_clear()
+        await client.aclose()
+
+    assert sync.parsed == async_.parsed == _ExtractedInvoice(invoice_number="DC-108478")
+    assert [path for path, _, _ in requests] == ["/v1/chat/completions"] * 2
+    assert posts == []
+    assert patches == []
+
+
 @pytest.mark.parametrize(
     ("base_url", "explicit_key"),
     [
@@ -569,6 +765,29 @@ async def test_llm_keeps_parsing_error_and_raw_text(loopback_gateway) -> None:
     assert result.parsed is None
     assert isinstance(result.parsing_error, Exception)
     assert result.raw_text == "not a JSON invoice"
+
+
+@pytest.mark.asyncio
+async def test_llm_masks_presigned_query_and_key_in_both_raw_replies_and_parse_errors(
+    loopback_gateway,
+) -> None:
+    origin, _ = loopback_gateway
+    client = llm_client.OpenAICompatibleLlmClient(_llm_settings(f"{origin}/signed-bad-json"))
+    try:
+        sync = client.invoke_structured("Extract a JSON invoice", _ExtractedInvoice)
+        async_ = await client.ainvoke_structured("Extract a JSON invoice", _ExtractedInvoice)
+    finally:
+        await client.aclose()
+
+    masked = "https://93.184.216.34/invoice.pdf?[REDACTED]"
+    for result in (sync, async_):
+        assert result.parsed is None
+        assert result.raw_text == f"not a JSON invoice: {masked} and [REDACTED]"
+        assert isinstance(result.parsing_error, Exception)
+        trace = "".join(traceback.format_exception(result.parsing_error))
+        assert masked in trace
+        assert "test-signature-value" not in trace
+        assert LLM_KEY not in trace
 
 
 def test_llm_errors_and_logs_hide_provider_keys(loopback_gateway, caplog: pytest.LogCaptureFixture):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
@@ -223,6 +223,9 @@ class RawChargeItem(BaseModel):
     currency: str | None = None
     payment_term: PaymentTerm | None = None
     source_text: str | None = None
+    page: int | None = None
+    line_number: int | None = None
+    debit_credit: Literal["DEBIT", "CREDIT", "UNKNOWN"] = "UNKNOWN"
 
 
 class RawDocumentExtraction(BaseModel):
@@ -233,6 +236,8 @@ class RawDocumentExtraction(BaseModel):
     document_date: str | None = None
     issuer: str | None = None
     recipient: str | None = None
+    payer_hint: str | None = None
+    payee_hint: str | None = None
     shipment_refs: ShipmentRefs = Field(default_factory=ShipmentRefs)
     excluded_clauses: list[ExcludedClause] = Field(default_factory=list)
     subtotal_amount: DecimalValue | None = None

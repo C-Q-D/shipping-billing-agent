@@ -383,6 +383,31 @@ def test_raw_extraction_validates_money_and_keeps_source_references(domain_model
     assert extracted.total_amount == Decimal("1310.40")
     assert extracted.shipment_refs.mbl_nos[0].model_dump() == mbl
     assert extracted.excluded_clauses[0].model_dump() == clause
+    assert (charge.page, charge.line_number, charge.debit_credit) == (None, None, "UNKNOWN")
+    assert (extracted.payer_hint, extracted.payee_hint) == (None, None)
+
+
+def test_raw_extraction_keeps_charge_direction_page_line_and_parties(domain_models) -> None:
+    payload = {
+        "payer_hint": "Example Shipper Ltd.",
+        "payee_hint": "Example Carrier Inc.",
+        "charges": [
+            {"raw_charge_name": "Handling", "page": 2, "line_number": 7, "debit_credit": "DEBIT"},
+            {"raw_charge_name": "Rebate", "page": 3, "line_number": 9, "debit_credit": "CREDIT"},
+        ],
+    }
+
+    extracted = domain_models.RawDocumentExtraction.model_validate(payload)
+
+    assert extracted.model_dump(include={"payer_hint", "payee_hint"}) == {
+        "payer_hint": "Example Shipper Ltd.",
+        "payee_hint": "Example Carrier Inc.",
+    }
+    assert [charge.model_dump(exclude_none=True) for charge in extracted.charges] == payload[
+        "charges"
+    ]
+    with pytest.raises(ValidationError, match="debit_credit"):
+        domain_models.RawChargeItem(raw_charge_name="Handling", debit_credit="OTHER")
 
 
 def test_raw_extraction_rejects_non_finite_charge_amount(domain_models) -> None:
@@ -421,3 +446,28 @@ def test_domain_imports_no_io_or_agent_frameworks() -> None:
     }
 
     assert not import_roots & forbidden_modules
+
+
+def test_parsers_only_use_injected_gateways_and_do_not_import_outer_layers() -> None:
+    parsers = Path(__file__).resolve().parents[2] / "src/shipping_billing_agent/parsers"
+    forbidden = {"gateways", "agent", "storage", "api", "cli"}
+    violations = []
+
+    for path in parsers.rglob("*.py"):
+        package = ["shipping_billing_agent", "parsers", *path.relative_to(parsers).parts[:-1]]
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
+            if isinstance(node, ast.Import):
+                imports = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                prefix = package[: len(package) - node.level + 1] if node.level else []
+                if node.module:
+                    prefix.extend(node.module.split("."))
+                imports = [".".join([*prefix, alias.name]) for alias in node.names]
+            else:
+                continue
+            for name in imports:
+                root, _, module = name.partition(".")
+                if root == "shipping_billing_agent" and module.partition(".")[0] in forbidden:
+                    violations.append((path.name, node.lineno, name))
+
+    assert not violations

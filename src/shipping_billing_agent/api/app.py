@@ -5,9 +5,10 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from shipping_billing_agent.config.settings import load_settings
+from shipping_billing_agent.gateways.url_guard import redact_url_query
 
 
-def create_app() -> FastAPI:
+def create_app(relay_publisher: object | None = None) -> FastAPI:
     """Create the FastAPI application instance."""
     fastapi_app = FastAPI(
         title="Shipping Intelligent Billing Assistant API",
@@ -22,9 +23,9 @@ def create_app() -> FastAPI:
             "status": "ok",
             "llm_configured": settings.is_llm_configured(),
             "llm_model": settings.llm_model,
-            "ocr_gateway_url": settings.ocr_gateway_url,
+            "ocr_gateway_url": redact_url_query(settings.ocr_gateway_url),
             "ocr_direct_mode": settings.is_ocr_direct_mode(),
-            "public_relay_configured": settings.is_public_relay_ready(),
+            "public_relay_configured": settings.is_public_relay_ready(relay_publisher),
         }
 
     return fastapi_app

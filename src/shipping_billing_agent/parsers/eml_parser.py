@@ -4,13 +4,14 @@ import re
 from base64 import b64decode
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from email import message_from_bytes, policy
-from email.message import EmailMessage
+from email import policy
+from email.message import Message
+from email.parser import BytesHeaderParser
 from mimetypes import guess_extension
 from quopri import decodestring
 from urllib.parse import unquote
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 from .filename_sanitizer import sanitize_filename
 
@@ -20,8 +21,14 @@ _BILL_WORDS = re.compile(
     r"invoice|bill|charge|statement|freight|账单|帳單|发票|發票|费用|費用", re.I
 )
 _SIGNATURE_BLOCK = re.compile(r"signature|foxmail", re.I)
-_SIGNATURE_SEPARATOR = re.compile(r"^\s*--[ \t]+\s*$")
+_SIGNATURE_SEPARATOR = re.compile(r"^[ \t]*--[ \t]+\r?$", re.MULTILINE)
+_SIGNATURE_CONTACT = re.compile(r"\b(?:tl|tel|web|email|fax)\s*[:：]", re.I)
+_SIGNOFF = re.compile(r"\b(?:regards|sincerely)\b|此致|敬上|敬礼", re.I)
+_DECORATIVE_IMAGE = re.compile(r"_foxmail\.|insertpic_", re.I)
+_SIGNATURE_TAIL_SIZE = 8
 _MIME_HEADER_END = re.compile(rb"\r\n\r\n|\n\n|\r\r")
+_MIME_LINE_BREAK = re.compile(rb"\r\n|\r|\n")
+_NONBLANK_BYTE = re.compile(rb"\S")
 
 
 class EmlParseError(ValueError):
@@ -32,16 +39,7 @@ def _content_id(value: str) -> str:
     return unquote(value).strip().strip("<>").casefold()
 
 
-def _related_root(message: EmailMessage, parts: list[EmailMessage]) -> EmailMessage:
-    start = _content_id(message.get_param("start") or "")
-    if start:
-        for part in parts:
-            if _content_id(part.get("Content-ID", "")) == start:
-                return part
-    return parts[0]
-
-
-def _is_attachment(message: EmailMessage) -> bool:
+def _is_attachment(message: Message) -> bool:
     return (
         message.get_content_disposition() == "attachment"
         or message.get_filename() is not None
@@ -60,17 +58,44 @@ class EmailBody:
 
 
 @dataclass(frozen=True, slots=True)
-class EmailAttachment:
-    message: EmailMessage
-    in_related: bool
-    source: bytes | None
+class _MimePart:
+    """Headers and offsets into the original wire bytes. Payloads are loaded on demand."""
+
+    headers: Message
+    source: bytes
+    start: int
+    body_start: int
+    end: int
+
+    @classmethod
+    def from_wire(
+        cls, source: bytes, start: int, end: int, *, default_type: str = "text/plain"
+    ) -> "_MimePart":
+        separator = _MIME_LINE_BREAK.match(source, start, end) or _MIME_HEADER_END.search(
+            source, start, end
+        )
+        body_start = separator.end() if separator is not None else end
+        headers = BytesHeaderParser(_class=Message, policy=policy.default).parsebytes(
+            source[start:body_start]
+        )
+        headers.set_default_type(default_type)
+        return cls(headers, source, start, body_start, end)
 
     @property
     def media_type(self) -> str:
-        return self.message.get_content_type()
+        return self.headers.get_content_type()
+
+    @property
+    def content_id(self) -> str:
+        return _content_id(self.headers.get("Content-ID", ""))
+
+    def iter_parts(self) -> Iterator["_MimePart"]:
+        default_type = "message/rfc822" if self.media_type == "multipart/digest" else "text/plain"
+        for start, end in _wire_parts(self):
+            yield _MimePart.from_wire(self.source, start, end, default_type=default_type)
 
     def filename(self, number: int) -> str:
-        name = self.message.get_filename()
+        name = self.headers.get_filename()
         if name:
             return name
         extension = (
@@ -80,21 +105,19 @@ class EmailAttachment:
         )
         return f"attachment-{number}{extension}"
 
+    def wire_bytes(self) -> bytes:
+        return self.source[self.start : self.end]
+
+    def has_body_bytes(self) -> bool:
+        return _NONBLANK_BYTE.search(self.source, self.body_start, self.end) is not None
+
     def read_bytes(self) -> bytes:
         if self.media_type == "message/rfc822":
-            encoding = self.message.get("Content-Transfer-Encoding", "").lower()
-            if self.source is not None and (header_end := _MIME_HEADER_END.search(self.source)):
-                return _decode_transfer(self.source[header_end.end() :], encoding)
-            if not self.message.is_multipart():
-                return self.message.get_payload(decode=True) or b""
-            enclosed, *rest = self.message.get_payload()
-            if rest:
-                raise EmlParseError("message/rfc822 附件包含多个邮件载荷")
-            if encoding == "base64":
-                return _decode_transfer(enclosed.get_payload(decode=True) or b"", encoding)
-            wire = enclosed.as_bytes(policy=policy.SMTP.clone(refold_source="none"))
-            return _decode_transfer(wire, encoding)
-        return self.message.get_payload(decode=True) or b""
+            encoding = self.headers.get("Content-Transfer-Encoding", "").lower()
+            return _decode_transfer(self.source[self.body_start : self.end], encoding)
+        # Decode only this admitted leaf, without recursively parsing MIME structures.
+        message = BytesHeaderParser(policy=policy.default).parsebytes(self.wire_bytes())
+        return message.get_payload(decode=True) or b""
 
 
 def _decode_transfer(wire: bytes, encoding: str) -> bytes:
@@ -107,30 +130,25 @@ def _decode_transfer(wire: bytes, encoding: str) -> bytes:
 
 @dataclass(slots=True)
 class ParsedEmail:
-    message: EmailMessage
-    source: bytes
     headers: dict[str, str]
-    body: EmailBody | None
-    image_cids: set[str] = field(default_factory=set)
+    body: EmailBody | None = None
+    attachments: list[_MimePart] = field(default_factory=list)
+    signature_cids: set[str] = field(default_factory=set)
     signature_filenames: set[str] = field(default_factory=set)
+    truncated: bool = False
 
-    def attachments(self) -> Iterator[EmailAttachment]:
-        yield from _attachments(self.message, self.source)
-
-    def is_signature_image(self, attachment: EmailAttachment, filename: str) -> bool:
-        cid = _content_id(attachment.message.get("Content-ID", ""))
-        if cid and cid in self.image_cids:
-            return True
-        lower_name = filename.casefold()
+    def is_signature_image(self, attachment: _MimePart, filename: str) -> bool:
+        if _BILL_WORDS.search(filename):
+            return False
         return (
-            (lower_name.startswith("insertpic_") or "_foxmail." in lower_name)
-            and (attachment.in_related or lower_name in self.signature_filenames)
-            and not _BILL_WORDS.search(lower_name)
+            attachment.content_id in self.signature_cids
+            or sanitize_filename(filename).casefold() in self.signature_filenames
         )
 
 
-def _wire_parts(data: bytes | None, boundary: str | None) -> Iterator[bytes]:
-    if data is None or not boundary:
+def _wire_parts(part: _MimePart) -> Iterator[tuple[int, int]]:
+    boundary = part.headers.get_boundary()
+    if not boundary:
         return
     # Keep the embedded mail's original line endings and header folding for SHA-256.
     # The line break immediately before a delimiter belongs to the MIME envelope.
@@ -138,109 +156,155 @@ def _wire_parts(data: bytes | None, boundary: str | None) -> Iterator[bytes]:
         rb"(?:\A|(?<=[\r\n]))--" + re.escape(boundary.encode()) + rb"(--)?[ \t]*(?:\r\n|\n|\r|\Z)"
     )
     start = None
-    for mark in delimiter.finditer(data):
+    for mark in delimiter.finditer(part.source, part.body_start, part.end):
         if start is not None:
             end = mark.start()
-            if data[end - 2 : end] == b"\r\n":
+            if end - start >= 2 and part.source[end - 2 : end] == b"\r\n":
                 end -= 2
-            elif data[end - 1 : end] in {b"\n", b"\r"}:
+            elif end > start and part.source[end - 1 : end] in {b"\n", b"\r"}:
                 end -= 1
-            yield data[start:end]
+            yield start, end
         if mark[1]:
             return
         start = mark.end()
     if start is not None:
-        yield data[start:]
+        yield start, part.end
 
 
-def _attachments(
-    message: EmailMessage, source: bytes | None, in_related: bool = False
-) -> Iterator[EmailAttachment]:
-    if _is_attachment(message):
-        yield EmailAttachment(message, in_related, source)
-    elif message.is_multipart():
-        parts = list(message.iter_parts())
-        related = message.get_content_type() == "multipart/related" and bool(parts)
-        root = _related_root(message, parts) if related else None
-        wire_parts = _wire_parts(source, message.get_boundary())
-        for part in parts:
-            wire = next(wire_parts, None)
-            if related and part is not root:
-                yield EmailAttachment(part, in_related=True, source=wire)
-            else:
-                yield from _attachments(part, wire, in_related or related)
+def _related_root_start(part: _MimePart) -> int | None:
+    start = _content_id(part.headers.get_param("start") or "")
+    if not start:
+        return next((offset for offset, _ in _wire_parts(part)), None)
+    parts = part.iter_parts()
+    first = next(parts, None)
+    if first is None:
+        return None
+    if start != first.content_id:
+        return next((child.start for child in parts if child.content_id == start), first.start)
+    return first.start
 
 
-def _html_text(html: str, cids: set[str], signature_names: set[str]) -> str:
+def _html_text(html: str, email: ParsedEmail) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(["script", "style", "head"]):
         tag.decompose()
-    for image in soup.find_all("img", src=True):
-        source = str(image["src"]).strip()
-        if source.lower().startswith("cid:"):
-            cids.add(_content_id(source[4:]))
-        if (
-            image.find_parent(id=_SIGNATURE_BLOCK)
-            or image.find_parent(class_=_SIGNATURE_BLOCK)
-            or image.find_previous(string=_SIGNATURE_SEPARATOR)
+    markers = [
+        node
+        for node in soup.descendants
+        if (isinstance(node, Tag) and node.name in {"img", "hr"})
+        or (isinstance(node, NavigableString) and not isinstance(node, Comment) and node.strip())
+    ]
+    separator = -1
+    for index, node in enumerate(markers):
+        if (isinstance(node, Tag) and node.name == "hr") or (
+            isinstance(node, NavigableString) and _SIGNATURE_SEPARATOR.search(node)
         ):
-            name = source.removeprefix("cid:").split("?", 1)[0]
-            signature_names.add(sanitize_filename(unquote(name)).casefold())
+            separator = index
+
+    for index, image in enumerate(markers):
+        if not isinstance(image, Tag) or image.name != "img" or not image.get("src"):
+            continue
+        source = str(image["src"]).strip()
+        explicit = image.find_parent(id=_SIGNATURE_BLOCK) or image.find_parent(
+            class_=_SIGNATURE_BLOCK
+        )
+        tail = len(markers) - index <= _SIGNATURE_TAIL_SIZE
+        context = (
+            "\n".join(
+                node
+                for node in markers[max(0, separator, index - _SIGNATURE_TAIL_SIZE) :]
+                if isinstance(node, NavigableString)
+            )
+            if tail
+            else ""
+        )
+        after_signoff = separator >= 0 and index > separator and _SIGNATURE_CONTACT.search(context)
+        decorative = _DECORATIVE_IMAGE.search(source) and (
+            _SIGNATURE_CONTACT.search(context) or _SIGNOFF.search(context)
+        )
+        if not (explicit or after_signoff or decorative):
+            continue
+        if source.lower().startswith("cid:"):
+            if cid := _content_id(source[4:]):
+                email.signature_cids.add(cid)
+        else:
+            name = source.split("?", 1)[0]
+            email.signature_filenames.add(sanitize_filename(unquote(name)).casefold())
     return soup.get_text("\n", strip=True)
 
 
-def _body_parts(
-    message: EmailMessage, cids: set[str], signature_names: set[str]
-) -> list[EmailBody]:
-    if _is_attachment(message):
-        return []
-    media_type = message.get_content_type()
-    if message.is_multipart():
-        parts = list(message.iter_parts())
-        if media_type == "multipart/related" and parts:
-            return _body_parts(_related_root(message, parts), cids, signature_names)
-        alternatives = [_body_parts(part, cids, signature_names) for part in parts]
-        if media_type == "multipart/alternative":
-            # Inspect every HTML representation for CID references before choosing the text.
-            nonempty = [part for part in alternatives if part]
-            if not nonempty:
-                return []
-            return next(
-                (
-                    part
-                    for part in nonempty
-                    if all(body.media_type == "text/plain" for body in part)
-                ),
-                nonempty[0],
-            )
-        return [body for group in alternatives for body in group]
-    if media_type not in _TEXT_TYPES:
-        return []
-    data = message.get_payload(decode=True) or b""
+def _read_body(part: _MimePart, email: ParsedEmail) -> EmailBody:
+    data = part.read_bytes()
     try:
-        text = data.decode(message.get_content_charset() or "utf-8", errors="replace")
+        text = data.decode(part.headers.get_content_charset() or "utf-8", errors="replace")
     except LookupError:
         text = data.decode("utf-8", errors="replace")
-    if media_type == "text/html":
-        text = _html_text(text, cids, signature_names)
-    return [EmailBody(text, data, media_type)] if text.strip() else []
+    if part.media_type == "text/html":
+        text = _html_text(text, email)
+    return EmailBody(text, data, part.media_type)
 
 
-def parse_eml(data: bytes) -> ParsedEmail:
-    message = message_from_bytes(data, policy=policy.default)
-    if not message.keys() or (
-        message.get_content_maintype() == "multipart" and not message.is_multipart()
-    ):
+def parse_eml(data: bytes, *, max_children: int) -> ParsedEmail:
+    root = _MimePart.from_wire(data, 0, len(data))
+    if not root.headers.keys():
         raise EmlParseError("邮件头或 MIME 分隔符无效")
-    headers = {name: str(message[name]) for name in _HEADERS if name in message}
-    cids: set[str] = set()
-    signature_names: set[str] = set()
-    parts = _body_parts(message, cids, signature_names)
-    body = parts[0] if parts else None
-    if len(parts) > 1:
-        body = EmailBody(
-            "\n\n".join(part.text for part in parts),
-            b"\n\n".join(part.data for part in parts),
+    if root.headers.get_content_maintype() == "multipart" and next(_wire_parts(root), None) is None:
+        raise EmlParseError("邮件头或 MIME 分隔符无效")
+    headers = {name: str(root.headers[name]) for name in _HEADERS if name in root.headers}
+    email = ParsedEmail(headers)
+    slots = max_children
+    body_reserved = False
+
+    def collect(part: _MimePart, *, related_resource: bool = False) -> list[EmailBody]:
+        nonlocal slots, body_reserved
+        if related_resource or _is_attachment(part.headers):
+            if slots == 0:
+                email.truncated = True
+            else:
+                # Keep the wire range only. The dispatcher checks the shared budget again
+                # before loading the payload, after any earlier nested mail has expanded.
+                email.attachments.append(part)
+                slots -= 1
+            return []
+
+        media_type = part.media_type
+        if media_type in _TEXT_TYPES:
+            if not body_reserved and slots == 0:
+                email.truncated = part.has_body_bytes()
+                return []
+            body = _read_body(part, email)
+            if not body.text.strip():
+                return []
+            if not body_reserved:
+                body_reserved = True
+                slots -= 1
+            return [body]
+
+        related_root = _related_root_start(part) if media_type == "multipart/related" else None
+        groups: list[list[EmailBody]] = []
+        for child in part.iter_parts():
+            bodies = collect(child, related_resource=related_root not in {None, child.start})
+            if bodies:
+                groups.append(bodies)
+            if email.truncated:
+                break
+        if groups and media_type == "multipart/alternative":
+            plain_groups = (
+                group for group in groups if all(body.media_type == "text/plain" for body in group)
+            )
+            return next(
+                plain_groups,
+                groups[0],
+            )
+        return [body for group in groups for body in group]
+
+    bodies = collect(root)
+    if len(bodies) == 1:
+        email.body = bodies[0]
+    elif bodies:
+        email.body = EmailBody(
+            "\n\n".join(body.text for body in bodies),
+            b"\n\n".join(body.data for body in bodies),
             "text/plain",
         )
-    return ParsedEmail(message, data, headers, body, cids, signature_names)
+    return email

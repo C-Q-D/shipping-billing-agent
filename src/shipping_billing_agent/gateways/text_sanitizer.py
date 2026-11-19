@@ -21,14 +21,14 @@ _QUERY_KEYS = {
 }
 _QUERY_PREFIXES = ("x_amz_", "x_goog_", "x_oss_")
 
+_REMITTANCE_LABEL = r"(?:ach|wire|aba|routing|acct\.?|account|a/c)(?!\w)"
 _ACCOUNT_LABEL = (
-    r"\b(?:(?:bank|beneficiary)[ \t]+account(?:[ \t]+(?:no\.?|number))?"
-    r"|(?:account|acct\.?|a/c)[ \t]*(?:no\.?|number|(?=[#:]))"
-    r"|(?:routing|aba)(?:[ \t]+(?:no\.?|number|code))?)(?!\w)"
+    rf"\b(?:(?:bank|beneficiary)[ \t]+)?{_REMITTANCE_LABEL}"
+    rf"(?:[ \t/#:：=]*{_REMITTANCE_LABEL})*(?:[ \t]*(?:no\.?|number|code)(?!\w))?"
     r"|(?:银行|汇款|收款)(?:账号|帐号|账户)"
 )
 _BIC_LABEL = r"\b(?:swift(?:[ \t]*/[ \t]*bic)?|bic)(?:[ \t]+(?:code|no\.?|number))?(?!\w)"
-_FIELD_SEPARATOR = r"[ \t]*[:：#=]?[ \t]*(?:\r?\n[ \t]*)?"
+_FIELD_SEPARATOR = r"[ \t/:：#=]*(?:\r?\n[ \t]*)?"
 _BANK_FIELDS = re.compile(
     rf"(?P<label>{_ACCOUNT_LABEL}){_FIELD_SEPARATOR}"
     r"(?P<value>(?=(?:[0-9][ \t-]?){4}[0-9])[0-9]+"
@@ -45,6 +45,14 @@ _IBAN_FIELD = re.compile(
     r"(?P<value>[A-Z]{2}[0-9]{2}(?:[A-Z0-9]{11,30}"
     r"|(?:[ \t]+(?!(?:rate|date|bill)\b)[A-Z0-9]{4}(?!\w|[.,][0-9])){2,7}"
     r"(?:[ \t]+(?=[A-Z0-9]*[0-9])[A-Z0-9]{1,3})?))(?!\w|[.,][0-9])",
+    re.IGNORECASE,
+)
+_JSON_BANK_FIELD = re.compile(
+    r'(?P<key>(?<!\\)"(?:(?:bank[_ -]?)?account(?:[_ -]?(?:no|number))?'
+    r"|routing(?:[_ -]?(?:no|number))?|aba(?:[_ -]?routing(?:[_ -]?number)?)?"
+    r'|ach(?:[_ -]?number)?|swift(?:[_ -]?code)?|bic|iban)"\s*:\s*)'
+    r'(?:"(?:[^"\\]|\\.)*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)'
+    r"(?=\s*(?:[,}\]]|\Z))",
     re.IGNORECASE,
 )
 _BANK_HEADING = re.compile(
@@ -103,6 +111,7 @@ def _mask_unlabeled_accounts(text: str) -> str:
 
 
 def sanitize_for_llm(text: str) -> str:
+    text = _JSON_BANK_FIELD.sub(rf'\g<key>"{_BANK_MASK}"', text)
     text = HTTP_URL_PATTERN.sub(_sanitize_signed_url, text)
     text = _BANK_FIELDS.sub(_mask_field_value, text)
     text = _BIC_FIELD.sub(_mask_field_value, text)

@@ -12,6 +12,7 @@ from shipping_billing_agent.domain.models import (
     SourceKind,
 )
 from shipping_billing_agent.gateways.local_ocr import RapidOcrFallback
+from shipping_billing_agent.gateways.text_sanitizer import sanitize_for_llm
 
 SAMPLES = Path(__file__).resolve().parents[2] / "笔试题AIAGENT"
 
@@ -20,6 +21,8 @@ SAMPLES = Path(__file__).resolve().parents[2] / "笔试题AIAGENT"
 def dispatcher():
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
+    if not SAMPLES.is_dir():
+        pytest.skip("当前检出未提供笔试题AIAGENT原题目录")
     return DocumentParserDispatcher(
         ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK,
         local_ocr=RapidOcrFallback(),
@@ -54,11 +57,17 @@ def test_original_eml_deduplicates_body_and_keeps_all_attachment_bytes(dispatche
         assert attachment.raw_bytes == original_payload
         assert attachment.content_sha256 == sha256(original_payload).hexdigest()
 
-    for suffix in ("MBL", "HBL"):
+    expected_text = {
+        "MBL": ("SUN TRACK EXPRESS", "HZMHK331281"),
+        "HBL": ("TARGETING A INC", "FREIGHT PREPAID", "OOLU4055331281"),
+    }
+    for suffix, phrases in expected_text.items():
         pdf = by_name[f"4055331281_{suffix}.pdf"]
         assert pdf.original_filename == f"4055331281\xa0{suffix}.pdf"
         assert pdf.source_kind is SourceKind.PDF
         assert pdf.status is DocumentStatus.PARSED, pdf.error_message
+        for phrase in phrases:
+            assert phrase in pdf.raw_text, f"{suffix} 原文缺少 {phrase}"
 
     signature = by_name["InsertPic_C25B.jpg"]
     assert signature.status is DocumentStatus.SKIPPED_NOISE
@@ -97,6 +106,24 @@ def test_original_pdf_invoice_one_keeps_all_three_text_pages(dispatcher):
     assert re.findall(r"(?m)^\[Page (\d+) \| Text\]$", doc.raw_text) == ["1", "2", "3"]
     assert "CMDUCHN4053601" in doc.raw_text
     assert "245.0000" in doc.raw_text
+
+
+def test_original_pdf_invoice_one_layout_masks_all_remittance_numbers(dispatcher):
+    doc = _parse_sample(dispatcher, "PDF示例账单1.pdf")
+    fake_account = "000123456"
+    sample_text, replacements = re.subn(
+        r"(\b(?:ABA #|ABA/ROUTING WIRE#:|ACH:|Account Number|ACCT #:)[ \t]+)\d+",
+        rf"\g<1>{fake_account}",
+        doc.raw_text,
+    )
+    assert replacements == 6
+
+    sanitized = sanitize_for_llm(sample_text)
+
+    assert sanitized.count("[REDACTED_BANK_ACCT]") >= 6
+    assert fake_account not in sanitized
+    assert "245.0000" in sanitized
+    assert "CMDUCHN4053601" in sanitized
 
 
 def test_original_image_passes_its_amounts_through_real_rapidocr(dispatcher):

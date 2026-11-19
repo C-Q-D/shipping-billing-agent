@@ -2,14 +2,18 @@ from base64 import b64encode
 from email import policy
 from email.message import EmailMessage
 from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 from struct import pack_into, unpack_from
 from types import SimpleNamespace
 
 import pytest
+from docx import Document
+from openpyxl import Workbook
 from PIL import Image
 
 from shipping_billing_agent.config.limits import ResourceLimits
+from shipping_billing_agent.config.settings import AppSettings
 from shipping_billing_agent.domain.models import (
     DocumentStatus,
     ExtractionChannel,
@@ -18,6 +22,8 @@ from shipping_billing_agent.domain.models import (
     OcrStructuredPayload,
     SourceKind,
 )
+from shipping_billing_agent.gateways.local_ocr import RapidOcrFallback
+from shipping_billing_agent.gateways.url_guard import validate_public_url
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
@@ -137,6 +143,54 @@ def test_docx_reads_interleaved_paragraphs_and_tables_with_header_footer():
     ]
 
 
+def test_docx_preserves_nested_table_and_cell_paragraph_order_through_a_merge():
+    from shipping_billing_agent.parsers.word_parser import parse_word
+
+    word = Document()
+    word.add_paragraph("Statement")
+    layout = word.add_table(rows=2, cols=2)
+    cell = layout.cell(0, 0).merge(layout.cell(1, 1))
+    cell.text = "Before charges"
+    cell.add_table(rows=1, cols=2).rows[0].cells[0].text = "FREIGHT"
+    cell.tables[0].cell(0, 1).text = "187.65"
+    cell.paragraphs[-1].text = "After charges"
+    word.add_paragraph("End of statement")
+    with BytesIO() as stream:
+        word.save(stream)
+        text, tables = parse_word(stream.getvalue(), "nested.docx")
+
+    assert [table.rows for table in tables] == [
+        [["Before charges\nAfter charges", ""], ["", ""]],
+        [["FREIGHT", "187.65"]],
+    ]
+    assert [line.strip() for line in text.splitlines() if line.strip()] == [
+        "Statement",
+        "Before charges",
+        "FREIGHT\t187.65",
+        "After charges",
+        "End of statement",
+    ]
+
+
+@pytest.mark.parametrize("filename", ["empty.xlsx", "empty.docx"])
+def test_parse_batch_reports_office_documents_with_only_blank_cells_as_failed(filename):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    if filename.endswith(".xlsx"):
+        office = Workbook()
+        office.active["A1"] = "  "
+    else:
+        office = Document()
+        office.add_table(rows=1, cols=2).cell(0, 0).text = "  "
+    with BytesIO() as stream:
+        office.save(stream)
+        (document,) = DocumentParserDispatcher().parse_batch([(filename, stream.getvalue())])
+
+    assert document.status is DocumentStatus.FAILED
+    assert document.extraction_channel is ExtractionChannel.FAILED
+    assert document.error_message == "文档内容为空，未提取到任何文本或表格"
+
+
 def test_doc_uses_row_offsets_to_keep_middle_and_trailing_empty_cells():
     document = _parse_fixture("b01_empty_columns.doc")
 
@@ -175,6 +229,22 @@ def test_doc_rejects_ambiguous_cells_without_valid_papx():
         parse_word(bytes(data), "ambiguous.doc")
 
 
+def test_doc_rejects_a_middle_empty_cell_without_papx_even_without_triple_markers():
+    from shipping_billing_agent.parsers.word_parser import WordParseError, parse_word
+
+    data = bytearray((FIXTURES / "b01_empty_columns.doc").read_bytes())
+    # Fill the last cell without shifting the WordDocument stream or its offsets.
+    start = data.index(b"65.25\x07\x07\x07")
+    data[start : start + 8] = b"5.25\x07A\x07\x07"
+    _, (table,) = parse_word(bytes(data), "middle-empty.doc")
+    assert table.rows[1] == ["THC", "", "5.25", "A"]
+
+    pack_into("<I", data, _word_stream_start(data) + 0x9A + 13 * 8 + 4, 0)
+
+    with pytest.raises(WordParseError, match="缺少有效 PlcfBtePapx 行尾属性"):
+        parse_word(bytes(data), "middle-empty.doc")
+
+
 def test_doc_rejects_encrypted_flag():
     from shipping_billing_agent.parsers.word_parser import WordParseError, parse_word
 
@@ -208,6 +278,34 @@ def test_pdf_renders_only_sparse_scan_page_and_keeps_text_page_tables():
     assert table.rows == [["Fee", "Amount"], ["Filing", "14.21"]]
 
 
+def test_pdf_reads_second_page_amount_from_the_actual_raster():
+    from shipping_billing_agent.parsers.pdf_parser import parse_pdf
+
+    text, _, channel = parse_pdf(
+        (FIXTURES / "b01_mixed.pdf").read_bytes(), local_ocr=RapidOcrFallback()
+    )
+
+    first_page, second_page = text.split("[Page 2 | OCR]\n")
+    assert "[Page 1 | Text]\nPayment terms: net thirty days." in first_page
+    assert "FREIGHT 187.65" in second_page
+    assert channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+
+
+def test_pdf_without_local_ocr_fails_at_the_scanned_page():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+    from shipping_billing_agent.parsers.pdf_parser import PdfParseError, parse_pdf
+
+    data = (FIXTURES / "b01_mixed.pdf").read_bytes()
+    with pytest.raises(PdfParseError, match="第 2 页为扫描图像页，未配置本地 OCR 引擎"):
+        parse_pdf(data, local_ocr=None)
+
+    dispatcher = DocumentParserDispatcher(ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK)
+    (document,) = dispatcher.parse_batch([("mixed.pdf", data)])
+    assert document.status is DocumentStatus.FAILED
+    assert document.extraction_channel is ExtractionChannel.FAILED
+    assert document.error_message == "第 2 页为扫描图像页，未配置本地 OCR 引擎"
+
+
 def test_pdf_reports_corrupt_data():
     from shipping_billing_agent.parsers.pdf_parser import PdfParseError, parse_pdf
 
@@ -238,6 +336,7 @@ def test_batch_validation_rejects_invalid_files_and_checks_real_ssrf_guard():
         [("empty.pdf", b""), ("large.xlsx", b"12345"), ("unknown.bin", b"data")],
         ["http://127.0.0.1/a.pdf", "not a URL"],
         limits=ResourceLimits(max_file_bytes=4),
+        url_validator=validate_public_url,
     )
 
     assert {item.filename_or_url: item.code for item in issues} == {
@@ -261,6 +360,7 @@ def test_remote_only_never_uses_local_pdf_or_image_ocr_without_ready_relay(relay
         ocr_mode=OcrMode.REMOTE_ONLY,
         remote_ocr=remote,
         local_ocr=local,
+        url_validator=validate_public_url,
         public_relay_base_url="https://8.8.8.8" if relay_base_configured else "",
         relay_publisher=None if relay_base_configured else relay,
     )
@@ -283,7 +383,10 @@ def test_remote_with_ready_relay_preserves_the_local_file_hash():
     remote = RecordingRemoteOcr()
     relay = RecordingRelay()
     dispatcher = DocumentParserDispatcher(
-        remote_ocr=remote, relay_publisher=relay, public_relay_base_url="https://8.8.8.8"
+        remote_ocr=remote,
+        relay_publisher=relay,
+        public_relay_base_url="https://8.8.8.8",
+        url_validator=validate_public_url,
     )
     data = (FIXTURES / "b01_mixed.pdf").read_bytes()
     (document,) = dispatcher.parse_batch([("../invoice.pdf", data)])
@@ -300,12 +403,66 @@ def test_remote_with_ready_relay_preserves_the_local_file_hash():
     assert remote.urls == ["https://8.8.8.8/files/bill.pdf?signature=fixture"]
 
 
+def test_relay_publishes_with_the_configured_ttl():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    settings = AppSettings(_env_file=None, relay_presign_ttl_seconds=45)
+    relay = RecordingRelay()
+    dispatcher = DocumentParserDispatcher(
+        remote_ocr=RecordingRemoteOcr(),
+        relay_publisher=relay,
+        public_relay_base_url="https://8.8.8.8",
+        url_validator=validate_public_url,
+        relay_presign_ttl_seconds=settings.relay_presign_ttl_seconds,
+    )
+
+    (document,) = dispatcher.parse_batch([("bill.pdf", b"synthetic invoice")])
+
+    assert document.status is DocumentStatus.METADATA_ONLY, document.error_message
+    assert relay.files == [(b"synthetic invoice", "bill.pdf", 45)]
+
+
+@pytest.mark.parametrize("ttl_seconds", [0, 301])
+def test_dispatcher_rejects_out_of_range_relay_ttl(ttl_seconds):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    with pytest.raises(ValueError, match="relay_presign_ttl_seconds"):
+        DocumentParserDispatcher(relay_presign_ttl_seconds=ttl_seconds)
+
+
+def test_batch_validation_requires_an_injected_url_validator_for_public_urls():
+    from shipping_billing_agent.parsers.dispatcher import validate_batch_inputs
+
+    with pytest.raises(ValueError, match="^必须注入 url_validator$"):
+        validate_batch_inputs([], ["https://93.184.216.34/bill.pdf"])
+
+
+def test_dispatcher_requires_an_injected_url_validator_for_batch_and_retry_urls():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(remote_ocr=RecordingRemoteOcr())
+    url = "https://93.184.216.34/bill.pdf"
+
+    with pytest.raises(ValueError, match="^必须注入 url_validator$"):
+        dispatcher.parse_batch([], [url])
+    with pytest.raises(ValueError, match="^必须注入 url_validator$"):
+        dispatcher.retry_single_document("bill.pdf", existing_doc_id="doc-1", public_url=url)
+
+
+def test_dispatcher_requires_an_injected_url_validator_for_relay_publisher():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    with pytest.raises(ValueError, match="^必须注入 url_validator$"):
+        DocumentParserDispatcher(relay_publisher=RecordingRelay())
+
+
 def test_public_url_metadata_only_keeps_no_content_hash():
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
     remote = RecordingRemoteOcr()
     url = "https://8.8.8.8/download?signature=fixture"
-    (document,) = DocumentParserDispatcher(remote_ocr=remote).parse_batch([], [url])
+    dispatcher = DocumentParserDispatcher(remote_ocr=remote, url_validator=validate_public_url)
+    (document,) = dispatcher.parse_batch([], [url])
 
     assert remote.urls == [url]
     assert document.source_kind is SourceKind.URL
@@ -329,6 +486,39 @@ def test_eml_alternative_uses_html_only_when_plain_is_empty():
     assert body.source_kind is SourceKind.EML_BODY
     assert body.parent_doc_id == root.doc_id
     assert body.raw_text.strip() == "Pay 98.35"
+
+
+@pytest.mark.parametrize(
+    ("filename", "html"),
+    [
+        ("invoice.png", '<p>Charges</p><img src="cid:bill-img"><p>Amount due 246.00</p>'),
+        ("scan.png", '<p>Charges</p><img src="cid:bill-img"><p>Amount due 246.00</p>'),
+        ("InsertPic_scan.png", '<p>Charges</p><img src="cid:bill-img"><p>Amount due 246.00</p>'),
+        ("账单.jpg", '<div class="signature"><img src="cid:bill-img"></div>'),
+    ],
+)
+def test_eml_parses_inline_bill_images_instead_of_skipping_them(filename, html):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    image_data = b"synthetic invoice image"
+    message = _mail("Charges attached")
+    message.add_alternative(html, subtype="html")
+    message.get_payload()[-1].add_related(
+        image_data, maintype="image", subtype="png", cid="<bill-img>", filename=filename
+    )
+    local = RecordingLocalOcr()
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=local
+    )
+
+    root, body, image = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert body.raw_text.strip() == "Charges attached"
+    assert image.parent_doc_id == root.doc_id
+    assert image.status is DocumentStatus.PARSED, image.error_message
+    assert image.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert image.raw_text == "Image 246.00"
+    assert local.images == [(image_data, filename)]
 
 
 @pytest.mark.parametrize("encoded", [False, True])
@@ -392,9 +582,48 @@ def test_eml_stops_at_the_fourth_nested_mail_and_preserves_parent_links():
     assert rejected.content_sha256 == sha256(rejected.raw_bytes).hexdigest()
 
 
-def _wide_mail(attachment_data: bytes) -> EmailMessage:
+def test_eml_retry_inherits_depth_without_expanding_the_fourth_mail():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    (retried,) = DocumentParserDispatcher().retry_single_document(
+        "fourth.eml",
+        _mail("Level four").as_bytes(),
+        existing_doc_id="fourth",
+        parent_doc_id="third",
+        depth=4,
+    )
+
+    assert (retried.doc_id, retried.parent_doc_id) == ("fourth", "third")
+    assert retried.status is DocumentStatus.FAILED
+    assert retried.extraction_channel is ExtractionChannel.FAILED
+    assert retried.error_message == "邮件嵌套深度超过 3 层"
+
+
+def test_eml_retry_inherits_remaining_expansion_slots():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    wire = _wide_mail((FIXTURES / "b01_merged.xls").read_bytes(), attachment_count=1).as_bytes()
+
+    root, body = DocumentParserDispatcher().retry_single_document(
+        "second.eml",
+        wire,
+        existing_doc_id="second",
+        parent_doc_id="parent",
+        depth=2,
+        remaining_expanded_slots=1,
+    )
+
+    assert (root.doc_id, root.parent_doc_id) == ("second", "parent")
+    assert root.status is DocumentStatus.FAILED
+    assert root.error_message == "单批展开文档数超过 120 项上限，部分子件已截断"
+    assert body.parent_doc_id == root.doc_id
+    assert body.status is DocumentStatus.PARSED
+    assert body.raw_text.strip() == "Many charges"
+
+
+def _wide_mail(attachment_data: bytes, attachment_count: int) -> EmailMessage:
     message = _mail("Many charges")
-    for index in range(130):
+    for index in range(attachment_count):
         message.add_attachment(
             attachment_data,
             maintype="application",
@@ -404,23 +633,101 @@ def _wide_mail(attachment_data: bytes) -> EmailMessage:
     return message
 
 
-def test_eml_batch_limit_records_one_truncation_and_still_parses_later_top_level_file():
+@pytest.mark.parametrize(
+    ("attachment_count", "expected_status"),
+    [
+        (117, DocumentStatus.PARSED),
+        (118, DocumentStatus.PARSED),
+        (119, DocumentStatus.FAILED),
+    ],
+)
+def test_eml_batch_limit_accepts_the_last_slot_and_only_flags_a_real_overflow(
+    attachment_count, expected_status
+):
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
     data = (FIXTURES / "b01_merged.xls").read_bytes()
-    files = [("wide.eml", _wide_mail(data).as_bytes()), ("last.xls", data)]
-    documents = DocumentParserDispatcher().parse_batch(files)
+    message = _wide_mail(data, attachment_count)
+    root, body, *attachments = DocumentParserDispatcher().parse_batch(
+        [("wide.eml", message.as_bytes())]
+    )
 
-    assert len(documents) == 120
-    root, _, first_attachment, *_, rejected, last = documents
-    assert first_attachment.sanitized_filename == "bill-0.xls"
-    assert first_attachment.status is DocumentStatus.PARSED
-    assert [doc for doc in documents if doc.status is DocumentStatus.FAILED] == [rejected]
-    assert rejected.parent_doc_id == root.doc_id
-    assert "120" in rejected.error_message
-    assert rejected.content_sha256 == sha256(data).hexdigest()
+    assert len(attachments) + 2 == min(attachment_count + 2, 120)
+    assert root.status is expected_status
+    if expected_status is DocumentStatus.FAILED:
+        assert root.extraction_channel is ExtractionChannel.FAILED
+        assert root.error_message == "单批展开文档数超过 120 项上限，部分子件已截断"
+    assert body.status is DocumentStatus.PARSED
+    assert all(doc.status is DocumentStatus.PARSED for doc in attachments)
+    assert [doc.sanitized_filename for doc in attachments] == [
+        f"bill-{index}.xls" for index in range(min(attachment_count, 118))
+    ]
+    assert attachments[-1].content_sha256 == sha256(data).hexdigest()
+
+
+@pytest.mark.parametrize("later_has_body", [True, False])
+def test_eml_with_zero_remaining_slots_reports_cutoff_and_retains_later_top_level_file(
+    later_has_body,
+):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    data = (FIXTURES / "b01_merged.xls").read_bytes()
+    later = _mail("Fee statement") if later_has_body else EmailMessage(policy=policy.SMTP)
+    if not later_has_body:
+        later["Subject"] = "Attachment only"
+        later.add_attachment(
+            data, maintype="application", subtype="octet-stream", filename="charges.xls"
+        )
+    files = [
+        ("first.eml", _wide_mail(data, 1).as_bytes()),
+        ("later.eml", later.as_bytes()),
+        ("last.xls", data),
+    ]
+    parsed = DocumentParserDispatcher(limits=ResourceLimits(max_expanded_documents=5))
+
+    root, body, kept, later_root, last = parsed.parse_batch(files)
+
+    assert later_root.status is DocumentStatus.FAILED
+    assert later_root.extraction_channel is ExtractionChannel.FAILED
+    assert later_root.error_message == "单批展开文档数超过 5 项上限，部分子件已截断"
+    assert root.status is DocumentStatus.PARSED
+    assert all(doc.status is DocumentStatus.PARSED for doc in (body, kept))
+    assert kept.sanitized_filename == "bill-0.xls"
     assert last.sanitized_filename == "last.xls"
     assert last.status is DocumentStatus.PARSED
+
+
+def test_eml_budget_stops_before_building_or_decoding_overflow_mime_payloads(monkeypatch):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    wire = _wide_mail((FIXTURES / "b01_merged.xls").read_bytes(), 5).as_bytes()
+    materialized = []
+    decoded = []
+    set_payload = EmailMessage.set_payload
+    get_payload = EmailMessage.get_payload
+
+    def record_payload(message, payload, *args, **kwargs):
+        if message.get_content_type() == "application/octet-stream" and payload:
+            materialized.append(message.get_filename())
+        return set_payload(message, payload, *args, **kwargs)
+
+    def record_decode(message, i=None, decode=False):
+        if message.get_content_type() == "application/octet-stream" and decode:
+            decoded.append(message.get_filename())
+        return get_payload(message, i, decode)
+
+    monkeypatch.setattr(EmailMessage, "set_payload", record_payload)
+    monkeypatch.setattr(EmailMessage, "get_payload", record_decode)
+    dispatcher = DocumentParserDispatcher(limits=ResourceLimits(max_expanded_documents=3))
+
+    root, body, attachment = dispatcher.parse_batch([("wide.eml", wire)])
+
+    assert materialized == ["bill-0.xls"]
+    assert decoded == ["bill-0.xls"]
+    assert root.status is DocumentStatus.FAILED
+    assert body.status is DocumentStatus.PARSED
+    assert attachment.status is DocumentStatus.PARSED
+    assert attachment.sanitized_filename == "bill-0.xls"
 
 
 def test_eml_bad_attachment_is_isolated_from_sibling_and_later_top_level_file():

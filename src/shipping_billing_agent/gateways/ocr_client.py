@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from shipping_billing_agent.config.settings import AppSettings
 from shipping_billing_agent.domain.models import OcrListItem, OcrStructuredPayload
 from shipping_billing_agent.gateways.url_guard import (
+    install_http_url_log_filter,
     redact_url_queries_in_text,
     validate_public_url,
 )
@@ -48,6 +49,7 @@ class PltPltOcrClient:
         transport: httpx.BaseTransport | None = None,
         async_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        install_http_url_log_filter()
         self._gateway_url = settings.ocr_gateway_url
         self._task = settings.ocr_task
         self._timeout = httpx.Timeout(

@@ -36,20 +36,48 @@ def _read_docx(data: bytes) -> tuple[str, list[ParsedTable]]:
     lines: list[str] = []
     tables: list[ParsedTable] = []
 
+    def append_table(block: Table, location: str) -> None:
+        parsed = ParsedTable(rows=[], source=f"[{location} | Table {len(tables) + 1}]")
+        tables.append(parsed)
+        # Keep the cell proxies alive while tracking XML identities across merged rows.
+        grids = [(row.grid_cols_before, row.cells, row.grid_cols_after) for row in block.rows]
+        seen_tcs: set[int] = set()
+        for before, cells, after in grids:
+            row_values = [""] * before
+            row_line = row_values.copy()
+            for cell in cells:
+                cell_id = id(cell._tc)
+                if cell_id in seen_tcs:
+                    row_values.append("")
+                    row_line.append("")
+                    continue
+
+                seen_tcs.add(cell_id)
+                paragraphs: list[str] = []
+                line_paragraphs: list[str] = []
+                for child in cell.iter_inner_content():
+                    if isinstance(child, Paragraph):
+                        paragraphs.append(child.text)
+                        line_paragraphs.append(child.text)
+                    else:
+                        row_line.append("\n".join(line_paragraphs))
+                        if any(value.strip() for value in row_line):
+                            lines.append("\t".join(row_line))
+                        append_table(child, location)
+                        row_line = [""] * len(row_values)
+                        line_paragraphs.clear()
+                row_values.append("\n".join(paragraphs))
+                row_line.append("\n".join(line_paragraphs))
+            parsed.rows.append(row_values + [""] * after)
+            lines.append("\t".join(row_line + [""] * after))
+
     def append_blocks(blocks: Iterator[Paragraph | Table], location: str) -> None:
         for block in blocks:
             if isinstance(block, Paragraph):
                 if block.text.strip():
                     lines.append(block.text)
                 continue
-            rows = [
-                [""] * row.grid_cols_before
-                + [cell.text for cell in row.cells]
-                + [""] * row.grid_cols_after
-                for row in block.rows
-            ]
-            tables.append(ParsedTable(rows=rows, source=f"[{location} | Table {len(tables) + 1}]"))
-            lines.extend("\t".join(row) for row in rows)
+            append_table(block, location)
 
     for number, section in enumerate(doc.sections, 1):
         for header in (section.header, section.first_page_header, section.even_page_header):
@@ -232,10 +260,8 @@ def _legacy_blocks(
     text: str, row_ends: set[int], table_paragraphs: set[int]
 ) -> tuple[str, list[ParsedTable]]:
     row_ends = {i for i in row_ends if i > 0 and text[i - 1] == _CELL_MARKER}
-    if not row_ends:
-        if _CELL_MARKER * 3 in text:
-            raise WordParseError("缺少有效 PlcfBtePapx，无法确定连续空单元格的列位")
-        row_ends = {i for i in range(1, len(text)) if text[i - 1 : i + 1] == _CELL_MARKER * 2}
+    if not row_ends and _CELL_MARKER in text:
+        raise WordParseError("缺少有效 PlcfBtePapx 行尾属性，无法确认 .doc 表格列位")
 
     lines: list[str] = []
     tables: list[ParsedTable] = []

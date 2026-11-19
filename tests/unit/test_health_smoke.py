@@ -9,6 +9,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from shipping_billing_agent.api.app import create_app
+from shipping_billing_agent.config.settings import load_settings
+from shipping_billing_agent.gateways.llm_client import (
+    LlmNotConfiguredError,
+    OpenAICompatibleLlmClient,
+)
 
 
 @pytest.fixture
@@ -68,6 +73,30 @@ def test_health_deepseek_key_requires_https_and_exact_host(
     assert payload_deepseek["llm_configured"] is True
 
 
+@pytest.mark.parametrize(
+    ("base_url", "key"),
+    [
+        ("https://other.example/v1", "synthetic-deepseek-key"),
+        ("https://user:pass@example.test/v1", "synthetic-provider-key"),
+        ("https://@example.test/v1", "synthetic-provider-key"),
+        ("https://example.test:70000/v1", "synthetic-provider-key"),
+        ("https://exa mple.test/v1", "synthetic-provider-key"),
+        ("https:///v1", "synthetic-provider-key"),
+        ("ftp://example.test/v1", "synthetic-provider-key"),
+    ],
+)
+def test_health_and_llm_client_reject_the_same_invalid_credentials(
+    health_client: TestClient, monkeypatch: pytest.MonkeyPatch, base_url: str, key: str
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-deepseek-key")
+    monkeypatch.setenv("LLM_API_KEY", key)
+    monkeypatch.setenv("LLM_BASE_URL", base_url)
+
+    assert health_client.get("/api/v1/health").json()["llm_configured"] is False
+    with pytest.raises(LlmNotConfiguredError):
+        OpenAICompatibleLlmClient(load_settings())
+
+
 def test_health_reads_dotenv_and_observes_environment_override(
     health_client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -103,3 +132,28 @@ def test_health_relay_url_alone_does_not_advertise_ready(
     payload = health_client.get("/api/v1/health").json()
 
     assert payload["public_relay_configured"] is False
+
+
+def test_health_reports_registered_relay_as_ready(
+    health_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RelayPublisher:
+        def publish(self, _content: bytes, _filename: str, *, ttl_seconds: int) -> str:
+            pytest.fail("Health checks must not publish files")
+
+    monkeypatch.setenv("PUBLIC_RELAY_BASE_URL", "https://relay.example.com")
+    with TestClient(create_app(relay_publisher=RelayPublisher())) as client:
+        assert client.get("/api/v1/health").json()["public_relay_configured"] is True
+
+
+def test_health_masks_ocr_gateway_query(
+    health_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "OCR_GATEWAY_URL", "https://gateway.pltplt.com/ai/process?token=synthetic-gateway-token"
+    )
+
+    response = health_client.get("/api/v1/health")
+
+    assert response.json()["ocr_gateway_url"] == "https://gateway.pltplt.com/ai/process?[REDACTED]"
+    assert "synthetic-gateway-token" not in response.text

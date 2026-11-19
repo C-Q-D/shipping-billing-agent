@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from functools import cache
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import AnyHttpUrl, Field, TypeAdapter, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_LLM_MODEL = "deepseek-flash"
 DEFAULT_OCR_GATEWAY_URL = "https://gateway.pltplt.com/ai/process"
+_DEEPSEEK_ENDPOINT = ("https", "api.deepseek.com")
+_HTTP_URL = TypeAdapter(AnyHttpUrl)
 
 
 class AppSettings(BaseSettings):
@@ -69,17 +71,45 @@ class AppSettings(BaseSettings):
             return base_url, explicit_key
 
         try:
-            endpoint = urlparse(base_url)
+            endpoint = urlsplit(base_url)
         except ValueError:
             return base_url, None
 
-        if endpoint.scheme.lower() == "https" and endpoint.hostname == "api.deepseek.com":
+        if (endpoint.scheme, endpoint.hostname) == _DEEPSEEK_ENDPOINT:
             return base_url, self.deepseek_api_key.strip() or None
         return base_url, None
 
+    def resolve_validated_llm_credentials(self) -> tuple[str, str] | None:
+        """Resolve credentials for a syntactically valid endpoint without network I/O."""
+        base_url, api_key = self.resolve_llm_credentials()
+        if (
+            not api_key
+            or "\\" in base_url
+            or any(char.isspace() or ord(char) < 32 or char == "\x7f" for char in base_url)
+        ):
+            return None
+
+        try:
+            source_url = urlsplit(base_url)
+            endpoint = _HTTP_URL.validate_python(base_url)
+            port = source_url.port
+        except ValueError:
+            return None
+
+        host = source_url.hostname
+        if not host or "%" in host or source_url.username is not None or port == 0:
+            return None
+        if not endpoint.host or source_url.scheme != endpoint.scheme:
+            return None
+        if (
+            api_key == self.deepseek_api_key.strip()
+            and (endpoint.scheme, host) != _DEEPSEEK_ENDPOINT
+        ):
+            return None
+        return str(endpoint), api_key
+
     def is_llm_configured(self) -> bool:
-        _, api_key = self.resolve_llm_credentials()
-        return api_key is not None
+        return self.resolve_validated_llm_credentials() is not None
 
     def is_ocr_direct_mode(self) -> bool:
         return not self.ocr_trust_env and not self.ocr_proxy_url.strip()

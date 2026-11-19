@@ -12,6 +12,7 @@ import httpx
 from langchain_core.messages import BaseMessage, convert_to_messages
 from langchain_core.messages.utils import MessageLikeRepresentation
 from langchain_openai import ChatOpenAI
+from langsmith import tracing_context
 from pydantic import BaseModel
 
 from shipping_billing_agent.config.settings import AppSettings
@@ -73,26 +74,12 @@ def _sanitize_messages(messages: LlmMessages) -> list[BaseMessage]:
     return sanitized
 
 
-def _resolve_endpoint(settings: AppSettings) -> tuple[httpx.URL, str]:
-    base_url, api_key = settings.resolve_llm_credentials()
-    if not api_key:
-        raise LlmNotConfiguredError("当前 LLM 端点未配置可用密钥")
-    try:
-        endpoint = httpx.URL(base_url)
-    except (httpx.InvalidURL, ValueError):
-        raise LlmNotConfiguredError("LLM 端点 URL 格式无效") from None
-    if endpoint.scheme not in {"http", "https"} or not endpoint.host or endpoint.userinfo:
-        raise LlmNotConfiguredError("LLM 端点必须使用无用户信息的 HTTP 或 HTTPS URL")
-    if api_key == settings.deepseek_api_key.strip() and (
-        endpoint.scheme != "https" or endpoint.host != "api.deepseek.com"
-    ):
-        raise LlmNotConfiguredError("DeepSeek 密钥仅可用于 https://api.deepseek.com")
-    return endpoint, api_key
-
-
 class OpenAICompatibleLlmClient:
     def __init__(self, settings: AppSettings) -> None:
-        endpoint, api_key = _resolve_endpoint(settings)
+        credentials = settings.resolve_validated_llm_credentials()
+        if credentials is None:
+            raise LlmNotConfiguredError("当前 LLM 端点未配置有效地址或可用密钥")
+        endpoint, api_key = credentials
         self._model_name = settings.llm_model
         self._api_keys = sorted(
             {api_key, settings.deepseek_api_key.strip()} - {""}, key=len, reverse=True
@@ -109,7 +96,7 @@ class OpenAICompatibleLlmClient:
             async_client = httpx.AsyncClient(**http_options)
             chat = ChatOpenAI(
                 model=settings.llm_model,
-                base_url=str(endpoint),
+                base_url=endpoint,
                 api_key=api_key,
                 timeout=settings.llm_timeout_seconds,
                 max_retries=settings.llm_max_retries,
@@ -134,8 +121,11 @@ class OpenAICompatibleLlmClient:
             text = text.replace(key, "[REDACTED]")
         return text
 
+    def _redact_response_text(self, text: str) -> str:
+        return redact_url_queries_in_text(self._redact_keys(text))
+
     def _gateway_error(self, context: str, cause: Exception) -> LlmGatewayError:
-        details = redact_url_queries_in_text(self._redact_keys(str(cause)))
+        details = self._redact_response_text(str(cause))
         error = LlmGatewayError(f"{context}（{type(cause).__name__}）：{details}")
         # Retain diagnostics without exposing SDK exceptions that hold request credentials.
         _LOGGER.warning("%s", error)
@@ -144,12 +134,12 @@ class OpenAICompatibleLlmClient:
     def _structured_response(self, result: dict[str, Any]) -> StructuredLlmResponse[Any]:
         raw = result["raw"]
         original_text = str(raw.text)
-        raw_text = self._redact_keys(original_text)
+        raw_text = self._redact_response_text(original_text)
         parsing_error = result["parsing_error"]
         if parsing_error is not None:
             trace = "".join(format_exception(parsing_error))
-            if raw_text != original_text or self._redact_keys(trace) != trace:
-                details = self._redact_keys(str(parsing_error))
+            if raw_text != original_text or self._redact_response_text(trace) != trace:
+                details = self._redact_response_text(str(parsing_error))
                 parsing_error = ValueError(f"{type(parsing_error).__name__}: {details}")
         return StructuredLlmResponse(
             parsed=result["parsed"],
@@ -163,8 +153,11 @@ class OpenAICompatibleLlmClient:
         self, messages: LlmMessages, schema: type[_SchemaT]
     ) -> StructuredLlmResponse[_SchemaT]:
         try:
-            model = self._chat.with_structured_output(schema, method="json_mode", include_raw=True)
-            result = model.invoke(_sanitize_messages(messages))
+            with tracing_context(enabled=False):
+                model = self._chat.with_structured_output(
+                    schema, method="json_mode", include_raw=True
+                )
+                result = model.invoke(_sanitize_messages(messages))
             return self._structured_response(result)
         except Exception as exc:
             error = self._gateway_error("LLM 请求失败", exc)
@@ -174,8 +167,11 @@ class OpenAICompatibleLlmClient:
         self, messages: LlmMessages, schema: type[_SchemaT]
     ) -> StructuredLlmResponse[_SchemaT]:
         try:
-            model = self._chat.with_structured_output(schema, method="json_mode", include_raw=True)
-            result = await model.ainvoke(_sanitize_messages(messages))
+            with tracing_context(enabled=False):
+                model = self._chat.with_structured_output(
+                    schema, method="json_mode", include_raw=True
+                )
+                result = await model.ainvoke(_sanitize_messages(messages))
             return self._structured_response(result)
         except Exception as exc:
             error = self._gateway_error("LLM 请求失败", exc)
