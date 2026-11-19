@@ -16,13 +16,17 @@ from shipping_billing_agent.agent import (
     extract_document_by_rules,
     run_billing_pipeline,
 )
+from shipping_billing_agent.agent import graph as billing_graph
 from shipping_billing_agent.agent.prompts import select_minimal_document_snippet
 from shipping_billing_agent.config.limits import ResourceLimits
 from shipping_billing_agent.domain.models import (
+    AccountingEntityProfile,
     AlertCode,
+    AlertSeverity,
     DocumentStatus,
     ExistingBillRecord,
     ExtractionChannel,
+    MatchLevel,
     OcrStructuredPayload,
     OperationType,
     ParsedDocument,
@@ -100,7 +104,7 @@ class FakeStructuredLlmClient:
 
 
 def _response(
-    amount: str, *, total: str = "100.00", currency: str = "USD", **extra: Any
+    amount: str, *, total: str | None = "100.00", currency: str = "USD", **extra: Any
 ) -> StructuredLlmResponse[RawDocumentExtraction]:
     raw_text = json.dumps(
         {
@@ -285,8 +289,12 @@ async def test_empty_eml_and_unpriced_bill_of_lading_skip_the_model() -> None:
     assert bill.document.status is email.document.status is DocumentStatus.METADATA_ONLY
     assert bill.extraction and bill.extraction.metadata_only
     assert email.extraction and email.extraction.metadata_only
-    assert bill.extraction.extraction.issuer == "Example Export Ltd."
-    assert "Port of Discharge: LONG BEACH, CA" in bill.document.metadata["transport_context"]
+    assert bill.extraction.extraction.issuer is bill.extraction.extraction.recipient is None
+    assert {
+        "Shipper: Example Export Ltd.",
+        "Consignee: Example Import Ltd.",
+        "Port of Discharge: LONG BEACH, CA",
+    } <= set(bill.document.metadata["transport_context"])
 
 
 @pytest.mark.asyncio
@@ -507,6 +515,7 @@ def test_reversed_email_package_resolves_parties_without_inheriting_freight_term
     mbl = _document(
         "MBL",
         "BILL OF LADING\nShipper: SUN TRACK EXPRESS (CHINA) CO., LTD.\n"
+        "YANGPU DISTRICT, SHANGHAI, CHINA\n"
         "Consignee: TARGETING A INC\nB/L No.: HZMHK331281\nBooking: 4055331281\n"
         "Container No.: TIIU8975975\nPort of Discharge: LONG BEACH, CA\nFREIGHT PREPAID",
         parent_doc_id=root.doc_id,
@@ -527,17 +536,42 @@ def test_reversed_email_package_resolves_parties_without_inheriting_freight_term
     assert row.shipment_refs.container_nos == ["TIIU8975975"]
     assert {ref.value for ref in row.shipment_refs.mbl_nos} == {"HZMHK331281", "OOLU4055331281"}
     assert any(alert.code is AlertCode.MULTI_SOURCE_BL_MISMATCH for alert in row.validation_alerts)
+    inferred = {
+        (alert.field, alert.actual)
+        for alert in row.validation_alerts
+        if alert.code is AlertCode.CONTEXT_INFERRED_FIELD
+        and alert.severity is AlertSeverity.WARNING
+    }
+    assert ("mbl_nos", "HZMHK331281") in inferred
+    assert ("mbl_nos", "OOLU4055331281") not in inferred
+    assert row.operation is OperationType.PENDING_REVIEW
     assert [clause.text for clause in row.excluded_clauses] == ["Carrier Free H/C"]
     assert "root.pdf/body.pdf" in row.source_evidence.source_paths
 
+    configured = [AccountingEntityProfile(canonical_name="Other Corp", aliases=["SHA"])]
+    result = run_billing_pipeline([mbl, root, body, hbl], "Other Corp", profiles=configured)
+    (record,) = result.records
+    assert (record.payer_hint, record.posting_type) == ("SHA", PostingType.AP)
+    assert not any(
+        alert.field == "payer_hint" and alert.code is AlertCode.CONTEXT_INFERRED_FIELD
+        for alert in record.validation_alerts
+    )
+    unrelated = run_billing_pipeline(
+        [mbl, body, root], "SUN TRACK EXPRESS (CHINA) CO., LTD.", profiles=configured
+    )
+    assert unrelated.records[0].posting_type is None
 
-def test_term_only_notice_inherits_omitted_billing_fields() -> None:
+
+@pytest.mark.parametrize(
+    ("old_term", "operation"), [("PP", OperationType.UPDATE), ("CC", OperationType.NO_CHANGE)]
+)
+def test_term_only_notice_inherits_omitted_billing_fields(old_term, operation) -> None:
     doc = _document(
         "notice",
-        f"Debit Note DN-202609-001\nIssuer: {_ENTITY}\nBill To: {_CUSTOMER}\n"
-        "Charge: Handling Charge\nChange payment term to CC",
+        "Debit Note DN-202609-001\nCharge: Handling Charge\nChange payment term to CC",
     )
     parsed = extract_document_by_rules(doc)
+    assert parsed.extraction.issuer is parsed.extraction.recipient is None
     (charge,) = parsed.charges
     assert charge.charge.amount is None and charge.charge.currency is None
     bill = ExistingBillRecord(
@@ -548,13 +582,15 @@ def test_term_only_notice_inherits_omitted_billing_fields() -> None:
         amount="30.00",
         currency="USD",
         posting_type="AR",
-        payment_term="PP",
+        payment_term=old_term,
         issuer=_ENTITY,
         recipient=_CUSTOMER,
     )
     result = run_billing_pipeline([doc], _ENTITY, existing_bills=[bill])
     (row,) = result.records
-    assert row.operation is OperationType.UPDATE and row.matched_existing_bill_id == bill.id
+    assert row.operation is operation and row.review_status is ReviewStatus.AUTO_READY
+    assert row.match_level is MatchLevel.L1_DOC_CHARGE and row.matched_existing_bill_id == bill.id
+    assert (row.issuer, row.recipient, row.posting_type) == (_ENTITY, _CUSTOMER, PostingType.AR)
     assert (row.amount, row.currency, row.payment_term) == (Decimal("30.00"), "USD", PaymentTerm.CC)
 
 
@@ -585,3 +621,150 @@ def test_small_snippet_keeps_business_lines_and_escapes_document_id() -> None:
     assert 'doc_id="id&quot; &gt; &lt;tag"' in snippet
     assert "Total USD 100.00" in snippet and "Invoice No. INV-123" in snippet
     assert "redundant paragraph" not in snippet
+
+
+@pytest.mark.parametrize("currency", ["CAD", "AUD", "HKD", "SGD"])
+def test_bare_dollars_stay_ambiguous_among_explicit_currencies(currency: str) -> None:
+    doc = _document(
+        "mixed-dollars",
+        f"Invoice No. INV-123\nIssuer: {_ENTITY}\nPort of Discharge: LOS ANGELES\n"
+        f"Handling Charge $30.00\nStorage Fee 20.00 {currency}",
+    )
+    proposal = _response(
+        "30.00",
+        total=None,
+        total_currency=None,
+        charges=[
+            {"raw_charge_name": "Handling Charge", "amount": "30.00", "currency": "USD"},
+            {"raw_charge_name": "Storage Fee", "amount": "20.00", "currency": currency},
+        ],
+    )
+    for options in (
+        {"extractor_mode": "rule_only"},
+        {"llm_client": FakeStructuredLlmClient([proposal])},
+    ):
+        result = run_billing_pipeline([doc], _ENTITY, **options)
+        handling, storage = result.records
+        assert handling.currency is None and handling.raw_invalid_fields["currency"] == "$"
+        assert handling.operation is OperationType.PENDING_REVIEW
+        assert any(
+            (alert.code, alert.field, alert.actual)
+            == (
+                AlertCode.INVALID_OR_MISSING_CURRENCY,
+                "currency",
+                "$",
+            )
+            for alert in handling.validation_alerts
+        )
+        assert storage.currency == currency and storage.review_status is ReviewStatus.AUTO_READY
+
+
+@pytest.mark.parametrize(
+    "label", ["CNTR", "Container No.", "CTNR:", "Container:", "Container No.:\n"]
+)
+def test_container_labels_pass_ocr_candidates_to_iso_validator(label: str) -> None:
+    doc = _document("box", _INV_BODY + f"\n{label} JX1U45O4463")
+    client = FakeStructuredLlmClient([_response("100.00")])
+    (row,) = run_billing_pipeline([doc], _ENTITY, llm_client=client).records
+    assert row.shipment_refs.container_nos == ["JX1U45O4463"]
+    (alert,) = [
+        alert
+        for alert in row.validation_alerts
+        if alert.code is AlertCode.CONTAINER_ISO6346_MISMATCH
+    ]
+    assert (alert.severity, alert.actual, alert.expected) == (
+        AlertSeverity.WARNING,
+        "JX1U45O4463",
+        "JXLU4504463",
+    )
+    assert row.operation is OperationType.PENDING_REVIEW
+
+
+@pytest.mark.parametrize(
+    "summary", ["Total USD 0.00", "Subtotal 30.00 USD", "Total USD 30.00\nTotal EUR 40.00"]
+)
+def test_summary_without_charges_fails_at_document_level(summary: str) -> None:
+    missing = _document("no-lines", f"Invoice INV-EMPTY\nIssuer: {_ENTITY}\n{summary}")
+    good = _document("healthy")
+    result = run_billing_pipeline([missing, good], _ENTITY)
+    assert [row.source_doc_id for row in result.records] == [good.doc_id]
+    assert result.failed_doc_ids == [missing.doc_id]
+    (failure,) = result.failed_document_alerts
+    assert failure.reason == "文档包含账单总额声明但未提取到有效费用明细"
+    assert failure.affected_record_ids == []
+
+
+def test_source_evidence_and_summary_are_safe_before_batch_validation(monkeypatch) -> None:
+    signed = "https://example.invalid/direct.pdf?X-Amz-Signature=signed-value#private"
+    root = _document("mail", "", source_kind="EML", public_url=signed.replace("direct", "email"))
+    standalone = _document("copy", public_url=signed, original_filename=signed)
+    attachment = _document(
+        "attachment", parent_doc_id=root.doc_id, content_sha256=standalone.content_sha256
+    )
+    real_validate = billing_graph.validate_batch
+
+    def inspect_evidence(records, bundles):
+        assert len(records) == 2
+        for record in records:
+            assert "signed-value" not in record.source_evidence.model_dump_json()
+            assert record.source_doc_totals.source_doc_id == record.source_doc_id
+            assert record.source_doc_totals.total_amount == Decimal("100.00")
+        return real_validate(records, bundles)
+
+    monkeypatch.setattr(billing_graph, "validate_batch", inspect_evidence)
+    result = run_billing_pipeline([standalone, attachment, root], _ENTITY)
+    (row,) = result.records
+    assert set(row.source_evidence.source_paths) == {
+        "https://example.invalid/direct.pdf",
+        "https://example.invalid/email.pdf/attachment.pdf",
+    }
+    assert "signed-value" not in result.model_dump_json()
+    assert standalone.public_url == signed
+
+
+def test_grounding_accepts_reordered_same_name_rows_at_decimal_tolerance() -> None:
+    document = _document(
+        "same-name",
+        f"Invoice No. INV-123\nIssuer: {_ENTITY}\n"
+        "Handling Fee 30.00 USD (CC)\nHandling Charge 70.00 USD (PP)\nTotal USD 100.00",
+    )
+    response = _response(
+        "100.00",
+        charges=[
+            {"raw_charge_name": "Handling Charge", "amount": "70.02", "currency": "USD"},
+            {"raw_charge_name": "Handling Fee", "amount": "30.00", "currency": "USD"},
+        ],
+    )
+    result = run_billing_pipeline(
+        [document], _ENTITY, llm_client=FakeStructuredLlmClient([response])
+    )
+    assert result.llm_calls_used == 1 and not result.failed_doc_ids
+    assert [
+        (row.amount, row.payment_term, row.source_evidence.line_number) for row in result.records
+    ] == [
+        (Decimal("70.02"), PaymentTerm.PP, 4),
+        (Decimal("30.00"), PaymentTerm.CC, 3),
+    ]
+    assert all(row.review_status is ReviewStatus.AUTO_READY for row in result.records)
+
+
+def test_grounding_keeps_explicit_invalid_audit_until_the_model_supplies_valid_values() -> None:
+    document = _document(
+        "unreadable",
+        f"Invoice No. INV-123\nIssuer: {_ENTITY}\nDate: 2026-02-30\nHandling Charge 1.310.40 ZZZ",
+    )
+    first = _response(
+        "unused", total=None, total_currency=None, charges=[{"raw_charge_name": "Handling Charge"}]
+    )
+    second = _response("1310.40", total=None, total_currency=None, document_date="2026-02-28")
+    result = run_billing_pipeline(
+        [document], _ENTITY, llm_client=FakeStructuredLlmClient([first, second])
+    )
+    (row,) = result.records
+    assert result.llm_calls_used == 2 and not result.failed_doc_ids
+    assert (row.amount, row.currency, row.document_date) == (
+        Decimal("1310.40"),
+        "USD",
+        "2026-02-28",
+    )
+    assert row.review_status is ReviewStatus.AUTO_READY and not row.raw_invalid_fields

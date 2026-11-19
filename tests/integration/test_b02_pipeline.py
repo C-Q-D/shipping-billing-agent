@@ -1,3 +1,11 @@
+"""Run B02 against synthetic inputs and the four original assessment files.
+
+For a standalone checkout, obtain the original assessment attachments from the
+assessment provider and place them in 笔试题AIAGENT/ at the repository root.
+Use the original filenames for 图片示例.png, PDF示例账单1.pdf, PDF 示例账单2.pdf,
+and the single 深圳容宇 PRE-ALERT*.eml with its embedded attachments intact.
+"""
+
 import json
 import re
 from collections.abc import Iterator, Sequence
@@ -8,6 +16,7 @@ from io import BytesIO
 from itertools import permutations
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import anyio
 import httpx
@@ -16,7 +25,9 @@ from jsonschema import Draft202012Validator
 from openpyxl import Workbook
 
 from shipping_billing_agent.agent import arun_billing_pipeline, run_billing_pipeline
+from shipping_billing_agent.agent import graph as billing_graph
 from shipping_billing_agent.config.limits import ResourceLimits
+from shipping_billing_agent.config.settings import AppSettings
 from shipping_billing_agent.domain import (
     AccountingEntityProfile,
     AlertCode,
@@ -43,13 +54,20 @@ from shipping_billing_agent.domain import (
 from shipping_billing_agent.domain.models import DocumentStatus, OcrMode, SourceKind
 from shipping_billing_agent.gateways.llm_client import (
     FakeStructuredLlmClient,
+    OpenAICompatibleLlmClient,
     StructuredLlmResponse,
 )
 from shipping_billing_agent.gateways.local_ocr import RapidOcrFallback
+from shipping_billing_agent.gateways.ocr_client import PltPltOcrClient
+from shipping_billing_agent.gateways.url_guard import validate_public_url
 from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
 ROOT = Path(__file__).resolve().parents[2]
 SAMPLES = ROOT / "笔试题AIAGENT"
+SAMPLE_INSTRUCTIONS = (
+    "请从笔试题发放方取得原题四份附件，保留原文件名放入仓库根目录的 笔试题AIAGENT/，"
+    "文件为 图片示例.png、PDF示例账单1.pdf、PDF 示例账单2.pdf 和 深圳容宇 PRE-ALERT*.eml。"
+)
 FIXTURES = ROOT / "tests" / "fixtures"
 NEPTUNE = "NEPTUNE SHIPPING LIMITED"
 FORWARDER = "ALL AMERICA FORWARDING"
@@ -70,7 +88,7 @@ EMAIL_PROFILES = (
 @pytest.fixture(scope="module", autouse=True)
 def offline() -> Iterator[None]:
     def reject_request(*args: object, **kwargs: object) -> None:
-        pytest.fail("B02 integration tests must use local parsers and fake LLM clients")
+        pytest.fail("B02 integration tests use local parsers and in-memory gateway transports")
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("LANGSMITH_TRACING", "false")
@@ -114,14 +132,22 @@ def _parse_file(dispatcher: DocumentParserDispatcher, path: Path) -> ParsedDocum
     return document
 
 
+def _sample_path(pattern: str) -> Path:
+    if not SAMPLES.is_dir():
+        pytest.skip(SAMPLE_INSTRUCTIONS)
+    matches = [path for path in SAMPLES.glob(pattern) if path.is_file()]
+    assert len(matches) == 1, f"{pattern} 应匹配恰好一份原题文件。{SAMPLE_INSTRUCTIONS}"
+    return matches[0]
+
+
 @pytest.fixture(scope="module")
 def pdf_two(dispatcher: DocumentParserDispatcher) -> ParsedDocument:
-    return _parse_file(dispatcher, SAMPLES / "PDF 示例账单2.pdf")
+    return _parse_file(dispatcher, _sample_path("PDF 示例账单2.pdf"))
 
 
 @pytest.fixture(scope="module")
 def original_email(dispatcher: DocumentParserDispatcher) -> list[ParsedDocument]:
-    (sample,) = SAMPLES.glob("深圳容宇 PRE-ALERT*.eml")
+    sample = _sample_path("深圳容宇 PRE-ALERT*.eml")
     return _parse_files(dispatcher, [(sample.name, sample.read_bytes())])
 
 
@@ -191,7 +217,7 @@ def _invoice_pdf(reference: str, amount: str, *extra_lines: str) -> bytes:
 def test_original_image_retains_rated_fee_and_recalculates_approved_records(
     dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator
 ) -> None:
-    document = _parse_file(dispatcher, SAMPLES / "图片示例.png")
+    document = _parse_file(dispatcher, _sample_path("图片示例.png"))
     assert document.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
     profiles = (
         AccountingEntityProfile(canonical_name=ZIM, aliases=[ZIM_PRINTED]),
@@ -245,7 +271,7 @@ def test_original_image_retains_rated_fee_and_recalculates_approved_records(
 def test_original_pdf_one_excludes_conditional_fees_and_remittance_by_page(
     dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator
 ) -> None:
-    document = _parse_file(dispatcher, SAMPLES / "PDF示例账单1.pdf")
+    document = _parse_file(dispatcher, _sample_path("PDF示例账单1.pdf"))
     assert document.extraction_channel is ExtractionChannel.LOCAL_PDF_TEXT_FALLBACK
     result = run_billing_pipeline([document], NEPTUNE)
     assert not result.failed_document_alerts
@@ -447,6 +473,20 @@ def test_original_email_combines_transport_refs_independent_of_attachment_order(
         "4055331281",
         ["TIIU8975975"],
     )
+    assert row.operation is OperationType.PENDING_REVIEW
+    assert row.review_status is ReviewStatus.NEEDS_REVIEW
+    borrowed = {
+        (alert.field, alert.actual)
+        for alert in row.validation_alerts
+        if alert.code is AlertCode.CONTEXT_INFERRED_FIELD
+        and alert.severity is AlertSeverity.WARNING
+    }
+    assert {
+        ("mbl_nos", "HZMHK331281"),
+        ("hbl_no", "SSZSE26093128"),
+        ("payer_hint", SUN_TRACK),
+    } <= borrowed
+    assert ("mbl_nos", "OOLU4055331281") not in borrowed
     assert any("Carrier Free H/C" in clause.text for clause in row.excluded_clauses)
     audit = _export(billing_schema, result.records, "audit")
     assert len(audit[1]) == 1
@@ -572,18 +612,20 @@ def test_cross_document_same_bill_and_charge_with_different_amounts_requires_rev
     [(1, PaymentTerm.PP, OperationType.UPDATE), (2, PaymentTerm.CC, OperationType.NO_CHANGE)],
     ids=["V1-update", "V2-no-change"],
 )
+@pytest.mark.parametrize("printed_parties", [False, True])
 def test_payment_term_notice_inherits_the_rest_independent_of_history_order(
     dispatcher: DocumentParserDispatcher,
     billing_schema: Draft202012Validator,
     version: int,
     old_term: PaymentTerm,
     operation: OperationType,
+    printed_parties: bool,
 ) -> None:
     reference = "DN-202609-001"
+    parties = [f"Issuer: {VENDOR}", f"Bill To: {CUSTOMER}"] if printed_parties else []
     notice = _pdf(
         f"Debit Note {reference}",
-        f"Issuer: {VENDOR}",
-        f"Bill To: {CUSTOMER}",
+        *parties,
         "Charge: Handling Charge",
         "Change payment term to CC",
     )
@@ -613,6 +655,9 @@ def test_payment_term_notice_inherits_the_rest_independent_of_history_order(
     assert not result.failed_document_alerts
     extraction = result.documents[0].extraction
     assert extraction is not None
+    assert (extraction.extraction.issuer, extraction.extraction.recipient) == (
+        (VENDOR, CUSTOMER) if printed_parties else (None, None)
+    )
     (notice_line,) = extraction.charges
     assert notice_line.charge.amount is notice_line.charge.currency is None
     for order in permutations(history):
@@ -625,6 +670,7 @@ def test_payment_term_notice_inherits_the_rest_independent_of_history_order(
     assert row.raw_explicit_amount is None
     assert (row.amount, row.currency, row.payment_term) == (Decimal("30.00"), "USD", PaymentTerm.CC)
     assert row.posting_type is PostingType.AR
+    assert (row.issuer, row.recipient) == (VENDOR, CUSTOMER)
     assert row.operation is operation and row.review_status is ReviewStatus.AUTO_READY
     assert row.matched_existing_bill_id == "prior-hc"
     term_change = FieldDiff(
@@ -803,3 +849,691 @@ def test_sparse_office_invoice_exports_exact_decimal_numbers_in_all_modes(
         assert re.search(rb'"unit_price"\s*:\s*0\.0025\s*[,}]', payload)
         if mode == "audit":
             assert first["audit_trail"]["source_evidence"]["source_file"] == "precision.xlsx"
+
+
+def _model_reply(**payload: Any) -> FakeStructuredLlmClient:
+    return FakeStructuredLlmClient(
+        StructuredLlmResponse(None, json.dumps(payload), None, "offline-fake")
+    )
+
+
+@pytest.mark.parametrize(("budget", "fields"), [(1, {}), (2, {"amount": None, "currency": None})])
+def test_model_omission_cannot_erase_invalid_source_values_before_l1_inheritance(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    budget: int,
+    fields: dict[str, Any],
+) -> None:
+    reference = "DN-202609-001"
+    notice = _pdf(
+        f"Debit Note {reference}",
+        "Date: 2026-02-30",
+        "Currency: ZZZ",
+        "Charge: Handling Charge",
+        "Amount: 1.310.40",
+        "Change payment term to CC",
+    )
+    documents = _parse_files(dispatcher, [("notice.pdf", notice)])
+    previous = ExistingBillRecord(
+        id="prior",
+        accounting_entity=VENDOR,
+        reference_no=reference,
+        issuer=VENDOR,
+        recipient=CUSTOMER,
+        document_date="2026-02-27",
+        charge_item="Handling Charge",
+        amount="30.00",
+        currency="USD",
+        payment_term="PP",
+        posting_type="AR",
+    )
+    header = {"document_date": None, "total_currency": None} if fields else {}
+    client = _model_reply(
+        reference_no=reference,
+        **header,
+        charges=[{"raw_charge_name": "Handling Charge", "payment_term": "CC", **fields}],
+    )
+    result = run_billing_pipeline(
+        documents,
+        VENDOR,
+        existing_bills=[previous],
+        llm_client=client,
+        limits=ResourceLimits(max_llm_calls_per_batch=budget),
+    )
+    (row,) = result.records
+    assert result.llm_calls_used == len(client.sync_calls) == budget
+    assert row.retry_count == budget - 1
+    assert row.match_level is MatchLevel.L1_DOC_CHARGE and row.matched_existing_bill_id == "prior"
+    assert row.amount is row.currency is row.document_date is None
+    assert row.payment_term is PaymentTerm.CC and row.posting_type is PostingType.AR
+    assert row.raw_amount_text == "1.310.40"
+    assert row.raw_invalid_fields == {
+        "document_date": "2026-02-30",
+        "total_currency": "ZZZ",
+        "currency": "ZZZ",
+        "amount": "1.310.40",
+    }
+    assert row.explicit_fields >= row.raw_invalid_fields.keys()
+    source = result.documents[0].extraction
+    assert source is not None and source.raw_invalid_fields["document_date"] == "2026-02-30"
+    assert source.charges[0].raw_invalid_fields == {"currency": "ZZZ", "amount": "1.310.40"}
+    for code in (
+        AlertCode.INVALID_DOCUMENT_DATE,
+        AlertCode.INVALID_OR_MISSING_CURRENCY,
+        AlertCode.OCR_NUMERIC_CONFUSION,
+    ):
+        _assert_review_blocker(row, code)
+    assert _export(billing_schema, result.records)[1] == []
+
+
+@pytest.mark.parametrize(
+    "proposed_amounts",
+    [("60", "40"), ("70", "30"), ("30",), ("30", "70", "0")],
+    ids=["same-sum", "swapped-fees", "omitted-fee", "extra-fee"],
+)
+def test_model_fee_amounts_must_agree_with_independent_source_rows(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    proposed_amounts: tuple[str, ...],
+) -> None:
+    pdf = _pdf(
+        "Invoice No. INV-ROWS",
+        f"Issuer: {VENDOR}",
+        f"Bill To: {CUSTOMER}",
+        "Handling Fee 30.00 USD",
+        "Storage Fee 70.00 USD",
+        "Total USD 100.00",
+    )
+    documents = _parse_files(dispatcher, [("fees.pdf", pdf)])
+    client = _model_reply(
+        charges=[
+            {"raw_charge_name": name, "amount": value, "currency": "USD"}
+            for name, value in zip(
+                ("Handling Charge", "Storage Fee", "Trucking Fee"), proposed_amounts, strict=False
+            )
+        ],
+        total_amount="100.00",
+        total_currency="USD",
+    )
+    result = run_billing_pipeline(documents, VENDOR, llm_client=client)
+    assert result.llm_calls_used == 2 and not result.failed_doc_ids
+    assert [row.amount for row in result.records] == list(map(Decimal, proposed_amounts))
+    for row in result.records:
+        _assert_review_blocker(row, AlertCode.AMOUNT_TOTAL_MISMATCH)
+        assert any(alert.field == "reported_charge_amount" for alert in row.validation_alerts)
+    correction = client.sync_calls[1][0][1]["content"]
+    assert "reported_charge_amount" in correction and "原文值=" in correction
+    assert _export(billing_schema, result.records)[1] == []
+
+
+@pytest.mark.parametrize(
+    "invented_summary",
+    [{"totals_by_currency": {"USD": 60}}, {"subtotal_amount": "60.00", "tax_amount": "40.00"}],
+    ids=["invented-currency-total", "invented-subtotal-and-tax"],
+)
+def test_model_cannot_change_what_the_printed_summary_reconciles(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    invented_summary: dict[str, Any],
+) -> None:
+    document = _parse_files(
+        dispatcher,
+        [
+            (
+                "total.pdf",
+                _pdf(
+                    "Invoice No. INV-TOTAL",
+                    f"Issuer: {VENDOR}",
+                    f"Bill To: {CUSTOMER}",
+                    "Handling Charge 60.00 USD",
+                    "Total USD 100.00",
+                ),
+            )
+        ],
+    )
+    client = _model_reply(
+        charges=[{"raw_charge_name": "Handling Charge", "amount": "60.00", "currency": "USD"}],
+        **invented_summary,
+    )
+    result = run_billing_pipeline(document, VENDOR, llm_client=client)
+    (row,) = result.records
+    _assert_review_blocker(row, AlertCode.AMOUNT_TOTAL_MISMATCH)
+    _assert_total(result.documents[0], Decimal("100.00"))
+    assert result.documents[0].extraction.totals_by_currency == {}
+    assert row.source_doc_totals.total_amount == Decimal("100.00")
+    assert row.source_doc_totals.totals_by_currency == {}
+    assert row.source_doc_totals.subtotal_amount is row.source_doc_totals.tax_amount is None
+    assert any(
+        (alert.field, alert.actual, alert.expected) == ("total_amount", "60.00", "100.00")
+        for alert in row.validation_alerts
+    )
+    assert _export(billing_schema, result.records)[1] == []
+    recalculated, _ = recalculate_for_entity(result.records, CUSTOMER)
+    _assert_review_blocker(recalculated[0], AlertCode.AMOUNT_TOTAL_MISMATCH)
+
+
+def test_model_cannot_reverse_dc_108478_explicit_payment_direction(
+    pdf_two: ParsedDocument, billing_schema: Draft202012Validator
+) -> None:
+    client = _model_reply(
+        reference_no="DC-108478",
+        issuer="Unrelated Buyer",
+        recipient="Unrelated Buyer",
+        payer_hint="Unrelated Buyer",
+        payee_hint="Different Payee",
+        charges=[
+            {"raw_charge_name": name, "amount": amount, "currency": "USD"}
+            for name, amount in (
+                ("Handling Charge", "65.00"),
+                ("Detention Free Time Charge", "1310.40"),
+                ("Handling Charge", "35.00"),
+            )
+        ],
+    )
+    result = run_billing_pipeline([pdf_two], "Unrelated Buyer", llm_client=client)
+    assert len(result.records) == 3 and not result.failed_doc_ids
+    for row in result.records:
+        assert row.payee_hint == f"{NEPTUNE} (LAX)" and row.payer_hint is None
+        assert row.posting_type is None
+        _assert_review_blocker(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
+        assert {"payer_hint", "payee_hint"} <= {
+            alert.field
+            for alert in row.validation_alerts
+            if alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT
+        }
+    assert _export(billing_schema, result.records)[1] == []
+
+
+@pytest.mark.parametrize(
+    ("details", "term"),
+    [
+        ("Handling Fee 30.00 USD", None),
+        ("Handling Charge 30.00 USD (CC)", PaymentTerm.CC),
+        ("Handling Charge 30.00(PP) USD", PaymentTerm.PP),
+    ],
+)
+def test_pdf_fee_names_currency_and_parenthesized_terms(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    details: str,
+    term: PaymentTerm | None,
+) -> None:
+    pdf = _pdf("Invoice No. INV-TERM", f"Issuer: {VENDOR}", details, "Total USD 30.00")
+    result = run_billing_pipeline(_parse_files(dispatcher, [("terms.pdf", pdf)]), VENDOR)
+    (row,) = result.records
+    assert row.raw_charge_name == ("Handling Fee" if term is None else "Handling Charge")
+    assert (row.amount, row.currency, row.payment_term) == (Decimal("30.00"), "USD", term)
+    assert row.review_status is ReviewStatus.AUTO_READY and not result.failed_doc_ids
+    assert len(_export(billing_schema, result.records)[1]) == 1
+
+
+def test_pdf_totals_without_details_and_labeled_ocr_box_have_visible_failures(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+) -> None:
+    empty, box = _parse_files(
+        dispatcher,
+        [
+            ("empty-total.pdf", _pdf("Invoice No. INV-1", f"Issuer: {VENDOR}", "Total USD 100.00")),
+            ("ocr-box.pdf", _invoice_pdf("INV-BOX-1", "30.00", "CTNR: JX1U45O4463")),
+        ],
+    )
+    result = run_billing_pipeline([empty, box], VENDOR)
+    assert result.failed_doc_ids == [empty.doc_id]
+    (failure,) = result.failed_document_alerts
+    assert failure.reason == "文档包含账单总额声明但未提取到有效费用明细"
+    (row,) = result.records
+    assert row.source_doc_id == box.doc_id and row.operation is OperationType.PENDING_REVIEW
+    assert row.shipment_refs.container_nos == ["JX1U45O4463"]
+    (alert,) = [
+        alert
+        for alert in row.validation_alerts
+        if alert.code is AlertCode.CONTAINER_ISO6346_MISMATCH
+    ]
+    assert (alert.severity, alert.expected) == (AlertSeverity.WARNING, "JXLU4504463")
+    assert _export(billing_schema, result.records)[1] == []
+
+
+def test_pdf_bare_dollar_inferred_from_unambiguous_source_has_a_review_warning(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+) -> None:
+    document = _parse_files(
+        dispatcher,
+        [
+            (
+                "bare-dollar.pdf",
+                _pdf(
+                    "Invoice No. INV-DOLLARS-1",
+                    f"Issuer: {VENDOR}",
+                    "Port of Discharge: LOS ANGELES",
+                    "Handling Charge $30.00",
+                    "Storage Fee 20.00 USD",
+                ),
+            )
+        ],
+    )
+    result = run_billing_pipeline(document, VENDOR)
+    inferred, explicit = result.records
+    assert inferred.currency == explicit.currency == "USD"
+    assert inferred.operation is OperationType.PENDING_REVIEW
+    (alert,) = [
+        alert
+        for alert in inferred.validation_alerts
+        if alert.code is AlertCode.CONTEXT_INFERRED_FIELD
+    ]
+    assert (alert.severity, alert.field, alert.actual, alert.expected) == (
+        AlertSeverity.WARNING,
+        "currency",
+        "$",
+        "USD",
+    )
+    _, (official,) = _export(billing_schema, result.records)
+    assert official["charge_details"]["charge_item"] == "Storage Charge"
+
+
+@pytest.mark.parametrize("file_kind", ["pdf", "xlsx"])
+@pytest.mark.parametrize("contradiction", [False, True])
+def test_independent_printed_totals_reconcile_for_each_currency(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    file_kind: str,
+    contradiction: bool,
+) -> None:
+    total_usd = "31.00" if contradiction else "30.0"
+    if file_kind == "pdf":
+        data = _pdf(
+            "Invoice No. INV-MULTI",
+            f"Issuer: {VENDOR}",
+            "Handling Fee 30.00 USD",
+            "Storage Charge 40.00 EUR",
+            "Total USD 30.00",
+            "Total 40.00 EUR",
+            f"Grand Total USD {total_usd}",
+        )
+    else:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Invoice No. INV-MULTI"])
+        sheet.append([f"Issuer: {VENDOR}"])
+        sheet.append(["Description", "Currency", "Amount"])
+        sheet.append(["Handling Fee", "USD", "30.00"])
+        sheet.append(["Storage Charge", "EUR", "40.00"])
+        sheet.append(["Total", "USD", "30.00"])
+        sheet.append(["Total", "EUR", "40.00"])
+        sheet.append(["Grand Total", "USD", total_usd])
+        with BytesIO() as buffer:
+            workbook.save(buffer)
+            workbook.close()
+            data = buffer.getvalue()
+    documents = _parse_files(dispatcher, [(f"multi.{file_kind}", data)])
+    result = run_billing_pipeline(documents, VENDOR)
+    totals = {"USD": Decimal("30.00"), "EUR": Decimal("40.00")}
+    assert not result.failed_doc_ids and len(result.records) == 2
+    assert result.documents[0].extraction.totals_by_currency == totals
+    assert all(row.source_doc_totals.totals_by_currency == totals for row in result.records)
+    if contradiction:
+        for row in result.records:
+            _assert_review_blocker(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
+            assert any(alert.field == "total_amount.USD" for alert in row.validation_alerts)
+    else:
+        assert all(row.review_status is ReviewStatus.AUTO_READY for row in result.records)
+    assert len(_export(billing_schema, result.records)[1]) == (0 if contradiction else 2)
+
+
+@pytest.mark.parametrize("model_copy", [False, True], ids=["rule-only", "copied-by-model"])
+def test_borrowed_bl_is_traced_to_the_attachment_even_when_the_model_echoes_it(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    model_copy: bool,
+) -> None:
+    email = EmailMessage()
+    email.set_content(f"Issuer: {VENDOR}\nBill To: {CUSTOMER}\nHandling Charge 30.00 USD")
+    email.add_attachment(
+        _pdf("BILL OF LADING", "B/L No.: BL-12345"),
+        maintype="application",
+        subtype="pdf",
+        filename="bill-of-lading.pdf",
+    )
+    root, body, attachment = _parse_files(dispatcher, [("notice.eml", email.as_bytes())])
+    previous = ExistingBillRecord(
+        id="historical",
+        accounting_entity=VENDOR,
+        mbl_no="BL-12345",
+        posting_type="AR",
+        charge_item="Handling Charge",
+        amount="30.00",
+        currency="USD",
+        issuer=VENDOR,
+        recipient=CUSTOMER,
+    )
+    client = (
+        _model_reply(
+            shipment_refs={"mbl_nos": [{"value": "BL-12345", "source": "page 1"}]},
+            charges=[{"raw_charge_name": "Handling Charge", "amount": "30.00", "currency": "USD"}],
+        )
+        if model_copy
+        else None
+    )
+    result = run_billing_pipeline(
+        [attachment, body, root], VENDOR, existing_bills=[previous], llm_client=client
+    )
+    (row,) = result.records
+    assert row.source_doc_id == body.doc_id and row.matched_existing_bill_id == previous.id
+    assert row.match_level is MatchLevel.L2_BL_CHARGE_CURR
+    assert (
+        row.operation is OperationType.PENDING_REVIEW
+        and row.review_status is ReviewStatus.NEEDS_REVIEW
+    )
+    (alert,) = [
+        alert for alert in row.validation_alerts if alert.code is AlertCode.CONTEXT_INFERRED_FIELD
+    ]
+    assert (alert.severity, alert.field, alert.actual) == (
+        AlertSeverity.WARNING,
+        "mbl_nos",
+        "BL-12345",
+    )
+    assert "bill-of-lading.pdf" in alert.message
+    assert [(ref.value, ref.source) for ref in row.shipment_refs.mbl_nos] == [
+        ("BL-12345", "bill-of-lading.pdf")
+    ]
+    body_result = next(
+        bundle.document for bundle in result.documents if bundle.document.doc_id == body.doc_id
+    )
+    assert body_result.metadata["sibling_field_sources"] == [
+        {
+            "field": "mbl_nos",
+            "value": "BL-12345",
+            "sibling_doc_id": attachment.doc_id,
+            "filename": "bill-of-lading.pdf",
+            "line_index": None,
+        }
+    ]
+    assert not result.failed_doc_ids and _export(billing_schema, result.records)[1] == []
+
+
+@pytest.mark.parametrize("failure_stage", ["parser", "extractor"])
+def test_failed_attachment_lists_all_and_only_records_from_its_email_package(
+    dispatcher: DocumentParserDispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    email = EmailMessage()
+    email.set_content(
+        f"Issuer: {VENDOR}\nBill To: {CUSTOMER}\nHandling Charge 30.00 USD\nStorage Fee 20.00 USD"
+    )
+    broken_pdf = (
+        b"invalid PDF bytes"
+        if failure_stage == "parser"
+        else _pdf("BILL OF LADING", "B/L No.: BL-12345")
+    )
+    email.add_attachment(broken_pdf, maintype="application", subtype="pdf", filename="broken.pdf")
+    email.add_attachment(
+        _pdf(
+            "Invoice No. INV-ENCLOSED", f"Issuer: {VENDOR}", "Trucking Fee 10 USD", "Total USD 10"
+        ),
+        maintype="application",
+        subtype="pdf",
+        filename="enclosed.pdf",
+    )
+    root, body, broken, enclosed, outside = dispatcher.parse_batch(
+        [
+            ("package.eml", email.as_bytes()),
+            ("unrelated.pdf", _invoice_pdf("INV-OUTSIDE", "40.00")),
+        ]
+    )
+    assert broken.parent_doc_id == root.doc_id
+    if failure_stage == "extractor":
+        assert broken.status is DocumentStatus.PARSED
+        extract = billing_graph.extract_document_by_rules
+
+        def break_one_extraction(doc):
+            if doc.doc_id == broken.doc_id:
+                raise RuntimeError("simulated attachment extraction failure")
+            return extract(doc)
+
+        monkeypatch.setattr(billing_graph, "extract_document_by_rules", break_one_extraction)
+    else:
+        assert broken.status is DocumentStatus.FAILED
+    result = run_billing_pipeline([outside, broken, enclosed, body, root], VENDOR)
+    assert result.failed_doc_ids == [broken.doc_id]
+    (failure,) = result.failed_document_alerts
+    assert failure.filename == "broken.pdf"
+    assert failure.affected_record_ids == [
+        row.id for row in result.records if row.source_doc_id in {body.doc_id, enclosed.doc_id}
+    ]
+    assert len(failure.affected_record_ids) == 3 and len(result.records) == 4
+    assert all(row.review_status is ReviewStatus.AUTO_READY for row in result.records)
+
+
+def test_independent_hbls_in_same_mail_stay_visible_as_a_conflict(
+    dispatcher: DocumentParserDispatcher,
+) -> None:
+    email = EmailMessage()
+    email.set_content(f"Issuer: {VENDOR}\nHandling Charge 30.00 USD")
+    for index in (1, 2):
+        email.add_attachment(
+            _pdf("BILL OF LADING", f"HBL No.: HBL-{index}"),
+            maintype="application",
+            subtype="pdf",
+            filename=f"hbl-{index}.pdf",
+        )
+    documents = _parse_files(dispatcher, [("conflicting-hbls.eml", email.as_bytes())])
+    (row,) = run_billing_pipeline(documents, VENDOR).records
+    assert row.shipment_refs.hbl_no is None and row.operation is OperationType.PENDING_REVIEW
+    (alert,) = [
+        alert for alert in row.validation_alerts if alert.code is AlertCode.MULTI_SOURCE_BL_MISMATCH
+    ]
+    assert (alert.field, alert.severity, alert.actual) == (
+        "hbl_no",
+        AlertSeverity.WARNING,
+        "HBL-1、HBL-2",
+    )
+
+
+def _parse_mock_ocr(payload: bytes, file_url: str) -> ParsedDocument:
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=payload, headers={"content-type": "application/json"})
+
+    settings = AppSettings(
+        _env_file=None,
+        ocr_gateway_url="https://ocr.example.test/ai/process",
+        ocr_trust_env=False,
+        ocr_proxy_url="",
+    )
+    ocr = PltPltOcrClient(settings, transport=httpx.MockTransport(respond))
+    dispatcher = DocumentParserDispatcher(remote_ocr=ocr, url_validator=validate_public_url)
+    (document,) = dispatcher.parse_batch([], public_urls=[file_url])
+    (request,) = requests
+    assert request.method == "POST" and json.loads(request.content)["file"] == file_url
+    assert document.status is DocumentStatus.PARSED
+    assert document.extraction_channel is ExtractionChannel.PLTPLT_OCR
+    return document
+
+
+def test_real_ocr_transport_parties_cannot_become_billing_parties(
+    billing_schema: Draft202012Validator,
+) -> None:
+    document = _parse_mock_ocr(
+        b'{"data":{"list":[{"fileType":"Invoice","invoiceNumber":"INV-1",'
+        b'"shipper":"Seller","consignee":"Buyer","chargeList":['
+        b'{"name":"Handling Charge","amount":30.00,"currency":"USD"}]}]}}',
+        "https://93.184.216.34/invoice.pdf",
+    )
+    client = _model_reply(
+        issuer="Seller",
+        recipient="Buyer",
+        payer_hint="Buyer",
+        payee_hint="Seller",
+        charges=[{"raw_charge_name": "Handling Charge", "amount": "30.00", "currency": "USD"}],
+    )
+    for model in (None, client):
+        result = run_billing_pipeline([document], "Buyer", llm_client=model)
+        (row,) = result.records
+        assert (
+            row.issuer
+            is row.recipient
+            is row.payer_hint
+            is row.payee_hint
+            is row.posting_type
+            is None
+        )
+        assert {"Shipper: Seller", "Consignee: Buyer"} <= set(
+            result.documents[0].document.metadata["transport_context"]
+        )
+        _assert_review_blocker(row, AlertCode.ENTITY_NOT_MATCHED)
+        if model is not None:
+            _assert_review_blocker(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
+        assert _export(billing_schema, result.records)[1] == []
+
+
+def test_remote_ocr_json_number_preserves_cents_through_all_exports_and_redacts_url(
+    billing_schema: Draft202012Validator,
+) -> None:
+    unsigned = "https://93.184.216.34/precision.pdf"
+    signature = "synthetic-signature-for-ocr"
+    signed = f"{unsigned}?X-Amz-Signature={signature}&X-Amz-Expires=300"
+    document = _parse_mock_ocr(
+        b'{"success":true,"data":{"list":[{"fileType":"Invoice","invoiceNumber":"INV-EXACT",'
+        b'"issuer":"Example Carrier Ltd.","billTo":"Example Customer Inc.","totalCurrency":"USD",'
+        b'"totalAmount":9007199254740991.01,"chargeList":[{"chargeName":"Wharfage",'
+        b'"amount":9007199254740991.01,"unitPrice":0.0025,"currency":"USD"}]}]}}',
+        signed,
+    )
+    amount = Decimal("9007199254740991.01")
+    raw_amount = document.ocr_payload.items[0].charge_list[0]["amount"]
+    assert isinstance(raw_amount, Decimal) and raw_amount.as_tuple() == amount.as_tuple()
+    result = run_billing_pipeline([document], VENDOR)
+    assert not result.failed_doc_ids
+    (row,) = result.records
+    assert (
+        row.amount.as_tuple() == amount.as_tuple() and row.review_status is ReviewStatus.AUTO_READY
+    )
+    assert row.source_doc_totals.total_amount.as_tuple() == amount.as_tuple()
+    assert row.source_evidence.source_paths == [unsigned]
+    assert document.public_url == signed and result.documents[0].document.public_url == unsigned
+    assert signature not in result.model_dump_json()
+    for mode in ("official", "full_standard", "audit"):
+        payload, (item,) = _export(billing_schema, result.records, mode)
+        assert signature.encode() not in payload
+        assert item["charge_details"]["amount"].as_tuple() == amount.as_tuple()
+        assert re.search(rb'"amount"\s*:\s*9007199254740991\.01\s*[,}]', payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [1, 2])
+@pytest.mark.parametrize("use_async", [True, False], ids=["async", "sync"])
+async def test_real_llm_http_retries_share_the_graph_budget(
+    dispatcher: DocumentParserDispatcher,
+    budget: int,
+    use_async: bool,
+) -> None:
+    documents = _parse_files(dispatcher, [("invoice.pdf", _invoice_pdf("INV-HTTP", "100.00"))])
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, urlsplit(str(request.url)).path))
+        if len(requests) == 1:
+            return httpx.Response(503, headers={"retry-after-ms": "1"}, json={"error": "retry"})
+        content = json.dumps(
+            {
+                "charges": [
+                    {"raw_charge_name": "Handling Charge", "amount": "100.00", "currency": "USD"}
+                ],
+            }
+        )
+        return httpx.Response(
+            200,
+            json={
+                "id": "mock-completion",
+                "model": "mock-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": content},
+                    }
+                ],
+            },
+        )
+
+    settings = AppSettings(
+        _env_file=None,
+        llm_base_url="https://llm.example.test/v1",
+        llm_api_key="offline-test-token",
+        deepseek_api_key="",
+        llm_proxy_url="",
+        llm_trust_env=False,
+        llm_max_retries=2,
+    )
+    transport = httpx.MockTransport(respond)
+    client = OpenAICompatibleLlmClient(settings, transport=transport, async_transport=transport)
+    options = dict(llm_client=client, limits=ResourceLimits(max_llm_calls_per_batch=budget))
+    try:
+        if use_async:
+            result = await arun_billing_pipeline(documents, VENDOR, **options)
+        else:
+            result = await anyio.to_thread.run_sync(
+                partial(run_billing_pipeline, documents, VENDOR, **options)
+            )
+    finally:
+        await client.aclose()
+    assert result.llm_calls_used == budget
+    assert requests == [("POST", "/v1/chat/completions")] * budget
+    if budget == 1:
+        assert not result.records and result.failed_doc_ids == [documents[0].doc_id]
+        assert "已用完批次 LLM 调用额度" in result.failed_document_alerts[0].reason
+        assert result.warnings == ["已用完批次 LLM 调用额度"]
+    else:
+        (row,) = result.records
+        assert row.review_status is ReviewStatus.AUTO_READY and row.retry_count == 0
+        assert not result.failed_doc_ids and not result.warnings
+
+
+def test_late_record_assembly_failure_discards_partial_rows_and_keeps_healthy_documents(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broken, good = _parse_files(
+        dispatcher,
+        [
+            (
+                "break-late.pdf",
+                _pdf(
+                    "Invoice No. INV-BROKEN",
+                    f"Issuer: {VENDOR}",
+                    "Handling Charge 30.00 USD",
+                    "Storage Fee 70.00 USD",
+                    "Total USD 100.00",
+                ),
+            ),
+            ("healthy.pdf", _invoice_pdf("INV-HEALTHY-1", "20.00")),
+        ],
+    )
+    real_source_evidence = billing_graph._source_evidence
+    seen = []
+
+    def source_evidence(doc: ParsedDocument, charge: RawChargeItem, path: str):
+        if doc.doc_id == broken.doc_id:
+            seen.append(charge.raw_charge_name)
+            if charge.raw_charge_name == "Storage Fee":
+                raise RuntimeError("simulated unexpected assembly failure")
+        return real_source_evidence(doc, charge, path)
+
+    monkeypatch.setattr(billing_graph, "_source_evidence", source_evidence)
+    result = run_billing_pipeline([broken, good], VENDOR, extractor_mode="rule_only")
+    assert seen == ["Handling Charge", "Storage Fee"]
+    assert result.failed_doc_ids == [broken.doc_id]
+    (failure,) = result.failed_document_alerts
+    assert failure.reason == (
+        "文档账单记录组装失败（RuntimeError）。文档包含账单总额声明但未提取到有效费用明细"
+    )
+    assert not failure.affected_record_ids
+    (row,) = result.records
+    assert row.source_doc_id == good.doc_id and row.review_status is ReviewStatus.AUTO_READY
+    _, (official,) = _export(billing_schema, result.records)
+    assert official["document_info"]["reference_no"] == "INV-HEALTHY-1"

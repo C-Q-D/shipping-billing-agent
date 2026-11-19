@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -20,13 +21,15 @@ from shipping_billing_agent.domain import (
     SourceRefValue,
     ValidationAlert,
     dumps_decimal_json,
+    entity_matches,
     normalize_currency,
     normalize_party_name,
     normalize_payment_term,
     parse_decimal_strict,
     parse_llm_raw_extraction,
 )
-from shipping_billing_agent.domain.models import DocumentStatus, SourceKind
+from shipping_billing_agent.domain.currency import ACTIVE_ISO4217_CODES
+from shipping_billing_agent.domain.models import DocumentStatus, SourceKind, sanitize_source_path
 from shipping_billing_agent.gateways.text_sanitizer import sanitize_for_llm
 
 _PAGE = re.compile(r"^\[Page (\d+)(?:\s*\|[^]]+)?\]$", re.I)
@@ -36,11 +39,22 @@ _DATE = (
     r"|[0-9OILS]{1,2}[-/][0-9OILS]{1,2}[-/][0-9OILS]{4})"
 )
 _NUMBER = r"[-+]?(?=[0-9OILS,.]*[0-9])[0-9OILS]+(?:[.,][0-9OILS]+)*(?:[Ee][-+]?[0-9]+)?"
-_CURRENCY = r"(?:US\$|CA\$|HK\$|CN¥|[$€£¥]|[A-Z]{3})"
+_PRINTED_CURRENCY_ALIASES = {"CA$": "CAD", "AU$": "AUD", "HK$": "HKD", "SG$": "SGD", "CN¥": "CNY"}
+_CURRENCY_CODES = "|".join(sorted(ACTIVE_ISO4217_CODES))
+_CURRENCY_SYMBOL = r"(?:US\$|CA\$|AU\$|HK\$|SG\$|CN¥|[$€£¥])"
+_CURRENCY = rf"(?:{_CURRENCY_SYMBOL}|RMB|{_CURRENCY_CODES})"
+# A trailing uppercase code occupies a currency slot even if it is invalid.
+_CURRENCY_SLOT = rf"(?:{_CURRENCY}|(?-i:[A-Z]{{3}}))"
 _TERM = r"(?:PP|CC|P|C|PREPAID|COLLECT)"
+_END_TERM = rf"(?:\s+{_TERM}|\s*\({_TERM}\))"
 _REF = r"(?=[A-Z0-9./-]*[0-9])[A-Z0-9][A-Z0-9./-]*"
 _BOX = re.compile(r"\b[A-Z]{3}[UJZ][0-9]{7}\b", re.I)
-_LABELED_BOX = re.compile(r"\b[A-Z]{4}[0-9OILS]{7}\b", re.I)
+_BOX_LABEL = re.compile(
+    r"\b(?:CONTAINERS?\b(?:\(S\))?|CNTR\b|CTNR\b)\.?\s*"
+    r"(?:(?:NO\b\.?|NUMBER\b)\s*)?[:#=]?\s*",
+    re.I,
+)
+_LABELED_BOX = re.compile(r"\b(?=[A-Z0-9]{0,10}[A-Z])(?=[A-Z0-9]{0,10}[0-9])[A-Z0-9]{11}\b", re.I)
 _COMPANY = re.compile(
     r"^.+?\b(?:CO[., ]+LTD|INCORPORATED|CORPORATION|LIMITED|LTD|INC|LLC|GMBH)\b[.,]?",
     re.I,
@@ -78,14 +92,15 @@ _SUMMARY = re.compile(
     re.I,
 )
 _MONEY = re.compile(
-    rf"(?:(?P<prefix>{_CURRENCY})\s*)?(?P<amount>{_NUMBER})"
-    rf"(?:\s*(?P<suffix>{_CURRENCY}))?",
+    rf"(?:(?P<prefix>{_CURRENCY_SLOT})\s*)?(?P<amount>{_NUMBER})"
+    rf"(?:\s*(?P<suffix>{_CURRENCY_SLOT})(?!\w))?",
     re.I,
 )
 _SUMMARY_DUE_TO = re.compile(rf"^(?P<party>.+?)\s+(?=(?:{_CURRENCY}\s+)?{_NUMBER}(?:\s|$))", re.I)
+_SUMMARY_FIELDS = ("subtotal_amount", "tax_amount", "total_amount")
 _PAYMENT_INSTRUCTION = re.compile(
-    rf"^(?P<payer>.+?)\s+(?:pays?|to pay)\s+(?P<payee>[^:]+):\s*"
-    rf"(?P<name>.+?)\s*(?P<money>(?:{_CURRENCY}\s*)?{_NUMBER}(?:\s*{_CURRENCY})?)$",
+    r"^(?P<payer>.+?)\s+(?:pays?|to pay)\s+(?P<payee>[^:]+):\s*"
+    r"(?P<charge>.+)$",
     re.I,
 )
 _LEDGER_ROW = re.compile(
@@ -95,14 +110,17 @@ _LEDGER_ROW = re.compile(
     re.I,
 )
 _TEXT_ROW = re.compile(
-    rf"^(?P<name>.+?)[ :\t]+(?:(?P<prefix>{_CURRENCY})\s*)?(?P<amount>{_NUMBER})"
-    rf"(?:\s*(?P<suffix>{_CURRENCY}))?(?:\s+(?P<term>{_TERM}))?$",
+    rf"^(?P<name>.+?)(?:[ :\t]+|(?={_CURRENCY_SYMBOL}))"
+    rf"(?:(?P<prefix>{_CURRENCY})\s*)?(?P<amount>{_NUMBER})"
+    rf"(?:\s*\((?P<amount_term>{_TERM})\))?(?:\s*(?P<suffix>{_CURRENCY_SLOT}))?"
+    rf"(?P<term>{_END_TERM})?$",
     re.I,
 )
 _RATE_ROW = re.compile(
     rf"^(?P<name>wharfage(?: administration fee)?)\s+"
     rf"(?P<rate>{_NUMBER})(?:\s*(?P<rate_currency>{_CURRENCY}))?\s+"
-    rf"(?P<amount>{_NUMBER})(?:\s*(?P<currency>{_CURRENCY}))?(?:\s+(?P<term>{_TERM}))?$",
+    rf"(?P<amount>{_NUMBER})(?:\s*\((?P<amount_term>{_TERM})\))?"
+    rf"(?:\s*(?P<currency>{_CURRENCY_SLOT}))?(?P<term>{_END_TERM})?$",
     re.I,
 )
 _TRANSPORT_LABEL = re.compile(
@@ -143,8 +161,8 @@ _OCR_FIELDS = {
     "document_type": ("fileType", "documentType"),
     "reference_no": ("invoiceNumber", "referenceNo", "debitNoteNumber", "creditNoteNumber"),
     "document_date": ("invoiceDate", "documentDate", "date", "debitNoteDate", "creditNoteDate"),
-    "issuer": ("issuer", "seller", "shipper"),
-    "recipient": ("recipient", "billTo", "consignee"),
+    "issuer": ("issuer", "seller"),
+    "recipient": ("recipient", "billTo"),
     "payer_hint": ("payer", "payerHint"),
     "payee_hint": ("payee", "payeeHint", "balanceDueTo"),
     "subtotal_amount": ("subtotal", "subtotalAmount", "netAmount"),
@@ -168,11 +186,16 @@ _REFERENCE_LABELS = {
     "hbl_no": r"(?:HBL|HOUSE\s+B/?L)(?:\s*(?:number|no\.?|#))?",
     "booking_no": r"(?:booking|bkg)(?:\s*(?:number|no\.?|#))?",
 }
+_CURRENCY_LABEL = re.compile(r"^currency\s*[:=]\s*([^\s:]+)$", re.I)
 _PARTY_LABELS = {
     "issuer": r"issuer|issued by|bill from|seller|vendor",
     "recipient": r"recipient|bill to|sold to|customer",
     "payer_hint": r"payer|paid by",
     "payee_hint": r"payee|paid to|balance due to",
+}
+_TRANSPORT_PARTY_LABELS = {
+    "shipper": r"shipper(?:/exporter)?(?:\s+booking number.*|\s+document no.*)?",
+    "consignee": r"consignee(?:\([^)]*\))?(?:\s+forwarding agent.*)?",
 }
 
 
@@ -191,6 +214,8 @@ class _Evidence:
     container_nos: list[str] = field(default_factory=list)
     clauses: list[ExcludedClause] = field(default_factory=list)
     issues: list[ValidationAlert] = field(default_factory=list)
+    summaries: list[tuple[str, Any, str | None]] = field(default_factory=list)
+    currencies: set[str] = field(default_factory=set)
 
     def add_mbl(self, value: str, source: str) -> None:
         ref = SourceRefValue(value=value.upper(), source=source)
@@ -220,6 +245,14 @@ def _text_lines(text: str) -> list[_Line]:
             page = int(match[1])
         elif text:
             lines.append(_Line(text, number, page))
+    return lines
+
+
+def _source_lines(doc: ParsedDocument) -> list[_Line]:
+    lines = _text_lines(doc.raw_text)
+    if doc.ocr_payload is not None:
+        # The gateway also renders each structured item as one JSON line.
+        return [line for line in lines if not line.text.startswith("{")]
     return lines
 
 
@@ -303,7 +336,9 @@ def _record_summary(text: str, evidence: _Evidence) -> bool:
             return True
         evidence.fields.setdefault("payee_hint", due_to["party"].strip())
         rest = rest[3 + due_to.end() :]
-    stated_currency = re.search(rf"\b(?:currency|curr|cur)\s*:?\s*({_CURRENCY})(?!\w)", rest, re.I)
+    stated_currency = re.search(
+        rf"\b(?:currency|curr|cur)\s*:?\s*({_CURRENCY_SLOT})(?!\w)", rest, re.I
+    )
     if stated_currency:
         rest = rest[: stated_currency.start()].rstrip()
     # "TOTAL THREE (3)" on a B/L is a package count.
@@ -321,24 +356,14 @@ def _record_summary(text: str, evidence: _Evidence) -> bool:
         field_name = "subtotal_amount"
     elif "tax" in label or label.startswith("税"):
         field_name = "tax_amount"
-    _remember_ocr_or_printed_value(evidence, field_name, amount)
-    if currency:
-        evidence.fields.setdefault("total_currency", currency)
+    evidence.summaries.append((field_name, amount, currency))
     return True
 
 
-def _remember_ocr_or_printed_value(evidence: _Evidence, field_name: str, value: Any) -> None:
-    previous = evidence.fields.setdefault(field_name, value)
+def _flag_conflicting_value(
+    evidence: _Evidence, field_name: str, previous: Any, value: Any
+) -> None:
     if previous == value:
-        return
-    if field_name in ("total_amount", "subtotal_amount", "tax_amount"):
-        try:
-            if parse_decimal_strict(previous) == parse_decimal_strict(value):
-                return
-        except ValueError:
-            # Preserve an unreadable value in the conflict evidence for manual review.
-            pass
-    elif field_name != "reference_no":
         return
     issue = ValidationAlert.from_code(
         AlertCode.CROSS_DOCUMENT_CONFLICT,
@@ -349,6 +374,59 @@ def _remember_ocr_or_printed_value(evidence: _Evidence, field_name: str, value: 
     )
     if issue not in evidence.issues:
         evidence.issues.append(issue)
+
+
+def _currency_token(raw: str) -> str:
+    token = raw.strip()
+    return _PRINTED_CURRENCY_ALIASES.get(token.upper(), token)
+
+
+def _summary_values(evidence: _Evidence, dollar_currency: str | None) -> None:
+    def scope(token: str | None) -> str | None:
+        if token == "$":
+            return dollar_currency or token
+        if not isinstance(token, str) or not token:
+            return None
+        return normalize_currency(_currency_token(token))[0] or token.upper()
+
+    default = scope(evidence.fields.get("total_currency"))
+    total_scopes = {
+        scope(token) for field, _, token in evidence.summaries if token and field == "total_amount"
+    }
+    if not default and len(total_scopes) == 1:
+        default = next(iter(total_scopes))
+
+    by_field = defaultdict(dict)
+    for field_name, value, token in evidence.summaries:
+        currency = scope(token) or default
+        previous = by_field[field_name].setdefault(currency, value)
+        try:
+            equal = parse_decimal_strict(previous) == parse_decimal_strict(value)
+        except ValueError:
+            equal = previous == value
+        if not equal:
+            label = f"{field_name}.{currency}" if currency and len(total_scopes) > 1 else field_name
+            _flag_conflicting_value(evidence, label, previous, value)
+
+    totals = by_field.get("total_amount", {})
+    separate_totals = {
+        currency: total for currency, total in totals.items() if currency is not None
+    }
+    currency_totals = len(separate_totals) > 1
+    if currency_totals:
+        evidence.fields["totals_by_currency"] = separate_totals
+    scalar_scope = default if default in totals else next(iter(totals), default)
+    for field_name, amounts in by_field.items():
+        if field_name == "total_amount" and currency_totals:
+            if None in amounts:
+                evidence.fields[field_name] = amounts[None]
+            continue
+        if totals and field_name != "total_amount" and scalar_scope not in amounts:
+            continue
+        currency = scalar_scope if scalar_scope in amounts else next(iter(amounts))
+        evidence.fields[field_name] = amounts[currency]
+        if not currency_totals and currency:
+            evidence.fields.setdefault("total_currency", currency)
 
 
 def _value_after(lines: Sequence[_Line], label: str, value: str) -> str | None:
@@ -396,14 +474,22 @@ def _collect_text_headers(
         date = next((line.text for line in lines if re.fullmatch(_DATE, line.text, re.I)), None)
     if date:
         evidence.fields.setdefault("document_date", date)
+    for line in lines:
+        if currency := _CURRENCY_LABEL.fullmatch(line.text):
+            evidence.fields.setdefault("total_currency", currency[1])
+            evidence.currencies.add(currency[1])
     for field_name, label in _PARTY_LABELS.items():
         value = _party(lines, label)
-        if value and (field_name != "payer_hint" or " " in value):
+        if value:
             evidence.fields.setdefault(field_name, value)
     if title:
         leading_companies = []
         for line in lines[:18]:
-            if _REMITTANCE.search(line.text) or "PAYMENTS MUST BE ISSUED" in line.text.upper():
+            if (
+                _REMITTANCE.search(line.text)
+                or "PAYMENTS MUST BE ISSUED" in line.text.upper()
+                or re.match(r"(?:SHIPPER|CONSIGNEE)\b", line.text, re.I)
+            ):
                 break
             if _COMPANY.match(line.text) and not line.text.upper().startswith("AS AGENTS FOR"):
                 leading_companies.append(_first_company(line.text))
@@ -411,6 +497,11 @@ def _collect_text_headers(
             evidence.fields.setdefault("issuer", leading_companies[0])
             if len(leading_companies) > 1 and title[0].upper() == "INVOICE":
                 evidence.fields.setdefault("recipient", leading_companies[1])
+    payer = evidence.fields.get("payer_hint")
+    if payer and evidence.fields.get("recipient") and re.fullmatch(r"[A-Z0-9]{8,}", payer):
+        # A printed internal payer account code is separate from the named invoice recipient.
+        if not entity_matches(payer, evidence.fields["recipient"]):
+            evidence.fields.pop("payer_hint")
     if "reference_no" not in evidence.fields and (
         notice_number := _value_after(lines, r"(?:debit|credit)\s+note|invoice", _REF)
     ):
@@ -448,40 +539,61 @@ def _collect_transport(
         else:
             evidence.add_mbl(bl, filename)
     for index, line in enumerate(lines):
-        evidence.add_containers(
-            line.text,
-            labeled=bool(re.search(r"\b(?:CONTAINER|CNTR)\.?\s*(?:NO|#)", line.text, re.I)),
-        )
-        upper = line.text.upper()
+        evidence.add_containers(line.text)
+        following = ""
         if index + 1 < len(lines) and lines[index + 1].page == line.page:
             following = lines[index + 1].text
-            if upper.startswith("SHIPPER") and "B/L" in upper:
-                refs = re.findall(rf"\s+({_REF})(?=\s|$)", following, re.I)
-                if refs and "DOCUMENT NO" in upper:
-                    evidence.fields.setdefault("hbl_no", refs[-1].upper())
-                elif len(refs) >= 2 and "BOOKING" in upper:
-                    evidence.fields.setdefault("booking_no", refs[-2].upper())
-                    evidence.add_mbl(refs[-1], filename)
+        for label in _BOX_LABEL.finditer(line.text):
+            value = line.text[label.end() :] or following
+            while match := _LABELED_BOX.match(value):
+                evidence.add_containers(match[0], labeled=True)
+                value = value[match.end() :].lstrip(" ,;/\t")
+        upper = line.text.upper()
+        if following and upper.startswith("SHIPPER") and "B/L" in upper:
+            refs = re.findall(rf"\s+({_REF})(?=\s|$)", following, re.I)
+            if refs and "DOCUMENT NO" in upper:
+                evidence.fields.setdefault("hbl_no", refs[-1].upper())
+            elif len(refs) >= 2 and "BOOKING" in upper:
+                evidence.fields.setdefault("booking_no", refs[-2].upper())
+                evidence.add_mbl(refs[-1], filename)
         if bl_kind == "HBL" and (
             exported := re.match(rf"^EXPORT REFERENCES\s+({_REF})$", line.text, re.I)
         ):
             evidence.add_mbl(exported[1], filename)
     if is_transport:
         evidence.fields.setdefault("document_type", "BILL OF LADING")
-        parties = {
-            "issuer": r"shipper(?:/exporter)?(?:\s+booking number.*|\s+document no.*)?",
-            "recipient": r"consignee(?:\([^)]*\))?(?:\s+forwarding agent.*)?",
-        }
-        for field_name, label in parties.items():
-            if value := _party(lines, label):
-                evidence.fields.setdefault(field_name, value)
     return is_transport
 
 
+def _transport_parties(doc: ParsedDocument, lines: Sequence[_Line]) -> list[tuple[str, str]]:
+    parties = [
+        (role, name)
+        for role, label in _TRANSPORT_PARTY_LABELS.items()
+        if (name := _party(lines, label))
+    ]
+    if doc.ocr_payload is not None:
+        for item in doc.ocr_payload.items:
+            fields = {"shipper": item.shipper, "consignee": item.consignee}
+            if isinstance(item.other, Mapping):
+                fields = {
+                    **_fields_for_keys(item.other, {key: (key,) for key in fields}),
+                    **{key: value for key, value in fields.items() if value},
+                }
+            parties.extend(
+                (role, name)
+                for role, name in fields.items()
+                if isinstance(name, str) and name.strip()
+            )
+    return list(dict.fromkeys(parties))
+
+
 def transport_context(doc: ParsedDocument) -> list[str]:
-    """Select labeled port and freight terms for a transport document."""
-    lines = _text_lines(doc.raw_text)
-    values = []
+    """Keep transport parties, ports and freight terms as context."""
+    lines = _source_lines(doc)
+    values = [
+        f"{role.capitalize()}: {sanitize_for_llm(name)}"
+        for role, name in _transport_parties(doc, lines)
+    ]
     for index, line in enumerate(lines):
         if not _TRANSPORT_LABEL.search(line.text):
             continue
@@ -513,6 +625,10 @@ def _charge_from_columns(
                 fields["debit_credit"] = "DEBIT" if debit is not None else "CREDIT"
     if fields.get("debit_credit") is not None:
         fields["debit_credit"] = str(fields["debit_credit"]).strip().upper()
+    if isinstance(term := fields.get("payment_term"), str):
+        term = term.strip()
+        if term.startswith("(") and term.endswith(")"):
+            fields["payment_term"] = term[1:-1]
     return {
         **fields,
         "source_text": text,
@@ -568,7 +684,6 @@ def _collect_tables(doc: ParsedDocument, evidence: _Evidence) -> None:
 def _collect_ocr(doc: ParsedDocument, evidence: _Evidence) -> None:
     if doc.ocr_payload is None:
         return
-    currency_totals = {}
     for index, item in enumerate(doc.ocr_payload.items, 1):
         page = index
         extra = item.model_extra or {}
@@ -603,23 +718,31 @@ def _collect_ocr(doc: ParsedDocument, evidence: _Evidence) -> None:
                 evidence.add_mbl(mbl.strip(), source)
             separate_totals = refs.pop("totals_by_currency", None)
             if isinstance(separate_totals, Mapping):
-                totals = evidence.fields.setdefault("totals_by_currency", {})
-                if isinstance(totals, dict):
-                    for currency, amount in separate_totals.items():
-                        totals.setdefault(currency, amount)
+                evidence.summaries.extend(
+                    ("total_amount", amount, str(currency))
+                    for currency, amount in separate_totals.items()
+                    if amount is not None
+                )
             elif separate_totals is not None:
                 evidence.fields.setdefault("totals_by_currency", separate_totals)
             for name, value in refs.items():
                 evidence.fields.setdefault(name, value)
         for ctr in item.ctr_list:
             evidence.add_containers(str(ctr), labeled=True)
-        notes = _Evidence(fields=item_fields)
-        for field_name in ("subtotal_amount", "tax_amount", "total_amount"):
-            value = item_fields.get(field_name)
+        item_currency = item_fields.get("total_currency")
+        if isinstance(item_currency, str):
+            evidence.currencies.add(item_currency)
+        for field_name in _SUMMARY_FIELDS:
+            value = item_fields.pop(field_name, None)
+            if value is None:
+                continue
+            currency = item_currency
             if isinstance(value, str) and (money := _MONEY.fullmatch(value.strip())):
-                item_fields[field_name] = money["amount"]
-                if token := money["prefix"] or money["suffix"]:
-                    item_fields.setdefault("total_currency", token)
+                value = money["amount"]
+                currency = money["prefix"] or money["suffix"] or currency
+                item_currency = item_currency or currency
+            evidence.summaries.append((field_name, value, currency))
+        notes = _Evidence(fields=item_fields)
         for value in (item.other, extra):
             if isinstance(value, Mapping):
                 descriptions = [f"{key.rstrip(':： ')}: {entry}" for key, entry in value.items()]
@@ -634,17 +757,13 @@ def _collect_ocr(doc: ParsedDocument, evidence: _Evidence) -> None:
                     evidence.add_clause(text, reason, page)
                 else:
                     _record_summary(text, notes)
-        evidence.issues.extend(issue for issue in notes.issues if issue not in evidence.issues)
-        item_currency = item_fields.get("total_currency")
-        currency = normalize_currency(item_currency)[0] if isinstance(item_currency, str) else None
-        if currency and "total_amount" in item_fields:
-            currency_totals.setdefault(currency, item_fields["total_amount"])
+        evidence.summaries.extend(
+            (name, value, currency or item_currency) for name, value, currency in notes.summaries
+        )
         for name, value in item_fields.items():
-            # Different printed currencies can each carry their own total.
-            if name == "total_amount" and item_currency != evidence.fields.get("total_currency"):
-                evidence.fields.setdefault(name, value)
-            else:
-                _remember_ocr_or_printed_value(evidence, name, value)
+            previous = evidence.fields.setdefault(name, value)
+            if name == "reference_no":
+                _flag_conflicting_value(evidence, name, previous, value)
         for row in item.charge_list:
             fields = _fields_for_keys(row, _COLUMN_KEYS)
             name = fields.get("raw_charge_name")
@@ -666,8 +785,6 @@ def _collect_ocr(doc: ParsedDocument, evidence: _Evidence) -> None:
             evidence.charges.append(
                 _charge_from_columns(fields, text, len(evidence.charges) + 1, page)
             )
-    if len(currency_totals) > 1:
-        evidence.fields.setdefault("totals_by_currency", currency_totals)
 
 
 def _split_ocr_rows(lines: Sequence[_Line], evidence: _Evidence, skipped: set[int]) -> set[int]:
@@ -680,8 +797,7 @@ def _split_ocr_rows(lines: Sequence[_Line], evidence: _Evidence, skipped: set[in
     end = len(lines)
     if end >= header + 3 and re.fullmatch(_CURRENCY, lines[-2].text, re.I):
         if re.fullmatch(_NUMBER, lines[-1].text, re.I):
-            evidence.fields.setdefault("total_amount", lines[-1].text)
-            evidence.fields.setdefault("total_currency", lines[-2].text)
+            evidence.summaries.append(("total_amount", lines[-1].text, lines[-2].text))
             end -= 2
     starts = [
         index
@@ -709,7 +825,7 @@ def _split_ocr_rows(lines: Sequence[_Line], evidence: _Evidence, skipped: set[in
             for line in detail
             if re.fullmatch(_CURRENCY, line.text, re.I) and line.text.upper() == line.text
         ]
-        currency = numbers[-1]["suffix"] or numbers[0]["suffix"]
+        currency = numbers[-1]["prefix"] or numbers[-1]["suffix"] or numbers[0]["suffix"]
         term = next((line.text for line in detail if normalize_payment_term(line.text)), None)
         evidence.charges.append(
             {
@@ -728,12 +844,23 @@ def _split_ocr_rows(lines: Sequence[_Line], evidence: _Evidence, skipped: set[in
     return consumed
 
 
+def _text_charge_fields(row: re.Match[str]) -> dict[str, str | None]:
+    return {
+        "raw_charge_name": row["name"],
+        "amount": row["amount"],
+        "currency": row["prefix"] or row["suffix"],
+        "payment_term": row["amount_term"] or (row["term"] or "").strip(" ()") or None,
+    }
+
+
 def _collect_text_charges(
     doc: ParsedDocument, lines: Sequence[_Line], evidence: _Evidence, skipped: set[int]
 ) -> None:
     consumed = _split_ocr_rows(lines, evidence, skipped)
     change_term = None
     change_charge = None
+    labeled_amount = None
+    amount_line = None
     in_ledger = False
     for line in lines:
         text = line.text
@@ -747,19 +874,18 @@ def _collect_text_charges(
         if re.search(r"\b(?:DESCRIPTION|CHARGE)\b.*\bQTY\b.*\bDEBIT\b", text, re.I):
             in_ledger = True
             continue
+        if amount := re.fullmatch(r"(?:charge\s+)?amount\s*:\s*(.+)", text, re.I):
+            labeled_amount, amount_line = amount[1], line
+            continue
         if payment := _PAYMENT_INSTRUCTION.fullmatch(text):
-            money = _MONEY.fullmatch(payment["money"])
-            if money and _FEE.search(payment["name"]):
+            row = _TEXT_ROW.fullmatch(payment["charge"])
+            if row and _FEE.search(row["name"]):
                 evidence.fields.setdefault("payer_hint", payment["payer"].strip())
                 evidence.fields.setdefault("payee_hint", payment["payee"].strip())
                 evidence.fields.setdefault("document_type", "EMAIL SETTLEMENT INSTRUCTION")
-                fields = {
-                    "raw_charge_name": "Handling Charge"
-                    if _key(payment["name"]) == "hc"
-                    else payment["name"],
-                    "amount": money["amount"],
-                    "currency": money["prefix"] or money["suffix"],
-                }
+                fields = _text_charge_fields(row)
+                if _key(row["name"]) == "hc":
+                    fields["raw_charge_name"] = "Handling Charge"
                 evidence.charges.append(_charge_from_columns(fields, text, line.number, line.page))
                 continue
         if waybill := re.match(
@@ -782,18 +908,15 @@ def _collect_text_charges(
                 "unit_price": rate_row["rate"],
                 "amount": rate_row["amount"],
                 "currency": rate_row["currency"] or rate_row["rate_currency"],
-                "payment_term": rate_row["term"],
+                "payment_term": rate_row["amount_term"]
+                or (rate_row["term"] or "").strip(" ()")
+                or None,
             }
             evidence.charges.append(_charge_from_columns(fields, line.text, line.number, line.page))
         elif (row := _TEXT_ROW.fullmatch(text)) and (
             _FEE.search(row["name"]) and not _TRANSPORT_LABEL.search(row["name"])
         ):
-            fields = {
-                "raw_charge_name": row["name"],
-                "amount": row["amount"],
-                "currency": row["prefix"] or row["suffix"],
-                "payment_term": row["term"],
-            }
+            fields = _text_charge_fields(row)
             evidence.charges.append(_charge_from_columns(fields, line.text, line.number, line.page))
         if change := re.search(
             rf"\bchange\s+(?:the\s+)?payment\s+terms?\s+to\s+({_TERM})\b", text, re.I
@@ -808,14 +931,36 @@ def _collect_text_charges(
             and not _TRANSPORT_LABEL.search(text)
         ):
             change_charge = text
-    if (
-        change_term
-        and not evidence.charges
-        and (change_charge or evidence.fields.get("reference_no"))
-    ):
-        evidence.charges.append(
-            {"raw_charge_name": change_charge or "", "payment_term": change_term}
+    if not evidence.charges and (change_term or labeled_amount) and change_charge:
+        fields = {"raw_charge_name": change_charge, "payment_term": change_term}
+        if amount_line is not None:
+            fields["amount"] = labeled_amount
+            if money := _MONEY.fullmatch(labeled_amount or ""):
+                fields.update(amount=money["amount"], currency=money["prefix"] or money["suffix"])
+            fields.update(
+                source_text=amount_line.text, line_number=amount_line.number, page=amount_line.page
+            )
+        evidence.charges.append(fields)
+
+
+def _annotate_dollar(
+    envelope: RawExtractionEnvelope | RawChargeEnvelope,
+    field_name: str,
+    currency: str | None,
+    reason: str | None,
+) -> None:
+    envelope.explicit_fields.add(field_name)
+    if currency is None:
+        envelope.raw_invalid_fields[field_name] = "$"
+    envelope.raw_parse_issues.append(
+        ValidationAlert.from_code(
+            AlertCode.CONTEXT_INFERRED_FIELD if currency else AlertCode.INVALID_OR_MISSING_CURRENCY,
+            reason or "无法确定 $ 所指币种",
+            field=field_name,
+            actual="$",
+            expected=currency,
         )
+    )
 
 
 def _extract_local(doc: ParsedDocument) -> RawExtractionEnvelope:
@@ -832,7 +977,7 @@ def _extract_local(doc: ParsedDocument) -> RawExtractionEnvelope:
 
     evidence = _Evidence()
     _collect_ocr(doc, evidence)
-    lines = _text_lines(doc.raw_text) if doc.ocr_payload is None else []
+    lines = _source_lines(doc)
     title = _collect_text_headers(doc, lines, evidence)
     is_transport = _collect_transport(doc, lines, evidence, bool(title))
     skipped = _capture_clauses(lines, evidence)
@@ -848,25 +993,54 @@ def _extract_local(doc: ParsedDocument) -> RawExtractionEnvelope:
     if not evidence.charges and doc.tables and not is_office:
         _collect_tables(doc, evidence)
 
+    summary_tokens = [token for _, _, token in evidence.summaries]
+    tokens = (
+        evidence.fields.get("total_currency"),
+        *evidence.currencies,
+        *(row.get("currency") for row in evidence.charges),
+        *summary_tokens,
+    )
+    known_currencies = {
+        currency
+        for token in tokens
+        if isinstance(token, str) and (currency := normalize_currency(_currency_token(token))[0])
+    }
+    dollar_currency, dollar_reason = normalize_currency(
+        "$",
+        context_currencies=known_currencies,
+        us_shipping_context=bool(_US_CONTEXT.search(doc.raw_text)),
+    )
+    _summary_values(evidence, dollar_currency)
     ocr_metadata_only = (
         doc.ocr_payload is not None
         and doc.ocr_payload.has_metadata
         and not doc.ocr_payload.has_charges
     )
     metadata_only = doc.status is DocumentStatus.METADATA_ONLY or (
-        not evidence.charges
-        and "total_amount" not in evidence.fields
-        and (is_transport or ocr_metadata_only)
+        not evidence.charges and not evidence.summaries and (is_transport or ocr_metadata_only)
     )
-    currency = evidence.fields.get("total_currency")
-    us_context = _US_CONTEXT.search(doc.raw_text)
-    if currency == "$" and us_context:
-        currency = evidence.fields["total_currency"] = "USD"
-    for charge in evidence.charges:
-        if charge.get("currency") is None and currency:
-            charge["currency"] = currency
-        if charge.get("currency") == "$" and us_context and currency in (None, "USD"):
-            charge["currency"] = "USD"
+    document_currency = evidence.fields.get("total_currency")
+    dollar_summary = document_currency == "$" or "$" in summary_tokens
+    if document_currency == "$":
+        evidence.fields["total_currency"] = dollar_currency
+    elif isinstance(document_currency, str):
+        evidence.fields["total_currency"] = _currency_token(document_currency)
+    totals = evidence.fields.get("totals_by_currency")
+    dollar_summary_field = "total_currency"
+    if isinstance(totals, dict):
+        # Keep an ambiguous symbol in the audit instead of feeding it back into inference.
+        if "$" in totals:
+            totals.pop("$")
+            dollar_summary_field = "totals_by_currency.$"
+    dollar_rows = []
+    for index, charge in enumerate(evidence.charges if not metadata_only else ()):
+        currency = charge.get("currency")
+        if currency is None and len(known_currencies) <= 1:
+            currency = document_currency
+        if currency == "$":
+            dollar_rows.append(index)
+            currency = dollar_currency
+        charge["currency"] = _currency_token(currency) if isinstance(currency, str) else currency
 
     refs = ShipmentRefs(
         mbl_nos=evidence.mbl_nos,
@@ -886,90 +1060,143 @@ def _extract_local(doc: ParsedDocument) -> RawExtractionEnvelope:
         )
     )
     result.raw_parse_issues.extend(evidence.issues)
+    if dollar_summary:
+        _annotate_dollar(result, dollar_summary_field, dollar_currency, dollar_reason)
+    for index in dollar_rows:
+        _annotate_dollar(result.charges[index], "currency", dollar_currency, dollar_reason)
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class SiblingFieldUse:
+    field: str
+    value: str
+    source: ParsedDocument
+    line_index: int | None = None
+
+    @property
+    def filename(self) -> str:
+        return sanitize_source_path(self.source.original_filename) or self.source.sanitized_filename
 
 
 def _package_parties(
     siblings: Sequence[tuple[ParsedDocument, RawExtractionEnvelope]],
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, ParsedDocument, str | None]]:
     parties = []
     for doc, envelope in siblings:
         for name in (envelope.extraction.issuer, envelope.extraction.recipient):
             if name:
-                parties.append((name, doc.sanitized_filename))
+                parties.append((name, doc, None))
+        lines = _source_lines(doc)
+        shipper_address = re.search(
+            r"^SHIPPER\b[^\n]*(?:\n(?!CONSIGNEE\b)[^\n]*){0,5}",
+            "\n".join(line.text for line in lines),
+            re.I | re.M,
+        )
+        for role, name in _transport_parties(doc, lines):
+            shanghai_shipper = (
+                role == "shipper"
+                and shipper_address
+                and re.search(r"\bSHANGHAI\b", shipper_address[0], re.I)
+            )
+            parties.append((name, doc, "sha" if shanghai_shipper else None))
         if not envelope.metadata_only:
             continue
-        lines = _text_lines(doc.raw_text)
         for current, following in zip(lines, lines[1:], strict=False):
             if "FOR CARGO ARRIVAL" in current.text.upper() and current.page == following.page:
                 first = _first_company(following.text)
                 second = following.text[len(first) :].strip()
                 if second:
-                    parties.append((_first_company(second), doc.sanitized_filename))
+                    parties.append((_first_company(second), doc, None))
     return parties
 
 
 def _resolve_short_party(
-    name: str, candidates: Sequence[tuple[str, str]], profiles: Sequence[AccountingEntityProfile]
-) -> tuple[str, str] | None:
+    name: str,
+    candidates: Sequence[tuple[str, ParsedDocument, str | None]],
+    profiles: Sequence[AccountingEntityProfile],
+) -> tuple[str, list[ParsedDocument]] | None:
     key = normalize_party_name(name)
+    if any(normalize_party_name(profile.canonical_name) == key for profile in profiles):
+        return None
     aliases = {
-        normalize_party_name(profile.canonical_name)
+        normalize_party_name(profile.canonical_name): profile.canonical_name
         for profile in profiles
         if any(key == normalize_party_name(alias) for alias in profile.aliases)
     }
     if not key or len(aliases) > 1:
         return None
+    canonical = next(iter(aliases.values()), None)
     matches = []
-    for candidate, source in candidates:
+    for candidate, source, location_alias in candidates:
         full_name = normalize_party_name(candidate)
-        if (
-            full_name in aliases
-            or (
-                key == "sha"
-                and (full_name == "sun track express" or full_name.startswith("sun track express "))
-            )
-            or (
+        if full_name == key:
+            continue
+        if canonical:
+            matches_party = entity_matches(candidate, canonical, profiles)
+        else:
+            matches_party = key == location_alias or (
                 key.isascii()
                 and key.isalpha()
                 and 3 <= len(key) <= 5
                 and full_name.replace(" ", "").startswith(key)
                 and " " in full_name
             )
-        ):
+        if matches_party:
             matches.append((candidate, source))
+    if not matches:
+        return None
     # The same party can have different OCR word breaks in the MBL and HBL.
-    if len({normalize_party_name(candidate).replace(" ", "") for candidate, _ in matches}) == 1:
-        return min(matches, key=lambda match: (len(match[0]), match))
-    return None
+    distinct_names = {normalize_party_name(candidate).replace(" ", "") for candidate, _ in matches}
+    if canonical is None and len(distinct_names) != 1:
+        return None
+    full_name = canonical or min(
+        (candidate for candidate, _ in matches), key=lambda value: (len(value), value)
+    )
+    return full_name, list({doc.doc_id: doc for _, doc in matches}.values())
+
+
+def _envelope_currencies(envelope: RawExtractionEnvelope) -> set[str]:
+    return {
+        currency
+        for currency in (
+            envelope.total_currency,
+            *envelope.totals_by_currency,
+            *(row.charge.currency for row in envelope.charges),
+        )
+        if currency
+    }
 
 
 def _resolve_package_dollars(
     envelope: RawExtractionEnvelope,
     siblings: Sequence[tuple[ParsedDocument, RawExtractionEnvelope]],
-) -> list[RawChargeEnvelope]:
+    source_extraction: RawExtractionEnvelope | None,
+) -> tuple[list[RawChargeEnvelope], list[SiblingFieldUse]]:
     if not any(row.raw_invalid_fields.get("currency") == "$" for row in envelope.charges):
-        return envelope.charges
-    source_envelopes = [envelope, *(sibling for _, sibling in siblings)]
-    known_currencies = {
-        currency
-        for source in source_envelopes
-        for currency in (
-            source.total_currency,
-            *source.totals_by_currency,
-            *(row.charge.currency for row in source.charges),
-        )
-        if currency
-    }
+        return envelope.charges, []
+    known_currencies = _envelope_currencies(envelope).union(
+        *(_envelope_currencies(sibling) for _, sibling in siblings)
+    )
+    if source_extraction is not None:
+        known_currencies.update(_envelope_currencies(source_extraction))
+    us_sources = [doc for doc, _ in siblings if _US_CONTEXT.search(doc.raw_text)]
     currency, reason = normalize_currency(
-        "$",
-        context_currencies=known_currencies,
-        us_shipping_context=any(_US_CONTEXT.search(doc.raw_text) for doc, _ in siblings),
+        "$", context_currencies=known_currencies, us_shipping_context=bool(us_sources)
     )
     if currency is None:
-        return envelope.charges
+        return envelope.charges, []
+    sources = [doc for doc, sibling in siblings if currency in _envelope_currencies(sibling)]
+    sources = sources or us_sources
+    message = reason or "根据同封邮件的上下文确定币种"
+    if sources:
+        filenames = dict.fromkeys(
+            sanitize_source_path(doc.original_filename) or doc.sanitized_filename for doc in sources
+        )
+        message += f"（字段 currency 补自 {'、'.join(filenames)}）"
     resolved = []
-    for row in envelope.charges:
+    uses = []
+    for index, row in enumerate(envelope.charges):
         if row.raw_invalid_fields.get("currency") != "$":
             resolved.append(row)
             continue
@@ -985,12 +1212,13 @@ def _resolve_package_dollars(
         issues.append(
             ValidationAlert.from_code(
                 AlertCode.CONTEXT_INFERRED_FIELD,
-                reason or "币种补自同封邮件的运输上下文",
+                message,
                 field="currency",
                 expected=currency,
                 actual="$",
             )
         )
+        uses.extend(SiblingFieldUse("currency", currency, doc, index) for doc in sources)
         resolved.append(
             row.model_copy(
                 update={
@@ -1000,56 +1228,100 @@ def _resolve_package_dollars(
                 }
             )
         )
-    return resolved
+    return resolved, uses
+
+
+def _context_alerts(uses: Sequence[SiblingFieldUse]) -> list[ValidationAlert]:
+    filenames = defaultdict(list)
+    for use in uses:
+        filenames[use.field, use.value].append(use.filename)
+    return [
+        ValidationAlert.from_code(
+            AlertCode.CONTEXT_INFERRED_FIELD,
+            f"字段 {field_name} 补自同封邮件的 {'、'.join(dict.fromkeys(sources))}",
+            field=field_name,
+            actual=value,
+        )
+        for (field_name, value), sources in filenames.items()
+    ]
 
 
 def apply_sibling_context(
     envelope: RawExtractionEnvelope,
     siblings: Sequence[tuple[ParsedDocument, RawExtractionEnvelope]],
     profiles: Sequence[AccountingEntityProfile],
-) -> tuple[RawExtractionEnvelope, list[str]]:
+    *,
+    source_extraction: RawExtractionEnvelope | None = None,
+    merge_mbls: bool = True,
+) -> tuple[RawExtractionEnvelope, list[SiblingFieldUse]]:
     """Fill transport references and resolve payment shorthand using sibling evidence."""
     if not siblings:
         return envelope, []
     extracted = envelope.extraction
     own = extracted.shipment_refs
-    refs = [candidate.extraction.shipment_refs for _, candidate in siblings]
+    independent = source_extraction.extraction.shipment_refs if source_extraction else own
+    refs = [(doc, candidate.extraction.shipment_refs) for doc, candidate in siblings]
     updates: dict[str, Any] = {}
-    reasoning = []
-    # Keep each source's own MBLs in the bundle for the batch conflict validator.
-    mbl = list(
-        {(ref.value, ref.source): ref for item in (own, *refs) for ref in item.mbl_nos}.values()
-    )
-    containers = list(dict.fromkeys(value for item in (own, *refs) for value in item.container_nos))
-    ref_updates: dict[str, Any] = {"mbl_nos": mbl, "container_nos": containers}
+    uses = []
+    own_mbls = {ref.value for ref in independent.mbl_nos}
+    sibling_mbls = {}
+    containers = list(own.container_nos)
+    for doc, source_refs in refs:
+        for ref in source_refs.mbl_nos:
+            if merge_mbls or not own_mbls or ref.value in own_mbls:
+                sibling_mbls[ref.value, ref.source] = ref
+                if ref.value not in own_mbls:
+                    uses.append(SiblingFieldUse("mbl_nos", ref.value, doc))
+        for value in source_refs.container_nos:
+            containers.append(value)
+            if value not in independent.container_nos:
+                uses.append(SiblingFieldUse("container_nos", value, doc))
+    borrowed_mbls = {value for value, _ in sibling_mbls} - own_mbls
+    mbls = {(ref.value, ref.source): ref for ref in own.mbl_nos if ref.value not in borrowed_mbls}
+    mbls.update(sibling_mbls)
+    ref_updates: dict[str, Any] = {
+        "mbl_nos": list(mbls.values()),
+        "container_nos": list(dict.fromkeys(containers)),
+    }
     for field_name in ("hbl_no", "booking_no"):
-        values = {value for item in refs if (value := getattr(item, field_name))}
-        if not getattr(own, field_name) and len(values) == 1:
-            ref_updates[field_name] = next(iter(values))
+        sibling_values = [
+            (doc, value) for doc, item in refs if (value := getattr(item, field_name))
+        ]
+        values = {value for _, value in sibling_values}
+        current = getattr(own, field_name)
+        if not current and len(values) == 1:
+            current = ref_updates[field_name] = next(iter(values))
+        if current and not getattr(independent, field_name):
+            uses.extend(
+                SiblingFieldUse(field_name, value, doc)
+                for doc, value in sibling_values
+                if value == current
+            )
     merged = own.model_copy(update=ref_updates)
     if merged != own:
         updates["shipment_refs"] = merged
-        reasoning.append("运输参考号补自同封邮件的正文或附件")
     candidates = _package_parties(siblings)
-    for field_name, role in (("payer_hint", "付款方"), ("payee_hint", "收款方")):
+    for field_name in ("payer_hint", "payee_hint"):
         if (short := getattr(extracted, field_name)) and (
             resolved := _resolve_short_party(short, candidates, profiles)
         ):
-            name, source = resolved
+            name, sources = resolved
             updates[field_name] = name
-            reasoning.append(f"{role} {short} 对应同封邮件 {source} 中的 {name}")
-    charges = _resolve_package_dollars(envelope, siblings)
+            uses.extend(SiblingFieldUse(field_name, name, source) for source in sources)
+    charges, currency_uses = _resolve_package_dollars(envelope, siblings, source_extraction)
+    uses.extend(currency_uses)
     if charges is not envelope.charges:
         updates["charges"] = [row.charge for row in charges]
-    if not updates:
-        return envelope, reasoning
+    if not updates and not uses:
+        return envelope, []
+    alerts = _context_alerts([use for use in uses if use.line_index is None])
     return envelope.model_copy(
         update={
             "extraction": extracted.model_copy(update=updates),
             "charges": charges,
-            "explicit_fields": envelope.explicit_fields | updates.keys(),
+            "raw_parse_issues": [*envelope.raw_parse_issues, *alerts],
         }
-    ), reasoning
+    ), uses
 
 
 def extract_document_by_rules(

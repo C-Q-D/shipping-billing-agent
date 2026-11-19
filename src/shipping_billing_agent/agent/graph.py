@@ -7,9 +7,10 @@ import re
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from functools import partial
 from threading import Lock
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 import anyio
 from langgraph.graph import END, START, StateGraph
@@ -17,6 +18,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from shipping_billing_agent.config.limits import ResourceLimits
 from shipping_billing_agent.domain import (
+    DECIMAL_TOLERANCE,
     AccountingEntityProfile,
     AlertCode,
     BatchPipelineResult,
@@ -26,20 +28,28 @@ from shipping_billing_agent.domain import (
     FailedDocumentAlert,
     ParsedDocument,
     ProcessedBillingRecord,
+    RawChargeEnvelope,
     RawChargeItem,
     RawDocumentExtraction,
     RawExtractionEnvelope,
+    SourceDocTotalsSnapshot,
     SourceEvidence,
     ValidationAlert,
     dumps_decimal_json,
+    entity_matches,
     match_and_inherit_batch,
     normalize_charge_item,
     parse_llm_raw_extraction,
     resolve_entity_perspective,
     validate_batch,
 )
-from shipping_billing_agent.domain.models import DocumentStatus, SourceKind
-from shipping_billing_agent.gateways.llm_client import StructuredLlmClient
+from shipping_billing_agent.domain.entity_resolver import FIELD_FORMAT_ALERT_CODES
+from shipping_billing_agent.domain.models import DocumentStatus, SourceKind, sanitize_source_path
+from shipping_billing_agent.gateways.llm_client import (
+    LlmBudgetExhaustedError,
+    StructuredLlmClient,
+    llm_request_budget,
+)
 from shipping_billing_agent.gateways.text_sanitizer import sanitize_for_llm
 
 from .prompts import (
@@ -64,6 +74,8 @@ _REPAIRABLE_CHECKS = frozenset(
     }
 )
 _BUDGET_EXHAUSTED = "已用完批次 LLM 调用额度"
+_NO_CHARGE_DETAILS = "文档包含账单总额声明但未提取到有效费用明细"
+_LINE_TOLERANCE = Fraction(DECIMAL_TOLERANCE)
 _DEFAULT_LIMITS = ResourceLimits()
 _SHEET_ROW = re.compile(r"^\[Sheet: (.+?) \| Row (\d+)\] \[Row (\d+)\]")
 _TABLE_ROW = re.compile(r"^\[[^]]+\] \[Row (\d+)\]")
@@ -92,11 +104,14 @@ class LlmBudgetGuard:
 
     async def try_acquire(self) -> bool:
         async with self._async_lock:
-            with self._thread_lock:
-                if self._calls_used >= self._max_calls:
-                    return False
-                self._calls_used += 1
-                return True
+            return self.try_acquire_sync()
+
+    def try_acquire_sync(self) -> bool:
+        with self._thread_lock:
+            if self._calls_used >= self._max_calls:
+                return False
+            self._calls_used += 1
+            return True
 
 
 class BillingGraphInput(TypedDict):
@@ -116,6 +131,7 @@ class _BillingState(BillingGraphInput, _BillingGraphOutput, total=False):
     bundles: list[DocumentExtractionBundle]
     rule_extractions: dict[str, RawExtractionEnvelope]
     package_sources: dict[str, tuple[tuple[ParsedDocument, RawExtractionEnvelope], ...]]
+    package_ids: dict[str, str]
     paths: dict[str, str]
     budget: LlmBudgetGuard
     limiter: anyio.CapacityLimiter
@@ -152,11 +168,19 @@ def _source_path(doc: ParsedDocument, by_id: dict[str, ParsedDocument]) -> str:
     seen = set()
     while doc.doc_id not in seen:
         seen.add(doc.doc_id)
-        parts.append(doc.public_url or doc.original_filename)
+        parts.append(sanitize_source_path(doc.public_url or doc.original_filename) or "")
         if doc.parent_doc_id not in by_id:
             break
         doc = by_id[doc.parent_doc_id]
     return "/".join(reversed(parts))
+
+
+def _redact_document_paths(doc: ParsedDocument) -> ParsedDocument:
+    paths = {
+        field: sanitize_source_path(getattr(doc, field))
+        for field in ("public_url", "original_filename", "sanitized_filename")
+    }
+    return doc.model_copy(update=paths)
 
 
 def _source_evidence(doc: ParsedDocument, charge: RawChargeItem, path: str) -> SourceEvidence:
@@ -168,7 +192,7 @@ def _source_evidence(doc: ParsedDocument, charge: RawChargeItem, path: str) -> S
     elif match := _TABLE_ROW.match(source_text):
         row = int(match[1])
     return SourceEvidence(
-        source_file=doc.original_filename,
+        source_file=sanitize_source_path(doc.original_filename),
         source_doc_id=doc.doc_id,
         source_paths=[path],
         page=charge.page,
@@ -184,30 +208,20 @@ def _records_for_bundle(
     bundle: DocumentExtractionBundle,
     state: _BillingState,
     extra_reasoning: Sequence[str] = (),
-    *,
-    source_extraction: RawExtractionEnvelope | None = None,
 ) -> list[ProcessedBillingRecord]:
     doc, envelope = bundle.document, bundle.extraction
     if envelope is None or envelope.metadata_only:
         return []
     data = envelope.extraction
-    refs = data.shipment_refs
-    if source_extraction is not None and doc.source_kind is not SourceKind.EML_BODY:
-        own_mbls = source_extraction.extraction.shipment_refs.mbl_nos
-        if own_mbls:
-            # Validate attachments' independent MBL evidence before merging divergent references.
-            own_values = {ref.value for ref in own_mbls}
-            refs = refs.model_copy(
-                update={
-                    "mbl_nos": [ref for ref in refs.mbl_nos if ref.value in own_values],
-                }
-            )
+    totals = SourceDocTotalsSnapshot.from_extraction(doc.doc_id, envelope)
     records = []
     for index, entry in enumerate(envelope.charges):
         charge = entry.charge
         standard_name, from_dictionary = normalize_charge_item(
             charge.raw_charge_name, state.get("charge_dictionary", ())
         )
+        if standard_name is None:
+            continue
         perspective = resolve_entity_perspective(
             state["accounting_entity"],
             issuer=data.issuer,
@@ -221,6 +235,7 @@ def _records_for_bundle(
         )
         batch_id = state.get("batch_id")
         record_prefix = f"{batch_id}:{doc.doc_id}" if batch_id else doc.doc_id
+        raw_issues = [*envelope.raw_parse_issues, *entry.raw_parse_issues]
         records.append(
             ProcessedBillingRecord(
                 id=f"{record_prefix}:{index + 1}",
@@ -251,14 +266,23 @@ def _records_for_bundle(
                 raw_amount_text=entry.raw_amount_text,
                 raw_unit_price_text=entry.raw_unit_price_text,
                 raw_quantity_text=entry.raw_quantity_text,
-                shipment_refs=refs,
+                shipment_refs=data.shipment_refs,
                 source_evidence=_source_evidence(doc, charge, state["paths"][doc.doc_id]),
+                source_doc_totals=totals,
                 validation_alerts=perspective.validation_alerts,
-                ai_reasoning=[*perspective.ai_reasoning, *extra_reasoning],
+                ai_reasoning=[
+                    *perspective.ai_reasoning,
+                    *(
+                        issue.message
+                        for issue in raw_issues
+                        if issue.code is AlertCode.CONTEXT_INFERRED_FIELD
+                    ),
+                    *extra_reasoning,
+                ],
                 excluded_clauses=data.excluded_clauses,
                 explicit_fields=envelope.explicit_fields | entry.explicit_fields,
                 raw_invalid_fields={**envelope.raw_invalid_fields, **entry.raw_invalid_fields},
-                raw_parse_issues=[*envelope.raw_parse_issues, *entry.raw_parse_issues],
+                raw_parse_issues=raw_issues,
                 retry_count=bundle.retry_count,
             )
         )
@@ -272,33 +296,254 @@ def _sibling_context_text(sources: _SiblingSources) -> str:
         facts = {
             "source": doc.sanitized_filename,
             "shipment_refs": data.shipment_refs.model_dump(exclude_none=True),
-            "shipper_or_issuer": data.issuer,
-            "consignee_or_recipient": data.recipient,
-            "transport_terms": doc.metadata.get("transport_context"),
+            "billing_issuer": data.issuer,
+            "billing_recipient": data.recipient,
+            "transport_context": doc.metadata.get("transport_context"),
         }
         context.append(dumps_decimal_json({key: value for key, value in facts.items() if value}))
     return "\n".join(context)
 
 
-def _ground_model_extraction(
-    extraction: RawExtractionEnvelope, rules: RawExtractionEnvelope
-) -> RawExtractionEnvelope:
-    """Use an independently read, printed total to check the model's proposal."""
-    data = extraction.extraction
-    issues = list(extraction.raw_parse_issues)
+def _source_audit(
+    proposed: RawExtractionEnvelope | RawChargeEnvelope,
+    observed: RawExtractionEnvelope | RawChargeEnvelope,
+    values: RawDocumentExtraction | RawChargeItem,
+) -> dict[str, Any]:
+    invalid = {
+        **proposed.raw_invalid_fields,
+        **{
+            field: token
+            for field, token in observed.raw_invalid_fields.items()
+            if getattr(values, field, None) is None
+        },
+    }
+    explicit = proposed.explicit_fields | observed.explicit_fields
+    issues = list(proposed.raw_parse_issues)
+    for issue in observed.raw_parse_issues:
+        if issue.code in FIELD_FORMAT_ALERT_CODES and issue.field:
+            if getattr(values, issue.field, None) is not None:
+                continue
+            if issue.field in type(values).model_fields and issue.field in explicit:
+                invalid.setdefault(issue.field, issue.actual or "")
+        if issue not in issues:
+            issues.append(issue)
+    return {
+        "explicit_fields": explicit,
+        "raw_invalid_fields": invalid,
+        "raw_parse_issues": issues,
+    }
+
+
+def _ground_charge(proposed: RawChargeEnvelope, observed: RawChargeEnvelope) -> RawChargeEnvelope:
+    printed, model = observed.charge, proposed.charge
+    updates = {
+        field: value
+        for field in ("source_text", "page", "line_number")
+        if (value := getattr(printed, field)) is not None
+    }
+    # Only independent source evidence can disambiguate a printed bare dollar sign.
+    bare_dollar = observed.raw_invalid_fields.get("currency") == "$" or any(
+        issue.field == "currency" and issue.actual == "$" for issue in observed.raw_parse_issues
+    )
+    currency_conflict = printed.currency and model.currency and printed.currency != model.currency
+    if bare_dollar or printed.currency:
+        updates["currency"] = printed.currency
+    if printed.payment_term is not None and model.payment_term is None:
+        updates["payment_term"] = printed.payment_term
+    charge = model.model_copy(update=updates)
+    audit = _source_audit(proposed, observed, charge)
+    if currency_conflict:
+        audit["raw_parse_issues"].append(
+            ValidationAlert.from_code(
+                AlertCode.INVALID_OR_MISSING_CURRENCY,
+                "模型提取的费用行币种与原文不符",
+                field="currency",
+                expected=printed.currency,
+                actual=model.currency,
+            )
+        )
+    for field in ("amount", "unit_price", "quantity"):
+        text_field = f"raw_{field}_text"
+        if field in observed.raw_invalid_fields and getattr(charge, field) is None:
+            audit[text_field] = getattr(observed, text_field)
+    return proposed.model_copy(update={"charge": charge, **audit})
+
+
+def _amount_pairs(
+    rows: Sequence[RawChargeEnvelope], indexes: Sequence[int]
+) -> list[tuple[Fraction, str, int]]:
+    return sorted(
+        (Fraction(amount), rows[index].charge.currency or "", index)
+        for index in indexes
+        if (amount := rows[index].charge.amount) is not None
+    )
+
+
+def _ground_charges(
+    proposed: list[RawChargeEnvelope],
+    rules: RawExtractionEnvelope,
+    dictionary: Sequence[ChargeDictionaryItem],
+) -> tuple[list[RawChargeEnvelope], list[ValidationAlert]]:
+    def indexes_by_name(rows: list[RawChargeEnvelope]) -> dict[str, list[int]]:
+        indexes = defaultdict(list)
+        for index, row in enumerate(rows):
+            if name := normalize_charge_item(row.charge.raw_charge_name, dictionary)[0]:
+                indexes[name].append(index)
+        return indexes
+
+    def amounts_text(rows: Sequence[RawChargeEnvelope], indexes: Sequence[int]) -> str:
+        return ", ".join(rows[index].raw_amount_text or "缺失" for index in indexes) or "无费用行"
+
+    observed = rules.charges
+    grounded = proposed.copy()
+    issues = []
+    model_groups = indexes_by_name(proposed)
+    source_groups = indexes_by_name(observed)
+    for name, source_indexes in source_groups.items():
+        model_indexes = model_groups.get(name, [])
+        source_amounts = _amount_pairs(observed, source_indexes)
+        model_amounts = _amount_pairs(proposed, model_indexes)
+        paired_source, paired_model = set(), set()
+        model_position = 0
+        # Match sorted amounts within each fee name before falling back to unpaired rows for audit.
+        for amount, _, source_index in source_amounts:
+            while model_position < len(model_amounts):
+                candidate, _, model_index = model_amounts[model_position]
+                if candidate > amount + _LINE_TOLERANCE:
+                    break
+                model_position += 1
+                if candidate >= amount - _LINE_TOLERANCE:
+                    grounded[model_index] = _ground_charge(
+                        proposed[model_index], observed[source_index]
+                    )
+                    paired_source.add(source_index)
+                    paired_model.add(model_index)
+                    break
+        remainder_source = [index for index in source_indexes if index not in paired_source]
+        remainder_model = [index for index in model_indexes if index not in paired_model]
+        for source_index, model_index in zip(remainder_source, remainder_model, strict=False):
+            grounded[model_index] = _ground_charge(proposed[model_index], observed[source_index])
+        missing_source_audit = any(
+            observed[index].raw_invalid_fields or observed[index].raw_parse_issues
+            for index in remainder_source[len(remainder_model) :]
+        )
+        if (
+            len(paired_source) != len(source_amounts)
+            or (source_amounts and len(model_indexes) > len(source_indexes))
+            or missing_source_audit
+        ):
+            issues.append(
+                ValidationAlert.from_code(
+                    AlertCode.AMOUNT_TOTAL_MISMATCH,
+                    f"模型提取的 {name} 费用行与原文金额或行数不符",
+                    field="reported_charge_amount",
+                    expected=amounts_text(observed, source_indexes),
+                    actual=amounts_text(proposed, model_indexes),
+                )
+            )
+    summary = rules.subtotal_amount if rules.subtotal_amount is not None else rules.total_amount
+    additional_fees = sorted(model_groups.keys() - source_groups.keys())
+    source_amounts = [row.charge.amount for row in observed]
+    if (
+        summary is not None
+        and source_amounts
+        and additional_fees
+        and all(amount is not None for amount in source_amounts)
+    ):
+        observed_sum = sum(Fraction(amount) for amount in source_amounts if amount is not None)
+        if abs(observed_sum - Fraction(summary)) <= _LINE_TOLERANCE:
+            issues.append(
+                ValidationAlert.from_code(
+                    AlertCode.AMOUNT_TOTAL_MISMATCH,
+                    "原文已识别的费用行与汇总相符，模型另报了无法核对的费用行",
+                    field="reported_charge_amount",
+                    actual="、".join(additional_fees),
+                    expected="、".join(source_groups),
+                )
+            )
+    return grounded, issues
+
+
+def _ground_parties(
+    data: RawDocumentExtraction,
+    observed: RawDocumentExtraction,
+    doc: ParsedDocument,
+    profiles: Sequence[AccountingEntityProfile],
+) -> tuple[dict[str, str | None], list[ValidationAlert]]:
+    transport_names = [
+        label.partition(": ")[2]
+        for label in doc.metadata.get("transport_context", ())
+        if isinstance(label, str) and label.startswith(("Shipper: ", "Consignee: "))
+    ]
+    has_payment_direction = bool(observed.payer_hint or observed.payee_hint)
+    transport_only = bool(doc.ocr_payload and transport_names) and not any(
+        (observed.issuer, observed.recipient, observed.payer_hint, observed.payee_hint)
+    )
     updates = {}
-    for field in ("subtotal_amount", "tax_amount", "total_amount", "total_currency"):
+    issues = []
+    for field, counterpart in (
+        ("issuer", "payee_hint"),
+        ("recipient", "payer_hint"),
+        ("payer_hint", "recipient"),
+        ("payee_hint", "issuer"),
+    ):
+        printed, model = getattr(observed, field), getattr(data, field)
+        if printed:
+            updates[field] = printed
+        if not model or (printed and entity_matches(model, printed, profiles)):
+            continue
+        alternative = getattr(observed, counterpart)
+        matches_transport = any(entity_matches(model, name, profiles) for name in transport_names)
+        needs_source_party = (
+            has_payment_direction or alternative or transport_only or matches_transport
+        )
+        contradicts_source = printed or (
+            needs_source_party
+            and not (alternative and entity_matches(model, alternative, profiles))
+        )
+        if contradicts_source:
+            updates[field] = printed
+            issues.append(
+                ValidationAlert.from_code(
+                    AlertCode.CROSS_DOCUMENT_CONFLICT,
+                    "模型给出的结算主体与原文收付证据不符",
+                    field=field,
+                    expected=printed or alternative,
+                    actual=model,
+                )
+            )
+        elif has_payment_direction and field in ("payer_hint", "payee_hint"):
+            # A labeled issuer or recipient does not supply the missing leg of the instruction.
+            updates[field] = printed
+    return updates, issues
+
+
+def _ground_model_extraction(
+    extraction: RawExtractionEnvelope,
+    rules: RawExtractionEnvelope,
+    doc: ParsedDocument,
+    profiles: Sequence[AccountingEntityProfile],
+    dictionary: Sequence[ChargeDictionaryItem],
+) -> RawExtractionEnvelope:
+    """Check model proposals against independent billing evidence from the source."""
+    data = extraction.extraction
+    updates, issues = _ground_parties(data, rules.extraction, doc, profiles)
+    has_source_summary = _has_billing_summary(rules) or rules.tax_amount is not None
+    for field, code in (
+        ("subtotal_amount", AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH),
+        ("tax_amount", AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH),
+        ("total_amount", AlertCode.AMOUNT_TOTAL_MISMATCH),
+        ("total_currency", AlertCode.INVALID_OR_MISSING_CURRENCY),
+    ):
         observed = getattr(rules.extraction, field)
         proposed = getattr(data, field)
-        if observed is None or field in extraction.raw_invalid_fields:
+        if observed is None:
+            if rules.raw_invalid_fields.get(field) == "$" or (
+                has_source_summary and field not in rules.explicit_fields
+            ):
+                updates[field] = None
             continue
         if proposed is not None and proposed != observed:
-            code = {
-                "subtotal_amount": AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH,
-                "tax_amount": AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH,
-                "total_amount": AlertCode.AMOUNT_TOTAL_MISMATCH,
-                "total_currency": AlertCode.INVALID_OR_MISSING_CURRENCY,
-            }[field]
             issues.append(
                 ValidationAlert.from_code(
                     code,
@@ -309,9 +554,18 @@ def _ground_model_extraction(
                 )
             )
         updates[field] = observed
-    for field in ("payer_hint", "payee_hint"):
-        if (observed := getattr(rules.extraction, field)) and not getattr(data, field):
-            updates[field] = observed
+    for currency, total in rules.totals_by_currency.items():
+        proposed = extraction.totals_by_currency.get(currency)
+        if proposed is not None and proposed != total:
+            issues.append(
+                ValidationAlert.from_code(
+                    AlertCode.AMOUNT_TOTAL_MISMATCH,
+                    "模型报告的分币种总额与原文不符",
+                    field=f"reported_totals_by_currency.{currency}",
+                    expected=str(total),
+                    actual=str(proposed),
+                )
+            )
     clauses = [
         clause.model_copy(update={"text": sanitize_for_llm(clause.text)})
         for clause in data.excluded_clauses
@@ -319,39 +573,57 @@ def _ground_model_extraction(
     for clause in rules.extraction.excluded_clauses:
         if clause not in clauses:
             clauses.append(clause)
-    charges = []
-    for row in extraction.charges:
-        charge = row.charge
-        if _non_billing_reason(f"{charge.raw_charge_name} {charge.source_text or ''}"):
-            continue
-        charges.append(row)
-    if (
-        any(row.charge.amount for row in rules.charges)
-        and charges
-        and all(row.charge.amount == 0 for row in charges)
-    ):
-        issues.append(
-            ValidationAlert.from_code(
-                AlertCode.LLM_EXTRACTION_FAILED,
-                "源单存在非零费用，模型提取的费用全部为零",
-                field="amount",
-                actual="0",
+    charges, line_issues = _ground_charges(
+        [
+            row
+            for row in extraction.charges
+            if not _non_billing_reason(
+                f"{row.charge.raw_charge_name} {row.charge.source_text or ''}"
             )
-        )
+        ],
+        rules,
+        dictionary,
+    )
+    printed_refs, model_refs = rules.extraction.shipment_refs, data.shipment_refs
+    printed_mbls = {ref.value for ref in printed_refs.mbl_nos}
+    refs = model_refs.model_copy(
+        update={
+            "mbl_nos": [
+                *printed_refs.mbl_nos,
+                *(
+                    ref.model_copy(update={"source": sanitize_source_path(ref.source)})
+                    for ref in model_refs.mbl_nos
+                    if ref.value not in printed_mbls
+                ),
+            ],
+            "hbl_no": printed_refs.hbl_no or model_refs.hbl_no,
+            "booking_no": printed_refs.booking_no or model_refs.booking_no,
+            "container_nos": list(
+                dict.fromkeys([*printed_refs.container_nos, *model_refs.container_nos])
+            ),
+        }
+    )
+    grounded = data.model_copy(
+        update={
+            **updates,
+            "excluded_clauses": clauses,
+            "charges": [row.charge for row in charges],
+            "shipment_refs": refs,
+        }
+    )
+    audit = _source_audit(extraction, rules, grounded)
+    audit["raw_parse_issues"].extend([*issues, *line_issues])
+    if not rules.totals_by_currency:
+        audit["explicit_fields"].discard("totals_by_currency")
     return extraction.model_copy(
         update={
-            "extraction": data.model_copy(
-                update={
-                    **updates,
-                    "excluded_clauses": clauses,
-                    "charges": [row.charge for row in charges],
-                }
-            ),
+            **audit,
+            "extraction": grounded,
             "charges": charges,
-            "raw_parse_issues": issues,
-            "explicit_fields": extraction.explicit_fields | updates.keys(),
-            "has_explicit_total": rules.has_explicit_total or extraction.has_explicit_total,
-            "totals_by_currency": rules.totals_by_currency or extraction.totals_by_currency,
+            "has_explicit_total": rules.has_explicit_total
+            or grounded.total_amount is not None
+            or "total_amount" in audit["raw_invalid_fields"],
+            "totals_by_currency": rules.totals_by_currency,
             # Metadata-only eligibility is decided locally, before making a model call.
             "metadata_only": False,
         }
@@ -360,6 +632,19 @@ def _ground_model_extraction(
 
 def _has_source(doc: ParsedDocument) -> bool:
     return bool(doc.raw_text.strip() or doc.tables or doc.ocr_payload)
+
+
+def _has_billing_summary(envelope: RawExtractionEnvelope | None) -> bool:
+    return (
+        envelope is not None
+        and not envelope.metadata_only
+        and (
+            envelope.has_explicit_total
+            or envelope.total_amount is not None
+            or envelope.subtotal_amount is not None
+            or bool(envelope.totals_by_currency)
+        )
+    )
 
 
 def _amount_snapshot(extraction: RawExtractionEnvelope) -> str:
@@ -413,34 +698,33 @@ class _BillingNodes:
 
     async def build_context_packages(self, state: _BillingState) -> dict:
         groups = defaultdict(list)
-        by_id = {doc.doc_id: doc for doc in state["documents"]}
+        documents = [_redact_document_paths(doc) for doc in state["documents"]]
+        by_id = {doc.doc_id: doc for doc in documents}
         paths = {doc_id: _source_path(doc, by_id) for doc_id, doc in by_id.items()}
+        package_ids = {doc_id: _package_id(doc, by_id) for doc_id, doc in by_id.items()}
         bundles = []
         failures = {}
         rule_extractions = {}
-        for document in state["documents"]:
-            doc = document
+        for doc in documents:
             envelope = None
             if doc.status is DocumentStatus.FAILED:
                 failures[doc.doc_id] = sanitize_for_llm(doc.error_message or "文档解析失败")
             elif doc.status is not DocumentStatus.SKIPPED_NOISE:
                 try:
                     envelope = extract_document_by_rules(doc)
+                    context = transport_context(doc)
                 except Exception as exc:
                     failures[doc.doc_id] = f"文档规则抽取失败（{type(exc).__name__}）"
+                    envelope = None
                 else:
                     rule_extractions[doc.doc_id] = envelope
-                    if envelope.metadata_only:
-                        metadata = doc.metadata.copy()
-                        if context := transport_context(doc):
-                            metadata["transport_context"] = context
+                    if context:
                         doc = doc.model_copy(
-                            update={
-                                "status": DocumentStatus.METADATA_ONLY,
-                                "metadata": metadata,
-                            }
+                            update={"metadata": {**doc.metadata, "transport_context": context}}
                         )
-                    groups[_package_id(doc, by_id)].append((doc, envelope))
+                    if envelope.metadata_only:
+                        doc = doc.model_copy(update={"status": DocumentStatus.METADATA_ONLY})
+                    groups[package_ids[doc.doc_id]].append((doc, envelope))
             bundles.append(DocumentExtractionBundle(document=doc, extraction=envelope))
         package_sources = {}
         for sources in groups.values():
@@ -452,9 +736,11 @@ class _BillingNodes:
                     if sibling.doc_id != doc.doc_id and _has_source(sibling)
                 )
         return {
+            "documents": documents,
             "bundles": bundles,
             "rule_extractions": rule_extractions,
             "package_sources": package_sources,
+            "package_ids": package_ids,
             "paths": paths,
             "budget": LlmBudgetGuard(self.limits.max_llm_calls_per_batch),
             "limiter": anyio.CapacityLimiter(self.limits.max_concurrency),
@@ -465,32 +751,48 @@ class _BillingNodes:
         }
 
     async def _invoke(
-        self, state: _BillingState, messages: list[dict[str, str]], rules: RawExtractionEnvelope
+        self,
+        state: _BillingState,
+        messages: list[dict[str, str]],
+        rules: RawExtractionEnvelope,
+        doc: ParsedDocument,
     ) -> _ModelAttempt:
         client = self.client
         assert client is not None
         budget = state["budget"]
         if not budget.remaining:
             return _ModelAttempt(failure=_BUDGET_EXHAUSTED)
-        # The borrowed client's gateway handles the request timeout. Every new call here
-        # reserves a budget slot after it receives an available concurrency slot.
+        # Reuse the reservation for the first POST and charge each SDK retry separately.
         async with state["limiter"]:
             if not await budget.try_acquire():
                 return _ModelAttempt(failure=_BUDGET_EXHAUSTED)
             try:
-                if self.use_sync_client:
-                    response = await anyio.to_thread.run_sync(
-                        client.invoke_structured, messages, RawDocumentExtraction
-                    )
-                else:
-                    response = await client.ainvoke_structured(messages, RawDocumentExtraction)
+                with llm_request_budget(
+                    budget.try_acquire_sync, budget.try_acquire, initial_slots=1
+                ):
+                    if self.use_sync_client:
+                        response = await anyio.to_thread.run_sync(
+                            client.invoke_structured, messages, RawDocumentExtraction
+                        )
+                    else:
+                        response = await client.ainvoke_structured(messages, RawDocumentExtraction)
                 envelope = parse_llm_raw_extraction(response.raw_text, response.parsed)
-                envelope = _ground_model_extraction(envelope, rules)
+                envelope = _ground_model_extraction(
+                    envelope,
+                    rules,
+                    doc,
+                    state.get("profiles", ()),
+                    state.get("charge_dictionary", ()),
+                )
+            except LlmBudgetExhaustedError:
+                return _ModelAttempt(failure=_BUDGET_EXHAUSTED, invoked=True)
             except Exception as exc:
                 return _ModelAttempt(
                     failure=f"LLM 调用或解码失败（{type(exc).__name__}）", invoked=True
                 )
-        if not any(row.charge.raw_charge_name.strip() for row in envelope.charges):
+        if not any(
+            normalize_charge_item(row.charge.raw_charge_name)[0] for row in envelope.charges
+        ):
             reason = "LLM 抽取结果缺少有效费用明细"
             if not any(
                 issue.code is AlertCode.LLM_EXTRACTION_FAILED for issue in envelope.raw_parse_issues
@@ -517,7 +819,7 @@ class _BillingNodes:
                 )
             except Exception as exc:
                 return _ModelAttempt(failure=f"无法准备 LLM 抽取证据（{type(exc).__name__}）")
-            return await self._invoke(state, messages, bundle.extraction)
+            return await self._invoke(state, messages, bundle.extraction, doc)
 
         candidates = [
             bundle
@@ -538,18 +840,27 @@ class _BillingNodes:
         }
 
     def validate_raw_documents(self, state: _BillingState) -> dict:
+        if self.client is None:
+            return {"correction_alerts": {}}
         correction_alerts = {}
-        for bundle in state["bundles"]:
+        failures = state["failures"].copy()
+        bundles = state["bundles"].copy()
+        for index, bundle in enumerate(bundles):
             doc, envelope = bundle.document, bundle.extraction
             if envelope is None or envelope.metadata_only or not _has_source(doc):
                 continue
-            rows = _records_for_bundle(bundle, state)
-            alerts = [
-                alert
-                for row in validate_batch(rows, [bundle])
-                for alert in row.validation_alerts
-                if alert.code in _REPAIRABLE_CHECKS
-            ]
+            try:
+                rows = _records_for_bundle(bundle, state)
+                alerts = [
+                    alert
+                    for row in validate_batch(rows, [bundle])
+                    for alert in row.validation_alerts
+                    if alert.code in _REPAIRABLE_CHECKS
+                ]
+            except Exception as exc:
+                failures[doc.doc_id] = f"文档抽取复检失败（{type(exc).__name__}）"
+                bundles[index] = bundle.model_copy(update={"extraction": None})
+                continue
             # Missing amount on an incremental notice can be filled by the historical bill.
             # Retry explicit extraction failures here and let inheritance handle omitted fields.
             raw_issues = [*envelope.raw_parse_issues]
@@ -560,7 +871,7 @@ class _BillingNodes:
             )
             if alerts:
                 correction_alerts[doc.doc_id] = alerts
-        return {"correction_alerts": correction_alerts}
+        return {"correction_alerts": correction_alerts, "failures": failures, "bundles": bundles}
 
     def _can_retry(self, doc_id: str, state: _BillingState) -> bool:
         return (
@@ -590,7 +901,7 @@ class _BillingNodes:
                 )
             except Exception as exc:
                 return _ModelAttempt(failure=f"无法准备 LLM 自修复证据（{type(exc).__name__}）")
-            return await self._invoke(state, messages, state["rule_extractions"][doc.doc_id])
+            return await self._invoke(state, messages, state["rule_extractions"][doc.doc_id], doc)
 
         bundles = state["bundles"]
         candidates = [
@@ -645,50 +956,110 @@ class _BillingNodes:
     def normalize_match_and_validate(self, state: _BillingState) -> dict:
         records = []
         enriched_bundles = []
+        independent_bundles = []
+        failures = state["failures"].copy()
         for bundle in state["bundles"]:
             doc, envelope = bundle.document, bundle.extraction
-            if envelope is None or envelope.metadata_only or not envelope.charges:
-                enriched_bundles.append(bundle)
-                continue
-            enriched, context_reasoning = apply_sibling_context(
-                envelope,
-                state["package_sources"][doc.doc_id],
-                state.get("profiles", ()),
-            )
-            enriched_bundle = bundle.model_copy(update={"extraction": enriched})
-            enriched_bundles.append(enriched_bundle)
-            reasoning = [*context_reasoning, *state["correction_logs"].get(doc.doc_id, ())]
-            if bundle.retry_count and doc.doc_id not in state["failures"]:
-                checks = state["correction_alerts"].get(doc.doc_id)
-                reasoning.append(
-                    "第 2 轮复检仍有差异\n" + format_validation_alerts(checks)
-                    if checks
-                    else "第 2 轮自修复复检通过"
+            source = state["rule_extractions"].get(doc.doc_id)
+            enriched_bundle = bundle
+            rows = []
+            try:
+                if envelope is not None and not envelope.metadata_only and envelope.charges:
+                    enriched, field_uses = apply_sibling_context(
+                        envelope,
+                        state["package_sources"][doc.doc_id],
+                        state.get("profiles", ()),
+                        source_extraction=source,
+                        # Keep attachments' independent references for matching and conflict checks.
+                        merge_mbls=doc.source_kind is SourceKind.EML_BODY,
+                    )
+                    if field_uses:
+                        sources = [
+                            {
+                                "field": use.field,
+                                "value": use.value,
+                                "sibling_doc_id": use.source.doc_id,
+                                "filename": use.filename,
+                                "line_index": use.line_index,
+                            }
+                            for use in field_uses
+                        ]
+                        metadata = {**doc.metadata, "sibling_field_sources": sources}
+                        doc = doc.model_copy(update={"metadata": metadata})
+                    enriched_bundle = bundle.model_copy(
+                        update={"document": doc, "extraction": enriched}
+                    )
+                    reasoning = list(state["correction_logs"].get(doc.doc_id, ()))
+                    if bundle.retry_count and doc.doc_id not in failures:
+                        checks = state["correction_alerts"].get(doc.doc_id)
+                        reasoning.append(
+                            "第 2 轮复检仍有差异\n" + format_validation_alerts(checks)
+                            if checks
+                            else "第 2 轮自修复复检通过"
+                        )
+                    rows = _records_for_bundle(enriched_bundle, state, reasoning)
+            except Exception as exc:
+                failures[doc.doc_id] = f"文档账单记录组装失败（{type(exc).__name__}）"
+                enriched_bundle = bundle
+            else:
+                independent_bundles.append(bundle)
+            if (
+                not rows
+                and doc.status is DocumentStatus.PARSED
+                and (_has_billing_summary(envelope) or _has_billing_summary(source))
+            ):
+                prior_failure = failures.get(doc.doc_id)
+                failures[doc.doc_id] = (
+                    f"{prior_failure}。{_NO_CHARGE_DETAILS}"
+                    if prior_failure
+                    else _NO_CHARGE_DETAILS
                 )
-            records.extend(
-                _records_for_bundle(enriched_bundle, state, reasoning, source_extraction=envelope)
-            )
+            records.extend(rows)
+            enriched_bundles.append(enriched_bundle)
         matched = match_and_inherit_batch(
             records, state.get("existing_bills", ()), state.get("profiles", ())
         )
-        return {"records": validate_batch(matched, state["bundles"]), "bundles": enriched_bundles}
+        return {
+            "records": validate_batch(matched, independent_bundles),
+            "bundles": enriched_bundles,
+            "failures": failures,
+        }
 
     def finalize_output(self, state: _BillingState) -> dict:
+        by_id = {doc.doc_id: doc for doc in state["documents"]}
+        doc_ids_by_hash = defaultdict(list)
+        for doc in by_id.values():
+            if doc.content_sha256:
+                doc_ids_by_hash[doc.content_sha256].append(doc.doc_id)
         records_by_doc = defaultdict(list)
+        records_by_package = defaultdict(list)
         for record in state["records"]:
-            records_by_doc[record.source_doc_id].append(record.id)
-        failures = [
-            FailedDocumentAlert(
-                doc_id=doc.doc_id,
-                filename=doc.original_filename,
-                reason=state["failures"][doc.doc_id],
-                affected_record_ids=records_by_doc[doc.doc_id],
+            doc = by_id[record.source_doc_id]
+            sources = doc_ids_by_hash.get(doc.content_sha256, (doc.doc_id,))
+            for doc_id in sources:
+                records_by_doc[doc_id].append(record.id)
+            for package in dict.fromkeys(state["package_ids"][doc_id] for doc_id in sources):
+                records_by_package[package].append(record.id)
+        failures = []
+        for doc in state["documents"]:
+            if doc.doc_id not in state["failures"]:
+                continue
+            affected = records_by_doc[doc.doc_id]
+            if doc.parent_doc_id and doc.source_kind is not SourceKind.EML_BODY:
+                package = state["package_ids"].get(
+                    doc.parent_doc_id, state["package_ids"][doc.doc_id]
+                )
+                affected = list(dict.fromkeys([*affected, *records_by_package[package]]))
+            failures.append(
+                FailedDocumentAlert(
+                    doc_id=doc.doc_id,
+                    filename=doc.original_filename,
+                    reason=state["failures"][doc.doc_id],
+                    affected_record_ids=affected,
+                )
             )
-            for doc in state["documents"]
-            if doc.doc_id in state["failures"]
-        ]
         budget = state["budget"]
-        exhausted = _BUDGET_EXHAUSTED in state["failures"].values() or (
+        exhausted = any(_BUDGET_EXHAUSTED in reason for reason in state["failures"].values()) or (
             self.client is not None
             and budget.remaining == 0
             and any(self._can_retry(doc_id, state) for doc_id in state["correction_alerts"])
