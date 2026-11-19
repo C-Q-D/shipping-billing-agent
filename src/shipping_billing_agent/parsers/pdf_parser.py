@@ -17,8 +17,12 @@ _MIN_TEXT_CHARACTERS = 15
 _OCR_RESOLUTION_DPI = 200
 _COLLINEAR_TOL_PT = 1.0
 _LONG_RULE_SPAN_PT = 40.0
-_MAX_DECORATIVE_RULES = 3
+_BAR_RULE_MAX_THICKNESS_PT = 6.0
+_BAR_RULE_MIN_ASPECT = 15.0
+_SCANLINE_MAX_GAP_PT = 6.0
+_SCANLINE_MIN_RUN = 4
 _Point = tuple[float, float]
+_RuleSegment = tuple[float, float, float]
 
 
 class PdfParseError(ValueError):
@@ -78,14 +82,43 @@ def _is_table_segment(
     return False
 
 
-def _is_non_table_curve(curve: dict[str, Any], table_grids: list[_TableGrid]) -> bool:
+def _classify_straight_segment(
+    p1: _Point,
+    p2: _Point,
+    table_grids: list[_TableGrid],
+    horiz_segments: list[_RuleSegment],
+    vert_segments: list[_RuleSegment],
+) -> int:
+    if _is_table_segment(p1, p2, table_grids):
+        return 0
+    (x0, y0), (x1, y1) = p1, p2
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    if dx <= 0.5 and dy <= 0.5:
+        return 1
+    if dy <= 0.5:
+        horiz_segments.append(((y0 + y1) / 2, min(x0, x1), max(x0, x1)))
+        return 0
+    if dx <= 0.5:
+        vert_segments.append(((x0 + x1) / 2, min(y0, y1), max(y0, y1)))
+        return 0
+    return 1
+
+
+def _process_curve(
+    curve: dict[str, Any],
+    table_grids: list[_TableGrid],
+    horiz_segments: list[_RuleSegment],
+    vert_segments: list[_RuleSegment],
+) -> tuple[bool, int]:
     path = curve.get("path")
     if path is None:
-        return any(
-            not _is_table_segment(p1, p2, table_grids)
+        added = sum(
+            _classify_straight_segment(p1, p2, table_grids, horiz_segments, vert_segments)
             for p1, p2 in pairwise(curve.get("pts") or ())
         )
+        return False, added
 
+    added = 0
     subpath_start: _Point | None = None
     current: _Point | None = None
     for operator, *points in path:
@@ -99,45 +132,53 @@ def _is_non_table_curve(curve: dict[str, Any], table_grids: list[_TableGrid]) ->
             if current == end:
                 continue
         else:
-            return True
-        if (
-            current is not None
-            and end is not None
-            and not _is_table_segment(current, end, table_grids)
-        ):
-            return True
+            return True, 0
+        if current is not None and end is not None:
+            added += _classify_straight_segment(
+                current, end, table_grids, horiz_segments, vert_segments
+            )
         current = end
-    return False
+    return False, added
 
 
-def _count_rule_clusters(segments: list[tuple[float, float, float]]) -> tuple[int, int]:
+def _count_rule_clusters(segments: list[_RuleSegment]) -> tuple[int, list[float]]:
     if not segments:
-        return 0, 0
+        return 0, []
 
     ordered = iter(sorted(segments, key=lambda segment: segment[0]))
     anchor_coord, min_pos, max_pos = next(ordered)
-    short_rules = long_rules = 0
+    short_rules = 0
+    long_coords: list[float] = []
     for coord, lo, hi in ordered:
         if abs(coord - anchor_coord) <= _COLLINEAR_TOL_PT:
             min_pos, max_pos = min(min_pos, lo), max(max_pos, hi)
             continue
         if max_pos - min_pos > _LONG_RULE_SPAN_PT:
-            long_rules += 1
+            long_coords.append(anchor_coord)
         else:
             short_rules += 1
         anchor_coord, min_pos, max_pos = coord, lo, hi
 
     if max_pos - min_pos > _LONG_RULE_SPAN_PT:
-        long_rules += 1
+        long_coords.append(anchor_coord)
     else:
         short_rules += 1
-    return short_rules, long_rules
+    return short_rules, long_coords
+
+
+def _has_dense_parallel_rules(long_coords: list[float]) -> bool:
+    run = 1
+    for previous, coord in pairwise(long_coords):
+        run = run + 1 if coord - previous <= _SCANLINE_MAX_GAP_PT else 1
+        if run >= _SCANLINE_MIN_RUN:
+            return True
+    return False
 
 
 def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
     glyph_elements = 0
-    horiz_segments: list[tuple[float, float, float]] = []
-    vert_segments: list[tuple[float, float, float]] = []
+    horiz_segments: list[_RuleSegment] = []
+    vert_segments: list[_RuleSegment] = []
 
     for line in page.lines:
         points = line.get("pts") or ()
@@ -145,29 +186,28 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
             p1, p2 = points[0], points[1]
         else:
             p1, p2 = (line["x0"], line["top"]), (line["x1"], line["bottom"])
-        if _is_table_segment(p1, p2, table_grids):
-            continue
-        (x0, y0), (x1, y1) = p1, p2
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        if dx <= 0.5 and dy <= 0.5:
-            glyph_elements += 1
-        elif dy <= 0.5:
-            horiz_segments.append(((y0 + y1) / 2, min(x0, x1), max(x0, x1)))
-        elif dx <= 0.5:
-            vert_segments.append(((x0 + x1) / 2, min(y0, y1), max(y0, y1)))
-        else:
-            glyph_elements += 1
+        glyph_elements += _classify_straight_segment(
+            p1, p2, table_grids, horiz_segments, vert_segments
+        )
 
     for rect in page.rects:
         x0, top, x1, bottom = rect["x0"], rect["top"], rect["x1"], rect["bottom"]
         width, height = abs(x1 - x0), abs(bottom - top)
         if width <= 4.0 and height <= 4.0:
             glyph_elements += 1
-        elif width <= 3.0:
+        elif width <= 3.0 or (
+            width <= _BAR_RULE_MAX_THICKNESS_PT
+            and height > _LONG_RULE_SPAN_PT
+            and height / max(width, 1e-6) >= _BAR_RULE_MIN_ASPECT
+        ):
             x = (x0 + x1) / 2
             if not _is_table_segment((x, top), (x, bottom), table_grids):
                 vert_segments.append((x, min(top, bottom), max(top, bottom)))
-        elif height <= 3.0:
+        elif height <= 3.0 or (
+            height <= _BAR_RULE_MAX_THICKNESS_PT
+            and width > _LONG_RULE_SPAN_PT
+            and width / max(height, 1e-6) >= _BAR_RULE_MIN_ASPECT
+        ):
             y = (top + bottom) / 2
             if not _is_table_segment((x0, y), (x1, y), table_grids):
                 horiz_segments.append((y, min(x0, x1), max(x0, x1)))
@@ -179,15 +219,20 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
                 continue
             glyph_elements += 1
 
-    short_h, long_h = _count_rule_clusters(horiz_segments)
-    short_v, long_v = _count_rule_clusters(vert_segments)
-    glyph_elements += short_h + short_v
-    has_non_table_curve = any(_is_non_table_curve(curve, table_grids) for curve in page.curves)
+    has_bezier_curve = False
+    for curve in page.curves:
+        has_bezier_curve, added = _process_curve(curve, table_grids, horiz_segments, vert_segments)
+        glyph_elements += added
+        if has_bezier_curve:
+            break
+
+    short_h, long_h_coords = _count_rule_clusters(horiz_segments)
+    short_v, long_v_coords = _count_rule_clusters(vert_segments)
     return (
-        has_non_table_curve
-        or glyph_elements >= 2
-        or long_h > _MAX_DECORATIVE_RULES
-        or long_v > _MAX_DECORATIVE_RULES
+        has_bezier_curve
+        or glyph_elements + short_h + short_v >= 2
+        or _has_dense_parallel_rules(long_h_coords)
+        or _has_dense_parallel_rules(long_v_coords)
     )
 
 

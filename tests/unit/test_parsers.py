@@ -586,6 +586,59 @@ def test_r6_3_pdf_keeps_short_electronic_text_with_a_segmented_rule(segments, lo
     assert document.raw_text.endswith("[Page 2 | Text]\nUSD 245.00"), document.raw_text
 
 
+@pytest.fixture(
+    params=[
+        pytest.param(
+            (
+                b"24 144 m 48 144 l 72 144 l 96 144 l 120 144 l 144 144 l "
+                b"168 144 l 192 144 l 216 144 l 240 144 l 264 144 l S\n",
+                1,
+            ),
+            id="a3-single-collinear-path",
+        ),
+        pytest.param(
+            (
+                b"24 44 m 264 44 l S\n24 70 m 264 70 l S\n"
+                b"24 96 m 264 96 l S\n24 122 m 264 122 l S\n",
+                0,
+            ),
+            id="a4a-spaced-parallel-rules",
+        ),
+        pytest.param((b"24 120 240 4 re f\n24 86 240 4 re f\n", 0), id="a4b-filled-bars"),
+    ]
+)
+def t10_decorated_pdf(request) -> bytes:
+    drawing, expected_curves = request.param
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE, drawing + b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n"
+    )
+    with BytesIO(data) as stream, pdfplumber.open(stream) as pdf:
+        page = pdf.pages[1]
+        assert len(page.curves) == expected_curves
+    return data
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+def test_t10_pdf_keeps_short_electronic_text_with_decorative_rules(t10_decorated_pdf, local_ocr):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=local_ocr
+    )
+    with patch.object(
+        RapidOcrFallback,
+        "recognize_pil_image",
+        autospec=True,
+        side_effect=RapidOcrFallback.recognize_pil_image,
+    ) as recognize_page:
+        (document,) = dispatcher.parse_batch([("electronic.pdf", t10_decorated_pdf)])
+
+    assert document.status is DocumentStatus.PARSED, document.error_message
+    recognize_page.assert_not_called()
+    assert document.extraction_channel is ExtractionChannel.LOCAL_PDF_TEXT_FALLBACK
+    assert document.raw_text.endswith("[Page 2 | Text]\nUSD 245.00"), document.raw_text
+
+
 def test_pdf_without_local_ocr_reads_the_complete_short_text_page():
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
@@ -921,22 +974,33 @@ def test_eml_parses_inline_bill_images_instead_of_skipping_them(filename, html):
     assert local.images == [(image_data, filename)]
 
 
-def test_eml_reads_bill_image_in_an_unmarked_footer():
+@pytest.mark.parametrize(
+    "html_body",
+    [
+        pytest.param(
+            '<article><p>Body</p><footer>Balance due USD 310.42 <img src="cid:scan"></footer>'
+            "</article>",
+            id="unmarked-footer",
+        ),
+        pytest.param(
+            '<div class="signature"><figure>'
+            '<img src="cid:scan" alt="Scanned invoice with carrier logo">'
+            "<figcaption>Invoice scan</figcaption></figure></div>",
+            id="a2a-invoice-caption-with-logo-in-alt",
+        ),
+    ],
+)
+def test_eml_reads_bill_image_in_a_footer_or_signature(html_body):
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
     message = _mail("Body")
-    message.add_alternative(
-        '<article><p>Body</p><footer>Balance due USD 310.42 <img src="cid:scan"></footer>'
-        "</article>",
-        subtype="html",
-    )
-    with Image.new("RGB", (460, 140), "white") as image, BytesIO() as buffer:
-        font = ImageFont.load_default(size=58)
-        ImageDraw.Draw(image).text((24, 28), "USD 310.42", font=font, fill="black")
-        image.save(buffer, format="PNG")
-        image_data = buffer.getvalue()
+    message.add_alternative(html_body, subtype="html")
     message.get_payload()[-1].add_related(
-        image_data, maintype="image", subtype="png", cid="<scan>", filename="scan.png"
+        _png_with_text("USD 310.42"),
+        maintype="image",
+        subtype="png",
+        cid="<scan>",
+        filename="scan.png",
     )
     dispatcher = DocumentParserDispatcher(
         ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
@@ -1066,6 +1130,21 @@ def _png_with_text(text: str) -> bytes:
             '<div class="signature"><img src="cid:logo" alt="ACME Freight logo"></div>',
             id="r6-5-freight-company-logo",
         ),
+        pytest.param(
+            '<footer><div><div>Best regards<br>ACME<br>Tel: 123456<img src="cid:logo"></div>'
+            '<div><img src="cid:scan"></div></div></footer>',
+            id="a1a-nested-scan-after-complete-signature",
+        ),
+        pytest.param(
+            '<footer><div><div><img src="cid:scan"></div>'
+            '<div><img src="cid:logo">Best regards<br>ACME<br>Tel: 123456</div></div></footer>',
+            id="a1b-nested-scan-before-complete-signature",
+        ),
+        pytest.param(
+            '<div class="signature"><img src="cid:scan" alt="Ocean freight USD 310.42"></div>'
+            '<div class="signature"><img src="cid:logo" alt="ACME Freight logo"></div>',
+            id="a2b-amount-in-freight-alt",
+        ),
     ],
 )
 def test_r6_eml_reads_the_bill_scan_and_skips_the_signature_logo(html_body):
@@ -1096,13 +1175,19 @@ def test_r6_eml_reads_the_bill_scan_and_skips_the_signature_logo(html_body):
     assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
 
 
-def test_r6_5_eml_skips_logo_after_text_only_footer_signature():
+@pytest.mark.parametrize(
+    "image_slot",
+    [
+        pytest.param('<div><img src="cid:logo"></div>', id="r6-5-wrapped-logo"),
+        pytest.param('<img src="cid:logo">', id="a5-direct-footer-logo"),
+    ],
+)
+def test_r6_5_eml_skips_logo_after_text_only_footer_signature(image_slot):
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
     message = _mail("Body")
     message.add_alternative(
-        '<footer><div>Best regards<br>ACME<br>Tel: 123456</div>'
-        '<div><img src="cid:logo"></div></footer>',
+        f"<footer><div>Best regards<br>ACME<br>Tel: 123456</div>{image_slot}</footer>",
         subtype="html",
     )
     message.get_payload()[-1].add_related(
@@ -1112,11 +1197,18 @@ def test_r6_5_eml_skips_logo_after_text_only_footer_signature():
         ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
     )
 
-    _, _, logo = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+    with patch.object(
+        RapidOcrFallback,
+        "recognize_image_bytes",
+        autospec=True,
+        side_effect=RapidOcrFallback.recognize_image_bytes,
+    ) as recognize_image:
+        _, _, logo = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
 
     assert logo.sanitized_filename == "logo.png"
     assert logo.status is DocumentStatus.SKIPPED_NOISE, logo.raw_text
     assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    recognize_image.assert_not_called()
 
 
 def test_eml_skips_a_logo_in_an_unmarked_footer_with_signoff_and_contact():

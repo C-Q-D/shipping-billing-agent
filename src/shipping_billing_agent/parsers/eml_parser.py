@@ -24,12 +24,11 @@ _BILL_TAG_WORDS = re.compile(
     r"invoice|bill|debit\s*note|credit\s*note|charge|statement|账单|帳單|发票|發票|费用|費用",
     re.I,
 )
-_LOGO_WORDS = re.compile(
-    r"\b(?:logo|icon|badge|avatar|banner|wechat|qrcode)\b|徽标|标志|图标", re.I
-)
 _BILL_AMOUNT_HINT = re.compile(r"\b(?:USD|EUR|GBP|CNY|RMB|HKD|JPY)\b|[$€£¥]\s*\d", re.I)
 _CONTENT_LANDMARKS = {"article", "aside", "footer", "header", "main", "section"}
-_FOOTER_UNITS = {"div", "p", "figure", "section", "article", "aside", "table", "ul", "ol"}
+_FOOTER_CONTAINERS = {
+    "div", "p", "section", "article", "aside", "table", "tr", "td", "th", "li", "address", "footer",
+}
 _SIGNATURE_BLOCK = re.compile(r"signature|foxmail", re.I)
 _SIGNATURE_SEPARATOR = re.compile(r"^[ \t]*--[ \t]+\r?$", re.MULTILINE)
 _SIGNATURE_CONTACT = re.compile(r"\b(?:tl|tel|web|email|fax)\s*[:：]", re.I)
@@ -198,12 +197,14 @@ def _is_bill_image_tag(image: Tag) -> bool:
     if (figure := image.find_parent("figure")) is not None:
         labels.append(figure.get("aria-label"))
         labels.extend(
-            caption.get_text(" ", strip=True) for caption in figure.find_all("figcaption")
+            caption.get_text(" ", strip=True)
+            for caption in figure.find_all("figcaption")
+            if caption.find_parent("figure") is figure
         )
     label_texts = [str(label) for label in labels if label]
-    if any(_LOGO_WORDS.search(label) for label in label_texts):
-        return False
-    return any(_BILL_TAG_WORDS.search(label) for label in label_texts)
+    return any(
+        _BILL_TAG_WORDS.search(label) or _BILL_AMOUNT_HINT.search(label) for label in label_texts
+    )
 
 
 def _signature_scope(node: Tag | NavigableString, body: Tag) -> Tag | None:
@@ -279,13 +280,39 @@ def _signature_context(
     return "\n".join(text), has_separator
 
 
-def _footer_unit(node: Tag | NavigableString, footer: Tag) -> Tag | None:
-    for parent in node.parents:
-        if parent is footer:
-            break
-        if parent.parent is footer:
-            return parent if parent.name in _FOOTER_UNITS else None
+def _nearest_container(node: Tag | NavigableString, footer: Tag) -> Tag:
+    if node is not footer:
+        for parent in node.parents:
+            if parent is footer or parent.name in _FOOTER_CONTAINERS:
+                return parent
+    return footer
+
+
+def _non_empty_children(tag: Tag) -> list[Tag | NavigableString]:
+    return [
+        child
+        for child in tag.children
+        if (isinstance(child, Tag) and child.name != "br")
+        or (isinstance(child, NavigableString) and not isinstance(child, Comment) and child.strip())
+    ]
+
+
+def _direct_child_containing(parent: Tag, node: Tag) -> Tag | None:
+    child = node
+    while child.parent is not None:
+        if child.parent is parent:
+            return child
+        child = child.parent
     return None
+
+
+def _has_text(slot: Tag | NavigableString) -> bool:
+    if isinstance(slot, NavigableString):
+        return not isinstance(slot, Comment) and bool(slot.strip())
+    return any(
+        isinstance(node, NavigableString) and not isinstance(node, Comment) and node.strip()
+        for node in slot.descendants
+    )
 
 
 def _ends_footer_context(marker: _HtmlMarker, footer: Tag, body_scope: Tag) -> bool:
@@ -294,53 +321,71 @@ def _ends_footer_context(marker: _HtmlMarker, footer: Tag, body_scope: Tag) -> b
     return other_landmark or (isinstance(node, Tag) and node.name == "hr")
 
 
-def _previous_footer_unit_text(
-    markers: list[_HtmlMarker],
-    index: int,
-    win_start: int,
-    body_scope: Tag,
-    footer_tag: Tag,
-    unit: Tag,
-) -> str:
-    prev_unit: Tag | None = None
-    boundary: Tag | NavigableString | None = None
-    texts: list[str] = []
-    for idx in range(index - 1, -1, -1):
-        marker = markers[idx]
-        node, scope = marker
-        if _ends_footer_context(marker, footer_tag, body_scope) or (
-            isinstance(node, NavigableString) and _SIGNATURE_SEPARATOR.search(node)
-        ):
-            boundary = node
-            break
-        marker_unit = _footer_unit(node, footer_tag)
-        if marker_unit is unit:
-            continue
-        if prev_unit is None:
-            if scope is not footer_tag or marker_unit is None:
-                return ""
-            prev_unit = marker_unit
-        elif marker_unit is not prev_unit:
-            break
-        if (
-            idx >= win_start
-            and scope is footer_tag
-            and isinstance(node, NavigableString)
-            and node.find_parent("figure") is None
-        ):
-            texts.append(node)
-
-    if prev_unit is None or not texts:
-        return ""
-    # The whole unit matters here, including figures without text or image markers.
-    nodes = prev_unit.descendants
-    if boundary is not None and _footer_unit(boundary, footer_tag) is prev_unit:
-        for node in nodes:
-            if node is boundary:
+def _minimal_signature_boxes(
+    footer: Tag, text_nodes: list[tuple[int, NavigableString, str]]
+) -> Iterator[tuple[Tag, list[tuple[int, str]]]]:
+    # Beautiful Soup compares tags by markup, so group by node identity.
+    by_container: dict[int, tuple[Tag, list[tuple[int, str]]]] = {}
+    for idx, node, text in text_nodes:
+        for parent in node.parents:
+            if parent is footer or parent.name in _FOOTER_CONTAINERS:
+                by_container.setdefault(id(parent), (parent, []))[1].append((idx, text))
+            if parent is footer:
                 break
-    if any(isinstance(node, Tag) and node.name in {"img", "figure"} for node in nodes):
-        return ""
-    return "\n".join(reversed(texts))
+
+    candidates: dict[int, tuple[Tag, list[tuple[int, str]]]] = {}
+    for box_id, (box, box_texts) in by_container.items():
+        context = "\n".join(text for _, text in box_texts)
+        if _SIGNOFF.search(context) and _SIGNATURE_CONTACT.search(context):
+            candidates[box_id] = (box, box_texts)
+
+    non_minimal: set[int] = set()
+    for box, _ in candidates.values():
+        if box is footer:
+            continue
+        for parent in box.parents:
+            if id(parent) in candidates:
+                non_minimal.add(id(parent))
+                break
+            if parent is footer:
+                break
+
+    for box_id, candidate in candidates.items():
+        if box_id not in non_minimal:
+            yield candidate
+
+
+def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool:
+    parent = box.parent
+    if not isinstance(parent, Tag) or (
+        parent is not footer and not any(ancestor is footer for ancestor in parent.parents)
+    ):
+        return False
+    img_slot = _direct_child_containing(parent, image)
+    if (
+        img_slot is None
+        or img_slot is box
+        or img_slot.name == "figure"
+        or img_slot.find("figure") is not None
+        or _has_text(img_slot)
+        or box.find(["img", "figure"]) is not None
+    ):
+        return False
+
+    siblings = _non_empty_children(parent)
+    pos_b = next(idx for idx, sibling in enumerate(siblings) if sibling is box)
+    pos_img = next(idx for idx, sibling in enumerate(siblings) if sibling is img_slot)
+    if pos_img == pos_b + 1:
+        return True
+    return (
+        pos_img == pos_b - 1
+        and parent is not footer
+        and parent.find("figure") is None
+        and all(
+            img is img_slot or any(ancestor is img_slot for ancestor in img.parents)
+            for img in parent.find_all("img")
+        )
+    )
 
 
 def _footer_signature_context(
@@ -353,63 +398,67 @@ def _footer_signature_context(
             if node.strip() and node.find_parent("figure") is figure
         )
 
-    unit = _footer_unit(image, footer_tag)
-    win_start = max(0, index - _SIGNATURE_TAIL_SIZE)
-    for idx in range(index - 1, win_start - 1, -1):
+    sep_start = 0
+    for idx in range(index - 1, -1, -1):
         marker = markers[idx]
         node, _ = marker
         if _ends_footer_context(marker, footer_tag, body_scope) or (
             isinstance(node, NavigableString) and _SIGNATURE_SEPARATOR.search(node)
         ):
-            win_start = idx + 1
+            sep_start = idx + 1
             break
 
     separator = None
-    for win_end in range(index + 1, len(markers)):
-        marker = markers[win_end]
+    for sep_end in range(index + 1, len(markers)):
+        marker = markers[sep_end]
         if _ends_footer_context(marker, footer_tag, body_scope):
             break
         node, _ = marker
         if isinstance(node, NavigableString) and (separator := _SIGNATURE_SEPARATOR.search(node)):
-            win_end += 1
+            sep_end += 1
             break
     else:
-        win_end = len(markers)
+        sep_end = len(markers)
 
-    unit_texts: list[tuple[int, str]] = []
-    unit_image_indices: list[int] = []
-    for idx in range(win_start, win_end):
+    text_nodes: list[tuple[int, NavigableString, str]] = []
+    images: list[tuple[int, Tag]] = []
+    for idx in range(sep_start, sep_end):
         node, scope = markers[idx]
-        if (
-            scope is not footer_tag
-            or _footer_unit(node, footer_tag) is not unit
-            or node.find_parent("figure") is not None
-        ):
+        if scope is not footer_tag or node.find_parent("figure") is not None:
             continue
         if isinstance(node, NavigableString):
-            text = node[:separator.start()] if separator and idx == win_end - 1 else node
+            text = node[:separator.start()] if separator and idx == sep_end - 1 else node
             if text.strip():
-                unit_texts.append((idx, text))
+                text_nodes.append((idx, node, text))
         elif node.name == "img":
-            unit_image_indices.append(idx)
+            images.append((idx, node))
 
-    if not unit_texts:
-        if unit is None:
-            return ""
-        return _previous_footer_unit_text(markers, index, win_start, body_scope, footer_tag, unit)
+    image_parent_ids = {id(parent) for parent in image.parents}
+    for box, box_texts in _minimal_signature_boxes(footer_tag, text_nodes):
+        if id(box) in image_parent_ids:
+            first_signoff = next((idx for idx, text in box_texts if _SIGNOFF.search(text)), None)
+            if first_signoff is not None and index < first_signoff:
+                has_img_after = any(
+                    idx > first_signoff and any(parent is box for parent in img.parents)
+                    for idx, img in images
+                )
+                pre_text = "\n".join(text for idx, text in box_texts if idx < first_signoff)
+                if (
+                    has_img_after
+                    or _BILL_TAG_WORDS.search(pre_text)
+                    or _BILL_AMOUNT_HINT.search(pre_text)
+                ):
+                    return pre_text
+        elif not _image_in_adjacent_signature_slot(box, image, footer_tag):
+            continue
+        return "\n".join(text for _, text in box_texts)
 
-    unit_signoff_indices = [idx for idx, text in unit_texts if _SIGNOFF.search(text)]
-    if unit_signoff_indices and index < unit_signoff_indices[0]:
-        first_signoff = unit_signoff_indices[0]
-        has_image_after_signoff = any(img_idx > first_signoff for img_idx in unit_image_indices)
-        pre_signoff_text = "\n".join(text for idx, text in unit_texts if idx < first_signoff)
-        if (
-            has_image_after_signoff
-            or _BILL_TAG_WORDS.search(pre_signoff_text)
-            or _BILL_AMOUNT_HINT.search(pre_signoff_text)
-        ):
-            return pre_signoff_text
-    return "\n".join(text for _, text in unit_texts)
+    image_container = _nearest_container(image, footer_tag)
+    return "\n".join(
+        text
+        for _, node, text in text_nodes
+        if _nearest_container(node, footer_tag) is image_container
+    )
 
 
 def _html_text(html: str, email: ParsedEmail) -> str:
