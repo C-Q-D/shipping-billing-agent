@@ -38,11 +38,28 @@ def parse_pdf(
                 page_number = page.page_number
                 text = page.extract_text() or ""
                 sparse_text = sum(not char.isspace() for char in text) < _MIN_TEXT_CHARACTERS
+                extracted_tables = [
+                    grid
+                    for grid in (page.extract_tables() or [])
+                    if any((cell or "").strip() for row in grid for cell in row)
+                ]
+                has_glyph_strokes = bool(page.curves) or (
+                    not extracted_tables
+                    and sum(
+                        1
+                        for obj in (*page.lines, *page.rects)
+                        if (
+                            abs(obj["x1"] - obj["x0"]) > 0.5
+                            and abs(obj["top"] - obj["bottom"]) > 0.5
+                        )
+                        or max(abs(obj["x1"] - obj["x0"]), abs(obj["top"] - obj["bottom"])) <= 25.0
+                    )
+                    >= 12
+                )
                 has_visual_objects = bool(page.images or page.curves or page.rects or page.lines)
                 needs_ocr = sparse_text and (
                     bool(page.images)
-                    or bool(page.curves)
-                    or (len(page.lines) + len(page.rects) >= 8)
+                    or has_glyph_strokes
                     or (not text.strip() and has_visual_objects)
                 )
                 if needs_ocr:
@@ -58,7 +75,7 @@ def parse_pdf(
                         ParsedTable(
                             rows=[[cell or "" for cell in row] for row in grid], source=source
                         )
-                        for grid in page.extract_tables()
+                        for grid in extracted_tables
                     )
                 sections.append(f"{source}\n{text}" if text else source)
                 page.close()

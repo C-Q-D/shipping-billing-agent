@@ -369,6 +369,31 @@ def test_pdf_without_local_ocr_reads_the_complete_short_text_page():
     )
 
 
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+def test_pdf_keeps_the_sparse_electronic_table_page_as_text(local_ocr):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    data = _two_page_pdf(
+        b"BT /F1 12 Tf 24 160 Td (Payment terms: net thirty days.) Tj ET\n",
+        b"24 96 m 24 152 l S\n72 96 m 72 152 l S\n120 96 m 120 152 l S\n"
+        b"168 96 m 168 152 l S\n264 96 m 264 152 l S\n"
+        b"24 96 m 264 96 l S\n24 124 m 264 124 l S\n24 152 m 264 152 l S\n"
+        b"BT /F1 12 Tf 30 134 Td (Fee) Tj ET\n"
+        b"BT /F1 12 Tf 176 106 Td (USD 245.00) Tj ET\n",
+    )
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=local_ocr
+    )
+    (document,) = dispatcher.parse_batch([("electronic.pdf", data)])
+
+    assert document.status is DocumentStatus.PARSED, document.error_message
+    assert document.raw_text.endswith("[Page 2 | Text]\nFee\nUSD 245.00"), document.raw_text
+    assert document.extraction_channel is ExtractionChannel.LOCAL_PDF_TEXT_FALLBACK
+    (table,) = document.tables
+    assert table.source == "[Page 2 | Text]"
+    assert table.rows == [["Fee", "", "", ""], ["", "", "", "USD 245.00"]]
+
+
 def test_pdf_reads_vector_fee_and_page_number_with_real_ocr():
     from shipping_billing_agent.parsers.pdf_parser import parse_pdf
 
@@ -680,6 +705,71 @@ def test_eml_reads_bill_image_in_an_unmarked_footer():
     assert scan.status is DocumentStatus.PARSED, scan.error_message
     assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
     assert "USD 310.42" in scan.raw_text, scan.raw_text
+
+
+def test_eml_keeps_the_body_scan_before_the_next_signature_separator():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    message = _mail("Charges attached")
+    message.add_alternative(
+        '<body><div>Charges attached<hr><img src="cid:scan"></div>'
+        '<hr><div>Best regards<br>ACME<br>Tel: 123456<img src="cid:logo"></div></body>',
+        subtype="html",
+    )
+    with Image.new("RGB", (460, 140), "white") as image, BytesIO() as buffer:
+        font = ImageFont.load_default(size=58)
+        ImageDraw.Draw(image).text((24, 28), "USD 310.42", font=font, fill="black")
+        image.save(buffer, format="PNG")
+        scan_data = buffer.getvalue()
+    html = message.get_payload()[-1]
+    html.add_related(scan_data, maintype="image", subtype="png", cid="<scan>", filename="scan.png")
+    html.add_related(
+        b"synthetic signature logo",
+        maintype="image",
+        subtype="png",
+        cid="<logo>",
+        filename="logo.png",
+    )
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
+    )
+
+    _, _, scan, logo = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert scan.status is DocumentStatus.PARSED, scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "USD 310.42" in scan.raw_text, scan.raw_text
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+
+
+def test_eml_skips_a_logo_in_an_unmarked_footer_with_signoff_and_contact():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    message = _mail("Body")
+    message.add_alternative(
+        '<footer>Best regards<br>ACME<br>Tel: 123456<img src="cid:logo"></footer>', subtype="html"
+    )
+    message.get_payload()[-1].add_related(
+        b"synthetic signature logo",
+        maintype="image",
+        subtype="png",
+        cid="<logo>",
+        filename="logo.png",
+    )
+    local = RecordingLocalOcr()
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=local
+    )
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    assert local.images == []
 
 
 @pytest.mark.parametrize(

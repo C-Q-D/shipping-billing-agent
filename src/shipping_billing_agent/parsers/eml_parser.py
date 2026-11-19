@@ -181,8 +181,8 @@ def _related_root_start(part: _MimePart) -> int | None:
     return first.start
 
 
-def _signature_scope(node: Tag | NavigableString, body: Tag) -> int | None:
-    """Return the content block identity, or None inside an explicit signature."""
+def _signature_scope(node: Tag | NavigableString, body: Tag) -> tuple[int, str] | None:
+    """Return the content block ID and tag name, or None inside an explicit signature."""
     scope = body
     for parent in node.parents:
         if any(
@@ -194,14 +194,14 @@ def _signature_scope(node: Tag | NavigableString, body: Tag) -> int | None:
             break
         if scope is body and parent.name in _CONTENT_LANDMARKS:
             scope = parent
-    return id(scope)
+    return id(scope), scope.name
 
 
 def _signature_context(
-    markers: list[tuple[Tag | NavigableString, int | None]],
+    markers: list[tuple[Tag | NavigableString, tuple[int, str] | None]],
     index: int,
-    scope: int,
-    body_scope: int,
+    scope: tuple[int, str],
+    body_scope: tuple[int, str],
 ) -> tuple[str, bool]:
     start = max(0, index - _SIGNATURE_TAIL_SIZE)
     separator_text = ""
@@ -226,12 +226,31 @@ def _signature_context(
         has_separator = True
         break
 
+    trailing_text = ""
+    for next_index in range(index + 1, len(markers)):
+        node, node_scope = markers[next_index]
+        if node_scope is not None and node_scope not in (scope, body_scope):
+            break
+        if isinstance(node, NavigableString):
+            parts = _SIGNATURE_SEPARATOR.split(node, maxsplit=1)
+            if len(parts) == 1:
+                continue
+            if node_scope == scope:
+                trailing_text = parts[0]
+        elif node.name != "hr":
+            continue
+        break
+    else:
+        next_index = len(markers)
+
     text = [separator_text] if separator_text else []
     text.extend(
         node
-        for node, node_scope in markers[start:]
+        for node, node_scope in markers[start:next_index]
         if node_scope == scope and isinstance(node, NavigableString)
     )
+    if trailing_text:
+        text.append(trailing_text)
     return "\n".join(text), has_separator
 
 
@@ -240,7 +259,7 @@ def _html_text(html: str, email: ParsedEmail) -> str:
     for tag in soup.find_all(["script", "style", "head"]):
         tag.decompose()
     body = soup.body or soup
-    body_scope = id(body)
+    body_scope = (id(body), body.name)
     markers = [
         (node, _signature_scope(node, body))
         for node in soup.descendants
@@ -255,13 +274,14 @@ def _html_text(html: str, email: ParsedEmail) -> str:
         if scope is not None:
             if len(markers) - index > _SIGNATURE_TAIL_SIZE:
                 continue
+            _, scope_name = scope
             context, has_separator = _signature_context(markers, index, scope, body_scope)
             has_contact = _SIGNATURE_CONTACT.search(context) is not None
+            has_signoff = _SIGNOFF.search(context) is not None
             after_signoff = has_separator and has_contact
-            decorative = _DECORATIVE_IMAGE.search(source) and (
-                has_contact or _SIGNOFF.search(context)
-            )
-            if not (after_signoff or decorative):
+            footer_signature = scope_name == "footer" and has_contact and has_signoff
+            decorative = _DECORATIVE_IMAGE.search(source) and (has_contact or has_signoff)
+            if not (after_signoff or footer_signature or decorative):
                 continue
         if source.lower().startswith("cid:"):
             if cid := _content_id(source[4:]):
