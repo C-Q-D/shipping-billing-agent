@@ -491,13 +491,14 @@ def _signature_context(
     boundary, separator_kind, separator_text = _preceding_signature_boundary(
         markers, index, scope, body_scope
     )
-    if boundary < start or markers[boundary][1] is not scope:
-        separator_text = ""
-    if separator_kind == "hr":
+    if separator_kind is not None:
         # A signoff can precede several lines of contact details in the same section.
         start = boundary + 1
+        if markers[boundary][1] is not scope:
+            separator_text = ""
     else:
         start = max(start, boundary + 1)
+        separator_text = ""
 
     trailing_text = ""
     for next_index in range(index + 1, len(markers)):

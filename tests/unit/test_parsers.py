@@ -3170,6 +3170,41 @@ def test_r20_f2_main_insertpic_respects_signoff_requirement(html_body, expected_
     _assert_inline_image_ocr(scan, recognize_image, expected_text=expected_text)
 
 
+@pytest.mark.parametrize("image_cid", ["cid:InsertPic_001", "cid:logo"])
+@pytest.mark.parametrize(
+    "dash_signoff",
+    ["-- \n<p>Best regards</p>", "-- \nBest regards"],
+    ids=["separate-nodes", "same-node"],
+)
+def test_r21_a1_main_dash_long_signoff_skips_insertpic_and_logo(
+    image_cid, dash_signoff, r8_eml_ocr
+):
+    html = (
+        f"<main>{dash_signoff}"
+        "<p>Alex Chen</p>"
+        "<p>Operations Coordinator</p>"
+        "<p>ACME</p>"
+        "<p>Shanghai Branch</p>"
+        "<p>Export Division</p>"
+        "<p>Building A</p>"
+        "<p>Logistics Team</p>"
+        f'<p>Tel: 123456</p><img src="{image_cid}"></main>'
+    )
+    message = _mail("Body")
+    message.add_alternative(html, subtype="html")
+    _add_related_png(
+        message.get_payload()[-1],
+        filename="logo.png",
+        text="ACME",
+        cid=f"<{image_cid.removeprefix('cid:')}>",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    _assert_inline_image_ocr(logo, recognize_image, expected_text=None)
+
+
 @pytest.mark.parametrize(
     "html_body",
     [
