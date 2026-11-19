@@ -103,7 +103,10 @@ CREATE TABLE IF NOT EXISTS source_documents (
     source_kind TEXT NOT NULL CHECK (
         source_kind IN ('EML', 'EML_BODY', 'EML_ATTACHMENT', 'PDF', 'IMAGE', 'EXCEL', 'WORD', 'URL')
     ),
-    content_sha256 TEXT NOT NULL,
+    content_sha256 TEXT CHECK (
+        (source_kind = 'URL' AND content_sha256 IS NULL)
+        OR (content_sha256 IS NOT NULL AND length(trim(content_sha256)) > 0)
+    ),
     stored_path TEXT,
     public_url TEXT,
     extraction_channel TEXT NOT NULL CHECK (

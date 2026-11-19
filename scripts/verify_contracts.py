@@ -213,6 +213,66 @@ def verify_schema_sql() -> None:
         except sqlite3.IntegrityError:
             pass
 
+    # Verify URL source_kind accepts NULL content_sha256 while local PDF rejects NULL content_sha256
+    conn.execute(
+        "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "d-url",
+            "b1",
+            None,
+            "remote_bill.pdf",
+            "remote_bill.pdf",
+            "application/pdf",
+            "URL",
+            None,
+            None,
+            "https://example.com/remote_bill.pdf",
+            "PLTPLT_OCR",
+            "PARSED",
+            None,
+            "raw",
+            "{}",
+            "[]",
+            "{}",
+            None,
+            None,
+            "100.00",
+            "USD",
+            "2026-11-19T00:00:00Z",
+        ),
+    )
+    try:
+        conn.execute(
+            "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "d-bad-pdf",
+                "b1",
+                None,
+                "local.pdf",
+                "local.pdf",
+                "application/pdf",
+                "PDF",
+                None,
+                None,
+                None,
+                "PLTPLT_OCR",
+                "PARSED",
+                None,
+                "raw",
+                "{}",
+                "[]",
+                "{}",
+                None,
+                None,
+                None,
+                None,
+                "2026-11-19T00:00:00Z",
+            ),
+        )
+        raise AssertionError("Expected CHECK rejection for local PDF with NULL content_sha256")
+    except sqlite3.IntegrityError:
+        pass
+
     print("schema.sql PASSED (8 tables, Decimal text storage, retry<=1, baseline_sync_items, eval_runs NULLs)")
 
 
