@@ -4,7 +4,7 @@ mode: tracked
 docs_root: docs/workflow
 current_node: "arch-finalized"
 next_action: "进入 Phase 3：B00 骨架基线验证 + UI 规格与原型设计（ui-prototype / lumno-ui-style）+ 功能切片规划"
-check_cmd: "uv run --python 3.12 --with jsonschema --with iso4217 python scripts/verify_contracts.py"
+check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contracts.py && uv run pytest tests/unit -q && npm --prefix frontend run typecheck"
 ---
 
 # 项目研发工作流总索引

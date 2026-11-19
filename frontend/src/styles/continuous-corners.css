@@ -1,0 +1,45 @@
+/*
+ * Lumno Continuous Corners (Superellipse Progressive Enhancement)
+ *
+ * Keeps standard border-radius values as fallback and upgrades rectangular rounded
+ * corners to continuous curvature (superellipse(1.25)) where supported.
+ *
+ * IMPORTANT:
+ * 1. `--lumno-corner-shape` does NOT inherit (`inherits: false`), so elements nested
+ *    inside a capsule automatically regain `superellipse(1.25)`.
+ * 2. Capsules (`border-radius: 999px`) and circles (`50%`) MUST opt out via
+ *    `--lumno-corner-shape: round` (or `.lumno-pill` / `.rounded-full`), because
+ *    applying superellipse to a half-height radius optically flattens the ends.
+ * 3. Place after any `all: unset` resets, or keep `!important` as below.
+ */
+
+@property --lumno-corner-shape {
+  syntax: "*";
+  inherits: false;
+  initial-value: superellipse(1.25);
+}
+
+@supports (corner-shape: superellipse(1.25)) {
+  :where(*),
+  :where(*::before, *::after) {
+    corner-shape: var(--lumno-corner-shape) !important;
+  }
+
+  :where(
+    .lumno-pill,
+    .lumno-btn,
+    .lumno-toast,
+    .lumno-switch-slider,
+    .lumno-switch-slider::before,
+    .lumno-switch-slider::after,
+    .top-nav,
+    .pill-btn,
+    .pill-btn::before,
+    .pill-btn::after,
+    .rounded-full,
+    [data-corner="round"]
+  ) {
+    --lumno-corner-shape: round;
+    corner-shape: round !important;
+  }
+}

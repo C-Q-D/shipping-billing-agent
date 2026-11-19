@@ -1,0 +1,289 @@
+/*
+ * Lumno Design System — Shared Tokens & Base Rules
+ * Load before component and page stylesheets.
+ * Components read semantic tokens and avoid writing their own dark-mode selectors.
+ */
+
+:root {
+  /* 1. Corner Radius Scale (paired with continuous-corners.css superellipse(1.25)) */
+  --lumno-radius-xs: 4px;
+  --lumno-radius-sm: 6px;
+  --lumno-radius-md: 8px;
+  --lumno-radius-lg: 10px;
+  --lumno-radius-xl: 12px;
+  --lumno-radius-2xl: 14px;
+  --lumno-radius-menu: 16px;
+  --lumno-radius-dialog: 18px;
+  --lumno-radius-panel: 26px;
+  --lumno-radius-card-xl: 28px;
+  --lumno-radius-pill: 999px;
+
+  /* 2. Typography Scale */
+  --lumno-font-sans: "Open Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --lumno-font-serif-lead: "EB Garamond", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --lumno-font-serif-accent: "Cormorant Garamond", "EB Garamond", "Iowan Old Style", Georgia, serif;
+  --lumno-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, monospace;
+
+  --lumno-font-size-2xs: 10px;
+  --lumno-font-size-xs: 11px;
+  --lumno-font-size-sm: 12px;
+  --lumno-font-size-md: 13px;
+  --lumno-font-size-lg: 14px;
+  --lumno-font-size-xl: 16px;
+
+  /* 3. Motion & Easing Scale */
+  --lumno-duration-2xs: 120ms; /* Press feedback */
+  --lumno-duration-xs: 140ms;
+  --lumno-duration-sm: 160ms;  /* Color, border, opacity */
+  --lumno-duration-md: 180ms;
+  --lumno-duration-lg: 200ms;
+  --lumno-duration-xl: 220ms;
+  --lumno-duration-2xl: 240ms; /* Delayed spinner / toast threshold */
+  --lumno-duration-3xl: 280ms; /* Sliding indicators & switches */
+
+  --lumno-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --lumno-ease-snappy: cubic-bezier(0.16, 1, 0.3, 1);
+  --lumno-ease-emphasized: cubic-bezier(0.2, 0.9, 0.2, 1);
+  --lumno-ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --lumno-ease-overshoot: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --lumno-ease-menu: cubic-bezier(0.2, 1.45, 0.35, 1);
+
+  --lumno-slide: var(--lumno-duration-3xl) var(--lumno-ease-spring);
+  --lumno-accordion-open: 50ms cubic-bezier(0.41, 0.1, 0.67, 0.52);
+  --lumno-accordion-close: 135ms cubic-bezier(0.2, 0.55, 0.5, 1) 85ms;
+
+  /* 4. Z-Index Stacking Scale */
+  --lumno-z-raised: 1;
+  --lumno-z-overlay: 2;
+  --lumno-z-sticky: 30;
+  --lumno-z-modal: 9998;
+  --lumno-z-topbar: 10000;
+  --lumno-z-dropdown: 10000;
+  --lumno-z-tooltip: 10000;
+  --lumno-z-drag-lift: 10001;
+  --lumno-z-menu: 10002;
+  --lumno-z-context-menu: 10040;
+  --lumno-z-dialog: 10040;
+  --lumno-z-dialog-menu: 10060;
+  --lumno-z-toast: 10080;
+  --lumno-z-drag-ghost: 2147483645;
+  --lumno-z-max: 2147483647;
+
+  /* 5. Semantic Colors — Light Mode */
+  --lumno-color-page-bg: #f1f5f9;
+  --lumno-color-surface: #ffffff;
+  --lumno-color-surface-border: rgba(0, 0, 0, 0.12);
+  --lumno-color-text: #111827;
+  --lumno-color-text-muted: #6b7280;
+  --lumno-color-border: rgba(15, 23, 42, 0.08);
+  --lumno-color-divider: rgba(15, 23, 42, 0.12);
+
+  /* Interactive Control Fills (Subtle gray fill, NOT white-with-gray-border) */
+  --lumno-color-control-bg: rgba(15, 23, 42, 0.04);
+  --lumno-color-control-border: rgba(15, 23, 42, 0.05);
+  --lumno-color-control-hover: rgba(0, 0, 0, 0.05);
+  --lumno-color-fill-subtle: rgba(15, 23, 42, 0.1);
+  --lumno-color-fill-subtle-hover: rgba(15, 23, 42, 0.15);
+  --lumno-color-hover: rgba(15, 23, 42, 0.08);
+
+  /* Inverted Selection & Focus */
+  --lumno-color-selected: #111827;
+  --lumno-color-selected-text: #f9fafb;
+  --lumno-color-selection-outline: #6b7280;
+  --lumno-color-focus-ring: rgba(59, 130, 246, 0.65);
+  --lumno-color-input-focus-bg: rgba(59, 130, 246, 0.08);
+  --lumno-color-accent-rgb: 37 99 235;
+
+  /* Switch Brand Blue & Slate Pebble Primary */
+  --lumno-color-accent: linear-gradient(180deg, #4d7dcb 0%, #3462ad 100%);
+  --lumno-color-primary: linear-gradient(180deg, #404859 0%, #273042 100%);
+  --lumno-color-primary-hover: linear-gradient(180deg, #4a5467 0%, #2f3a4f 100%);
+  --lumno-color-primary-border: #12161f;
+  --lumno-color-on-primary: #ffffff;
+  --lumno-color-knob: #ffffff;
+
+  /* Shared Paper Floating Surface (Tooltip, Toast, Feature Hint) */
+  --lumno-color-toast-bg-top: #ffffff;
+  --lumno-color-toast-bg-bottom: #f7f9fc;
+  --lumno-color-toast-border: rgba(214, 219, 227, 0.95);
+  --lumno-color-toast-text: #1f2937;
+  --lumno-color-toast-error-bg: #991b1b;
+  --lumno-color-toast-error-border: rgba(255, 255, 255, 0.16);
+  --lumno-color-toast-error-text: #ffffff;
+
+  /* 6. Elevation & Micro-Tactile Shadows */
+  --lumno-shadow-panel: 0 1px 3px rgba(15, 23, 42, 0.08);
+  --lumno-shadow-control: 0 1px 3px rgba(15, 23, 42, 0.12);
+  --lumno-shadow-menu: 0 10px 24px rgba(15, 23, 42, 0.12);
+  --lumno-shadow-popover: 0 14px 36px rgba(15, 23, 42, 0.15);
+  --lumno-shadow-toast: 0 16px 36px rgba(17, 24, 39, 0.08), 0 3px 10px rgba(17, 24, 39, 0.05);
+
+  --lumno-shadow-knob:
+    0 0 0 0.5px rgba(15, 23, 42, 0.06),
+    0 1px 1px rgba(15, 23, 42, 0.06),
+    0 2px 5px rgba(15, 23, 42, 0.14);
+  --lumno-shadow-track-inset:
+    inset 0 0 0 0.5px rgba(15, 23, 42, 0.06),
+    inset 0 1px 2px rgba(15, 23, 42, 0.08);
+  --lumno-shadow-track-on: inset 0 1px 2px rgba(12, 32, 72, 0.3);
+
+  --lumno-shadow-primary:
+    0 1px 2px rgba(15, 23, 42, 0.18),
+    0 3px 6px -2px rgba(15, 23, 42, 0.24);
+  --lumno-shadow-primary-hover:
+    0 2px 3px rgba(15, 23, 42, 0.2),
+    0 6px 12px -4px rgba(15, 23, 42, 0.3);
+  --lumno-shadow-primary-pressed: 0 1px 1px rgba(15, 23, 42, 0.14);
+  --lumno-shadow-primary-sheen:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 1px 3px rgba(255, 255, 255, 0.1),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.22);
+  --lumno-shadow-primary-sheen-pressed: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+/* Dark Theme Overrides */
+body[data-theme="dark"],
+body[data-glass-style] [data-glass-ink-theme="dark"] {
+  --lumno-color-page-bg: #111111;
+  --lumno-color-surface: rgb(25, 25, 25);
+  --lumno-color-surface-border: rgba(255, 255, 255, 0.1);
+  --lumno-color-text: #e5e7eb;
+  --lumno-color-text-muted: #9ca3af;
+  --lumno-color-border: rgba(255, 255, 255, 0.12);
+  --lumno-color-divider: rgba(255, 255, 255, 0.14);
+
+  --lumno-color-control-bg: #2f2f2f;
+  --lumno-color-control-border: rgba(255, 255, 255, 0.12);
+  --lumno-color-control-hover: #363636;
+  --lumno-color-fill-subtle: rgba(255, 255, 255, 0.14);
+  --lumno-color-fill-subtle-hover: rgba(255, 255, 255, 0.2);
+  --lumno-color-hover: rgba(255, 255, 255, 0.09);
+
+  --lumno-color-selected: #3f3f3f;
+  --lumno-color-selected-text: #f8fafc;
+  --lumno-color-selection-outline: #9ca3af;
+  --lumno-color-focus-ring: rgba(191, 219, 254, 0.7);
+  --lumno-color-input-focus-bg: #383838;
+
+  --lumno-color-accent: linear-gradient(180deg, #5f8ad4 0%, #4470ba 100%);
+  --lumno-color-primary: linear-gradient(180deg, #4a566c 0%, #334157 100%);
+  --lumno-color-primary-hover: linear-gradient(180deg, #56647c 0%, #3a4b66 100%);
+  --lumno-color-primary-border: #0b0e14;
+  --lumno-color-on-primary: #f8fafc;
+  --lumno-color-knob: #f4f4f4;
+
+  --lumno-color-toast-bg-top: #111827;
+  --lumno-color-toast-bg-bottom: #0f172a;
+  --lumno-color-toast-border: rgba(255, 255, 255, 0.2);
+  --lumno-color-toast-text: #f8fafc;
+
+  --lumno-shadow-panel: 0 1px 4px rgba(0, 0, 0, 0.45);
+  --lumno-shadow-toast: 0 14px 30px rgba(0, 0, 0, 0.45);
+  --lumno-shadow-knob:
+    0 0 0 0.5px rgba(0, 0, 0, 0.2),
+    0 1px 1px rgba(0, 0, 0, 0.2),
+    0 2px 5px rgba(0, 0, 0, 0.32);
+  --lumno-shadow-track-inset:
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.04),
+    inset 0 1px 2px rgba(0, 0, 0, 0.24);
+  --lumno-shadow-track-on: inset 0 1px 2px rgba(0, 0, 0, 0.32);
+  --lumno-shadow-primary:
+    0 1px 2px rgba(0, 0, 0, 0.32),
+    0 3px 6px -2px rgba(0, 0, 0, 0.4);
+  --lumno-shadow-primary-hover:
+    0 2px 3px rgba(0, 0, 0, 0.34),
+    0 6px 12px -4px rgba(0, 0, 0, 0.46);
+  --lumno-shadow-primary-pressed: 0 1px 1px rgba(0, 0, 0, 0.28);
+  --lumno-shadow-primary-sheen:
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    inset 0 1px 3px rgba(255, 255, 255, 0.08),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.2);
+  --lumno-shadow-primary-sheen-pressed: inset 0 1px 2px rgba(0, 0, 0, 0.42);
+}
+
+@media (prefers-color-scheme: dark) {
+  body:not([data-theme]) {
+    --lumno-color-page-bg: #111111;
+    --lumno-color-surface: rgb(25, 25, 25);
+    --lumno-color-surface-border: rgba(255, 255, 255, 0.1);
+    --lumno-color-text: #e5e7eb;
+    --lumno-color-text-muted: #9ca3af;
+    --lumno-color-border: rgba(255, 255, 255, 0.12);
+    --lumno-color-divider: rgba(255, 255, 255, 0.14);
+    --lumno-color-control-bg: #2f2f2f;
+    --lumno-color-control-border: rgba(255, 255, 255, 0.12);
+    --lumno-color-control-hover: #363636;
+    --lumno-color-fill-subtle: rgba(255, 255, 255, 0.14);
+    --lumno-color-fill-subtle-hover: rgba(255, 255, 255, 0.2);
+    --lumno-color-hover: rgba(255, 255, 255, 0.09);
+    --lumno-color-selected: #3f3f3f;
+    --lumno-color-selected-text: #f8fafc;
+    --lumno-color-selection-outline: #9ca3af;
+    --lumno-color-focus-ring: rgba(191, 219, 254, 0.7);
+    --lumno-color-input-focus-bg: #383838;
+    --lumno-color-accent: linear-gradient(180deg, #5f8ad4 0%, #4470ba 100%);
+    --lumno-color-primary: linear-gradient(180deg, #4a566c 0%, #334157 100%);
+    --lumno-color-primary-hover: linear-gradient(180deg, #56647c 0%, #3a4b66 100%);
+    --lumno-color-primary-border: #0b0e14;
+    --lumno-color-on-primary: #f8fafc;
+    --lumno-color-knob: #f4f4f4;
+    --lumno-color-toast-bg-top: #111827;
+    --lumno-color-toast-bg-bottom: #0f172a;
+    --lumno-color-toast-border: rgba(255, 255, 255, 0.2);
+    --lumno-color-toast-text: #f8fafc;
+    --lumno-shadow-panel: 0 1px 4px rgba(0, 0, 0, 0.45);
+    --lumno-shadow-toast: 0 14px 30px rgba(0, 0, 0, 0.45);
+    --lumno-shadow-knob:
+      0 0 0 0.5px rgba(0, 0, 0, 0.2),
+      0 1px 1px rgba(0, 0, 0, 0.2),
+      0 2px 5px rgba(0, 0, 0, 0.32);
+    --lumno-shadow-track-inset:
+      inset 0 0 0 0.5px rgba(255, 255, 255, 0.04),
+      inset 0 1px 2px rgba(0, 0, 0, 0.24);
+    --lumno-shadow-track-on: inset 0 1px 2px rgba(0, 0, 0, 0.32);
+    --lumno-shadow-primary:
+      0 1px 2px rgba(0, 0, 0, 0.32),
+      0 3px 6px -2px rgba(0, 0, 0, 0.4);
+    --lumno-shadow-primary-hover:
+      0 2px 3px rgba(0, 0, 0, 0.34),
+      0 6px 12px -4px rgba(0, 0, 0, 0.46);
+    --lumno-shadow-primary-pressed: 0 1px 1px rgba(0, 0, 0, 0.28);
+    --lumno-shadow-primary-sheen:
+      inset 0 1px 0 rgba(255, 255, 255, 0.16),
+      inset 0 1px 3px rgba(255, 255, 255, 0.08),
+      inset 0 -1px 0 rgba(0, 0, 0, 0.2);
+    --lumno-shadow-primary-sheen-pressed: inset 0 1px 2px rgba(0, 0, 0, 0.42);
+  }
+}
+
+/* Unified Keyboard Focus Ring (excludes text fields whose outer shells draw focus) */
+:where(
+  button,
+  a[href],
+  summary,
+  [role="button"],
+  [role="link"],
+  [role="tab"],
+  [role="switch"],
+  [role="menuitem"],
+  [role="menuitemradio"],
+  [role="menuitemcheckbox"],
+  [role="option"],
+  [tabindex]:not([tabindex="-1"])
+):not(input, textarea, select):focus-visible {
+  outline: 2px solid var(--lumno-color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* Dual-Channel Reduced Motion: 0s transitions for layout reads, 0.01ms animations so animationend fires */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0s !important;
+    transition-delay: 0s !important;
+    scroll-behavior: auto !important;
+  }
+}
