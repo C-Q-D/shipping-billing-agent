@@ -3206,6 +3206,80 @@ def test_r21_a1_main_dash_long_signoff_skips_insertpic_and_logo(
 
 
 @pytest.mark.parametrize(
+    ("html_body", "image_name"),
+    [
+        pytest.param(
+            "<main><p>The carrier regards this shipment as urgent.</p><p>Tel: 123456</p>"
+            '<img src="cid:InsertPic_001">-- \n<p>Sender information</p></main>',
+            "InsertPic_001",
+            id="regards-before-dash",
+        ),
+        pytest.param(
+            "<footer><p>As regards the booking, see below:</p><p>Tel: 123456</p>"
+            '<img src="cid:quote_001"><hr><p>Sender information</p></footer>',
+            "quote_001",
+            id="as-regards-before-hr",
+        ),
+        pytest.param(
+            "<footer><p>We sincerely apologize for the surcharge adjustment.</p>"
+            '<p>Tel: 123456</p><img src="cid:quote_001"></footer>',
+            "quote_001",
+            id="sincerely-in-footer",
+        ),
+        pytest.param(
+            '<main><hr><p>As regards the booking, see below:</p><p>Tel: 123456</p>'
+            '<img src="cid:quote_001">'
+            + "<p>Shipment update</p>" * 8
+            + '</main><div class="signature"><img src="cid:quote_001"></div>',
+            "quote_001",
+            id="as-regards-outside-tail",
+        ),
+    ],
+)
+def test_r22_f1_eml_reads_quotes_near_body_prose(html_body, image_name, r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(html_body, image_name=image_name, text=amount)
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, quote = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert quote.sanitized_filename == f"{image_name}.png"
+    _assert_inline_image_ocr(quote, recognize_image, expected_text=amount)
+
+
+@pytest.mark.parametrize(
+    "signoff",
+    [
+        pytest.param("Best regards,", id="best-regards"),
+        pytest.param("Thank you, Warm regards,", id="warm-regards-after-comma"),
+        pytest.param("Thank you; Kind regards!", id="kind-regards-after-semicolon"),
+        pytest.param("Thank you — With best regards,", id="with-best-regards-after-dash"),
+        pytest.param("Thanks &amp; regards,", id="thanks-and-regards"),
+        pytest.param("Regards,", id="bare-regards"),
+        pytest.param("Sincerely,", id="bare-sincerely"),
+        pytest.param("Yours sincerely,", id="yours-sincerely"),
+        pytest.param("Sincerely yours", id="sincerely-yours"),
+        pytest.param("-- Best regards", id="double-dash"),
+        pytest.param("Best <span>regards</span>", id="split-span"),
+        pytest.param("此致", id="cizhi"),
+        pytest.param("敬上", id="jingshang"),
+        pytest.param("敬礼", id="jingli"),
+    ],
+)
+def test_r22_f1_eml_still_skips_logos_after_true_signoffs(signoff, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        f'<footer><div>{signoff}<br>ACME<br>Tel: 123456<img src="cid:sig_logo"></div></footer>',
+        image_name="sig_logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(logo, recognize_image, expected_text=None)
+
+
+@pytest.mark.parametrize(
     "html_body",
     [
         pytest.param(

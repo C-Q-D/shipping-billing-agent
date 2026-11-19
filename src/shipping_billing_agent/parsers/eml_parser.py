@@ -57,7 +57,15 @@ _CSS_IMPORTANT = re.compile(r"\s*!\s*important$")
 _SIGNATURE_BLOCK = re.compile(r"signature|foxmail", re.I)
 _SIGNATURE_SEPARATOR = re.compile(r"^[ \t]*--[ \t]+\r?$", re.MULTILINE)
 _SIGNATURE_CONTACT = re.compile(r"\b(?:tl|tel|web|email|fax)\s*[:：]", re.I)
-_SIGNOFF = re.compile(r"\b(?:regards|sincerely)\b|此致|敬上|敬礼", re.I)
+_SIGNOFF = re.compile(
+    r"(?:^[ \t]*|[ \t]*[-–—,;][ \t]*)"
+    r"(?:(?:(?:best|warm|kind|many|all|with(?:\s+(?:best|warm|kind))?"
+    r"|thanks(?:\s+(?:and|&))?)\s+regards"
+    r"|yours\s+sincerely|sincerely\s+yours)\b"
+    r"|(?:regards|sincerely)\b(?=[ \t]*(?:[,!.:;，！。：]|\r?$)))"
+    r"|此致|敬上|敬礼",
+    re.I | re.M,
+)
 _DECORATIVE_IMAGE = re.compile(r"_foxmail\.|insertpic_", re.I)
 _LOGO_CAPTION = re.compile(r"\blogo\b|徽标|徽標", re.I)
 _SIGNATURE_TAIL_SIZE = 8
