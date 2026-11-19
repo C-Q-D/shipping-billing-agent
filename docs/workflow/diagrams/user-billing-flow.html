@@ -1,0 +1,314 @@
+<!--
+模板：流程图·有泳道（diagram-templates，2026-11-08 用户定稿）
+用在：一件事分几步、每一步由谁做、在哪里并行或回流。
+固定部分：
+- 泳道竖排等宽，泳道名 15px 粗体居中、用泳道色；每条泳道一种分类色，最多 4 种。
+- 节点 192 宽的灯管卡片：左上编号圆 Ø24（g.badge，数字 14px 粗体），标题 15px 粗体，说明 13px、行距 20；高度 70 起，每多一行说明加 20。
+- 导线 2.5px，箭头是画出来的三角形（不用 marker）；一步分给多方同时做时用一根横的分叉条；回流用橙色虚线，走最外侧通道，不穿节点。
+- 箭头标签是胶囊，压在线段中间，13px 粗体，写清这条线的含义（例："不通过，先改：回 2 或 3"）。
+- 彗星颜色 = 下一步由谁做；图例放在图底部一行。
+内容怎么增减：
+- 泳道 1～4 条。3 条时各 231px、节点 192px：标题不超过 9 个汉字，说明每行不超过 10 个汉字、最多 5 行，再长就挪进回复正文。4 条时泳道 172px、节点 148px：标题不超过 6 个汉字，说明每行不超过 7 个汉字。1 条时节点仍是 192px。
+- 步骤超过 12 步拆成两张图。
+
+通用约定（6 个模板相同）：
+- 风格：C2 通电点亮。节点是霓虹灯管卡片：底框 + 熄灭时的暗描边 + 点亮层（彩色粗管 .tg + 白芯 .tc）。
+- 颜色变量都以 --dg- 开头。文字色、次要文字色、卡片底色、分隔线对到宿主的主题变量（--foreground、--muted-foreground、--card、--border），宿主没有这些变量时用逗号后面的固定值；分类色（青、绿、品红、琥珀，回流用橙）是模板自己的两套取值。深浅两套按 prefers-color-scheme 切换：浅色是默认，深色写在 <style> 末尾的 @media 里。
+- 动画：一轮 12 秒（时序图 14 秒），每档 5%。第 k 档的元素用类 igK 闪亮，导线用 dwK 画出（长度类 lNNN 等于路径长度），彗星用 tK 出发；88% 起全部熄灭再循环。系统设了"减少动态"时整张静止全亮。增删步骤时同步改这三种类。
+- 一个页面只放一张图：各模板的类名、动画名相同但取值不同，两张不同模板的图放进同一页会互相覆盖。
+- 要换的内容在 <!-- 内容 --> 和 <!-- 内容结束 --> 之间，其余是固定部分。放不下就删字或换行，不缩字号。
+-->
+<meta charset="utf-8">
+<style>
+.dg{font-family:var(--font-sans,"Paper Mono","JetBrains Mono","Cascadia Mono",Consolas,ui-monospace,"Microsoft YaHei","PingFang SC",monospace)}
+.dg{--dg-text:var(--foreground,#0f172a);--dg-text2:var(--muted-foreground,#475569);--dg-card2:var(--card,#ffffff);--dg-off:#d5dae1;--dg-loop:#c2410c;--dg-loop-g:rgba(194,65,12,.35);--dg-loopd:#f3d9ca;--dg-num:#ffffff;--dg-glass:#334155;--dg-g1:rgba(51,65,85,.28);--dg-g2:rgba(51,65,85,.12);--dg-sig:#334155;--dg-rule:var(--border,#e2e8f0);--dg-card-sh:drop-shadow(0 1px 2px rgba(15,23,42,.07))}
+.dg .ln-a{--dg-k:#0e7490;--dg-kg:rgba(14,116,144,.35);--dg-ks:rgba(14,116,144,.22);--dg-kc:#ffffff}
+.dg .ln-b{--dg-k:#4d7c0f;--dg-kg:rgba(77,124,15,.32);--dg-ks:rgba(77,124,15,.22);--dg-kc:#ffffff}
+.dg .ln-c{--dg-k:#a21caf;--dg-kg:rgba(162,28,175,.32);--dg-ks:rgba(162,28,175,.22);--dg-kc:#ffffff}
+.dg .ln-d{--dg-k:#b45309;--dg-kg:rgba(180,83,9,.32);--dg-ks:rgba(180,83,9,.22);--dg-kc:#ffffff}
+.dg .ln-o{--dg-k:#c2410c;--dg-kg:rgba(194,65,12,.35);--dg-ks:rgba(194,65,12,.22);--dg-kc:#ffffff}
+.dg .ln-n{--dg-k:#334155;--dg-kg:rgba(51,65,85,.25);--dg-ks:rgba(51,65,85,.16);--dg-kc:#ffffff}
+.dg .sa0{stop-color:#0e7490;stop-opacity:.14}
+.dg .sa5{stop-color:#0e7490;stop-opacity:.05}
+.dg .sa1{stop-color:#0e7490;stop-opacity:0}
+.dg .sb0{stop-color:#4d7c0f;stop-opacity:.13}
+.dg .sb5{stop-color:#4d7c0f;stop-opacity:.045}
+.dg .sb1{stop-color:#4d7c0f;stop-opacity:0}
+.dg .sc0{stop-color:#a21caf;stop-opacity:.12}
+.dg .sc5{stop-color:#a21caf;stop-opacity:.04}
+.dg .sc1{stop-color:#a21caf;stop-opacity:0}
+.dg .ln-a .sp{fill:url(#sp-a)}
+.dg .ln-b .sp{fill:url(#sp-b)}
+.dg .ln-c .sp{fill:url(#sp-c)}
+.dg svg{display:block;overflow:visible}
+.lane{fill:none;stroke:var(--dg-ks);stroke-width:1}
+.lane-h{font-size:15px;font-weight:700;text-anchor:middle;dominant-baseline:central}
+.dg .lane-h{fill:var(--dg-k);filter:drop-shadow(0 0 6px var(--dg-kg))}
+.card{fill:var(--dg-card2);filter:var(--dg-card-sh)}
+.dim{fill:none;stroke:var(--dg-off);stroke-width:1.5}
+.tg{fill:none;stroke:var(--dg-k);stroke-width:3.5}
+.dg .tg{filter:drop-shadow(0 0 6px var(--dg-kg)) drop-shadow(0 2px 6px var(--dg-kg))}
+.tc{fill:none;stroke:var(--dg-kc);stroke-width:1.25}
+.dg .tc{stroke-width:1;stroke-opacity:.9}
+.halo{fill:none;stroke:var(--dg-k);stroke-width:1.5;filter:drop-shadow(0 0 6px var(--dg-kg));animation:halo 2.4s ease-in-out infinite}
+.nc{fill:var(--dg-k);filter:drop-shadow(0 0 5px var(--dg-kg))}
+.nn{fill:var(--dg-num);font-size:14px;font-weight:700;text-anchor:middle;dominant-baseline:central}
+.tt{fill:var(--dg-text);font-size:15px;font-weight:600;dominant-baseline:central}
+.td{fill:var(--dg-text2);font-size:13px;dominant-baseline:central}
+.w{fill:none;stroke:var(--dg-off);stroke-width:2.5;stroke-linejoin:round}
+.ahd,.bard,.dotd{fill:var(--dg-off)}
+.loopd{fill:none;stroke:var(--dg-loopd);stroke-width:2.5;stroke-dasharray:8 6}
+.wl{fill:none;stroke:var(--dg-glass);stroke-width:2.5;stroke-linejoin:round;stroke-dasharray:calc(var(--dg-len) * 1px) calc(var(--dg-len) * 1px);opacity:0;filter:drop-shadow(0 0 3px var(--dg-g1)) drop-shadow(0 0 10px var(--dg-g2));animation-duration:12s;animation-timing-function:linear;animation-iteration-count:infinite}
+.ahl,.lga{fill:var(--dg-glass);filter:drop-shadow(0 0 3px var(--dg-g1))}
+.ahl-o{fill:var(--dg-loop);filter:drop-shadow(0 0 4px var(--dg-loop-g))}
+.barl,.dotl{fill:var(--dg-glass);filter:drop-shadow(0 0 4px var(--dg-g1)) drop-shadow(0 0 10px var(--dg-g2))}
+.loop{fill:none;stroke:var(--dg-loop);stroke-width:2.5;stroke-dasharray:8 6;filter:drop-shadow(0 0 3px var(--dg-loop-g)) drop-shadow(0 0 8px var(--dg-loop-g));animation:march 1.1s linear infinite}
+.lgw{fill:none;stroke:var(--dg-glass);stroke-width:2.5;stroke-linejoin:round;filter:drop-shadow(0 0 3px var(--dg-g1))}
+.chip-b{fill:var(--dg-card2);stroke:var(--dg-off);stroke-width:1.5}
+.chip-l{fill:none;stroke:var(--dg-k);stroke-width:1.5;filter:drop-shadow(0 0 4px var(--dg-kg)) drop-shadow(0 0 8px var(--dg-kg))}
+.lbl{fill:var(--dg-k);font-size:13px;font-weight:700;text-anchor:middle;dominant-baseline:central}
+.lg{fill:var(--dg-text2);font-size:13px;dominant-baseline:central}
+.lg-em{fill:var(--dg-card2);stroke:var(--dg-glass);stroke-width:1.5;filter:drop-shadow(0 0 5px var(--dg-g1))}
+.lg-sig{fill:var(--dg-sig);filter:drop-shadow(0 0 5px var(--dg-g1))}
+.lit{opacity:0;animation-duration:12s;animation-timing-function:linear;animation-iteration-count:infinite}
+.ig0{animation-name:ig0}
+.ig1{animation-name:ig1}
+.ig2{animation-name:ig2}
+.ig3{animation-name:ig3}
+.ig4{animation-name:ig4}
+.ig5{animation-name:ig5}
+.ig6{animation-name:ig6}
+.ig8{animation-name:ig8}
+.ig9{animation-name:ig9}
+.ig10{animation-name:ig10}
+.ig11{animation-name:ig11}
+.dw0{animation-name:dw0}
+.dw1{animation-name:dw1}
+.dw2{animation-name:dw2}
+.dw3{animation-name:dw3}
+.dw4{animation-name:dw4}
+.dw8{animation-name:dw8}
+.dw9{animation-name:dw9}
+.dw10{animation-name:dw10}
+@keyframes ig0{0%{opacity:0}0.5%{opacity:1}1%{opacity:.3}1.6%{opacity:1}2.2%{opacity:.55}2.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig1{0%,5%{opacity:0}5.5%{opacity:1}6%{opacity:.3}6.6%{opacity:1}7.2%{opacity:.55}7.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig2{0%,10%{opacity:0}10.5%{opacity:1}11%{opacity:.3}11.6%{opacity:1}12.2%{opacity:.55}12.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig3{0%,15%{opacity:0}15.5%{opacity:1}16%{opacity:.3}16.6%{opacity:1}17.2%{opacity:.55}17.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig4{0%,20%{opacity:0}20.5%{opacity:1}21%{opacity:.3}21.6%{opacity:1}22.2%{opacity:.55}22.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig5{0%,25%{opacity:0}25.5%{opacity:1}26%{opacity:.3}26.6%{opacity:1}27.2%{opacity:.55}27.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig6{0%,30%{opacity:0}30.5%{opacity:1}31%{opacity:.3}31.6%{opacity:1}32.2%{opacity:.55}32.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig8{0%,40%{opacity:0}40.5%{opacity:1}41%{opacity:.3}41.6%{opacity:1}42.2%{opacity:.55}42.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig9{0%,45%{opacity:0}45.5%{opacity:1}46%{opacity:.3}46.6%{opacity:1}47.2%{opacity:.55}47.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig10{0%,50%{opacity:0}50.5%{opacity:1}51%{opacity:.3}51.6%{opacity:1}52.2%{opacity:.55}52.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig11{0%,55%{opacity:0}55.5%{opacity:1}56%{opacity:.3}56.6%{opacity:1}57.2%{opacity:.55}57.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes dw0{0%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}5%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw1{0%,5%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}10%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw2{0%,10%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}15%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw3{0%,15%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}20%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw4{0%,20%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}25%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw8{0%,40%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}45%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw9{0%,45%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}50%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw10{0%,50%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}55%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+.fx{fill:none;stroke-width:3.5;stroke-linecap:round;stroke-dasharray:16px 3000px;opacity:0;animation:run 12s linear infinite}
+.dg .fx{stroke:var(--dg-k);filter:drop-shadow(0 0 4px var(--dg-kg)) drop-shadow(0 0 8px var(--dg-kg))}
+.fxt{fill:none;stroke:var(--dg-k);stroke-width:4;stroke-linecap:round;stroke-dasharray:70px 3000px;opacity:0;animation:runt 12s linear infinite}
+.ring{fill:none;stroke:var(--dg-k);stroke-width:3;opacity:0;filter:drop-shadow(0 0 10px var(--dg-kg));animation:ring 12s ease-out infinite}
+.l16{--dg-len:16}
+.l26{--dg-len:26}
+.l36{--dg-len:36}
+.l44{--dg-len:44}
+.l218{--dg-len:218}
+.l279{--dg-len:279}
+.l284{--dg-len:284}
+.l448{--dg-len:448}
+.l460{--dg-len:460}
+.l514{--dg-len:514}
+.l618{--dg-len:618}
+.l653{--dg-len:653}
+.t0{animation-delay:0s}
+.t1{animation-delay:.6s}
+.t2{animation-delay:1.2s}
+.t3{animation-delay:1.8s}
+.t4{animation-delay:2.4s}
+.t5{animation-delay:3s}
+.t6{animation-delay:3.6s}
+.t7{animation-delay:4.2s}
+.t8{animation-delay:4.8s}
+.t9{animation-delay:5.4s}
+.t10{animation-delay:6s}
+.t11{animation-delay:6.6s}
+@keyframes run{0%{opacity:1;stroke-dashoffset:16px}4.2%{opacity:1}5%,100%{opacity:0;stroke-dashoffset:calc(16px - var(--dg-len) * 1px)}}
+@keyframes runt{0%{opacity:.5;stroke-dashoffset:70px}4.2%{opacity:.5}5%,100%{opacity:0;stroke-dashoffset:calc(70px - var(--dg-len) * 1px)}}
+@keyframes ring{0%{opacity:0}1%{opacity:1}7%{opacity:0}100%{opacity:0}}
+@keyframes march{to{stroke-dashoffset:-28px}}
+@keyframes halo{0%,100%{opacity:.3}50%{opacity:.95}}
+@media (prefers-reduced-motion: reduce){.lit{animation:none;opacity:1}.wl{animation:none;stroke-dasharray:none;opacity:1}.fx,.fxt,.ring{display:none}.loop{animation:none}.halo{animation:none;opacity:.7}}
+.dg svg{max-width:100%;height:auto}
+@media (prefers-color-scheme: dark){
+.dg{--dg-text:var(--foreground,#f1f5f9);--dg-text2:var(--muted-foreground,#93a1ad);--dg-card2:var(--card,#07090c);--dg-off:#353d48;--dg-loop:#fb923c;--dg-loop-g:rgba(251,146,60,.55);--dg-loopd:#4a3324;--dg-num:#04131a;--dg-glass:#e6eef3;--dg-g1:rgba(230,238,243,.7);--dg-g2:rgba(201,214,223,.35);--dg-sig:#ffffff;--dg-rule:var(--border,#232831);--dg-card-sh:none}
+.dg .ln-a{--dg-k:#22d3ee;--dg-kg:rgba(34,211,238,.55);--dg-ks:rgba(34,211,238,.16);--dg-kc:#cffafe}
+.dg .ln-b{--dg-k:#a3e635;--dg-kg:rgba(163,230,53,.5);--dg-ks:rgba(163,230,53,.16);--dg-kc:#ecfccb}
+.dg .ln-c{--dg-k:#e879f9;--dg-kg:rgba(232,121,249,.55);--dg-ks:rgba(232,121,249,.16);--dg-kc:#fae8ff}
+.dg .ln-d{--dg-k:#fbbf24;--dg-kg:rgba(251,191,36,.5);--dg-ks:rgba(251,191,36,.16);--dg-kc:#fef3c7}
+.dg .ln-o{--dg-k:#fb923c;--dg-kg:rgba(251,146,60,.55);--dg-ks:rgba(251,146,60,.16);--dg-kc:#ffedd5}
+.dg .ln-n{--dg-k:#e6eef3;--dg-kg:rgba(201,214,223,.4);--dg-ks:rgba(201,214,223,.16);--dg-kc:#ffffff}
+.dg .sa0{stop-color:#22d3ee;stop-opacity:.24}
+.dg .sa5{stop-color:#22d3ee;stop-opacity:.07}
+.dg .sa1{stop-color:#22d3ee;stop-opacity:0}
+.dg .sb0{stop-color:#a3e635;stop-opacity:.2}
+.dg .sb5{stop-color:#a3e635;stop-opacity:.06}
+.dg .sb1{stop-color:#a3e635;stop-opacity:0}
+.dg .sc0{stop-color:#e879f9;stop-opacity:.24}
+.dg .sc5{stop-color:#e879f9;stop-opacity:.07}
+.dg .sc1{stop-color:#e879f9;stop-opacity:0}
+.dg .ln-a .sp{fill:url(#sp-a)}
+.dg .ln-b .sp{fill:url(#sp-b)}
+.dg .ln-c .sp{fill:url(#sp-c)}
+.dg .lane-h{fill:var(--dg-kc);filter:drop-shadow(0 0 2px var(--dg-k)) drop-shadow(0 0 8px var(--dg-k)) drop-shadow(0 0 16px var(--dg-kg))}
+.dg .tg{filter:drop-shadow(0 0 4px var(--dg-k)) drop-shadow(0 0 14px var(--dg-kg))}
+.dg .fx{stroke:#ffffff;filter:drop-shadow(0 0 4px var(--dg-k)) drop-shadow(0 0 10px var(--dg-kg))}
+}
+.ig7{animation-name:ig7}
+.dw5{animation-name:dw5}
+.dw6{animation-name:dw6}
+.dw7{animation-name:dw7}
+@keyframes ig7{0%,35%{opacity:0}35.5%{opacity:1}36%{opacity:.3}36.6%{opacity:1}37.2%{opacity:.55}37.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes dw5{0%,25%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}30%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw6{0%,30%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}35%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw7{0%,35%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}40%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+.l15{--dg-len:15}
+.l24{--dg-len:24}
+.l25{--dg-len:25}
+.l34{--dg-len:34}
+.l44{--dg-len:44}
+.l56{--dg-len:56}
+.l209{--dg-len:209}
+.l211{--dg-len:211}
+.l219{--dg-len:219}
+.l258{--dg-len:258}
+.l280{--dg-len:280}
+.l296{--dg-len:296}
+.l316{--dg-len:316}
+.l326{--dg-len:326}
+.l431{--dg-len:431}
+.l441{--dg-len:441}
+.l454{--dg-len:454}
+.l464{--dg-len:464}
+.l553{--dg-len:553}
+.l563{--dg-len:563}
+<!-- 内容 -->
+<svg width="712" height="1180" viewBox="0 0 712 1180" role="img" aria-label="航运账单智能处理与人工复核主流程图，3 条泳道 10 步">
+<defs>
+<radialGradient id="sp-a"><stop offset="0" class="sa0"></stop><stop offset="0.55" class="sa5"></stop><stop offset="1" class="sa1"></stop></radialGradient>
+<radialGradient id="sp-b"><stop offset="0" class="sb0"></stop><stop offset="0.55" class="sb5"></stop><stop offset="1" class="sb1"></stop></radialGradient>
+<radialGradient id="sp-c"><stop offset="0" class="sc0"></stop><stop offset="0.55" class="sc5"></stop><stop offset="1" class="sc1"></stop></radialGradient>
+</defs>
+
+<g class="ln-a"><rect class="lane" x="0.5" y="0.5" width="231" height="1127" rx="14"></rect><text class="lane-h" x="116" y="24">财务人员</text></g>
+<g class="ln-b"><rect class="lane" x="240.5" y="0.5" width="231" height="1127" rx="14"></rect><text class="lane-h" x="356" y="24">智能账单助手</text></g>
+<g class="ln-c"><rect class="lane" x="480.5" y="0.5" width="231" height="1127" rx="14"></rect><text class="lane-h" x="596" y="24">OCR 与历史账单库</text></g>
+
+<g class="lit ig0 ln-a"><ellipse class="sp" cx="116" cy="101" rx="116" ry="71"></ellipse></g>
+<g class="lit ig1 ln-b"><ellipse class="sp" cx="356" cy="215" rx="116" ry="61"></ellipse></g>
+<g class="lit ig2 ln-b"><ellipse class="sp" cx="356" cy="351" rx="116" ry="71"></ellipse></g>
+<g class="lit ig2 ln-c"><ellipse class="sp" cx="596" cy="351" rx="116" ry="71"></ellipse></g>
+<g class="lit ig3 ln-b"><ellipse class="sp" cx="356" cy="485" rx="116" ry="71"></ellipse></g>
+<g class="lit ig4 ln-b"><ellipse class="sp" cx="356" cy="609" rx="116" ry="71"></ellipse></g>
+<g class="lit ig5 ln-a"><ellipse class="sp" cx="116" cy="733" rx="116" ry="71"></ellipse></g>
+<g class="lit ig6 ln-b"><ellipse class="sp" cx="356" cy="847" rx="116" ry="61"></ellipse></g>
+<g class="lit ig9 ln-c"><ellipse class="sp" cx="596" cy="961" rx="116" ry="71"></ellipse></g>
+<g class="lit ig10 ln-a"><ellipse class="sp" cx="116" cy="1067" rx="116" ry="61"></ellipse></g>
+
+<path class="w" d="M212 101 H346 Q356 101 356 111 V172"></path>
+<path class="w" d="M356 250 V275"></path>
+<rect class="bard" x="344" y="275" width="264" height="6" rx="3"></rect>
+<path class="w" d="M356 281 V296"></path>
+<path class="w" d="M596 281 V296"></path>
+<path class="w" d="M356 396 V430"></path>
+<path class="w" d="M596 396 V408 Q596 418 586 418 H356"></path>
+<circle class="dotd" cx="356" cy="418" r="4.5"></circle>
+<path class="w" d="M356 530 V554"></path>
+<path class="w" d="M452 592 H586 Q596 592 596 602 V906"></path>
+<path class="w" d="M260 609 H126 Q116 609 116 619 V678"></path>
+<path class="w" d="M212 733 H346 Q356 733 356 743 V802"></path>
+<path class="w" d="M116 778 V951 Q116 961 126 961 H490"></path>
+<path class="w" d="M596 1006 V1057 Q596 1067 586 1067 H222"></path>
+<path class="loopd" d="M452 847 H468 Q476 847 476 839 V686 Q476 676 466 676 H366 Q356 676 356 666 V664"></path>
+
+<path class="ahd" d="M350 170 L362 170 L356 180 Z"></path>
+<path class="ahd" d="M350 296 L362 296 L356 306 Z"></path>
+<path class="ahd" d="M590 296 L602 296 L596 306 Z"></path>
+<path class="ahd" d="M350 430 L362 430 L356 440 Z"></path>
+<path class="ahd" d="M350 554 L362 554 L356 564 Z"></path>
+<path class="ahd" d="M590 906 L602 906 L596 916 Z"></path>
+<path class="ahd" d="M110 678 L122 678 L116 688 Z"></path>
+<path class="ahd" d="M350 802 L362 802 L356 812 Z"></path>
+<path class="ahd" d="M350 664 L362 664 L356 654 Z"></path>
+<path class="ahd" d="M490 955 L490 967 L500 961 Z"></path>
+<path class="ahd" d="M222 1061 L222 1073 L212 1067 Z"></path>
+
+<path class="wl dw0 l211" d="M212 101 H346 Q356 101 356 111 V172"></path>
+<path class="wl dw1 l25" d="M356 250 V275"></path>
+<path class="wl dw1 l15" d="M356 281 V296"></path>
+<path class="wl dw1 l15" d="M596 281 V296"></path>
+<path class="wl dw2 l34" d="M356 396 V430"></path>
+<path class="wl dw2 l258" d="M596 396 V408 Q596 418 586 418 H356"></path>
+<path class="wl dw3 l24" d="M356 530 V554"></path>
+<path class="wl dw4 l454" d="M452 592 H586 Q596 592 596 602 V906"></path>
+<path class="wl dw4 l209" d="M260 609 H126 Q116 609 116 619 V678"></path>
+<path class="wl dw5 l209" d="M212 733 H346 Q356 733 356 743 V802"></path>
+<path class="wl dw8 l553" d="M116 778 V951 Q116 961 126 961 H490"></path>
+<path class="wl dw9 l431" d="M596 1006 V1057 Q596 1067 586 1067 H222"></path>
+
+<g class="lit ig1"><rect class="barl" x="344" y="275" width="264" height="6" rx="3"></rect></g>
+<g class="lit ig2"><circle class="dotl" cx="356" cy="418" r="4.5"></circle></g>
+<g class="lit ig6"><path class="loop" d="M452 847 H468 Q476 847 476 839 V686 Q476 676 466 676 H366 Q356 676 356 666 V664"></path></g>
+<g class="lit ig1"><path class="ahl" d="M350 170 L362 170 L356 180 Z"></path></g>
+<g class="lit ig2"><path class="ahl" d="M350 296 L362 296 L356 306 Z"></path><path class="ahl" d="M590 296 L602 296 L596 306 Z"></path></g>
+<g class="lit ig3"><path class="ahl" d="M350 430 L362 430 L356 440 Z"></path></g>
+<g class="lit ig4"><path class="ahl" d="M350 554 L362 554 L356 564 Z"></path></g>
+<g class="lit ig9"><path class="ahl" d="M590 906 L602 906 L596 916 Z"></path></g>
+<g class="lit ig5"><path class="ahl" d="M110 678 L122 678 L116 688 Z"></path></g>
+<g class="lit ig6"><path class="ahl" d="M350 802 L362 802 L356 812 Z"></path></g>
+<g class="lit ig7"><path class="ahl-o" d="M350 664 L362 664 L356 654 Z"></path></g>
+<g class="lit ig9"><path class="ahl" d="M490 955 L490 967 L500 961 Z"></path></g>
+<g class="lit ig10"><path class="ahl" d="M222 1061 L222 1073 L212 1067 Z"></path></g>
+
+<path class="fxt ln-b l219 t0" d="M212 101 H346 Q356 101 356 111 V180"></path><path class="fx ln-b l219 t0" d="M212 101 H346 Q356 101 356 111 V180"></path>
+<path class="fxt ln-b l56 t1" d="M356 250 V306"></path><path class="fx ln-b l56 t1" d="M356 250 V306"></path>
+<path class="fxt ln-c l296 t1" d="M356 250 V278 H596 V306"></path><path class="fx ln-c l296 t1" d="M356 250 V278 H596 V306"></path>
+<path class="fxt ln-b l44 t2" d="M356 396 V440"></path><path class="fx ln-b l44 t2" d="M356 396 V440"></path>
+<path class="fxt ln-b l280 t2" d="M596 396 V408 Q596 418 586 418 H356 V440"></path><path class="fx ln-b l280 t2" d="M596 396 V408 Q596 418 586 418 H356 V440"></path>
+<path class="fxt ln-b l34 t3" d="M356 530 V564"></path><path class="fx ln-b l34 t3" d="M356 530 V564"></path>
+<path class="fxt ln-c l464 t4" d="M452 592 H586 Q596 592 596 602 V916"></path><path class="fx ln-c l464 t4" d="M452 592 H586 Q596 592 596 602 V916"></path>
+<path class="fxt ln-a l219 t4" d="M260 609 H126 Q116 609 116 619 V688"></path><path class="fx ln-a l219 t4" d="M260 609 H126 Q116 609 116 619 V688"></path>
+<path class="fxt ln-b l219 t5" d="M212 733 H346 Q356 733 356 743 V812"></path><path class="fx ln-b l219 t5" d="M212 733 H346 Q356 733 356 743 V812"></path>
+<path class="fxt ln-o l326 t6" d="M452 847 H468 Q476 847 476 839 V686 Q476 676 466 676 H366 Q356 676 356 666 V654"></path><path class="fx ln-o l326 t6" d="M452 847 H468 Q476 847 476 839 V686 Q476 676 466 676 H366 Q356 676 356 666 V654"></path>
+<path class="fxt ln-c l563 t8" d="M116 778 V951 Q116 961 126 961 H500"></path><path class="fx ln-c l563 t8" d="M116 778 V951 Q116 961 126 961 H500"></path>
+<path class="fxt ln-a l441 t9" d="M596 1006 V1057 Q596 1067 586 1067 H212"></path><path class="fx ln-a l441 t9" d="M596 1006 V1057 Q596 1067 586 1067 H212"></path>
+
+<g class="ln-c"><rect class="chip-b" x="536" y="730" width="120" height="22" rx="11"></rect><g class="lit ig4"><rect class="chip-l" x="536" y="730" width="120" height="22" rx="11"></rect></g><text class="lbl" x="596" y="741">校验通过直接出库</text></g>
+<g class="ln-a"><rect class="chip-b" x="142" y="598" width="84" height="22" rx="11"></rect><g class="lit ig4"><rect class="chip-l" x="142" y="598" width="84" height="22" rx="11"></rect></g><text class="lbl" x="184" y="609">异常/失败件</text></g>
+<g class="ln-b"><rect class="chip-b" x="242" y="722" width="76" height="22" rx="11"></rect><g class="lit ig5"><rect class="chip-l" x="242" y="722" width="76" height="22" rx="11"></rect></g><text class="lbl" x="280" y="733">修订或替换</text></g>
+<g class="ln-o"><rect class="chip-b" x="372" y="665" width="114" height="22" rx="11"></rect><g class="lit ig6"><rect class="chip-l" x="372" y="665" width="114" height="22" rx="11"></rect></g><text class="lbl" x="429" y="676">锁修订回第 6 步</text></g>
+<g class="ln-c"><rect class="chip-b" x="58" y="852" width="116" height="22" rx="11"></rect><g class="lit ig8"><rect class="chip-l" x="58" y="852" width="116" height="22" rx="11"></rect></g><text class="lbl" x="116" y="863">批准或驳回留痕</text></g>
+
+<g class="node ln-a"><rect class="card" x="20" y="56" width="192" height="90" rx="12"></rect><rect class="dim" x="20" y="56" width="192" height="90" rx="12"></rect><g class="lit ig0"><rect class="tg" x="20" y="56" width="192" height="90" rx="12"></rect><rect class="tc" x="20" y="56" width="192" height="90" rx="12"></rect></g><g class="badge"><circle class="nc" cx="44" cy="80" r="12"></circle><text class="nn" x="44" y="80">1</text></g><text class="tt" x="64" y="80">投递单据与主体</text><text class="td" x="64" y="104">上传多格式文件，选</text><text class="td" x="64" y="124">记账主体与旧账单</text><rect class="ring t0" x="20" y="56" width="192" height="90" rx="12"></rect></g>
+<g class="node ln-b"><rect class="card" x="260" y="180" width="192" height="70" rx="12"></rect><rect class="dim" x="260" y="180" width="192" height="70" rx="12"></rect><g class="lit ig1"><rect class="tg" x="260" y="180" width="192" height="70" rx="12"></rect><rect class="tc" x="260" y="180" width="192" height="70" rx="12"></rect></g><g class="badge"><circle class="nc" cx="284" cy="204" r="12"></circle><text class="nn" x="284" y="204">2</text></g><text class="tt" x="304" y="204">解包与噪声过滤</text><text class="td" x="304" y="228">拆邮件并跳过签名图</text><rect class="ring t1" x="260" y="180" width="192" height="70" rx="12"></rect></g>
+<g class="node ln-b"><rect class="card" x="260" y="306" width="192" height="90" rx="12"></rect><rect class="dim" x="260" y="306" width="192" height="90" rx="12"></rect><g class="lit ig2"><rect class="tg" x="260" y="306" width="192" height="90" rx="12"></rect><rect class="tc" x="260" y="306" width="192" height="90" rx="12"></rect></g><g class="badge"><circle class="nc" cx="284" cy="330" r="12"></circle><text class="nn" x="284" y="330">3</text></g><text class="tt" x="304" y="330">解析表格与文本</text><text class="td" x="304" y="354">读取邮件正文、</text><text class="td" x="304" y="374">Excel 与 Word 表</text><rect class="ring t2" x="260" y="306" width="192" height="90" rx="12"></rect></g>
+<g class="node ln-c"><rect class="card" x="500" y="306" width="192" height="90" rx="12"></rect><rect class="dim" x="500" y="306" width="192" height="90" rx="12"></rect><g class="lit ig2"><rect class="tg" x="500" y="306" width="192" height="90" rx="12"></rect><rect class="tc" x="500" y="306" width="192" height="90" rx="12"></rect></g><g class="badge"><circle class="nc" cx="524" cy="330" r="12"></circle><text class="nn" x="524" y="330">4</text></g><text class="tt" x="544" y="330">OCR 与旧账检索</text><text class="td" x="544" y="354">识别 PDF 图片并</text><text class="td" x="544" y="374">按主体查历史账单</text><rect class="ring t2" x="500" y="306" width="192" height="90" rx="12"></rect></g>
+<g class="node ln-b"><rect class="card" x="260" y="440" width="192" height="90" rx="12"></rect><rect class="dim" x="260" y="440" width="192" height="90" rx="12"></rect><g class="lit ig3"><rect class="tg" x="260" y="440" width="192" height="90" rx="12"></rect><rect class="tc" x="260" y="440" width="192" height="90" rx="12"></rect></g><g class="badge"><circle class="nc" cx="284" cy="464" r="12"></circle><text class="nn" x="284" y="464">5</text></g><text class="tt" x="304" y="464">抽取、匹配与继承</text><text class="td" x="304" y="488">映射费名、合并旧账</text><text class="td" x="304" y="508">与当前主体 AR/AP</text><rect class="ring t3" x="260" y="440" width="192" height="90" rx="12"></rect></g>
+<g class="node ln-b"><rect class="card" x="260" y="564" width="192" height="90" rx="12"></rect><rect class="dim" x="260" y="564" width="192" height="90" rx="12"></rect><g class="lit ig4"><rect class="tg" x="260" y="564" width="192" height="90" rx="12"></rect><rect class="tc" x="260" y="564" width="192" height="90" rx="12"></rect></g><g class="badge"><circle class="nc" cx="284" cy="588" r="12"></circle><text class="nn" x="284" y="588">6</text></g><text class="tt" x="304" y="588">校验与冲突门禁</text><text class="td" x="304" y="612">核对总额和编码，</text><text class="td" x="304" y="632">分流正常与异常项</text><rect class="ring t4" x="260" y="564" width="192" height="90" rx="12"></rect><rect class="ring t7" x="260" y="564" width="192" height="90" rx="12"></rect></g>
+<g class="node ln-a"><rect class="card" x="20" y="688" width="192" height="90" rx="12"></rect><rect class="dim" x="20" y="688" width="192" height="90" rx="12"></rect><g class="lit ig5"><rect class="halo" x="13" y="681" width="206" height="104" rx="18"></rect><rect class="tg" x="20" y="688" width="192" height="90" rx="12"></rect><rect class="tc" x="20" y="688" width="192" height="90" rx="12"></rect></g><g class="badge"><circle class="nc" cx="44" cy="712" r="12"></circle><text class="nn" x="44" y="712">7</text></g><text class="tt" x="64" y="712">工作台人工复核</text><text class="td" x="64" y="736">修字段、选旧账、</text><text class="td" x="64" y="756">重传或驳回排除</text><rect class="ring t5" x="20" y="688" width="192" height="90" rx="12"></rect><rect class="ring t8" x="20" y="688" width="192" height="90" rx="12"></rect></g>
+<g class="node ln-b"><rect class="card" x="260" y="812" width="192" height="70" rx="12"></rect><rect class="dim" x="260" y="812" width="192" height="70" rx="12"></rect><g class="lit ig6"><rect class="tg" x="260" y="812" width="192" height="70" rx="12"></rect><rect class="tc" x="260" y="812" width="192" height="70" rx="12"></rect></g><g class="badge"><circle class="nc" cx="284" cy="836" r="12"></circle><text class="nn" x="284" y="836">8</text></g><text class="tt" x="304" y="836">应用修订并重验</text><text class="td" x="304" y="860">锁定手改防重抽覆盖</text><rect class="ring t6" x="260" y="812" width="192" height="70" rx="12"></rect></g>
+<g class="node ln-c"><rect class="card" x="500" y="916" width="192" height="90" rx="12"></rect><rect class="dim" x="500" y="916" width="192" height="90" rx="12"></rect><g class="lit ig9"><rect class="halo" x="493" y="909" width="206" height="104" rx="18"></rect><rect class="tg" x="500" y="916" width="192" height="90" rx="12"></rect><rect class="tc" x="500" y="916" width="192" height="90" rx="12"></rect></g><g class="badge"><circle class="nc" cx="524" cy="940" r="12"></circle><text class="nn" x="524" y="940">9</text></g><text class="tt" x="544" y="940">生成标准 JSON</text><text class="td" x="544" y="964">正式件排驳回，审计</text><text class="td" x="544" y="984">件保留全部依据</text><rect class="ring t9" x="500" y="916" width="192" height="90" rx="12"></rect></g>
+<g class="node ln-a"><rect class="card" x="20" y="1032" width="192" height="70" rx="12"></rect><rect class="dim" x="20" y="1032" width="192" height="70" rx="12"></rect><g class="lit ig10"><rect class="tg" x="20" y="1032" width="192" height="70" rx="12"></rect><rect class="tc" x="20" y="1032" width="192" height="70" rx="12"></rect></g><g class="badge"><circle class="nc" cx="44" cy="1056" r="12"></circle><text class="nn" x="44" y="1056">10</text></g><text class="tt" x="64" y="1056">导出与入账交付</text><text class="td" x="64" y="1080">下载正式或审计 JSON</text><rect class="ring t10" x="20" y="1032" width="192" height="70" rx="12"></rect></g>
+
+<path class="lgw" d="M0 1164 H21"></path><path class="lga" d="M20 1158 L30 1164 L20 1170 Z"></path><text class="lg" x="38" y="1164">顺序</text>
+<path class="loop" d="M88 1164 H111"></path><path class="ahl-o" d="M110 1158 L120 1164 L110 1170 Z"></path><text class="lg" x="128" y="1164">回流</text>
+<rect class="barl" x="178" y="1161" width="28" height="6" rx="3"></rect><text class="lg" x="214" y="1164">并行</text>
+<rect class="lg-em" x="264" y="1155" width="28" height="18" rx="6"></rect><text class="lg" x="300" y="1164">重点</text>
+<circle class="lg-sig" cx="356" cy="1164" r="5"></circle><text class="lg" x="368" y="1164">光点颜色 = 下一步由谁做</text>
+</svg>
+<!-- 内容结束 -->
+</div>
