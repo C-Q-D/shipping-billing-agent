@@ -333,8 +333,8 @@ def _is_long_rule(merged: list[tuple[float, float]]) -> bool:
     return (
         shortest_core >= 3.0
         and longest_core - shortest_core <= _RULE_INTERVAL_TOL_PT
-        and 1.0 <= lengths[0] <= max_end_length
-        and 1.0 <= lengths[-1] <= max_end_length
+        and 0.0 < lengths[0] <= max_end_length
+        and 0.0 < lengths[-1] <= max_end_length
         and widest_gap <= longest_core * 2.5 + 2.0
     )
 

@@ -326,6 +326,28 @@ def _non_empty_children(tag: Tag) -> list[Tag | NavigableString]:
     return [child for child in tag.children if _is_significant_child(child)]
 
 
+def _last_significant_leaf(node: Tag | NavigableString) -> Tag | NavigableString:
+    current = node
+    while isinstance(current, Tag):
+        if current.name in {"img", "hr", "figure"}:
+            return current
+        children = _non_empty_children(current)
+        if not children:
+            return current
+        if all(
+            isinstance(child, NavigableString)
+            or (
+                child.name not in _FOOTER_CONTAINERS
+                and child.name not in {"img", "hr", "figure"}
+                and child.find(["img", "hr", "figure"]) is None
+            )
+            for child in children
+        ):
+            return current
+        current = children[-1]
+    return current
+
+
 def _ends_footer_context(marker: _HtmlMarker, footer: Tag, body_scope: Tag) -> bool:
     node, scope = marker
     other_landmark = scope is not None and scope is not footer and scope is not body_scope
@@ -333,7 +355,7 @@ def _ends_footer_context(marker: _HtmlMarker, footer: Tag, body_scope: Tag) -> b
 
 
 def _minimal_signature_boxes(
-    footer: Tag, text_nodes: list[tuple[int, NavigableString, str]]
+    footer: Tag, text_nodes: list[tuple[int, NavigableString, str]], *, require_signoff: bool = True
 ) -> Iterator[tuple[Tag, list[tuple[int, str]]]]:
     # Beautiful Soup compares tags by markup, so group by node identity.
     by_container: dict[int, tuple[Tag, list[tuple[int, str]]]] = {}
@@ -347,7 +369,9 @@ def _minimal_signature_boxes(
     candidates: dict[int, tuple[Tag, list[tuple[int, str]]]] = {}
     for box_id, (box, box_texts) in by_container.items():
         context = "\n".join(text for _, text in box_texts)
-        if _SIGNOFF.search(context) and _SIGNATURE_CONTACT.search(context):
+        if bool(_SIGNATURE_CONTACT.search(context)) and (
+            not require_signoff or bool(_SIGNOFF.search(context))
+        ):
             candidates[box_id] = (box, box_texts)
 
     non_minimal: set[int] = set()
@@ -374,14 +398,14 @@ def _preceded_by_bill_caption(slot: Tag, footer: Tag) -> bool:
         siblings = _non_empty_children(parent)
         position = next(idx for idx, sibling in enumerate(siblings) if sibling is current)
         if position > 0:
-            previous = siblings[position - 1]
-            if isinstance(previous, Tag):
+            leaf = _last_significant_leaf(siblings[position - 1])
+            if isinstance(leaf, Tag):
                 caption_boundaries = ["img", "hr", "figure"]
-                if previous.name in caption_boundaries or previous.find(caption_boundaries):
+                if leaf.name in caption_boundaries or leaf.find(caption_boundaries) is not None:
                     return False
-                text = previous.get_text(" ", strip=True)
+                text = leaf.get_text(" ", strip=True)
             else:
-                text = previous.strip()
+                text = leaf.strip()
             return bool(_BILL_TAG_WORDS.search(text) or _BILL_AMOUNT_HINT.search(text))
         if parent is footer:
             break
@@ -435,7 +459,13 @@ def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool
 
 
 def _footer_signature_context(
-    markers: list[_HtmlMarker], index: int, body_scope: Tag, footer_tag: Tag, image: Tag
+    markers: list[_HtmlMarker],
+    index: int,
+    body_scope: Tag,
+    footer_tag: Tag,
+    image: Tag,
+    *,
+    require_signoff: bool = True,
 ) -> str:
     if (figure := image.find_parent("figure")) is not None:
         return "\n".join(
@@ -480,7 +510,9 @@ def _footer_signature_context(
             images.append((idx, node))
 
     image_parent_ids = {id(parent) for parent in image.parents}
-    for box, box_texts in _minimal_signature_boxes(footer_tag, text_nodes):
+    for box, box_texts in _minimal_signature_boxes(
+        footer_tag, text_nodes, require_signoff=require_signoff
+    ):
         if id(box) in image_parent_ids:
             first_signoff = next((idx for idx, text in box_texts if _SIGNOFF.search(text)), None)
             if first_signoff is not None and index < first_signoff:
@@ -529,8 +561,10 @@ def _html_text(html: str, email: ParsedEmail) -> str:
             if len(markers) - index > _SIGNATURE_TAIL_SIZE:
                 continue
             context, has_separator = _signature_context(markers, index, scope, body)
-            if scope.name == "footer" and not has_separator:
-                context = _footer_signature_context(markers, index, body, scope, image)
+            if scope.name == "footer":
+                context = _footer_signature_context(
+                    markers, index, body, scope, image, require_signoff=not has_separator
+                )
             has_contact = _SIGNATURE_CONTACT.search(context) is not None
             has_signoff = _SIGNOFF.search(context) is not None
             after_signoff = has_separator and has_contact

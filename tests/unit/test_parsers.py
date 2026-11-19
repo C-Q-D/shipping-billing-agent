@@ -758,6 +758,22 @@ def test_r9_f3_pdf_keeps_electronic_text_with_a_clipped_final_dash(local_ocr):
 
 
 @pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+def test_r10_f3_sub_point_trailing_dash(local_ocr):
+    dash_length = 21.9
+    period = dash_length + 8
+    rule = b"".join(
+        b"%.1f 144 m %.1f 144 l S\n" % (24 + index * period, 24 + index * period + dash_length)
+        for index in range(8)
+    )
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE,
+        rule + b"263.2 144 m 264 144 l S\nBT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n",
+    )
+
+    _assert_decorated_pdf_keeps_electronic_text(data, local_ocr)
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
 def test_r9_f4_pdf_keeps_electronic_text_with_implicitly_closed_bars(local_ocr):
     data = _two_page_pdf(
         _PAYMENT_TERMS_PAGE,
@@ -1361,6 +1377,65 @@ def test_r9_f1_eml_reads_a_scan_with_a_caption_outside_the_signoff_wrapper(r8_em
     recognize_image.assert_called_once()
 
 
+def test_r10_f1_wrapped_previous_image_and_caption(r8_eml_ocr):
+    message = _mail("Body")
+    message.add_alternative(
+        '<footer><div><img src="cid:bill1"><p>Invoice scan</p></div>'
+        '<div><div><img src="cid:scan"></div>'
+        '<div><p>Best regards<br>ACME<br>Tel: 123456</p></div></div></footer>',
+        subtype="html",
+    )
+    amount = "USD 310.42"
+    image = _png_with_text(amount)
+    html = message.get_payload()[-1]
+    html.add_related(image, maintype="image", subtype="png", cid="<bill1>", filename="bill1.png")
+    html.add_related(image, maintype="image", subtype="png", cid="<scan>", filename="scan.png")
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, bill1, scan = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert bill1.sanitized_filename == "bill1.png"
+    assert scan.sanitized_filename == "scan.png"
+    assert bill1.status is DocumentStatus.PARSED, bill1.error_message
+    assert scan.status is DocumentStatus.PARSED, scan.error_message
+    assert bill1.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert amount in bill1.raw_text, bill1.raw_text
+    assert amount in scan.raw_text, scan.raw_text
+    assert recognize_image.call_count == 2
+
+
+def test_r10_f1_hr_before_footer_caption(r8_eml_ocr):
+    dispatcher, recognize_image = r8_eml_ocr
+    logo_mail = _mail_with_inline_png(
+        '<footer><hr><div>ACME<br>Tel: 123456</div><div><img src="cid:logo"></div></footer>',
+        image_name="logo",
+        text="ACME",
+    )
+
+    _, _, logo = dispatcher.parse_batch([("contact-only.eml", logo_mail)])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE, logo.raw_text
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    recognize_image.assert_not_called()
+
+    scan_mail = _mail_with_inline_png(
+        '<footer><hr><p>Invoice scan</p><div><div><img src="cid:scan"></div>'
+        '<div><p>Best regards<br>ACME<br>Tel: 123456</p></div></div></footer>',
+        image_name="scan",
+        text="USD 310.42",
+    )
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", scan_mail)])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert scan.status is DocumentStatus.PARSED, scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "USD 310.42" in scan.raw_text, scan.raw_text
+    recognize_image.assert_called_once()
+
+
 def test_r9_f2_eml_reads_a_negative_amount_and_skips_bare_currency_logos(r8_eml_ocr):
     dispatcher, recognize_image = r8_eml_ocr
     logo_labels = {
@@ -1436,6 +1511,25 @@ def test_r9_f5_eml_skips_a_logo_after_signoff_with_an_empty_sibling(r8_eml_ocr):
     data = _mail_with_inline_png(
         '<footer><div><p>Best regards<br>ACME<br>Tel: 123456</p><span></span></div>'
         '<img src="cid:logo"></footer>',
+        image_name="logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE, logo.raw_text
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    recognize_image.assert_not_called()
+
+
+@pytest.mark.parametrize("empty_span", ["", "<span></span>"], ids=["plain", "empty-span"])
+def test_r10_f5_wrapped_earlier_invoice_notice_before_company_logo(empty_span, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        '<footer><div><p>For invoice inquiries, please contact Accounts.</p>'
+        f'<p>Company logo</p>{empty_span}</div><div><div><img src="cid:logo"></div>'
+        '<div><p>Best regards<br>ACME<br>Tel: 123456</p></div></div></footer>',
         image_name="logo",
         text="ACME",
     )
