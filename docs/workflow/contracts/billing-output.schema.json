@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://shipping-billing-agent.local/schemas/billing-output.schema.json",
+  "title": "ShippingBillingOutputArray",
+  "description": "航运智能账单助手标准输出 JSON 契约（顶层数组，兼容题目第 5/6/7 节格式；UPDATE 必含旧账定位依据，使用官方 ISO 4217 现行货币代码，贷项冲减使用带负号金额）",
+  "type": "array",
+  "items": {
+    "$ref": "#/$defs/BillingOutputItem"
+  },
+  "$defs": {
+    "NullableString": {
+      "type": ["string", "null"]
+    },
+    "ActiveIsoCurrency": {
+      "type": "string",
+      "enum": [
+        "AED", "AFN", "ALL", "AMD", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM",
+        "BBD", "BDT", "BHD", "BIF", "BMD", "BND", "BOB", "BOV", "BRL", "BSD",
+        "BTN", "BWP", "BYN", "BZD", "CAD", "CDF", "CHE", "CHF", "CHW", "CLF",
+        "CLP", "CNY", "COP", "COU", "CRC", "CUP", "CVE", "CZK", "DJF", "DKK",
+        "DOP", "DZD", "EGP", "ERN", "ETB", "EUR", "FJD", "FKP", "GBP", "GEL",
+        "GHS", "GIP", "GMD", "GNF", "GTQ", "GYD", "HKD", "HNL", "HTG", "HUF",
+        "IDR", "ILS", "INR", "IQD", "IRR", "ISK", "JMD", "JOD", "JPY", "KES",
+        "KGS", "KHR", "KMF", "KPW", "KRW", "KWD", "KYD", "KZT", "LAK", "LBP",
+        "LKR", "LRD", "LSL", "LYD", "MAD", "MDL", "MGA", "MKD", "MMK", "MNT",
+        "MOP", "MRU", "MUR", "MVR", "MWK", "MXN", "MXV", "MYR", "MZN", "NAD",
+        "NGN", "NIO", "NOK", "NPR", "NZD", "OMR", "PAB", "PEN", "PGK", "PHP",
+        "PKR", "PLN", "PYG", "QAR", "RON", "RSD", "RUB", "RWF", "SAR", "SBD",
+        "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SOS", "SRD", "SSP", "STN",
+        "SVC", "SYP", "SZL", "THB", "TJS", "TMT", "TND", "TOP", "TRY", "TTD",
+        "TWD", "TZS", "UAH", "UGX", "USD", "USN", "UYI", "UYU", "UYW", "UZS",
+        "VED", "VES", "VND", "VUV", "WST", "XAD", "XAF", "XAG", "XAU", "XBA",
+        "XBB", "XBC", "XBD", "XCD", "XCG", "XDR", "XOF", "XPD", "XPF", "XPT",
+        "XSU", "XUA", "YER", "ZAR", "ZMW", "ZWG"
+      ]
+    },
+    "NullableActiveIsoCurrency": {
+      "oneOf": [
+        { "$ref": "#/$defs/ActiveIsoCurrency" },
+        { "type": "null" }
+      ]
+    },
+    "PaymentTerm": {
+      "type": ["string", "null"],
+      "enum": ["PP", "CC", null]
+    },
+    "PostingType": {
+      "type": ["string", "null"],
+      "enum": ["AR", "AP", null]
+    },
+    "DocumentInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_type", "reference_no", "document_date"],
+      "properties": {
+        "document_type": { "$ref": "#/$defs/NullableString" },
+        "reference_no": { "$ref": "#/$defs/NullableString" },
+        "document_date": {
+          "type": ["string", "null"],
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        }
+      }
+    },
+    "TransactionParty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issuer", "recipient"],
+      "properties": {
+        "issuer": { "$ref": "#/$defs/NullableString" },
+        "recipient": { "$ref": "#/$defs/NullableString" }
+      }
+    },
+    "ReadyChargeDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["charge_item", "amount", "currency", "payment_term"],
+      "properties": {
+        "charge_item": { "type": "string", "minLength": 1 },
+        "raw_charge_name": { "$ref": "#/$defs/NullableString" },
+        "quantity": { "type": ["number", "null"] },
+        "unit_price": { "type": ["number", "null"] },
+        "amount": { "type": "number" },
+        "currency": { "$ref": "#/$defs/ActiveIsoCurrency" },
+        "payment_term": { "$ref": "#/$defs/PaymentTerm" }
+      }
+    },
+    "ReadyFinancialAttributes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accounting_entity", "posting_type"],
+      "properties": {
+        "accounting_entity": { "type": "string", "minLength": 1 },
+        "posting_type": {
+          "type": "string",
+          "enum": ["AR", "AP"]
+        }
+      }
+    },
+    "AuditTrailBase": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["ai_reasoning"],
+      "properties": {
+        "ai_reasoning": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "match_level": { "type": ["string", "null"] },
+        "matched_bill_ref": { "$ref": "#/$defs/NullableString" },
+        "source_file": { "$ref": "#/$defs/NullableString" },
+        "extraction_channel": { "$ref": "#/$defs/NullableString" }
+      }
+    },
+    "AuditTrailForUpdate": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["ai_reasoning", "matched_bill_ref"],
+      "properties": {
+        "ai_reasoning": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "match_level": { "type": ["string", "null"] },
+        "matched_bill_ref": { "type": "string", "minLength": 1 },
+        "source_file": { "$ref": "#/$defs/NullableString" },
+        "extraction_channel": { "$ref": "#/$defs/NullableString" }
+      }
+    },
+    "CreateOrNoChangeItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "document_info",
+        "transaction_party",
+        "charge_details",
+        "financial_attributes",
+        "audit_trail"
+      ],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": ["CREATE", "NO_CHANGE"]
+        },
+        "document_info": { "$ref": "#/$defs/DocumentInfo" },
+        "transaction_party": { "$ref": "#/$defs/TransactionParty" },
+        "charge_details": { "$ref": "#/$defs/ReadyChargeDetails" },
+        "financial_attributes": { "$ref": "#/$defs/ReadyFinancialAttributes" },
+        "audit_trail": { "$ref": "#/$defs/AuditTrailBase" }
+      }
+    },
+    "UpdateItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "document_info",
+        "transaction_party",
+        "charge_details",
+        "financial_attributes",
+        "audit_trail"
+      ],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "const": "UPDATE"
+        },
+        "document_info": { "$ref": "#/$defs/DocumentInfo" },
+        "transaction_party": { "$ref": "#/$defs/TransactionParty" },
+        "charge_details": { "$ref": "#/$defs/ReadyChargeDetails" },
+        "financial_attributes": { "$ref": "#/$defs/ReadyFinancialAttributes" },
+        "audit_trail": { "$ref": "#/$defs/AuditTrailForUpdate" }
+      }
+    },
+    "PendingReviewItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "document_info",
+        "transaction_party",
+        "charge_details",
+        "financial_attributes",
+        "audit_trail"
+      ],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "const": "PENDING_REVIEW"
+        },
+        "document_info": { "$ref": "#/$defs/DocumentInfo" },
+        "transaction_party": { "$ref": "#/$defs/TransactionParty" },
+        "charge_details": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["charge_item", "amount", "currency", "payment_term"],
+          "properties": {
+            "charge_item": { "$ref": "#/$defs/NullableString" },
+            "raw_charge_name": { "$ref": "#/$defs/NullableString" },
+            "quantity": { "type": ["number", "null"] },
+            "unit_price": { "type": ["number", "null"] },
+            "amount": { "type": ["number", "null"] },
+            "currency": { "$ref": "#/$defs/NullableActiveIsoCurrency" },
+            "payment_term": { "$ref": "#/$defs/PaymentTerm" }
+          }
+        },
+        "financial_attributes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["accounting_entity", "posting_type"],
+          "properties": {
+            "accounting_entity": { "type": "string", "minLength": 1 },
+            "posting_type": { "$ref": "#/$defs/PostingType" }
+          }
+        },
+        "audit_trail": { "$ref": "#/$defs/AuditTrailBase" }
+      }
+    },
+    "BillingOutputItem": {
+      "oneOf": [
+        { "$ref": "#/$defs/CreateOrNoChangeItem" },
+        { "$ref": "#/$defs/UpdateItem" },
+        { "$ref": "#/$defs/PendingReviewItem" }
+      ]
+    }
+  }
+}

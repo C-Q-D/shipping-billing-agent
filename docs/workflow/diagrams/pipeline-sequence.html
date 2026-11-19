@@ -1,0 +1,255 @@
+<!--
+模板：时序图（diagram-templates，2026-11-08 用户定稿）
+用在：几方之间按先后顺序来回发消息、调用、等待。
+固定部分：
+- 参与方 = 顶部灯管卡片（标题 15px 粗体居中 + 13px 说明，说明可省），每方一种分类色，第 5 方用中性色。
+- 生命线 = 同色虚线；消息文字跨过别的生命线时，生命线在文字处断开。
+- 请求画实线，返回画虚线。编号圆 + 消息文字（13px）放在箭头上方，从发送方一侧排起。
+- 处理中 = 生命线上 10px 宽的竖条；处理说明 = 竖条旁的细框卡片，颜色同参与方。
+- 阶段带 = 一条虚线 + 左边的阶段名胶囊。
+- 编号和彗星的颜色 = 收消息、接着干活的一方。图例在图底部一行。
+内容怎么增减：
+- 参与方 2～5 个：每列宽 = 712 ÷ 参与方数，生命线在列中间；卡片宽 = min(200, 列宽 − 12)；4 方时标题不超过 10 个汉字，5 方时不超过 7 个，放不下就换行。
+- 消息 3～14 条：超过 12 条按阶段分段，超过 14 条拆成两张。
+- 消息文字每行不超过 250px（约 19 个汉字），处理说明每行不超过 264px（约 20 个汉字），各最多 3 行。
+- 一行的竖向尺寸：文字高 12 + 20 × 行数，箭头在文字下方 8，处理说明在箭头下方 10，行与行之间 18。
+- 一方同时发给两方时，画一条线再分叉到第二方，编号只有一个。
+
+通用约定（6 个模板相同）：
+- 风格：C2 通电点亮。节点是霓虹灯管卡片：底框 + 熄灭时的暗描边 + 点亮层（彩色粗管 .tg + 白芯 .tc）。
+- 颜色变量都以 --dg- 开头。文字色、次要文字色、卡片底色、分隔线对到宿主的主题变量（--foreground、--muted-foreground、--card、--border），宿主没有这些变量时用逗号后面的固定值；分类色（青、绿、品红、琥珀，回流用橙）是模板自己的两套取值。深浅两套按 prefers-color-scheme 切换：浅色是默认，深色写在 <style> 末尾的 @media 里。
+- 动画：一轮 12 秒（时序图 14 秒），每档 5%。第 k 档的元素用类 igK 闪亮，导线用 dwK 画出（长度类 lNNN 等于路径长度），彗星用 tK 出发；88% 起全部熄灭再循环。系统设了"减少动态"时整张静止全亮。增删步骤时同步改这三种类。
+- 一个页面只放一张图：各模板的类名、动画名相同但取值不同，两张不同模板的图放进同一页会互相覆盖。
+- 要换的内容在 <!-- 内容 --> 和 <!-- 内容结束 --> 之间，其余是固定部分。放不下就删字或换行，不缩字号。
+-->
+<meta charset="utf-8">
+<style>
+.dg{font-family:var(--font-sans,"Paper Mono","JetBrains Mono","Cascadia Mono",Consolas,ui-monospace,"Microsoft YaHei","PingFang SC",monospace)}
+.dg{--dg-text:var(--foreground,#0f172a);--dg-text2:var(--muted-foreground,#475569);--dg-card2:var(--card,#ffffff);--dg-off:#d5dae1;--dg-num:#ffffff;--dg-glass:#334155;--dg-g1:rgba(51,65,85,.28);--dg-g2:rgba(51,65,85,.12);--dg-rule:var(--border,#e2e8f0);--dg-card-sh:drop-shadow(0 1px 2px rgba(15,23,42,.07))}
+.dg .ln-a{--dg-k:#0e7490;--dg-kg:rgba(14,116,144,.35);--dg-ks:rgba(14,116,144,.28);--dg-kc:#ffffff}
+.dg .ln-b{--dg-k:#4d7c0f;--dg-kg:rgba(77,124,15,.32);--dg-ks:rgba(77,124,15,.28);--dg-kc:#ffffff}
+.dg .ln-c{--dg-k:#a21caf;--dg-kg:rgba(162,28,175,.32);--dg-ks:rgba(162,28,175,.28);--dg-kc:#ffffff}
+.dg .ln-d{--dg-k:#b45309;--dg-kg:rgba(180,83,9,.32);--dg-ks:rgba(180,83,9,.28);--dg-kc:#ffffff}
+.dg .ln-n{--dg-k:#334155;--dg-kg:rgba(51,65,85,.25);--dg-ks:rgba(51,65,85,.2);--dg-kc:#ffffff}
+.dg svg{display:block;overflow:visible}
+.card{fill:var(--dg-card2);filter:var(--dg-card-sh)}
+.dim{fill:none;stroke:var(--dg-off);stroke-width:1.5}
+.tg{fill:none;stroke:var(--dg-k);stroke-width:3}
+.dg .tg{filter:drop-shadow(0 0 5px var(--dg-kg)) drop-shadow(0 2px 5px var(--dg-kg))}
+.tc{fill:none;stroke:var(--dg-kc);stroke-width:1.1}
+.dg .tc{stroke-width:.9;stroke-opacity:.9}
+.hh{fill:var(--dg-text);font-size:15px;font-weight:700;text-anchor:middle;dominant-baseline:central}
+.hd{fill:var(--dg-text2);font-size:13px;text-anchor:middle;dominant-baseline:central}
+.life{fill:none;stroke:var(--dg-k);stroke-opacity:.45;stroke-width:1.5;stroke-dasharray:4 6}
+.act-d{fill:var(--dg-card2);stroke:var(--dg-off);stroke-width:1.5}
+.act{fill:var(--dg-ks);stroke:var(--dg-k);stroke-width:2}
+.dg .act{filter:drop-shadow(0 0 4px var(--dg-kg))}
+.ntg{fill:none;stroke:var(--dg-k);stroke-width:1.5}
+.dg .ntg{filter:drop-shadow(0 0 4px var(--dg-kg))}
+.nc{fill:var(--dg-k);filter:drop-shadow(0 0 5px var(--dg-kg))}
+.nn{fill:var(--dg-num);font-size:14px;font-weight:700;text-anchor:middle;dominant-baseline:central}
+.mt,.nt{fill:var(--dg-text);font-size:13px;dominant-baseline:central}
+.w{fill:none;stroke:var(--dg-off);stroke-width:2.5;stroke-linejoin:round}
+.wd{fill:none;stroke:var(--dg-off);stroke-width:2.5;stroke-dasharray:8 6}
+.ahd{fill:var(--dg-off)}
+.wl{fill:none;stroke:var(--dg-glass);stroke-width:2.5;stroke-linejoin:round;stroke-dasharray:calc(var(--dg-len) * 1px) calc(var(--dg-len) * 1px);opacity:0;filter:drop-shadow(0 0 3px var(--dg-g1)) drop-shadow(0 0 10px var(--dg-g2));animation-duration:14s;animation-timing-function:linear;animation-iteration-count:infinite}
+.rl{fill:none;stroke:var(--dg-glass);stroke-width:2.5;stroke-dasharray:8 6;filter:drop-shadow(0 0 3px var(--dg-g1)) drop-shadow(0 0 10px var(--dg-g2))}
+.ahl,.lga{fill:var(--dg-glass);filter:drop-shadow(0 0 3px var(--dg-g1))}
+.lgw,.lgd{fill:none;stroke:var(--dg-glass);stroke-width:2.5;filter:drop-shadow(0 0 3px var(--dg-g1))}
+.lgd{stroke-dasharray:8 6}
+.band{fill:none;stroke:var(--dg-off);stroke-width:1;stroke-dasharray:2 4}
+.chip-b{fill:var(--dg-card2);stroke:var(--dg-off);stroke-width:1.5}
+.chip-l{fill:none;stroke:var(--dg-k);stroke-width:1.5;filter:drop-shadow(0 0 4px var(--dg-kg)) drop-shadow(0 0 8px var(--dg-kg))}
+.ph{fill:var(--dg-text2);font-size:13px;font-weight:700;dominant-baseline:central}
+.lg{fill:var(--dg-text2);font-size:13px;dominant-baseline:central}
+.lg-act,.lg-note{fill:var(--dg-card2);stroke:var(--dg-text2);stroke-width:1.5}
+.foot{font-size:13px;line-height:20px;color:var(--dg-text2);margin-top:12px}
+.lit{opacity:0;animation-duration:14s;animation-timing-function:linear;animation-iteration-count:infinite}
+.ig0{animation-name:ig0}
+.ig1{animation-name:ig1}
+.ig2{animation-name:ig2}
+.ig3{animation-name:ig3}
+.ig4{animation-name:ig4}
+.ig5{animation-name:ig5}
+.ig6{animation-name:ig6}
+.ig7{animation-name:ig7}
+.ig8{animation-name:ig8}
+.ig9{animation-name:ig9}
+.ig10{animation-name:ig10}
+.ig11{animation-name:ig11}
+.ig12{animation-name:ig12}
+.ig13{animation-name:ig13}
+.ig14{animation-name:ig14}
+.ig15{animation-name:ig15}
+.dw1{animation-name:dw1}
+.dw2{animation-name:dw2}
+.dw3{animation-name:dw3}
+.dw4{animation-name:dw4}
+.dw5{animation-name:dw5}
+.dw6{animation-name:dw6}
+.dw7{animation-name:dw7}
+.dw9{animation-name:dw9}
+.dw11{animation-name:dw11}
+.dw13{animation-name:dw13}
+.dw14{animation-name:dw14}
+.l132{--dg-len:132}
+.l168{--dg-len:168}
+.l173{--dg-len:173}
+.l175{--dg-len:175}
+.l178{--dg-len:178}
+.l351{--dg-len:351}
+.t1{animation-delay:0.7s}
+.t2{animation-delay:1.4s}
+.t3{animation-delay:2.1s}
+.t4{animation-delay:2.8s}
+.t5{animation-delay:3.5s}
+.t6{animation-delay:4.2s}
+.t7{animation-delay:4.9s}
+.t8{animation-delay:5.6s}
+.t9{animation-delay:6.3s}
+.t10{animation-delay:7s}
+.t11{animation-delay:7.7s}
+.t12{animation-delay:8.4s}
+.t13{animation-delay:9.1s}
+.t14{animation-delay:9.8s}
+@keyframes ig0{0%{opacity:0}0.5%{opacity:1}1%{opacity:.3}1.6%{opacity:1}2.2%{opacity:.55}2.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig1{0%,5%{opacity:0}5.5%{opacity:1}6%{opacity:.3}6.6%{opacity:1}7.2%{opacity:.55}7.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig2{0%,10%{opacity:0}10.5%{opacity:1}11%{opacity:.3}11.6%{opacity:1}12.2%{opacity:.55}12.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig3{0%,15%{opacity:0}15.5%{opacity:1}16%{opacity:.3}16.6%{opacity:1}17.2%{opacity:.55}17.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig4{0%,20%{opacity:0}20.5%{opacity:1}21%{opacity:.3}21.6%{opacity:1}22.2%{opacity:.55}22.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig5{0%,25%{opacity:0}25.5%{opacity:1}26%{opacity:.3}26.6%{opacity:1}27.2%{opacity:.55}27.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig6{0%,30%{opacity:0}30.5%{opacity:1}31%{opacity:.3}31.6%{opacity:1}32.2%{opacity:.55}32.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig7{0%,35%{opacity:0}35.5%{opacity:1}36%{opacity:.3}36.6%{opacity:1}37.2%{opacity:.55}37.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig8{0%,40%{opacity:0}40.5%{opacity:1}41%{opacity:.3}41.6%{opacity:1}42.2%{opacity:.55}42.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig9{0%,45%{opacity:0}45.5%{opacity:1}46%{opacity:.3}46.6%{opacity:1}47.2%{opacity:.55}47.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig10{0%,50%{opacity:0}50.5%{opacity:1}51%{opacity:.3}51.6%{opacity:1}52.2%{opacity:.55}52.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig11{0%,55%{opacity:0}55.5%{opacity:1}56%{opacity:.3}56.6%{opacity:1}57.2%{opacity:.55}57.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig12{0%,60%{opacity:0}60.5%{opacity:1}61%{opacity:.3}61.6%{opacity:1}62.2%{opacity:.55}62.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig13{0%,65%{opacity:0}65.5%{opacity:1}66%{opacity:.3}66.6%{opacity:1}67.2%{opacity:.55}67.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig14{0%,70%{opacity:0}70.5%{opacity:1}71%{opacity:.3}71.6%{opacity:1}72.2%{opacity:.55}72.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig15{0%,75%{opacity:0}75.5%{opacity:1}76%{opacity:.3}76.6%{opacity:1}77.2%{opacity:.55}77.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes dw1{0%,5%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}10%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw2{0%,10%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}15%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw3{0%,15%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}20%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw4{0%,20%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}25%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw5{0%,25%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}30%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw6{0%,30%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}35%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw7{0%,35%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}40%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw9{0%,45%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}50%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw11{0%,55%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}60%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw13{0%,65%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}70%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw14{0%,70%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}75%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+.fx{fill:none;stroke-width:3.5;stroke-linecap:round;stroke-dasharray:16px 3000px;opacity:0;animation:run 14s linear infinite}
+.dg .fx{stroke:var(--dg-k);filter:drop-shadow(0 0 4px var(--dg-kg)) drop-shadow(0 0 8px var(--dg-kg))}
+.fxt{fill:none;stroke:var(--dg-k);stroke-width:4;stroke-linecap:round;stroke-dasharray:70px 3000px;opacity:0;animation:runt 14s linear infinite}
+@keyframes run{0%{opacity:1;stroke-dashoffset:16px}4.2%{opacity:1}5%,100%{opacity:0;stroke-dashoffset:calc(16px - var(--dg-len) * 1px)}}
+@keyframes runt{0%{opacity:.5;stroke-dashoffset:70px}4.2%{opacity:.5}5%,100%{opacity:0;stroke-dashoffset:calc(70px - var(--dg-len) * 1px)}}
+@media (prefers-reduced-motion: reduce){.lit{animation:none;opacity:1}.wl{animation:none;stroke-dasharray:none;opacity:1}.fx,.fxt{display:none}}
+.dg svg{max-width:100%;height:auto}
+@media (prefers-color-scheme: dark){
+.dg{--dg-text:var(--foreground,#f1f5f9);--dg-text2:var(--muted-foreground,#93a1ad);--dg-card2:var(--card,#07090c);--dg-off:#353d48;--dg-num:#04131a;--dg-glass:#e6eef3;--dg-g1:rgba(230,238,243,.7);--dg-g2:rgba(201,214,223,.35);--dg-rule:var(--border,#232831);--dg-card-sh:none}
+.dg .ln-a{--dg-k:#22d3ee;--dg-kg:rgba(34,211,238,.55);--dg-ks:rgba(34,211,238,.22);--dg-kc:#cffafe}
+.dg .ln-b{--dg-k:#a3e635;--dg-kg:rgba(163,230,53,.5);--dg-ks:rgba(163,230,53,.22);--dg-kc:#ecfccb}
+.dg .ln-c{--dg-k:#e879f9;--dg-kg:rgba(232,121,249,.55);--dg-ks:rgba(232,121,249,.22);--dg-kc:#fae8ff}
+.dg .ln-d{--dg-k:#fbbf24;--dg-kg:rgba(251,191,36,.5);--dg-ks:rgba(251,191,36,.22);--dg-kc:#fef3c7}
+.dg .ln-n{--dg-k:#e6eef3;--dg-kg:rgba(201,214,223,.4);--dg-ks:rgba(201,214,223,.2);--dg-kc:#ffffff}
+.dg .tg{filter:drop-shadow(0 0 4px var(--dg-k)) drop-shadow(0 0 12px var(--dg-kg))}
+.dg .act{filter:drop-shadow(0 0 4px var(--dg-k)) drop-shadow(0 0 10px var(--dg-kg))}
+.dg .ntg{filter:drop-shadow(0 0 3px var(--dg-k)) drop-shadow(0 0 8px var(--dg-kg))}
+.dg .fx{stroke:#ffffff;filter:drop-shadow(0 0 4px var(--dg-k)) drop-shadow(0 0 10px var(--dg-kg))}
+}
+.dw8{animation-name:dw8}
+.dw10{animation-name:dw10}
+.dw12{animation-name:dw12}
+@keyframes dw8{0%,40%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}45%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw10{0%,50%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}55%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw12{0%,60%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}65%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+.l159{--dg-len:159}
+.l164{--dg-len:164}
+.l168{--dg-len:168}
+.l173{--dg-len:173}
+.l337{--dg-len:337}
+.l346{--dg-len:346}
+<!-- 内容 -->
+<svg width="712" height="1200" viewBox="0 0 712 1200" role="img" aria-label="航运账单智能体核心处理时序图，4 个参与方，11 条消息">
+<path class="band" d="M124 120 H712"></path><g class="ln-n"><rect class="chip-b" x="0" y="108" width="124" height="24" rx="12"></rect><g class="lit ig1"><rect class="chip-l" x="0" y="108" width="124" height="24" rx="12"></rect></g></g><text class="ph" x="12" y="120">阶段一 投递抽取</text>
+<path class="band" d="M150 434 H712"></path><g class="ln-n"><rect class="chip-b" x="0" y="422" width="150" height="24" rx="12"></rect><g class="lit ig5"><rect class="chip-l" x="0" y="422" width="150" height="24" rx="12"></rect></g></g><text class="ph" x="12" y="434">阶段二 校验与自修复</text>
+<path class="band" d="M150 874 H712"></path><g class="ln-n"><rect class="chip-b" x="0" y="862" width="150" height="24" rx="12"></rect><g class="lit ig9"><rect class="chip-l" x="0" y="862" width="150" height="24" rx="12"></rect></g></g><text class="ph" x="12" y="874">阶段三 复核与导出</text>
+
+<path class="life ln-a" d="M89 90 V106 M89 134 V860 M89 888 V1154"></path>
+<path class="life ln-b" d="M267 90 V142 M267 166 V178 M267 242 V420 M267 448 V606 M267 668 V814 M267 930 V982 M267 1006 V1018 M267 1106 V1154"></path>
+<path class="life ln-c" d="M445 90 V242 M445 306 V420 M445 448 V452 M445 476 V502 M445 568 V668 M445 740 V778 M445 802 V1154"></path>
+<path class="life ln-d" d="M623 90 V306 M623 380 V420 M623 448 V740 M623 814 V1154"></path>
+
+<g class="node ln-a"><rect class="card" x="6" y="0" width="166" height="90" rx="10"></rect><rect class="dim" x="6" y="0" width="166" height="90" rx="10"></rect><g class="lit ig0"><rect class="tg" x="6" y="0" width="166" height="90" rx="10"></rect><rect class="tc" x="6" y="0" width="166" height="90" rx="10"></rect></g><text class="hh" x="89" y="28">财务与工作台</text><text class="hd" x="89" y="54">Web / CLI 入口</text></g>
+<g class="node ln-b"><rect class="card" x="184" y="0" width="166" height="90" rx="10"></rect><rect class="dim" x="184" y="0" width="166" height="90" rx="10"></rect><g class="lit ig0"><rect class="tg" x="184" y="0" width="166" height="90" rx="10"></rect><rect class="tc" x="184" y="0" width="166" height="90" rx="10"></rect></g><text class="hh" x="267" y="28">应用与校验门禁</text><text class="hd" x="267" y="54">确定性安全与核心</text></g>
+<g class="node ln-c"><rect class="card" x="362" y="0" width="166" height="90" rx="10"></rect><rect class="dim" x="362" y="0" width="166" height="90" rx="10"></rect><g class="lit ig0"><rect class="tg" x="362" y="0" width="166" height="90" rx="10"></rect><rect class="tc" x="362" y="0" width="166" height="90" rx="10"></rect></g><text class="hh" x="445" y="28">LangGraph 智能体</text><text class="hd" x="445" y="54">解析与结构化编排</text></g>
+<g class="node ln-d"><rect class="card" x="540" y="0" width="166" height="90" rx="10"></rect><rect class="dim" x="540" y="0" width="166" height="90" rx="10"></rect><g class="lit ig0"><rect class="tg" x="540" y="0" width="166" height="90" rx="10"></rect><rect class="tc" x="540" y="0" width="166" height="90" rx="10"></rect></g><text class="hh" x="623" y="28">OCR 网关与 LLM</text><text class="hd" x="623" y="54">外部识别与推理</text></g>
+
+<path class="w" d="M89 178 H253"></path><path class="ahd" d="M252 172 L262 178 L252 184 Z"></path>
+<path class="w" d="M267 242 H431"></path><path class="ahd" d="M430 236 L440 242 L430 248 Z"></path>
+<path class="w" d="M445 306 H609"></path><path class="ahd" d="M608 300 L618 306 L608 312 Z"></path>
+<path class="wd" d="M618 380 H459"></path><path class="ahd" d="M460 374 L450 380 L460 386 Z"></path>
+<path class="w" d="M445 488 H281"></path><path class="ahd" d="M282 482 L272 488 L282 494 Z"></path>
+<path class="w" d="M267 668 H431"></path><path class="ahd" d="M430 662 L440 668 L430 674 Z"></path>
+<path class="w" d="M445 740 H609"></path><path class="ahd" d="M608 734 L618 740 L608 746 Z"></path>
+<path class="wd" d="M618 814 H281"></path><path class="ahd" d="M282 808 L272 814 L282 820 Z"></path>
+<path class="wd" d="M267 930 H103"></path><path class="ahd" d="M104 924 L94 930 L104 936 Z"></path>
+<path class="w" d="M89 1018 H253"></path><path class="ahd" d="M252 1012 L262 1018 L252 1024 Z"></path>
+<path class="wd" d="M267 1106 H103"></path><path class="ahd" d="M104 1100 L94 1106 L104 1112 Z"></path>
+
+<path class="wl dw1 l164" d="M89 178 H253"></path><g class="lit ig2"><path class="ahl" d="M252 172 L262 178 L252 184 Z"></path></g>
+<path class="wl dw2 l164" d="M267 242 H431"></path><g class="lit ig3"><path class="ahl" d="M430 236 L440 242 L430 248 Z"></path></g>
+<path class="wl dw3 l164" d="M445 306 H609"></path><g class="lit ig4"><path class="ahl" d="M608 300 L618 306 L608 312 Z"></path></g>
+<g class="lit ig4"><path class="rl" d="M618 380 H459"></path></g><g class="lit ig5"><path class="ahl" d="M460 374 L450 380 L460 386 Z"></path></g>
+<path class="wl dw5 l164" d="M445 488 H281"></path><g class="lit ig6"><path class="ahl" d="M282 482 L272 488 L282 494 Z"></path></g>
+<path class="wl dw7 l164" d="M267 668 H431"></path><g class="lit ig8"><path class="ahl" d="M430 662 L440 668 L430 674 Z"></path></g>
+<path class="wl dw8 l164" d="M445 740 H609"></path><g class="lit ig9"><path class="ahl" d="M608 734 L618 740 L608 746 Z"></path></g>
+<g class="lit ig9"><path class="rl" d="M618 814 H281"></path></g><g class="lit ig10"><path class="ahl" d="M282 808 L272 814 L282 820 Z"></path></g>
+<g class="lit ig10"><path class="rl" d="M267 930 H103"></path></g><g class="lit ig11"><path class="ahl" d="M104 924 L94 930 L104 936 Z"></path></g>
+<path class="wl dw11 l164" d="M89 1018 H253"></path><g class="lit ig12"><path class="ahl" d="M252 1012 L262 1018 L252 1024 Z"></path></g>
+<g class="lit ig12"><path class="rl" d="M267 1106 H103"></path></g><g class="lit ig13"><path class="ahl" d="M104 1100 L94 1106 L104 1112 Z"></path></g>
+
+<g class="ln-b"><rect class="act-d" x="262" y="178" width="10" height="64" rx="3"></rect><g class="lit ig2"><rect class="act" x="262" y="178" width="10" height="64" rx="3"></rect></g></g>
+<g class="ln-c"><rect class="act-d" x="440" y="242" width="10" height="64" rx="3"></rect><g class="lit ig3"><rect class="act" x="440" y="242" width="10" height="64" rx="3"></rect></g></g>
+<g class="ln-d"><rect class="act-d" x="618" y="306" width="10" height="74" rx="3"></rect><g class="lit ig4"><rect class="act" x="618" y="306" width="10" height="74" rx="3"></rect></g></g>
+<g class="ln-c"><rect class="act-d" x="440" y="380" width="10" height="108" rx="3"></rect><g class="lit ig5"><rect class="act" x="440" y="380" width="10" height="108" rx="3"></rect></g></g>
+<g class="ln-b"><rect class="act-d" x="262" y="488" width="10" height="180" rx="3"></rect><g class="lit ig6"><rect class="act" x="262" y="488" width="10" height="180" rx="3"></rect></g></g>
+<g class="ln-c"><rect class="act-d" x="440" y="668" width="10" height="72" rx="3"></rect><g class="lit ig8"><rect class="act" x="440" y="668" width="10" height="72" rx="3"></rect></g></g>
+<g class="ln-d"><rect class="act-d" x="618" y="740" width="10" height="74" rx="3"></rect><g class="lit ig9"><rect class="act" x="618" y="740" width="10" height="74" rx="3"></rect></g></g>
+<g class="ln-b"><rect class="act-d" x="262" y="814" width="10" height="116" rx="3"></rect><g class="lit ig10"><rect class="act" x="262" y="814" width="10" height="116" rx="3"></rect></g></g>
+<g class="ln-b"><rect class="act-d" x="262" y="1018" width="10" height="88" rx="3"></rect><g class="lit ig12"><rect class="act" x="262" y="1018" width="10" height="88" rx="3"></rect></g></g>
+
+<g class="node ln-b"><rect class="card" x="278" y="502" width="270" height="66" rx="8"></rect><rect class="dim" x="278" y="502" width="270" height="66" rx="8"></rect><g class="lit ig6"><rect class="ntg" x="278" y="502" width="270" height="66" rx="8"></rect></g></g><text class="nt" x="290" y="524">按主体四级匹配并局部继承未改字段，</text><text class="nt" x="290" y="544">再执行总额/含税/ISO/6346/去重校验门禁</text>
+<g class="node ln-b"><rect class="card" x="278" y="1028" width="252" height="52" rx="8"></rect><rect class="dim" x="278" y="1028" width="252" height="52" rx="8"></rect><g class="lit ig12"><rect class="ntg" x="278" y="1028" width="252" height="52" rx="8"></rect></g></g><text class="nt" x="290" y="1046">锁定人工修订防覆写，</text><text class="nt" x="290" y="1064">立即重算并持久化到 SQLite</text>
+
+<g class="badge ln-b"><circle class="nc" cx="105" cy="154" r="12"></circle><text class="nn" x="105" y="154">1</text></g><text class="mt" x="125" y="154">提交单据、记账主体与旧账基准</text>
+<g class="badge ln-c"><circle class="nc" cx="283" cy="218" r="12"></circle><text class="nn" x="283" y="218">2</text></g><text class="mt" x="303" y="218">校验 SSRF 与格式后拆包路由</text>
+<g class="badge ln-d"><circle class="nc" cx="461" cy="282" r="12"></circle><text class="nn" x="461" y="282">3</text></g><text class="mt" x="481" y="282">直连 OCR 并脱敏抽结构</text>
+<g class="badge ln-c"><circle class="nc" cx="461" cy="356" r="12"></circle><text class="nn" x="461" y="356">4</text></g><text class="mt" x="481" y="356">返回识别文本与费用草案</text>
+<g class="badge ln-b"><circle class="nc" cx="283" cy="464" r="12"></circle><text class="nn" x="283" y="464">5</text></g><text class="mt" x="303" y="464">提交归一化草稿进入匹配</text>
+<g class="badge ln-c"><circle class="nc" cx="283" cy="644" r="12"></circle><text class="nn" x="283" y="644">6</text></g><text class="mt" x="303" y="644">不平或疑似错识：触发 1 轮修复</text>
+<g class="badge ln-d"><circle class="nc" cx="461" cy="716" r="12"></circle><text class="nn" x="461" y="716">7</text></g><text class="mt" x="481" y="716">携差错报告请求模型重抽</text>
+<g class="badge ln-b"><circle class="nc" cx="283" cy="790" r="12"></circle><text class="nn" x="283" y="790">8</text></g><text class="mt" x="303" y="790">返回修复结果并复跑门禁</text>
+<g class="badge ln-a"><circle class="nc" cx="105" cy="906" r="12"></circle><text class="nn" x="105" y="906">9</text></g><text class="mt" x="125" y="906">分流返回正常与待复核/失败卡</text>
+<g class="badge ln-b"><circle class="nc" cx="105" cy="994" r="12"></circle><text class="nn" x="105" y="994">10</text></g><text class="mt" x="125" y="994">人工修订、选旧账或单文件重试</text>
+<g class="badge ln-a"><circle class="nc" cx="105" cy="1082" r="12"></circle><text class="nn" x="105" y="1082">11</text></g><text class="mt" x="125" y="1082">重验通过并导出合规标准 JSON</text>
+
+<path class="fxt ln-b l173 t1" d="M89 178 H262"></path><path class="fx ln-b l173 t1" d="M89 178 H262"></path>
+<path class="fxt ln-c l173 t2" d="M267 242 H440"></path><path class="fx ln-c l173 t2" d="M267 242 H440"></path>
+<path class="fxt ln-d l173 t3" d="M445 306 H618"></path><path class="fx ln-d l173 t3" d="M445 306 H618"></path>
+<path class="fxt ln-c l168 t4" d="M618 380 H450"></path><path class="fx ln-c l168 t4" d="M618 380 H450"></path>
+<path class="fxt ln-b l173 t5" d="M445 488 H272"></path><path class="fx ln-b l173 t5" d="M445 488 H272"></path>
+<path class="fxt ln-c l173 t7" d="M267 668 H440"></path><path class="fx ln-c l173 t7" d="M267 668 H440"></path>
+<path class="fxt ln-d l173 t8" d="M445 740 H618"></path><path class="fx ln-d l173 t8" d="M445 740 H618"></path>
+<path class="fxt ln-b l346 t9" d="M618 814 H272"></path><path class="fx ln-b l346 t9" d="M618 814 H272"></path>
+<path class="fxt ln-a l173 t10" d="M267 930 H94"></path><path class="fx ln-a l173 t10" d="M267 930 H94"></path>
+<path class="fxt ln-b l173 t11" d="M89 1018 H262"></path><path class="fx ln-b l173 t11" d="M89 1018 H262"></path>
+<path class="fxt ln-a l173 t12" d="M267 1106 H94"></path><path class="fx ln-a l173 t12" d="M267 1106 H94"></path>
+
+<path class="lgw" d="M0 1184 H21"></path><path class="lga" d="M20 1178 L30 1184 L20 1190 Z"></path><text class="lg" x="38" y="1184">请求</text><path class="lgd" d="M96 1184 H117"></path><path class="lga" d="M116 1178 L126 1184 L116 1190 Z"></path><text class="lg" x="134" y="1184">返回</text><rect class="lg-act" x="192" y="1174" width="8" height="20" rx="2"></rect><text class="lg" x="208" y="1184">处理中</text><rect class="lg-note" x="272" y="1176" width="26" height="16" rx="4"></rect><text class="lg" x="306" y="1184">处理说明</text><text class="lg" x="384" y="1184">颜色 = 接收处理的一方</text>
+</svg>
+
+<div class="foot" style="width: 712px">注：步骤 6–8 仅在命中差错或 OCR 格式异常时触发，且每单据最多受控自修复 1 轮；校验通过项跳过 6–8 直接进入步骤 9。</div>
+<!-- 内容结束 -->
+</div>

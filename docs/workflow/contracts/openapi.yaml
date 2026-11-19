@@ -1,0 +1,1730 @@
+openapi: 3.1.0
+info:
+  title: Shipping Intelligent Billing Assistant API
+  version: 1.0.0
+  license:
+    name: MIT (Project-Authored Spec Only)
+    identifier: MIT
+  description: >
+    多格式文档解析的航运智能账单助手智能体 REST API 契约。
+    覆盖多格式投递解析、记账主体视角 AR/AP 重算、四级匹配、确定性校验门禁、人工复核闭环、
+    多口径标准/审计 JSON 导出与 Harness 评测运行。
+
+security:
+  - {}
+
+servers:
+  - url: http://127.0.0.1:8000
+    description: Local FastAPI server (bound to localhost)
+
+tags:
+  - name: System
+    description: 健康检查与运行时能力状态
+  - name: MasterData
+    description: 记账主体、费用映射词典与已有历史账单基准管理
+  - name: Batches
+    description: 单据批次投递、文件恢复与主体切换重算
+  - name: Records
+    description: 单条账单人工修订、补充费用行、批准与驳回
+  - name: Export
+    description: 多口径标准 JSON 导出与基准同步
+  - name: Evaluation
+    description: Harness 离线与联机稳定性评测
+
+paths:
+  /api/v1/health:
+    get:
+      tags: [System]
+      operationId: getHealth
+      summary: 获取服务健康状态与外接能力配置状态
+      responses:
+        "200":
+          description: 服务正常
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+              examples:
+                normal:
+                  summary: 正常联机能力就绪
+                  value:
+                    status: ok
+                    llm_configured: true
+                    llm_model: deepseek-flash
+                    ocr_gateway_url: https://gateway.pltplt.com/ai/process
+                    ocr_direct_mode: true
+                    public_relay_configured: false
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/entities:
+    get:
+      tags: [MasterData]
+      operationId: listAccountingEntities
+      summary: 获取全部记账主体档案与别名列表
+      responses:
+        "200":
+          description: 记账主体列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AccountingEntity"
+              examples:
+                normal:
+                  summary: 含默认主体与别名
+                  value:
+                    - id: ent-neptune
+                      canonical_name: NEPTUNE SHIPPING LIMITED
+                      aliases: ["NEPTUNE SHIPPING LIMITED (LAX)", "Neptune Shipping"]
+                      is_default: true
+                      created_at: "2026-11-19T08:00:00Z"
+                      updated_at: "2026-11-19T08:00:00Z"
+                empty:
+                  summary: 尚无主体
+                  value: []
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    post:
+      tags: [MasterData]
+      operationId: createAccountingEntity
+      summary: 新增记账主体及其别名
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountingEntityUpsert"
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountingEntity"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/entities/{entity_id}:
+    put:
+      tags: [MasterData]
+      operationId: updateAccountingEntity
+      summary: 更新指定记账主体的名称或别名
+      parameters:
+        - $ref: "#/components/parameters/EntityId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountingEntityUpsert"
+      responses:
+        "200":
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountingEntity"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/dictionary:
+    get:
+      tags: [MasterData]
+      operationId: listChargeDictionary
+      summary: 查询费用名称标准映射词典
+      responses:
+        "200":
+          description: 词典条目列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ChargeDictionaryEntry"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    post:
+      tags: [MasterData]
+      operationId: upsertChargeDictionaryEntry
+      summary: 新增或更新费用名称别名映射
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChargeDictionaryCreate"
+      responses:
+        "201":
+          description: 已保存映射条目
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChargeDictionaryEntry"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/dictionary/{entry_id}:
+    delete:
+      tags: [MasterData]
+      operationId: deleteChargeDictionaryEntry
+      summary: 删除自定义费用映射条目
+      parameters:
+        - name: entry_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: 已删除
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/existing-bills:
+    get:
+      tags: [MasterData]
+      operationId: listExistingBills
+      summary: 按可选记账主体过滤查询已有历史账单基准
+      parameters:
+        - name: accounting_entity
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 历史账单列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ExistingBill"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    delete:
+      tags: [MasterData]
+      operationId: clearExistingBills
+      summary: 清空已有历史账单基准（可选按主体清理）
+      parameters:
+        - name: accounting_entity
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "204":
+          description: 已清空
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/existing-bills/import:
+    post:
+      tags: [MasterData]
+      operationId: importExistingBills
+      summary: 批量导入已有历史账单 JSON 基准
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExistingBillImportRequest"
+      responses:
+        "200":
+          description: 导入结果摘要
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExistingBillImportResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/batches:
+    get:
+      tags: [Batches]
+      operationId: listBatches
+      summary: 获取最近解析批次列表（支持页面刷新恢复工作现场）
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+      responses:
+        "200":
+          description: 批次摘要列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BatchSummary"
+              examples:
+                empty:
+                  summary: 首次空数据态
+                  value: []
+                normal:
+                  summary: 含最近处理批次
+                  value:
+                    - id: batch-01
+                      short_code: B-1119-01
+                      accounting_entity: NEPTUNE SHIPPING LIMITED
+                      source_channel: WEB
+                      status: PARTIAL_ERROR
+                      stage: COMPLETED
+                      stage_message: 解析完成（3 份成功，1 份待处理）
+                      ocr_mode: REMOTE_WITH_LOCAL_FALLBACK
+                      total_files: 4
+                      succeeded_files: 3
+                      failed_files: 1
+                      counts:
+                        create: 3
+                        update: 1
+                        no_change: 0
+                        pending_review: 2
+                        rejected: 0
+                      created_at: "2026-11-19T09:00:00Z"
+                      updated_at: "2026-11-19T09:01:00Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    post:
+      tags: [Batches]
+      operationId: createBatch
+      summary: 上传多格式单据或公网 URL 并启动解析批次（支持 wait=false 异步轮询 stage）
+      parameters:
+        - name: wait
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [accounting_entity]
+              properties:
+                accounting_entity:
+                  type: string
+                  minLength: 1
+                  maxLength: 120
+                ocr_mode:
+                  type: string
+                  enum: [REMOTE_ONLY, REMOTE_WITH_LOCAL_FALLBACK]
+                  default: REMOTE_ONLY
+                public_urls_json:
+                  type: string
+                  description: 可选公网文件 URL 字符串数组的 JSON 序列化文本
+                existing_bills_json:
+                  type: string
+                  description: 可选随批附带的已有账单 JSON 数组文本
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+      responses:
+        "201":
+          description: 批次解析完成返回完整详情（wait=true）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+        "202":
+          description: 批次已入队后台执行（wait=false），请轮询 GET /api/v1/batches/{batch_id}
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /api/v1/batches/demo:
+    post:
+      tags: [Batches]
+      operationId: createDemoBatch
+      summary: 一键载入笔试内置 4 份真实样本并启动解析（默认 REMOTE_ONLY，需显式开启本地兜底）
+      parameters:
+        - name: wait
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                accounting_entity:
+                  type: string
+                  default: NEPTUNE SHIPPING LIMITED
+                ocr_mode:
+                  type: string
+                  enum: [REMOTE_ONLY, REMOTE_WITH_LOCAL_FALLBACK]
+                  default: REMOTE_ONLY
+      responses:
+        "201":
+          description: 演示批次创建成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+        "202":
+          description: 演示批次已入队（wait=false）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/batches/import-review-bundle:
+    post:
+      tags: [Batches]
+      operationId: importReviewBundle
+      summary: 导入 CLI 生成的强约束 ReviewBundleV1 复核包并在工作台接手继续处理
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReviewBundleV1"
+      responses:
+        "201":
+          description: 导入成功并返回工作台批次详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/batches/{batch_id}:
+    get:
+      tags: [Batches]
+      operationId: getBatchDetail
+      summary: 获取指定批次的完整文件树、失败告警、账单明细与汇总计数
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+      responses:
+        "200":
+          description: 批次完整详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+              examples:
+                edge_credit_and_failure:
+                  summary: 边界场景（含贷项负金额与单文件失败告警）
+                  value:
+                    id: batch-edge-01
+                    short_code: B-1119-09
+                    accounting_entity: ALL AMERICA FORWARDING, INC.
+                    source_channel: WEB
+                    status: PARTIAL_ERROR
+                    stage: COMPLETED
+                    stage_message: 解析完成（1 份成功，1 份失败）
+                    ocr_mode: REMOTE_ONLY
+                    total_files: 2
+                    succeeded_files: 1
+                    failed_files: 1
+                    counts:
+                      create: 1
+                      update: 0
+                      no_change: 0
+                      pending_review: 0
+                      rejected: 0
+                    documents:
+                      - id: doc-fail-1
+                        parent_doc_id: null
+                        original_filename: scan_corrupted.png
+                        sanitized_filename: scan_corrupted.png
+                        source_kind: IMAGE
+                        extraction_channel: FAILED
+                        status: FAILED
+                        error_message: 远端 OCR 网关超时或无法读取该本地图片（未配置公网地址）
+                        affected_record_ids: []
+                        excluded_clauses: []
+                        shipment_refs: {}
+                        subtotal_amount: null
+                        tax_amount: null
+                        total_amount: null
+                        total_currency: null
+                    failed_documents:
+                      - doc_id: doc-fail-1
+                        filename: scan_corrupted.png
+                        error_message: 远端 OCR 网关超时或无法读取该本地图片（未配置公网地址）
+                        affected_record_ids: []
+                    records:
+                      - id: rec-cn-1
+                        source_doc_id: doc-ok-1
+                        source_line_index: 0
+                        operation: CREATE
+                        review_status: AUTO_READY
+                        match_level: NONE
+                        matched_existing_bill_id: null
+                        candidate_bills: []
+                        document_info:
+                          document_type: Credit Note
+                          reference_no: CN-202611-01
+                          document_date: "2026-11-10"
+                        transaction_party:
+                          issuer: ZIM INTEGRATED SHIPPING
+                          recipient: ALL AMERICA FORWARDING, INC.
+                        charge_details:
+                          charge_item: Handling Charge
+                          raw_charge_name: H/D Fee Rebate
+                          quantity: 1
+                          unit_price: -40.0
+                          amount: -40.0
+                          currency: USD
+                          payment_term: PP
+                        financial_attributes:
+                          accounting_entity: ALL AMERICA FORWARDING, INC.
+                          posting_type: AP
+                        shipment_refs:
+                          mbl_nos: []
+                          hbl_no: null
+                          booking_no: null
+                          container_nos: []
+                        source_evidence:
+                          source_file: cn_sample.pdf
+                          page: 1
+                          snippet: "CREDIT(-): H/D Fee Rebate 40.00 USD"
+                        field_diffs: []
+                        validation_alerts: []
+                        ai_reasoning:
+                          - "贷项冲减：我方作为接收方收到供应商 Credit Note，保持 AP 归属并将冲减金额表达为 -40.00"
+                        human_overrides: {}
+                        reject_reason: null
+                        created_at: "2026-11-19T09:00:00Z"
+                        updated_at: "2026-11-19T09:00:00Z"
+                    created_at: "2026-11-19T09:00:00Z"
+                    updated_at: "2026-11-19T09:01:00Z"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/batches/{batch_id}/switch-entity:
+    post:
+      tags: [Batches]
+      operationId: switchBatchAccountingEntity
+      summary: 切换批次当前记账主体并即时重算 AR/AP、匹配关系与清理跨主体批准态
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [accounting_entity]
+              properties:
+                accounting_entity:
+                  type: string
+                  minLength: 1
+                  maxLength: 120
+      responses:
+        "200":
+          description: 切换并重算完成
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SwitchEntityResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/batches/{batch_id}/documents/{doc_id}/retry:
+    post:
+      tags: [Batches]
+      operationId: retryOrReplaceDocument
+      summary: 原地重试或上传替换单个失败文件/附件并重算受影响费用
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+        - $ref: "#/components/parameters/DocId"
+      requestBody:
+        required: false
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                ocr_mode:
+                  type: string
+                  enum: [REMOTE_ONLY, REMOTE_WITH_LOCAL_FALLBACK]
+                public_url:
+                  type: string
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: 重试完成并返回最新批次详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/batches/{batch_id}/documents/{doc_id}:
+    patch:
+      tags: [Batches]
+      operationId: patchDocumentTotals
+      summary: 人工修正单据级小计、税额或总计（解决行金额正确而OCR识错总计的阻断）并重跑对账门禁
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+        - $ref: "#/components/parameters/DocId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DocumentTotalsPatchRequest"
+      responses:
+        "200":
+          description: 修正并重跑该单据全部行的对账门禁
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/batches/{batch_id}/documents/{doc_id}/force-parse:
+    post:
+      tags: [Batches]
+      operationId: forceParseSkippedDocument
+      summary: 将默认跳过的邮件内嵌签名图强制纳入 OCR 提取并重算批次
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+        - $ref: "#/components/parameters/DocId"
+      responses:
+        "200":
+          description: 强制解析完成并返回最新批次详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/batches/{batch_id}/records:
+    post:
+      tags: [Records]
+      operationId: addManualBillingRecord
+      summary: 同单漏提费用行时由财务从来源单据上下文手工新增一条费用记录
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManualRecordCreate"
+      responses:
+        "201":
+          description: 新增成功并返回更新后的批次详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/batches/{batch_id}/records/{record_id}:
+    patch:
+      tags: [Records]
+      operationId: patchBillingRecord
+      summary: 全字段人工修订与可选历史账单关联，锁定修订字段并即时重跑校验门禁
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+        - $ref: "#/components/parameters/RecordId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecordPatchRequest"
+      responses:
+        "200":
+          description: 修订与重验完成
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/batches/{batch_id}/records/{record_id}/approve:
+    post:
+      tags: [Records]
+      operationId: approveBillingRecord
+      summary: 带理由批准软告警记录（存在数值/平账/缺币种等硬性红灯时拒绝并返回 422）
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+        - $ref: "#/components/parameters/RecordId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  minLength: 2
+                  maxLength: 500
+      responses:
+        "200":
+          description: 批准成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /api/v1/batches/{batch_id}/records/{record_id}/reject:
+    post:
+      tags: [Records]
+      operationId: rejectBillingRecord
+      summary: 驳回并从正式入账口径中排除该条费用记录
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+        - $ref: "#/components/parameters/RecordId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  minLength: 2
+                  maxLength: 500
+      responses:
+        "200":
+          description: 已标记驳回
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/batches/{batch_id}/export:
+    get:
+      tags: [Export]
+      operationId: exportBatchJson
+      summary: 导出预览与计数统计（正式标准版/四态全量标准版/完整审计版）
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+        - name: mode
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [official, full_standard, audit]
+            default: official
+      responses:
+        "200":
+          description: 导出载荷及口径计数
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExportResponse"
+              examples:
+                official:
+                  summary: 正式标准导出（included_count 与 records 条数严格一致）
+                  value:
+                    mode: official
+                    included_count: 1
+                    excluded_pending_count: 1
+                    excluded_rejected_count: 1
+                    records:
+                      - operation: UPDATE
+                        document_info:
+                          document_type: Debit Note
+                          reference_no: DN-202609-001
+                          document_date: "2026-09-20"
+                        transaction_party:
+                          issuer: Destination Agent
+                          recipient: Origin Agent
+                        charge_details:
+                          charge_item: Handling Charge
+                          raw_charge_name: H/D Fee
+                          quantity: 1
+                          unit_price: 40.0
+                          amount: 40.0
+                          currency: USD
+                          payment_term: PP
+                        financial_attributes:
+                          accounting_entity: Origin Agent
+                          posting_type: AP
+                        audit_trail:
+                          matched_bill_ref: "DN-202609-001 / Handling Charge"
+                          ai_reasoning:
+                            - "通过单据编号和费用名称匹配到已有账单"
+                            - "根据识别结果将金额更新为 USD 40.00，未改字段继承原值"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/batches/{batch_id}/export/download:
+    get:
+      tags: [Export]
+      operationId: downloadBatchJsonArray
+      summary: 直接下载符合 billing-output.schema.json 的标准顶层 JSON 数组
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+        - name: mode
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [official, full_standard, audit]
+            default: official
+      responses:
+        "200":
+          description: 顶层标准 JSON 数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StandardOutputRecord"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/batches/{batch_id}/sync-baseline:
+    post:
+      tags: [Export]
+      operationId: syncBatchToBaseline
+      summary: 显式将本批次已就绪的 CREATE/UPDATE 记录写入工作台历史账单基准库（幂等）
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                idempotency_key:
+                  type: string
+      responses:
+        "200":
+          description: 同步成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncBaselineResult"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/eval-runs:
+    get:
+      tags: [Evaluation]
+      operationId: listEvalRuns
+      summary: 获取最近 Harness 评测运行结果列表
+      responses:
+        "200":
+          description: 评测历史列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EvalRunSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    post:
+      tags: [Evaluation]
+      operationId: triggerEvalRun
+      summary: 触发一次离线确定性或联机 Harness 评测基准运行
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_mode]
+              properties:
+                run_mode:
+                  type: string
+                  enum: [OFFLINE_DETERMINISTIC, LIVE_LLM, LIVE_E2E]
+                k_trials:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                  default: 3
+      responses:
+        "201":
+          description: 评测运行完成
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvalRunSummary"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+components:
+  parameters:
+    BatchId:
+      name: batch_id
+      in: path
+      required: true
+      schema:
+        type: string
+    DocId:
+      name: doc_id
+      in: path
+      required: true
+      schema:
+        type: string
+    RecordId:
+      name: record_id
+      in: path
+      required: true
+      schema:
+        type: string
+    EntityId:
+      name: entity_id
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: 请求参数或文件格式不合法
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            ssrf_blocked:
+              summary: 非法本地地址被 SSRF 防护拦截
+              value:
+                code: SSRF_BLOCKED
+                message: 禁止提交内网或本机回环地址作为外部 OCR 文件链接
+                details:
+                  url: "http://127.0.0.1:8000/secret.pdf"
+                request_id: req-9f1a2b
+    NotFound:
+      description: 目标资源不存在
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ValidationFailed:
+      description: 业务校验未通过或存在未解除的硬性阻断
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            hard_blocker:
+              summary: 金额对账红灯禁止直接批准
+              value:
+                code: HARD_BLOCKER_CANNOT_APPROVE
+                message: 该记录存在未解决的硬性数值或对账错误，请先修正金额/币种或选择驳回
+                details:
+                  blocker_codes: ["AMOUNT_TOTAL_MISMATCH"]
+                request_id: req-7c3d1e
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+        request_id:
+          type: ["string", "null"]
+
+    HealthStatus:
+      type: object
+      required: [status, llm_configured, ocr_gateway_url, ocr_direct_mode, public_relay_configured]
+      properties:
+        status:
+          type: string
+        llm_configured:
+          type: boolean
+        llm_model:
+          type: ["string", "null"]
+        ocr_gateway_url:
+          type: string
+        ocr_direct_mode:
+          type: boolean
+        public_relay_configured:
+          type: boolean
+
+    AccountingEntity:
+      type: object
+      required: [id, canonical_name, aliases, is_default, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        canonical_name:
+          type: string
+        aliases:
+          type: array
+          items:
+            type: string
+        is_default:
+          type: boolean
+        created_at:
+          type: string
+        updated_at:
+          type: string
+
+    AccountingEntityUpsert:
+      type: object
+      required: [canonical_name]
+      properties:
+        canonical_name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        aliases:
+          type: array
+          items:
+            type: string
+          default: []
+        is_default:
+          type: boolean
+          default: false
+
+    ChargeDictionaryEntry:
+      type: object
+      required: [id, raw_alias, standard_name, category, is_builtin, created_at]
+      properties:
+        id:
+          type: string
+        raw_alias:
+          type: string
+        standard_name:
+          type: string
+        category:
+          type: string
+        is_builtin:
+          type: boolean
+        created_at:
+          type: string
+
+    ChargeDictionaryCreate:
+      type: object
+      required: [raw_alias, standard_name]
+      properties:
+        raw_alias:
+          type: string
+          minLength: 1
+        standard_name:
+          type: string
+          minLength: 1
+        category:
+          type: string
+          default: general
+
+    ExistingBill:
+      type: object
+      required: [id, accounting_entity, charge_item, amount, currency, posting_type, version]
+      properties:
+        id:
+          type: string
+        external_bill_key:
+          type: ["string", "null"]
+        accounting_entity:
+          type: string
+        document_type:
+          type: ["string", "null"]
+        reference_no:
+          type: ["string", "null"]
+        document_date:
+          type: ["string", "null"]
+        issuer:
+          type: ["string", "null"]
+        recipient:
+          type: ["string", "null"]
+        mbl_no:
+          type: ["string", "null"]
+        hbl_no:
+          type: ["string", "null"]
+        booking_no:
+          type: ["string", "null"]
+        container_nos:
+          type: array
+          items:
+            type: string
+        charge_item:
+          type: string
+        raw_charge_name:
+          type: ["string", "null"]
+        quantity:
+          type: ["number", "null"]
+        unit_price:
+          type: ["number", "null"]
+        amount:
+          type: number
+        currency:
+          type: string
+        payment_term:
+          type: ["string", "null"]
+          enum: [PP, CC, null]
+        posting_type:
+          type: string
+          enum: [AR, AP]
+        version:
+          type: integer
+
+    ExistingBillImportRequest:
+      type: object
+      required: [bills]
+      properties:
+        default_accounting_entity:
+          type: ["string", "null"]
+        replace_existing:
+          type: boolean
+          default: false
+        bills:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    ExistingBillImportResult:
+      type: object
+      required: [imported_count, total_count]
+      properties:
+        imported_count:
+          type: integer
+        total_count:
+          type: integer
+
+    BatchCounts:
+      type: object
+      required: [create, update, no_change, pending_review, rejected]
+      properties:
+        create:
+          type: integer
+        update:
+          type: integer
+        no_change:
+          type: integer
+        pending_review:
+          type: integer
+        rejected:
+          type: integer
+
+    BatchSummary:
+      type: object
+      required:
+        - id
+        - short_code
+        - accounting_entity
+        - source_channel
+        - status
+        - stage
+        - ocr_mode
+        - total_files
+        - succeeded_files
+        - failed_files
+        - counts
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+        short_code:
+          type: string
+        accounting_entity:
+          type: string
+        source_channel:
+          type: string
+          enum: [WEB, CLI]
+        status:
+          type: string
+          enum: [PROCESSING, COMPLETED, PARTIAL_ERROR]
+        stage:
+          type: string
+          enum: [QUEUED, UNPACKING, EXTRACTING, MATCHING, VALIDATING, COMPLETED, FAILED]
+        stage_message:
+          type: ["string", "null"]
+        ocr_mode:
+          type: string
+          enum: [REMOTE_ONLY, REMOTE_WITH_LOCAL_FALLBACK]
+        total_files:
+          type: integer
+        succeeded_files:
+          type: integer
+        failed_files:
+          type: integer
+        counts:
+          $ref: "#/components/schemas/BatchCounts"
+        created_at:
+          type: string
+        updated_at:
+          type: string
+
+    ExcludedClause:
+      type: object
+      required: [text, reason]
+      properties:
+        page:
+          type: ["integer", "null"]
+        text:
+          type: string
+        reason:
+          type: string
+
+    SourceRefValue:
+      type: object
+      required: [value, source]
+      properties:
+        value:
+          type: string
+        source:
+          type: string
+
+    ShipmentRefs:
+      type: object
+      properties:
+        mbl_nos:
+          type: array
+          items:
+            $ref: "#/components/schemas/SourceRefValue"
+        hbl_no:
+          type: ["string", "null"]
+        booking_no:
+          type: ["string", "null"]
+        container_nos:
+          type: array
+          items:
+            type: string
+
+    SourceDocumentSummary:
+      type: object
+      required:
+        - id
+        - original_filename
+        - sanitized_filename
+        - source_kind
+        - extraction_channel
+        - status
+      properties:
+        id:
+          type: string
+        parent_doc_id:
+          type: ["string", "null"]
+        original_filename:
+          type: string
+        sanitized_filename:
+          type: string
+        source_kind:
+          type: string
+        extraction_channel:
+          type: string
+        status:
+          type: string
+          enum: [PARSED, SKIPPED_NOISE, METADATA_ONLY, FAILED]
+        error_message:
+          type: ["string", "null"]
+        affected_record_ids:
+          type: array
+          items:
+            type: string
+        excluded_clauses:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExcludedClause"
+        shipment_refs:
+          $ref: "#/components/schemas/ShipmentRefs"
+        subtotal_amount:
+          type: ["number", "null"]
+        tax_amount:
+          type: ["number", "null"]
+        total_amount:
+          type: ["number", "null"]
+        total_currency:
+          type: ["string", "null"]
+
+    FailedDocumentAlert:
+      type: object
+      required: [doc_id, filename, error_message, affected_record_ids]
+      properties:
+        doc_id:
+          type: string
+        filename:
+          type: string
+        error_message:
+          type: string
+        affected_record_ids:
+          type: array
+          items:
+            type: string
+
+    ValidationAlert:
+      type: object
+      required: [code, severity, message]
+      properties:
+        code:
+          type: string
+        severity:
+          type: string
+          enum: [WARNING, BLOCKER, RESOLVED]
+        field:
+          type: ["string", "null"]
+        message:
+          type: string
+        expected:
+          type: ["string", "null"]
+        actual:
+          type: ["string", "null"]
+
+    FieldDiff:
+      type: object
+      required: [field, old_value, new_value, changed]
+      properties:
+        field:
+          type: string
+        old_value: {}
+        new_value: {}
+        changed:
+          type: boolean
+
+    CandidateBillOption:
+      type: object
+      required: [id, label, amount, currency]
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        reference_no:
+          type: ["string", "null"]
+        charge_item:
+          type: string
+        amount:
+          type: number
+        currency:
+          type: string
+        document_date:
+          type: ["string", "null"]
+
+    DocumentInfo:
+      type: object
+      required: [document_type, reference_no, document_date]
+      properties:
+        document_type:
+          type: ["string", "null"]
+        reference_no:
+          type: ["string", "null"]
+        document_date:
+          type: ["string", "null"]
+
+    TransactionParty:
+      type: object
+      required: [issuer, recipient]
+      properties:
+        issuer:
+          type: ["string", "null"]
+        recipient:
+          type: ["string", "null"]
+
+    ChargeDetails:
+      type: object
+      required: [charge_item, amount, currency, payment_term]
+      properties:
+        charge_item:
+          type: ["string", "null"]
+        raw_charge_name:
+          type: ["string", "null"]
+        quantity:
+          type: ["number", "null"]
+        unit_price:
+          type: ["number", "null"]
+        amount:
+          type: ["number", "null"]
+        currency:
+          type: ["string", "null"]
+        payment_term:
+          type: ["string", "null"]
+          enum: [PP, CC, null]
+
+    FinancialAttributes:
+      type: object
+      required: [accounting_entity, posting_type]
+      properties:
+        accounting_entity:
+          type: string
+        posting_type:
+          type: ["string", "null"]
+          enum: [AR, AP, null]
+
+    BillingRecordDetail:
+      type: object
+      required:
+        - id
+        - source_doc_id
+        - source_line_index
+        - operation
+        - review_status
+        - match_level
+        - document_info
+        - transaction_party
+        - charge_details
+        - financial_attributes
+        - ai_reasoning
+      properties:
+        id:
+          type: string
+        source_doc_id:
+          type: string
+        source_line_index:
+          type: integer
+        operation:
+          type: string
+          enum: [CREATE, UPDATE, NO_CHANGE, PENDING_REVIEW]
+        review_status:
+          type: string
+          enum: [AUTO_READY, NEEDS_REVIEW, APPROVED, REJECTED]
+        match_level:
+          type: string
+        matched_existing_bill_id:
+          type: ["string", "null"]
+        candidate_bills:
+          type: array
+          items:
+            $ref: "#/components/schemas/CandidateBillOption"
+        document_info:
+          $ref: "#/components/schemas/DocumentInfo"
+        transaction_party:
+          $ref: "#/components/schemas/TransactionParty"
+        charge_details:
+          $ref: "#/components/schemas/ChargeDetails"
+        financial_attributes:
+          $ref: "#/components/schemas/FinancialAttributes"
+        shipment_refs:
+          $ref: "#/components/schemas/ShipmentRefs"
+        source_evidence:
+          type: object
+          additionalProperties: true
+        field_diffs:
+          type: array
+          items:
+            $ref: "#/components/schemas/FieldDiff"
+        validation_alerts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValidationAlert"
+        ai_reasoning:
+          type: array
+          items:
+            type: string
+        human_overrides:
+          type: object
+          additionalProperties: true
+        reject_reason:
+          type: ["string", "null"]
+        created_at:
+          type: string
+        updated_at:
+          type: string
+
+    BatchDetail:
+      allOf:
+        - $ref: "#/components/schemas/BatchSummary"
+        - type: object
+          required: [documents, failed_documents, records]
+          properties:
+            documents:
+              type: array
+              items:
+                $ref: "#/components/schemas/SourceDocumentSummary"
+            failed_documents:
+              type: array
+              items:
+                $ref: "#/components/schemas/FailedDocumentAlert"
+            records:
+              type: array
+              items:
+                $ref: "#/components/schemas/BillingRecordDetail"
+
+    SwitchEntityResponse:
+      type: object
+      required: [batch, reset_approval_count, notice]
+      properties:
+        batch:
+          $ref: "#/components/schemas/BatchDetail"
+        reset_approval_count:
+          type: integer
+        notice:
+          type: string
+
+    ManualRecordCreate:
+      type: object
+      required: [source_doc_id, charge_item, amount, currency]
+      properties:
+        source_doc_id:
+          type: string
+        charge_item:
+          type: string
+          minLength: 1
+        raw_charge_name:
+          type: ["string", "null"]
+        amount:
+          type: number
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+        payment_term:
+          type: ["string", "null"]
+          enum: [PP, CC, null]
+        posting_type:
+          type: ["string", "null"]
+          enum: [AR, AP, null]
+        reference_no:
+          type: ["string", "null"]
+        document_date:
+          type: ["string", "null"]
+        issuer:
+          type: ["string", "null"]
+        recipient:
+          type: ["string", "null"]
+        reason:
+          type: string
+          default: 人工补录漏提费用行
+
+    DocumentTotalsPatchRequest:
+      type: object
+      properties:
+        subtotal_amount:
+          type: ["number", "null"]
+        tax_amount:
+          type: ["number", "null"]
+        total_amount:
+          type: ["number", "null"]
+        total_currency:
+          type: ["string", "null"]
+        review_note:
+          type: ["string", "null"]
+
+    ReviewBundleV1:
+      type: object
+      required: [bundle_version, accounting_entity, documents, records]
+      properties:
+        bundle_version:
+          type: string
+          const: "1.0"
+        short_code:
+          type: ["string", "null"]
+        accounting_entity:
+          type: string
+          minLength: 1
+        ocr_mode:
+          type: string
+          enum: [REMOTE_ONLY, REMOTE_WITH_LOCAL_FALLBACK]
+          default: REMOTE_ONLY
+        documents:
+          type: array
+          items:
+            $ref: "#/components/schemas/SourceDocumentSummary"
+        records:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingRecordDetail"
+        existing_bills_snapshot:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExistingBill"
+          default: []
+
+    RecordPatchRequest:
+      type: object
+      properties:
+        charge_item:
+          type: ["string", "null"]
+        quantity:
+          type: ["number", "null"]
+        unit_price:
+          type: ["number", "null"]
+        amount:
+          type: ["number", "null"]
+        currency:
+          type: ["string", "null"]
+        payment_term:
+          type: ["string", "null"]
+          enum: [PP, CC, null]
+        posting_type:
+          type: ["string", "null"]
+          enum: [AR, AP, null]
+        document_type:
+          type: ["string", "null"]
+        reference_no:
+          type: ["string", "null"]
+        document_date:
+          type: ["string", "null"]
+        issuer:
+          type: ["string", "null"]
+        recipient:
+          type: ["string", "null"]
+        mbl_no:
+          type: ["string", "null"]
+        hbl_no:
+          type: ["string", "null"]
+        booking_no:
+          type: ["string", "null"]
+        container_nos:
+          type: ["array", "null"]
+          items:
+            type: string
+        matched_existing_bill_id:
+          type: ["string", "null"]
+        force_create_new:
+          type: boolean
+          default: false
+        review_note:
+          type: ["string", "null"]
+
+    StandardAuditTrail:
+      type: object
+      required: [ai_reasoning]
+      additionalProperties: true
+      properties:
+        ai_reasoning:
+          type: array
+          items:
+            type: string
+        match_level:
+          type: ["string", "null"]
+        matched_bill_ref:
+          type: ["string", "null"]
+
+    StandardOutputRecord:
+      type: object
+      required:
+        - operation
+        - document_info
+        - transaction_party
+        - charge_details
+        - financial_attributes
+        - audit_trail
+      properties:
+        operation:
+          type: string
+          enum: [CREATE, UPDATE, NO_CHANGE, PENDING_REVIEW]
+        document_info:
+          $ref: "#/components/schemas/DocumentInfo"
+        transaction_party:
+          $ref: "#/components/schemas/TransactionParty"
+        charge_details:
+          $ref: "#/components/schemas/ChargeDetails"
+        financial_attributes:
+          $ref: "#/components/schemas/FinancialAttributes"
+        audit_trail:
+          $ref: "#/components/schemas/StandardAuditTrail"
+
+    ExportResponse:
+      type: object
+      required: [mode, included_count, excluded_pending_count, excluded_rejected_count, records]
+      properties:
+        mode:
+          type: string
+          enum: [official, full_standard, audit]
+        included_count:
+          type: integer
+        excluded_pending_count:
+          type: integer
+        excluded_rejected_count:
+          type: integer
+        records:
+          type: array
+          items:
+            $ref: "#/components/schemas/StandardOutputRecord"
+
+    SyncBaselineResult:
+      type: object
+      required: [created_count, updated_count, skipped_count]
+      properties:
+        created_count:
+          type: integer
+        updated_count:
+          type: integer
+        skipped_count:
+          type: integer
+
+    EvalRunSummary:
+      type: object
+      required:
+        - id
+        - run_mode
+        - status
+        - model_name
+        - k_trials
+        - actual_trials
+        - total_cases
+        - created_at
+      properties:
+        id:
+          type: string
+        run_mode:
+          type: string
+          enum: [OFFLINE_DETERMINISTIC, LIVE_LLM, LIVE_E2E]
+        status:
+          type: string
+          enum: [COMPLETED, FAILED, UNVERIFIED]
+        error_message:
+          type: ["string", "null"]
+        model_name:
+          type: string
+        k_trials:
+          type: integer
+        actual_trials:
+          type: integer
+        total_cases:
+          type: integer
+        schema_valid_rate:
+          type: ["number", "null"]
+        field_exact_match:
+          type: ["number", "null"]
+        ar_ap_accuracy:
+          type: ["number", "null"]
+        operation_accuracy:
+          type: ["number", "null"]
+        conflict_recall:
+          type: ["number", "null"]
+        pass_at_k:
+          type: ["number", "null"]
+        pass_pow_k:
+          type: ["number", "null"]
+        report:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string

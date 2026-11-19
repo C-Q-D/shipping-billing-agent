@@ -2,9 +2,9 @@
 schema_version: 1
 mode: tracked
 docs_root: docs/workflow
-current_node: "prd-finalized"
-next_action: "进入架构与机器契约设计（arch-and-contract）"
-check_cmd: ""
+current_node: "arch-finalized"
+next_action: "进入 Phase 3：B00 骨架基线验证 + UI 规格与原型设计（ui-prototype / lumno-ui-style）+ 功能切片规划"
+check_cmd: "uv run --python 3.12 --with jsonschema --with iso4217 python scripts/verify_contracts.py"
 ---
 
 # 项目研发工作流总索引
@@ -19,6 +19,10 @@ check_cmd: ""
 | 类别 | 路径（相对项目根） | 内容与覆盖范围摘要 | 按需读取条件 |
 | :--- | :--- | :--- | :--- |
 | 产品需求文档（PRD） | `docs/workflow/product-spec.md` | 航运智能账单助手 PRD（`F-01`~`F-07` 功能流程、四态决策、校验门禁、验收标准与技术备注） | 架构设计、UI 原型、功能拆片与验收核对时读 |
+| 系统架构与契约规格书 | `docs/workflow/arch-contract.md` | 技术选型与许可证、模块单向依赖边界、安全底座与测试分层规范 | 搭建 B00、拆片开发、编码与审查时读 |
+| 数据库建表契约 | `docs/workflow/contracts/schema.sql` | SQLite 3 八张核心表 DDL（十进制字符串精度、局部同步幂等表与索引） | 编写 `storage` 层与迁移脚本时读 |
+| REST 接口契约 | `docs/workflow/contracts/openapi.yaml` | OpenAPI 3.1.0 接口定义、错误模型与 4 类场景示例 | 编写 `api` 路由与生成前端 `schema.d.ts` 时读 |
+| 标准输出 JSON Schema | `docs/workflow/contracts/billing-output.schema.json` | 题目第 5/6/7 节标准输出 JSON Draft 2020-12 校验契约 | 实现导出器、校验器与 Harness 时读 |
 | 分级待办池 | `docs/workflow/backlog.md` | 延后需求、死代码清理项、待补自动化检查队列 | 代码清理演进或规划下一轮功能时读 |
 
 ## 2. 图示与界面原型
@@ -26,6 +30,8 @@ check_cmd: ""
 | :--- | :--- | :--- | :--- |
 | 业务主流程图（泳道） | `docs/workflow/diagrams/user-billing-flow.html` | `F-01`~`F-06` 端到端单据解析、校验与人工复核回流主线 | 核对跨角色交互与闭环流转时查看 |
 | 决策与门禁流程图 | `docs/workflow/diagrams/operation-decision-flow.html` | `F-03`~`F-05` 校验门禁与四级匹配四态决策流程 | 实现核心判定引擎或复核规则时查看 |
+| 系统架构总图 | `docs/workflow/diagrams/architecture.html` | 调用方、四层模块依赖边界、本机存储与外部服务调用方向 | 核对模块职责与单向依赖边界时查看 |
+| 核心处理时序图 | `docs/workflow/diagrams/pipeline-sequence.html` | 投递拆包、OCR/LLM、匹配校验、1 轮自修复与人工修订锁定 | 核对 LangGraph 编排与失败边界时查看 |
 
 ## 3. 大功能目录索引（features/）
 > 状态枚举：`待规划` | `方案中` | `开发中(...)` | `待实连` | `待验收` | `受阻` | `已完成`（禁读） | `已搁置`（禁读）

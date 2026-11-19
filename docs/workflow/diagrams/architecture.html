@@ -1,0 +1,221 @@
+<!--
+模板：架构图（diagram-templates，2026-11-08 用户定稿）
+用在：系统由哪些部分组成、分几层、谁调用谁。
+固定部分：
+- 层 = 大圆角框（x 24、宽 652、圆角 14），层名霓虹字 15px 粗体在左上；层从上往下排，层间距 40。
+- 组 = 层里的细线框（宽 628）+ 13px 组名，框中框。
+- 组件 = 灯管卡片（g.node），标题 15px 粗体，说明 13px；组件没有编号圆。
+- 外部系统 = 虚线灯管，放进虚线边框的"外部"层。
+- 调用画单箭头，读写画双箭头，箭头标签胶囊压在线上；跨层的长线走左右两侧的通道（x 12、688、700），不穿过组件。
+- 颜色 = 所在的层；通电从上往下逐层点亮。图例和注脚在图下面。
+内容怎么增减：
+- 层 2～5 个，每层组件 1～8 个，超过 4 个排两行。
+- 一行 4 个组件时宽 146：标题不超过 8 个汉字，说明每行不超过 9 个汉字；一行 3 个宽 197，2 个宽 300，1 个宽 212、居中。
+- 说明最多 5 行，超过就让这个组件横跨两格，同组后面的组件顺延到下一行。
+
+通用约定（6 个模板相同）：
+- 风格：C2 通电点亮。节点是霓虹灯管卡片：底框 + 熄灭时的暗描边 + 点亮层（彩色粗管 .tg + 白芯 .tc）。
+- 颜色变量都以 --dg- 开头。文字色、次要文字色、卡片底色、分隔线对到宿主的主题变量（--foreground、--muted-foreground、--card、--border），宿主没有这些变量时用逗号后面的固定值；分类色（青、绿、品红、琥珀，回流用橙）是模板自己的两套取值。深浅两套按 prefers-color-scheme 切换：浅色是默认，深色写在 <style> 末尾的 @media 里。
+- 动画：一轮 12 秒（时序图 14 秒），每档 5%。第 k 档的元素用类 igK 闪亮，导线用 dwK 画出（长度类 lNNN 等于路径长度），彗星用 tK 出发；88% 起全部熄灭再循环。系统设了"减少动态"时整张静止全亮。增删步骤时同步改这三种类。
+- 一个页面只放一张图：各模板的类名、动画名相同但取值不同，两张不同模板的图放进同一页会互相覆盖。
+- 要换的内容在 <!-- 内容 --> 和 <!-- 内容结束 --> 之间，其余是固定部分。放不下就删字或换行，不缩字号。
+-->
+<meta charset="utf-8">
+<style>
+.dg{font-family:var(--font-sans,"Paper Mono","JetBrains Mono","Cascadia Mono",Consolas,ui-monospace,"Microsoft YaHei","PingFang SC",monospace)}
+.dg{--dg-text:var(--foreground,#0f172a);--dg-text2:var(--muted-foreground,#475569);--dg-card2:var(--card,#ffffff);--dg-off:#d5dae1;--dg-glass:#334155;--dg-g1:rgba(51,65,85,.28);--dg-g2:rgba(51,65,85,.12);--dg-rule:var(--border,#e2e8f0);--dg-card-sh:drop-shadow(0 1px 2px rgba(15,23,42,.07))}
+.dg .ln-a{--dg-k:#0e7490;--dg-kg:rgba(14,116,144,.35);--dg-ks:rgba(14,116,144,.28);--dg-kc:#ffffff}
+.dg .ln-b{--dg-k:#4d7c0f;--dg-kg:rgba(77,124,15,.32);--dg-ks:rgba(77,124,15,.28);--dg-kc:#ffffff}
+.dg .ln-c{--dg-k:#a21caf;--dg-kg:rgba(162,28,175,.32);--dg-ks:rgba(162,28,175,.28);--dg-kc:#ffffff}
+.dg .ln-d{--dg-k:#b45309;--dg-kg:rgba(180,83,9,.32);--dg-ks:rgba(180,83,9,.28);--dg-kc:#ffffff}
+.dg .ln-n{--dg-k:#334155;--dg-kg:rgba(51,65,85,.25);--dg-ks:rgba(51,65,85,.2);--dg-kc:#ffffff}
+.dg svg{display:block;overflow:visible}
+.layer{fill:none;stroke:var(--dg-ks);stroke-width:1.5}
+.layer.ext{stroke-dasharray:10 7}
+.ly-h{font-size:15px;font-weight:700;dominant-baseline:central}
+.dg .ly-h{fill:var(--dg-k);filter:drop-shadow(0 0 6px var(--dg-kg))}
+.grp{fill:none;stroke:var(--dg-ks);stroke-width:1}
+.gp-h{fill:var(--dg-k);font-size:13px;font-weight:700;dominant-baseline:central}
+.card{fill:var(--dg-card2);filter:var(--dg-card-sh)}
+.dim{fill:none;stroke:var(--dg-off);stroke-width:1.5}
+.tg{fill:none;stroke:var(--dg-k);stroke-width:3}
+.dg .tg{filter:drop-shadow(0 0 5px var(--dg-kg)) drop-shadow(0 2px 5px var(--dg-kg))}
+.tc{fill:none;stroke:var(--dg-kc);stroke-width:1.1}
+.dg .tc{stroke-width:.9;stroke-opacity:.9}
+.tg.ext,.tc.ext{stroke-dasharray:9 6}
+.tt{fill:var(--dg-text);font-size:15px;font-weight:600;dominant-baseline:central}
+.td{fill:var(--dg-text2);font-size:13px;dominant-baseline:central}
+.w{fill:none;stroke:var(--dg-off);stroke-width:2.5;stroke-linejoin:round}
+.ahd{fill:var(--dg-off)}
+.wl{fill:none;stroke:var(--dg-glass);stroke-width:2.5;stroke-linejoin:round;stroke-dasharray:calc(var(--dg-len) * 1px) calc(var(--dg-len) * 1px);opacity:0;filter:drop-shadow(0 0 3px var(--dg-g1)) drop-shadow(0 0 10px var(--dg-g2));animation-duration:12s;animation-timing-function:linear;animation-iteration-count:infinite}
+.ahl,.lga{fill:var(--dg-glass);filter:drop-shadow(0 0 3px var(--dg-g1))}
+.lgw{fill:none;stroke:var(--dg-glass);stroke-width:2.5;stroke-linejoin:round;filter:drop-shadow(0 0 3px var(--dg-g1))}
+.chip-b{fill:var(--dg-card2);stroke:var(--dg-off);stroke-width:1.5}
+.chip-l{fill:none;stroke:var(--dg-k);stroke-width:1.5;filter:drop-shadow(0 0 4px var(--dg-kg)) drop-shadow(0 0 8px var(--dg-kg))}
+.lbl{fill:var(--dg-k);font-size:13px;font-weight:700;text-anchor:middle;dominant-baseline:central}
+.lbl-t{fill:var(--dg-text);font-size:13px;font-weight:700;text-anchor:middle;dominant-baseline:central}
+.lg{fill:var(--dg-text2);font-size:13px;dominant-baseline:central}
+.lg-ext{fill:none;stroke:var(--dg-text2);stroke-width:1.5;stroke-dasharray:5 3}
+.foot{font-size:13px;line-height:20px;color:var(--dg-text2);margin-top:12px}
+.lit{opacity:0;animation-duration:12s;animation-timing-function:linear;animation-iteration-count:infinite}
+.ig0{animation-name:ig0}
+.ig1{animation-name:ig1}
+.ig2{animation-name:ig2}
+.ig3{animation-name:ig3}
+.ig4{animation-name:ig4}
+.ig5{animation-name:ig5}
+.ig6{animation-name:ig6}
+.dw0{animation-name:dw0}
+.dw2{animation-name:dw2}
+.dw3{animation-name:dw3}
+.dw5{animation-name:dw5}
+@keyframes ig0{0%{opacity:0}0.5%{opacity:1}1%{opacity:.3}1.6%{opacity:1}2.2%{opacity:.55}2.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig1{0%,5%{opacity:0}5.5%{opacity:1}6%{opacity:.3}6.6%{opacity:1}7.2%{opacity:.55}7.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig2{0%,10%{opacity:0}10.5%{opacity:1}11%{opacity:.3}11.6%{opacity:1}12.2%{opacity:.55}12.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig3{0%,15%{opacity:0}15.5%{opacity:1}16%{opacity:.3}16.6%{opacity:1}17.2%{opacity:.55}17.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig4{0%,20%{opacity:0}20.5%{opacity:1}21%{opacity:.3}21.6%{opacity:1}22.2%{opacity:.55}22.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig5{0%,25%{opacity:0}25.5%{opacity:1}26%{opacity:.3}26.6%{opacity:1}27.2%{opacity:.55}27.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes ig6{0%,30%{opacity:0}30.5%{opacity:1}31%{opacity:.3}31.6%{opacity:1}32.2%{opacity:.55}32.8%,88%{opacity:1}95%,100%{opacity:0}}
+@keyframes dw0{0%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}5%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw2{0%,10%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}15%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw3{0%,15%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}20%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw5{0%,25%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}30%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+.fx{fill:none;stroke-width:3.5;stroke-linecap:round;stroke-dasharray:16px 3000px;opacity:0;animation:run 12s linear infinite}
+.dg .fx{stroke:var(--dg-k);filter:drop-shadow(0 0 4px var(--dg-kg)) drop-shadow(0 0 8px var(--dg-kg))}
+.fxt{fill:none;stroke:var(--dg-k);stroke-width:4;stroke-linecap:round;stroke-dasharray:70px 3000px;opacity:0;animation:runt 12s linear infinite}
+.l40{--dg-len:40}
+.l60{--dg-len:60}
+.l80{--dg-len:80}
+.l98{--dg-len:98}
+.l642{--dg-len:642}
+.l892{--dg-len:892}
+.l958{--dg-len:958}
+.t0{animation-delay:0s}
+.t2{animation-delay:1.2s}
+.t3{animation-delay:1.8s}
+.t5{animation-delay:3s}
+@keyframes run{0%{opacity:1;stroke-dashoffset:16px}4.2%{opacity:1}5%,100%{opacity:0;stroke-dashoffset:calc(16px - var(--dg-len) * 1px)}}
+@keyframes runt{0%{opacity:.5;stroke-dashoffset:70px}4.2%{opacity:.5}5%,100%{opacity:0;stroke-dashoffset:calc(70px - var(--dg-len) * 1px)}}
+@media (prefers-reduced-motion: reduce){.lit{animation:none;opacity:1}.wl{animation:none;stroke-dasharray:none;opacity:1}.fx,.fxt{display:none}}
+.dg svg{max-width:100%;height:auto}
+@media (prefers-color-scheme: dark){
+.dg{--dg-text:var(--foreground,#f1f5f9);--dg-text2:var(--muted-foreground,#93a1ad);--dg-card2:var(--card,#07090c);--dg-off:#353d48;--dg-glass:#e6eef3;--dg-g1:rgba(230,238,243,.7);--dg-g2:rgba(201,214,223,.35);--dg-rule:var(--border,#232831);--dg-card-sh:none}
+.dg .ln-a{--dg-k:#22d3ee;--dg-kg:rgba(34,211,238,.55);--dg-ks:rgba(34,211,238,.22);--dg-kc:#cffafe}
+.dg .ln-b{--dg-k:#a3e635;--dg-kg:rgba(163,230,53,.5);--dg-ks:rgba(163,230,53,.22);--dg-kc:#ecfccb}
+.dg .ln-c{--dg-k:#e879f9;--dg-kg:rgba(232,121,249,.55);--dg-ks:rgba(232,121,249,.22);--dg-kc:#fae8ff}
+.dg .ln-d{--dg-k:#fbbf24;--dg-kg:rgba(251,191,36,.5);--dg-ks:rgba(251,191,36,.22);--dg-kc:#fef3c7}
+.dg .ln-n{--dg-k:#e6eef3;--dg-kg:rgba(201,214,223,.4);--dg-ks:rgba(201,214,223,.2);--dg-kc:#ffffff}
+.dg .ly-h{fill:var(--dg-kc);filter:drop-shadow(0 0 2px var(--dg-k)) drop-shadow(0 0 8px var(--dg-k)) drop-shadow(0 0 16px var(--dg-kg))}
+.dg .tg{filter:drop-shadow(0 0 4px var(--dg-k)) drop-shadow(0 0 12px var(--dg-kg))}
+.dg .fx{stroke:#ffffff;filter:drop-shadow(0 0 4px var(--dg-k)) drop-shadow(0 0 10px var(--dg-kg))}
+}
+.dw1{animation-name:dw1}
+.dw4{animation-name:dw4}
+@keyframes dw1{0%,5%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}10%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+@keyframes dw4{0%,20%{opacity:1;stroke-dashoffset:calc(var(--dg-len) * 1px)}25%,88%{opacity:1;stroke-dashoffset:0}95%,100%{opacity:0;stroke-dashoffset:0}}
+.t1{animation-delay:.6s}
+.t4{animation-delay:2.4s}
+.l14{--dg-len:14}
+.l24{--dg-len:24}
+.l34{--dg-len:34}
+.l54{--dg-len:54}
+.l86{--dg-len:86}
+.l96{--dg-len:96}
+.l647{--dg-len:647}
+.l657{--dg-len:657}
+.l955{--dg-len:955}
+.l965{--dg-len:965}
+<!-- 内容 -->
+<svg width="712" height="1142" viewBox="0 0 712 1142" role="img" aria-label="航运智能账单助手系统架构图，4 层">
+<g class="ln-a"><rect class="layer" x="24" y="0" width="652" height="118" rx="14"></rect><text class="ly-h" x="40" y="20">调用方（本机）</text></g>
+<g class="ln-b"><rect class="layer" x="24" y="158" width="652" height="590" rx="14"></rect><text class="ly-h" x="40" y="180">航运智能账单服务</text><text class="td" x="40" y="200">单进程默认绑定 127.0.0.1，业务逻辑与接口入口分离</text>
+<rect class="grp" x="36" y="214" width="628" height="110" rx="10"></rect><text class="gp-h" x="48" y="230">接口与安全边界</text>
+<rect class="grp" x="36" y="338" width="628" height="132" rx="10"></rect><text class="gp-h" x="48" y="354">核心编排与确定性门禁</text>
+<rect class="grp" x="36" y="484" width="628" height="252" rx="10"></rect><text class="gp-h" x="48" y="500">多格式解析与共用设施</text></g>
+<g class="ln-d"><rect class="layer" x="24" y="792" width="652" height="136" rx="14"></rect><text class="ly-h" x="40" y="814">本机数据与隔离目录</text></g>
+<g class="ln-c"><rect class="layer ext" x="24" y="972" width="652" height="124" rx="14"></rect><text class="ly-h" x="40" y="994">外部服务</text></g>
+
+<path class="w" d="M350 118 V204"></path>
+<path class="w" d="M350 314 V328"></path>
+<path class="w" d="M350 470 V484"></path>
+<path class="w" d="M350 748 V782"></path>
+<path class="w" d="M654 560 H678 Q688 560 688 570 V936 Q688 946 678 946 H206 Q196 946 196 956 V1000"></path>
+<path class="w" d="M654 584 H690 Q700 584 700 594 V952 Q700 962 690 962 H514 Q504 962 504 972 V1000"></path>
+
+<path class="ahd" d="M344 204 L356 204 L350 214 Z"></path>
+<path class="ahd" d="M344 328 L356 328 L350 338 Z"></path>
+<path class="ahd" d="M344 484 L356 484 L350 494 Z"></path>
+<path class="ahd" d="M344 758 L356 758 L350 748 Z"></path>
+<path class="ahd" d="M344 782 L356 782 L350 792 Z"></path>
+<path class="ahd" d="M190 1000 L202 1000 L196 1010 Z"></path>
+<path class="ahd" d="M498 1000 L510 1000 L504 1010 Z"></path>
+
+<path class="wl dw0 l86" d="M350 118 V204"></path>
+<path class="wl dw1 l14" d="M350 314 V328"></path>
+<path class="wl dw2 l14" d="M350 470 V484"></path>
+<path class="wl dw3 l34" d="M350 748 V782"></path>
+<path class="wl dw4 l955" d="M654 560 H678 Q688 560 688 570 V936 Q688 946 678 946 H206 Q196 946 196 956 V1000"></path>
+<path class="wl dw4 l647" d="M654 584 H690 Q700 584 700 594 V952 Q700 962 690 962 H514 Q504 962 504 972 V1000"></path>
+
+<g class="lit ig1"><path class="ahl" d="M344 204 L356 204 L350 214 Z"></path></g>
+<g class="lit ig2"><path class="ahl" d="M344 328 L356 328 L350 338 Z"></path></g>
+<g class="lit ig3"><path class="ahl" d="M344 484 L356 484 L350 494 Z"></path></g>
+<g class="lit ig4"><path class="ahl" d="M344 758 L356 758 L350 748 Z"></path><path class="ahl" d="M344 782 L356 782 L350 792 Z"></path></g>
+<g class="lit ig5"><path class="ahl" d="M190 1000 L202 1000 L196 1010 Z"></path><path class="ahl" d="M498 1000 L510 1000 L504 1010 Z"></path></g>
+
+<path class="fxt ln-b l96 t0" d="M350 118 V214"></path><path class="fx ln-b l96 t0" d="M350 118 V214"></path>
+<path class="fxt ln-b l24 t1" d="M350 314 V338"></path><path class="fx ln-b l24 t1" d="M350 314 V338"></path>
+<path class="fxt ln-b l24 t2" d="M350 470 V494"></path><path class="fx ln-b l24 t2" d="M350 470 V494"></path>
+<path class="fxt ln-d l54 t3" d="M350 738 V792"></path><path class="fx ln-d l54 t3" d="M350 738 V792"></path>
+<path class="fxt ln-c l965 t4" d="M654 560 H678 Q688 560 688 570 V936 Q688 946 678 946 H206 Q196 946 196 956 V1010"></path><path class="fx ln-c l965 t4" d="M654 560 H678 Q688 560 688 570 V936 Q688 946 678 946 H206 Q196 946 196 956 V1010"></path>
+<path class="fxt ln-c l657 t4" d="M654 584 H690 Q700 584 700 594 V952 Q700 962 690 962 H514 Q504 962 504 972 V1010"></path><path class="fx ln-c l657 t4" d="M654 584 H690 Q700 584 700 594 V952 Q700 962 690 962 H514 Q504 962 504 972 V1010"></path>
+
+<g class="ln-n"><rect class="chip-b" x="327" y="130" width="46" height="22" rx="11"></rect><g class="lit ig0"><rect class="chip-l" x="327" y="130" width="46" height="22" rx="11"></rect></g><text class="lbl" x="350" y="141">调用</text></g>
+<g class="ln-d"><rect class="chip-b" x="327" y="758" width="46" height="22" rx="11"></rect><g class="lit ig3"><rect class="chip-l" x="327" y="758" width="46" height="22" rx="11"></rect></g><text class="lbl" x="350" y="769">读写</text></g>
+<g class="ln-c"><rect class="chip-b" x="362" y="935" width="90" height="22" rx="11"></rect><g class="lit ig4"><rect class="chip-l" x="362" y="935" width="90" height="22" rx="11"></rect></g><text class="lbl" x="407" y="946">直连 OCR API</text></g>
+<g class="ln-c"><rect class="chip-b" x="530" y="951" width="110" height="22" rx="11"></rect><g class="lit ig4"><rect class="chip-l" x="530" y="951" width="110" height="22" rx="11"></rect></g><text class="lbl" x="585" y="962">脱敏文本调 LLM</text></g>
+
+<g class="ln-a">
+<g class="node"><rect class="card" x="46" y="38" width="197" height="66" rx="10"></rect><rect class="dim" x="46" y="38" width="197" height="66" rx="10"></rect><g class="lit ig0"><rect class="tg" x="46" y="38" width="197" height="66" rx="10"></rect><rect class="tc" x="46" y="38" width="197" height="66" rx="10"></rect></g><text class="tt" x="58" y="60">Web 财务工作台</text><text class="td" x="58" y="84">React + TS 复核界面</text></g>
+<g class="node"><rect class="card" x="251" y="38" width="197" height="66" rx="10"></rect><rect class="dim" x="251" y="38" width="197" height="66" rx="10"></rect><g class="lit ig0"><rect class="tg" x="251" y="38" width="197" height="66" rx="10"></rect><rect class="tc" x="251" y="38" width="197" height="66" rx="10"></rect></g><text class="tt" x="263" y="60">CLI 批处理入口</text><text class="td" x="263" y="84">批量解析与复核包</text></g>
+<g class="node"><rect class="card" x="456" y="38" width="198" height="66" rx="10"></rect><rect class="dim" x="456" y="38" width="198" height="66" rx="10"></rect><g class="lit ig0"><rect class="tg" x="456" y="38" width="198" height="66" rx="10"></rect><rect class="tc" x="456" y="38" width="198" height="66" rx="10"></rect></g><text class="tt" x="468" y="60">Harness 评测器</text><text class="td" x="468" y="84">回归集与 pass^k 报告</text></g>
+</g>
+
+<g class="ln-b">
+<g class="node"><rect class="card" x="46" y="244" width="300" height="70" rx="10"></rect><rect class="dim" x="46" y="244" width="300" height="70" rx="10"></rect><g class="lit ig1"><rect class="tg" x="46" y="244" width="300" height="70" rx="10"></rect><rect class="tc" x="46" y="244" width="300" height="70" rx="10"></rect></g><text class="tt" x="58" y="268">FastAPI HTTP 接口层</text><text class="td" x="58" y="292">严格对齐 openapi.yaml 与静态托管</text></g>
+<g class="node"><rect class="card" x="354" y="244" width="300" height="70" rx="10"></rect><rect class="dim" x="354" y="244" width="300" height="70" rx="10"></rect><g class="lit ig1"><rect class="tg" x="354" y="244" width="300" height="70" rx="10"></rect><rect class="tc" x="354" y="244" width="300" height="70" rx="10"></rect></g><text class="tt" x="366" y="268">应用编排与安全策略门</text><text class="td" x="366" y="292">SSRF 拦截、并发预算、修订锁定</text></g>
+
+<g class="node"><rect class="card" x="46" y="368" width="197" height="90" rx="10"></rect><rect class="dim" x="46" y="368" width="197" height="90" rx="10"></rect><g class="lit ig2"><rect class="tg" x="46" y="368" width="197" height="90" rx="10"></rect><rect class="tc" x="46" y="368" width="197" height="90" rx="10"></rect></g><text class="tt" x="58" y="392">LangGraph 智能体</text><text class="td" x="58" y="416">结构化抽取、标准化</text><text class="td" x="58" y="436">与 1 轮受控自修复</text></g>
+<g class="node"><rect class="card" x="251" y="368" width="197" height="90" rx="10"></rect><rect class="dim" x="251" y="368" width="197" height="90" rx="10"></rect><g class="lit ig2"><rect class="tg" x="251" y="368" width="197" height="90" rx="10"></rect><rect class="tc" x="251" y="368" width="197" height="90" rx="10"></rect></g><text class="tt" x="263" y="392">匹配与 AR/AP 引擎</text><text class="td" x="263" y="416">四级匹配、局部继承</text><text class="td" x="263" y="436">与贷项负号冲减判定</text></g>
+<g class="node"><rect class="card" x="456" y="368" width="198" height="90" rx="10"></rect><rect class="dim" x="456" y="368" width="198" height="90" rx="10"></rect><g class="lit ig2"><rect class="tg" x="456" y="368" width="198" height="90" rx="10"></rect><rect class="tc" x="456" y="368" width="198" height="90" rx="10"></rect></g><text class="tt" x="468" y="392">确定性校验门禁</text><text class="td" x="468" y="416">含税/零总额对账、</text><text class="td" x="468" y="436">ISO 6346 与双入口归并</text></g>
+
+<g class="node"><rect class="card" x="46" y="516" width="146" height="110" rx="10"></rect><rect class="dim" x="46" y="516" width="146" height="110" rx="10"></rect><g class="lit ig3"><rect class="tg" x="46" y="516" width="146" height="110" rx="10"></rect><rect class="tc" x="46" y="516" width="146" height="110" rx="10"></rect></g><text class="tt" x="58" y="540">EML 解包器</text><text class="td" x="58" y="564">头与正文解析、</text><text class="td" x="58" y="584">递归附件与去噪</text></g>
+<g class="node"><rect class="card" x="200" y="516" width="146" height="110" rx="10"></rect><rect class="dim" x="200" y="516" width="146" height="110" rx="10"></rect><g class="lit ig3"><rect class="tg" x="200" y="516" width="146" height="110" rx="10"></rect><rect class="tc" x="200" y="516" width="146" height="110" rx="10"></rect></g><text class="tt" x="212" y="540">Office 解析器</text><text class="td" x="212" y="564">xlsx/xls 与</text><text class="td" x="212" y="584">docx/doc 表格</text></g>
+<g class="node"><rect class="card" x="354" y="516" width="146" height="110" rx="10"></rect><rect class="dim" x="354" y="516" width="146" height="110" rx="10"></rect><g class="lit ig3"><rect class="tg" x="354" y="516" width="146" height="110" rx="10"></rect><rect class="tc" x="354" y="516" width="146" height="110" rx="10"></rect></g><text class="tt" x="366" y="540">PDF 与图像</text><text class="td" x="366" y="564">pdfplumber 与</text><text class="td" x="366" y="584">RapidOCR 兜底</text></g>
+<g class="node"><rect class="card" x="508" y="516" width="146" height="110" rx="10"></rect><rect class="dim" x="508" y="516" width="146" height="110" rx="10"></rect><g class="lit ig3"><rect class="tg" x="508" y="516" width="146" height="110" rx="10"></rect><rect class="tc" x="508" y="516" width="146" height="110" rx="10"></rect></g><text class="tt" x="520" y="540">外部网关适配</text><text class="td" x="520" y="564">OCR 直连开关、</text><text class="td" x="520" y="584">中转与 LLM 替身</text></g>
+
+<g class="node"><rect class="card" x="46" y="642" width="197" height="80" rx="10"></rect><rect class="dim" x="46" y="642" width="197" height="80" rx="10"></rect><g class="lit ig3"><rect class="tg" x="46" y="642" width="197" height="80" rx="10"></rect><rect class="tc" x="46" y="642" width="197" height="80" rx="10"></rect></g><text class="tt" x="58" y="666">SQLite 仓储层</text><text class="td" x="58" y="690">主体、旧账与复核状态</text></g>
+<g class="node"><rect class="card" x="251" y="642" width="197" height="80" rx="10"></rect><rect class="dim" x="251" y="642" width="197" height="80" rx="10"></rect><g class="lit ig3"><rect class="tg" x="251" y="642" width="197" height="80" rx="10"></rect><rect class="tc" x="251" y="642" width="197" height="80" rx="10"></rect></g><text class="tt" x="263" y="666">标准 JSON 导出器</text><text class="td" x="263" y="690">正式/全量/审计三口径</text></g>
+<g class="node"><rect class="card" x="456" y="642" width="198" height="80" rx="10"></rect><rect class="dim" x="456" y="642" width="198" height="80" rx="10"></rect><g class="lit ig3"><rect class="tg" x="456" y="642" width="198" height="80" rx="10"></rect><rect class="tc" x="456" y="642" width="198" height="80" rx="10"></rect></g><text class="tt" x="468" y="666">Harness 评测套件</text><text class="td" x="468" y="690">真值比对与稳定性度量</text></g>
+</g>
+
+<g class="ln-d">
+<g class="node"><rect class="card" x="46" y="832" width="197" height="84" rx="10"></rect><rect class="dim" x="46" y="832" width="197" height="84" rx="10"></rect><g class="lit ig4"><rect class="tg" x="46" y="832" width="197" height="84" rx="10"></rect><rect class="tc" x="46" y="832" width="197" height="84" rx="10"></rect></g><text class="tt" x="58" y="856">SQLite 单库文件</text><text class="td" x="58" y="880">schema.sql 8 张表</text></g>
+<g class="node"><rect class="card" x="251" y="832" width="197" height="84" rx="10"></rect><rect class="dim" x="251" y="832" width="197" height="84" rx="10"></rect><g class="lit ig4"><rect class="tg" x="251" y="832" width="197" height="84" rx="10"></rect><rect class="tc" x="251" y="832" width="197" height="84" rx="10"></rect></g><text class="tt" x="263" y="856">上传沙箱与复核包</text><text class="td" x="263" y="880">清洗路径与 SHA256</text></g>
+<g class="node"><rect class="card" x="456" y="832" width="198" height="84" rx="10"></rect><rect class="dim" x="456" y="832" width="198" height="84" rx="10"></rect><g class="lit ig4"><rect class="tg" x="456" y="832" width="198" height="84" rx="10"></rect><rect class="tc" x="456" y="832" width="198" height="84" rx="10"></rect></g><text class="tt" x="468" y="856">环境凭据与日志</text><text class="td" x="468" y="880">.env 隔离与脱敏过滤</text></g>
+</g>
+
+<g class="ln-c">
+<g class="node"><rect class="card" x="46" y="1010" width="300" height="72" rx="10"></rect><rect class="dim" x="46" y="1010" width="300" height="72" rx="10"></rect><g class="lit ig5"><rect class="tg ext" x="46" y="1010" width="300" height="72" rx="10"></rect><rect class="tc ext" x="46" y="1010" width="300" height="72" rx="10"></rect></g><text class="tt" x="58" y="1034">pltplt OCR 网关</text><text class="td" x="58" y="1058">gateway.pltplt.com/ai/process</text></g>
+<g class="node"><rect class="card" x="354" y="1010" width="300" height="72" rx="10"></rect><rect class="dim" x="354" y="1010" width="300" height="72" rx="10"></rect><g class="lit ig5"><rect class="tg ext" x="354" y="1010" width="300" height="72" rx="10"></rect><rect class="tc ext" x="354" y="1010" width="300" height="72" rx="10"></rect></g><text class="tt" x="366" y="1034">OpenAI 兼容 LLM 端点</text><text class="td" x="366" y="1058">DeepSeek / 结构化输出与重抽</text></g>
+</g>
+
+<path class="lgw" d="M0 1126 H21"></path><path class="lga" d="M20 1120 L30 1126 L20 1132 Z"></path><text class="lg" x="38" y="1126">调用</text>
+<path class="lgw" d="M96 1126 H114"></path><path class="lga" d="M98 1120 L88 1126 L98 1132 Z"></path><path class="lga" d="M112 1120 L122 1126 L112 1132 Z"></path><text class="lg" x="130" y="1126">读写</text>
+<rect class="lg-ext" x="180" y="1117" width="28" height="18" rx="5"></rect><text class="lg" x="216" y="1126">外部系统</text>
+<text class="lg" x="300" y="1126">颜色 = 所在的层；单向依赖逐层向下调用</text>
+</svg>
+
+<div class="foot" style="width: 712px">注：领域层（匹配/AR-AP/校验）零外部 IO；仅外部网关适配器按策略直连 OCR API 与脱敏调用 LLM 端点。</div>
+<!-- 内容结束 -->
+</div>
