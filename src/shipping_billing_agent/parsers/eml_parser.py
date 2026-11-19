@@ -415,6 +415,32 @@ def _preceded_by_bill_caption(slot: Tag, footer: Tag) -> bool:
     return False
 
 
+def _can_climb_signature_wrapper(parent: Tag, slot_b: Tag) -> bool:
+    children = _non_empty_children(parent)
+    last_hr = max(
+        (
+            idx
+            for idx, child in enumerate(children)
+            if isinstance(child, Tag) and (child.name == "hr" or child.find("hr") is not None)
+        ),
+        default=-1,
+    )
+    tail = children[last_hr + 1 :]
+    if not any(child is slot_b for child in tail):
+        return False
+    if any(
+        isinstance(child, Tag)
+        and (child.name in {"img", "figure"} or child.find(["img", "figure"]) is not None)
+        for child in tail
+    ):
+        return False
+    tail_text = " ".join(
+        child.get_text(" ", strip=True) if isinstance(child, Tag) else child.strip()
+        for child in tail
+    )
+    return not _is_bill_caption_text(tail_text)
+
+
 def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool:
     if box.find(["img", "figure"]) is not None:
         return False
@@ -423,8 +449,7 @@ def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool
     while (
         isinstance(slot_b.parent, Tag)
         and slot_b.parent is not footer
-        and slot_b.parent.find(["img", "figure", "hr"]) is None
-        and not _is_bill_caption_text(slot_b.parent.get_text(" ", strip=True))
+        and _can_climb_signature_wrapper(slot_b.parent, slot_b)
     ):
         slot_b = slot_b.parent
     parent = slot_b.parent
@@ -450,6 +475,7 @@ def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool
     return (
         pos_img == pos_b - 1
         and parent is not footer
+        and slot_b.find("hr") is None
         and pos_img == 0
         and parent.find("figure") is None
         and all(
@@ -526,13 +552,15 @@ def _footer_signature_context(
                     idx > first_sig_marker and any(parent is box for parent in img.parents)
                     for idx, img in images
                 )
-                pre_text = "\n".join(text for idx, text in box_texts if idx < first_sig_marker)
+                between_text = "\n".join(
+                    text for idx, text in box_texts if index < idx < first_sig_marker
+                )
                 if (
                     has_img_after
-                    or _is_bill_caption_text(pre_text)
-                    or (not pre_text.strip() and _preceded_by_bill_caption(image, footer_tag))
+                    or _is_bill_caption_text(between_text)
+                    or _preceded_by_bill_caption(image, footer_tag)
                 ):
-                    return pre_text
+                    return ""
         elif not _image_in_adjacent_signature_slot(box, image, footer_tag):
             continue
         return "\n".join(text for _, text in box_texts)

@@ -97,31 +97,35 @@ def _classify_rect(
     table_grids: list[_TableGrid],
     horiz_segments: list[_RuleSegment],
     vert_segments: list[_RuleSegment],
+    tiny_rects: list[tuple[float, float, float, float]],
 ) -> int:
     width, height = abs(x1 - x0), abs(bottom - top)
-    if width <= 4.0 and height <= 4.0:
-        return 1
-    if width <= _THIN_RULE_MAX_THICKNESS_PT or (
-        width <= _BAR_RULE_MAX_THICKNESS_PT
-        and height > _LONG_RULE_SPAN_PT
-        and height / max(width, 1e-6) >= _BAR_RULE_MIN_ASPECT
-    ):
-        x = (x0 + x1) / 2
-        if not _is_table_segment((x, top), (x, bottom), table_grids):
-            vert_segments.append((x, min(top, bottom), max(top, bottom)))
-        return 0
-    if height <= _THIN_RULE_MAX_THICKNESS_PT or (
-        height <= _BAR_RULE_MAX_THICKNESS_PT
-        and width > _LONG_RULE_SPAN_PT
-        and width / max(height, 1e-6) >= _BAR_RULE_MIN_ASPECT
-    ):
-        y = (top + bottom) / 2
-        if not _is_table_segment((x0, y), (x1, y), table_grids):
-            horiz_segments.append((y, min(x0, x1), max(x0, x1)))
-        return 0
+    is_tiny = width <= 4.0 and height <= 4.0
+    if not is_tiny:
+        if width <= _THIN_RULE_MAX_THICKNESS_PT or (
+            width <= _BAR_RULE_MAX_THICKNESS_PT
+            and height > _LONG_RULE_SPAN_PT
+            and height / max(width, 1e-6) >= _BAR_RULE_MIN_ASPECT
+        ):
+            x = (x0 + x1) / 2
+            if not _is_table_segment((x, top), (x, bottom), table_grids):
+                vert_segments.append((x, min(top, bottom), max(top, bottom)))
+            return 0
+        if height <= _THIN_RULE_MAX_THICKNESS_PT or (
+            height <= _BAR_RULE_MAX_THICKNESS_PT
+            and width > _LONG_RULE_SPAN_PT
+            and width / max(height, 1e-6) >= _BAR_RULE_MIN_ASPECT
+        ):
+            y = (top + bottom) / 2
+            if not _is_table_segment((x0, y), (x1, y), table_grids):
+                horiz_segments.append((y, min(x0, x1), max(x0, x1)))
+            return 0
 
     corners = ((x0, top), (x1, top), (x1, bottom), (x0, bottom), (x0, top))
     if all(_is_table_segment(p1, p2, table_grids) for p1, p2 in pairwise(corners)):
+        return 0
+    if is_tiny:
+        tiny_rects.append((min(x0, x1), min(top, bottom), max(x0, x1), max(top, bottom)))
         return 0
     if not filled and min(width, height) > _LONG_RULE_SPAN_PT:
         return 0
@@ -139,6 +143,7 @@ def _classify_straight_segment(
     table_grids: list[_TableGrid],
     horiz_segments: list[_RuleSegment],
     vert_segments: list[_RuleSegment],
+    tiny_rects: list[tuple[float, float, float, float]],
     *,
     linewidth: float = 1.0,
 ) -> int:
@@ -165,6 +170,7 @@ def _classify_straight_segment(
                 table_grids=table_grids,
                 horiz_segments=horiz_segments,
                 vert_segments=vert_segments,
+                tiny_rects=tiny_rects,
             )
         horiz_segments.append((y, left, right))
         return 0
@@ -181,6 +187,7 @@ def _classify_straight_segment(
                 table_grids=table_grids,
                 horiz_segments=horiz_segments,
                 vert_segments=vert_segments,
+                tiny_rects=tiny_rects,
             )
         vert_segments.append((x, top, bottom))
         return 0
@@ -258,6 +265,7 @@ def _process_curve(
     table_grids: list[_TableGrid],
     horiz_segments: list[_RuleSegment],
     vert_segments: list[_RuleSegment],
+    tiny_rects: list[tuple[float, float, float, float]],
 ) -> tuple[bool, int]:
     path = curve.get("path")
     if path is not None and any(operator not in {"m", "l", "h"} for operator, *_ in path):
@@ -267,7 +275,7 @@ def _process_curve(
     if path is None:
         added = sum(
             _classify_straight_segment(
-                p1, p2, table_grids, horiz_segments, vert_segments, linewidth=linewidth
+                p1, p2, table_grids, horiz_segments, vert_segments, tiny_rects, linewidth=linewidth
             )
             for p1, p2 in pairwise(curve.get("pts") or ())
         )
@@ -291,12 +299,13 @@ def _process_curve(
                 table_grids=table_grids,
                 horiz_segments=horiz_segments,
                 vert_segments=vert_segments,
+                tiny_rects=tiny_rects,
             )
             continue
         vertices = chain(points, points[:1]) if closed else points
         for p1, p2 in pairwise(vertices):
             added += _classify_straight_segment(
-                p1, p2, table_grids, horiz_segments, vert_segments, linewidth=linewidth
+                p1, p2, table_grids, horiz_segments, vert_segments, tiny_rects, linewidth=linewidth
             )
     return False, added
 
@@ -343,6 +352,21 @@ def _is_long_rule(merged: list[tuple[float, float]]) -> bool:
     )
 
 
+def _multi_segment_coords(segments: list[_RuleSegment]) -> list[float]:
+    anchors: list[float] = []
+    cluster_start: float | None = None
+    cluster_size = 0
+    for coord, _, _ in sorted(segments, key=lambda segment: segment[0]):
+        if cluster_start is None or coord - cluster_start > _COLLINEAR_TOL_PT:
+            cluster_start = coord
+            cluster_size = 1
+        else:
+            cluster_size += 1
+            if cluster_size == 2:
+                anchors.append(cluster_start)
+    return anchors
+
+
 def _count_rule_clusters(segments: list[_RuleSegment]) -> tuple[int, list[float]]:
     clusters: list[tuple[float, list[tuple[float, float]]]] = []
     for coord, lo, hi in sorted(segments, key=lambda segment: segment[0]):
@@ -374,6 +398,7 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
     glyph_elements = 0
     horiz_segments: list[_RuleSegment] = []
     vert_segments: list[_RuleSegment] = []
+    tiny_rects: list[tuple[float, float, float, float]] = []
 
     for line in page.lines:
         points = line.get("pts") or ()
@@ -382,7 +407,13 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
         else:
             p1, p2 = (line["x0"], line["top"]), (line["x1"], line["bottom"])
         glyph_elements += _classify_straight_segment(
-            p1, p2, table_grids, horiz_segments, vert_segments, linewidth=_line_width(line)
+            p1,
+            p2,
+            table_grids,
+            horiz_segments,
+            vert_segments,
+            tiny_rects,
+            linewidth=_line_width(line),
         )
 
     for rect in page.rects:
@@ -395,14 +426,35 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
             table_grids=table_grids,
             horiz_segments=horiz_segments,
             vert_segments=vert_segments,
+            tiny_rects=tiny_rects,
         )
 
     has_bezier_curve = False
     for curve in page.curves:
-        has_bezier_curve, added = _process_curve(curve, table_grids, horiz_segments, vert_segments)
+        has_bezier_curve, added = _process_curve(
+            curve, table_grids, horiz_segments, vert_segments, tiny_rects
+        )
         glyph_elements += added
         if has_bezier_curve:
             break
+
+    if tiny_rects:
+        # Match against existing rule segments before adding any tiny rectangles.
+        horiz_rule_ys = _multi_segment_coords(horiz_segments)
+        vert_rule_xs = _multi_segment_coords(vert_segments)
+        for rx0, rtop, rx1, rbottom in tiny_rects:
+            rw, rh = rx1 - rx0, rbottom - rtop
+            ry, rx = (rtop + rbottom) / 2, (rx0 + rx1) / 2
+            if rh <= _THIN_RULE_MAX_THICKNESS_PT and any(
+                abs(ry - hy) <= _COLLINEAR_TOL_PT for hy in horiz_rule_ys
+            ):
+                horiz_segments.append((ry, rx0, rx1))
+            elif rw <= _THIN_RULE_MAX_THICKNESS_PT and any(
+                abs(rx - vx) <= _COLLINEAR_TOL_PT for vx in vert_rule_xs
+            ):
+                vert_segments.append((rx, rtop, rbottom))
+            else:
+                glyph_elements += 1
 
     short_h, long_h_coords = _count_rule_clusters(horiz_segments)
     short_v, long_v_coords = _count_rule_clusters(vert_segments)
