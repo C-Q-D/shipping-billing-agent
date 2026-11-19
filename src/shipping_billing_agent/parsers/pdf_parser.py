@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from io import BytesIO
 from itertools import chain, pairwise
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import pdfplumber
 from pdfminer.pdfdocument import PDFEncryptionError
@@ -22,6 +22,7 @@ _COLLINEAR_TOL_PT = 1.0
 _RULE_INTERVAL_TOL_PT = 1.0
 _LONG_RULE_SPAN_PT = 40.0
 _THIN_RULE_MAX_THICKNESS_PT = 3.0
+_TINY_RECT_MAX_SIDE_PT = 4.0
 _BAR_RULE_MAX_THICKNESS_PT = 6.0
 _BAR_RULE_MIN_ASPECT = 15.0
 _SCANLINE_MAX_GAP_PT = 6.0
@@ -46,6 +47,14 @@ class _TableGrid:
     bottom: float
     xs: set[float]
     ys: set[float]
+
+
+class _RuleTile(NamedTuple):
+    band_lo: float
+    band_hi: float
+    span_lo: float
+    span_hi: float
+    index: int
 
 
 def _table_grid(table: Any) -> _TableGrid:
@@ -100,7 +109,7 @@ def _classify_rect(
     tiny_rects: list[tuple[float, float, float, float]],
 ) -> int:
     width, height = abs(x1 - x0), abs(bottom - top)
-    is_tiny = width <= 4.0 and height <= 4.0
+    is_tiny = width <= _TINY_RECT_MAX_SIDE_PT and height <= _TINY_RECT_MAX_SIDE_PT
     if not is_tiny:
         if width <= _THIN_RULE_MAX_THICKNESS_PT or (
             width <= _BAR_RULE_MAX_THICKNESS_PT
@@ -352,6 +361,61 @@ def _is_long_rule(merged: list[tuple[float, float]]) -> bool:
     )
 
 
+def _coalesce_tiny_rects(
+    tiny_rects: list[tuple[float, float, float, float]],
+    table_grids: list[_TableGrid],
+    horiz_segments: list[_RuleSegment],
+    vert_segments: list[_RuleSegment],
+) -> list[tuple[float, float, float, float]]:
+    consumed: set[int] = set()
+    for horizontal, segments in ((True, horiz_segments), (False, vert_segments)):
+        candidates: list[_RuleTile] = []
+        for index, (x0, top, x1, bottom) in enumerate(tiny_rects):
+            if index in consumed:
+                continue
+            band_lo, band_hi, span_lo, span_hi = (
+                (top, bottom, x0, x1) if horizontal else (x0, x1, top, bottom)
+            )
+            if band_hi - band_lo <= _THIN_RULE_MAX_THICKNESS_PT:
+                candidates.append(_RuleTile(band_lo, band_hi, span_lo, span_hi, index))
+
+        bands: dict[tuple[float, float], list[_RuleTile]] = {}
+        for tile in sorted(candidates, key=lambda tile: (tile.band_lo, tile.band_hi)):
+            anchor = (tile.band_lo, tile.band_hi)
+            # Keep both edges anchored to the first tile so tolerance cannot accumulate.
+            for band_lo, band_hi in reversed(bands):
+                if tile.band_lo - band_lo > _AXIS_TOL_PT:
+                    break
+                if abs(tile.band_hi - band_hi) <= _AXIS_TOL_PT:
+                    anchor = (band_lo, band_hi)
+                    break
+            bands.setdefault(anchor, []).append(tile)
+
+        for tiles in bands.values():
+            runs: list[tuple[float, list[_RuleTile]]] = []
+            for tile in sorted(tiles, key=lambda tile: tile.span_lo):
+                if not runs or tile.span_lo > runs[-1][0] + _AXIS_TOL_PT:
+                    runs.append((tile.span_hi, [tile]))
+                else:
+                    end, run = runs[-1]
+                    run.append(tile)
+                    runs[-1] = (max(end, tile.span_hi), run)
+
+            for end, run in runs:
+                start = run[0].span_lo
+                if end - start <= _TINY_RECT_MAX_SIDE_PT:
+                    continue
+                coord = (min(tile.band_lo for tile in run) + max(tile.band_hi for tile in run)) / 2
+                p1, p2 = (
+                    ((start, coord), (end, coord)) if horizontal else ((coord, start), (coord, end))
+                )
+                if not _is_table_segment(p1, p2, table_grids):
+                    segments.append((coord, start, end))
+                consumed.update(tile.index for tile in run)
+
+    return [rect for index, rect in enumerate(tiny_rects) if index not in consumed]
+
+
 def _multi_segment_coords(segments: list[_RuleSegment]) -> list[float]:
     anchors: list[float] = []
     cluster_start: float | None = None
@@ -439,7 +503,8 @@ def _has_glyph_strokes(page: Page, table_grids: list[_TableGrid]) -> bool:
             break
 
     if tiny_rects:
-        # Match against existing rule segments before adding any tiny rectangles.
+        tiny_rects = _coalesce_tiny_rects(tiny_rects, table_grids, horiz_segments, vert_segments)
+        # Match isolated rectangles against rule segments before adding them.
         horiz_rule_ys = _multi_segment_coords(horiz_segments)
         vert_rule_xs = _multi_segment_coords(vert_segments)
         for rx0, rtop, rx1, rbottom in tiny_rects:

@@ -38,7 +38,7 @@ _FOOTER_CONTAINERS = {
     "div", "p", "section", "article", "aside", "table", "tr", "td", "th", "li", "address", "footer",
 }
 _INLINE_TAGS = frozenset({
-    "a", "abbr", "b", "bdi", "bdo", "br", "cite", "code", "data", "del",
+    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "del",
     "dfn", "em", "font", "i", "ins", "kbd", "label", "mark", "q", "s",
     "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var", "wbr",
 })
@@ -333,23 +333,6 @@ def _non_empty_children(tag: Tag) -> list[Tag | NavigableString]:
     return [child for child in tag.children if _is_significant_child(child)]
 
 
-def _last_significant_leaf(node: Tag | NavigableString) -> Tag | NavigableString:
-    current = node
-    while isinstance(current, Tag):
-        if current.name in {"img", "hr", "figure"}:
-            return current
-        children = _non_empty_children(current)
-        if not children:
-            return current
-        if not any(
-            isinstance(descendant, Tag) and descendant.name not in _INLINE_TAGS
-            for descendant in current.descendants
-        ):
-            return current
-        current = children[-1]
-    return current
-
-
 def _ends_footer_context(marker: _HtmlMarker, footer: Tag, body_scope: Tag) -> bool:
     node, scope = marker
     other_landmark = scope is not None and scope is not footer and scope is not body_scope
@@ -392,51 +375,79 @@ def _minimal_signature_boxes(
             yield candidate
 
 
-def _preceded_by_bill_caption(slot: Tag, footer: Tag) -> bool:
-    current = slot
-    while isinstance(parent := current.parent, Tag) and (
-        parent is footer or any(ancestor is footer for ancestor in parent.parents)
-    ):
-        siblings = _non_empty_children(parent)
-        position = next(idx for idx, sibling in enumerate(siblings) if sibling is current)
-        if position > 0:
-            leaf = _last_significant_leaf(siblings[position - 1])
-            if isinstance(leaf, Tag):
-                caption_boundaries = ["img", "hr", "figure"]
-                if leaf.name in caption_boundaries or leaf.find(caption_boundaries) is not None:
-                    return False
-                text = leaf.get_text(" ", strip=True)
-            else:
-                text = leaf.strip()
-            return _is_bill_caption_text(text)
-        if parent is footer:
-            break
-        current = parent
-    return False
+def _preceded_by_bill_caption(image: Tag, footer: Tag) -> bool:
+    current_line: list[str] = []
+    last_line = ""
+    stopped = False
+
+    def flush() -> None:
+        nonlocal last_line
+        normalized = " ".join("".join(current_line).split())
+        if normalized:
+            last_line = normalized
+        current_line.clear()
+
+    def reset() -> None:
+        nonlocal last_line
+        current_line.clear()
+        last_line = ""
+
+    def walk(node: Tag) -> None:
+        nonlocal stopped
+        for child in node.children:
+            if child is image:
+                stopped = True
+                return
+            if isinstance(child, Comment):
+                continue
+            if isinstance(child, NavigableString):
+                raw = str(child)
+                parts = _SIGNATURE_SEPARATOR.split(raw)
+                if len(parts) > 1:
+                    reset()
+                    raw = parts[-1]
+                if raw:
+                    current_line.append(raw)
+            elif isinstance(child, Tag):
+                if child.name in {"hr", "img", "figure"}:
+                    reset()
+                    continue
+                if child.name == "br":
+                    flush()
+                    continue
+                is_block = child.name not in _INLINE_TAGS
+                if is_block:
+                    flush()
+                walk(child)
+                if stopped:
+                    return
+                if is_block:
+                    flush()
+
+    walk(footer)
+    caption = " ".join("".join(current_line).split()) or last_line
+    return _is_bill_caption_text(caption)
 
 
-def _can_climb_signature_wrapper(parent: Tag, slot_b: Tag) -> bool:
-    children = _non_empty_children(parent)
+def _can_climb_signature_wrapper(parent: Tag, box: Tag) -> bool:
+    descendants = list(parent.descendants)
     last_hr = max(
         (
             idx
-            for idx, child in enumerate(children)
-            if isinstance(child, Tag) and (child.name == "hr" or child.find("hr") is not None)
+            for idx, node in enumerate(descendants)
+            if isinstance(node, Tag) and node.name == "hr"
         ),
         default=-1,
     )
-    tail = children[last_hr + 1 :]
-    if not any(child is slot_b for child in tail):
+    tail = descendants[last_hr + 1 :]
+    if not any(node is box for node in tail):
         return False
-    if any(
-        isinstance(child, Tag)
-        and (child.name in {"img", "figure"} or child.find(["img", "figure"]) is not None)
-        for child in tail
-    ):
+    if any(isinstance(node, Tag) and node.name in {"img", "figure"} for node in tail):
         return False
     tail_text = " ".join(
-        child.get_text(" ", strip=True) if isinstance(child, Tag) else child.strip()
-        for child in tail
+        str(node).strip()
+        for node in tail
+        if isinstance(node, NavigableString) and not isinstance(node, Comment) and node.strip()
     )
     return not _is_bill_caption_text(tail_text)
 
@@ -449,7 +460,7 @@ def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool
     while (
         isinstance(slot_b.parent, Tag)
         and slot_b.parent is not footer
-        and _can_climb_signature_wrapper(slot_b.parent, slot_b)
+        and _can_climb_signature_wrapper(slot_b.parent, box)
     ):
         slot_b = slot_b.parent
     parent = slot_b.parent
@@ -482,7 +493,7 @@ def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool
             img is img_slot or any(ancestor is img_slot for ancestor in img.parents)
             for img in parent.find_all("img")
         )
-        and not _preceded_by_bill_caption(img_slot, footer)
+        and not _preceded_by_bill_caption(image, footer)
     )
 
 

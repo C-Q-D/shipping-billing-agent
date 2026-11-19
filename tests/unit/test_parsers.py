@@ -5,6 +5,7 @@ from email.message import EmailMessage
 from hashlib import sha256
 from io import BytesIO
 from itertools import accumulate, pairwise
+from math import ceil
 from pathlib import Path
 from struct import pack_into, unpack_from
 from types import SimpleNamespace
@@ -824,6 +825,39 @@ def test_r12_3_filled_rect_sub_half_point_dashed_rules(dash_lengths, rows, local
     _assert_decorated_pdf_keeps_electronic_text(data, local_ocr)
 
 
+@pytest.fixture(
+    params=[
+        ([0.5] + [20.875] * 8 + [0.5], (144,)),
+        ([21.95] * 8 + [0.4], (144, 120)),
+    ],
+    ids=["0.5pt-both-ends", "0.4pt-two-trailing-ends"],
+)
+def r13_tiled_dashed_rule_pdf(request) -> bytes:
+    dash_lengths, rows = request.param
+    # Keep the original 240 pt span and 8 pt gaps while tiling each dash.
+    dash_starts = accumulate((length + 8 for length in dash_lengths[:-1]), initial=24.0)
+    segments = tuple(zip(dash_starts, dash_lengths, strict=True))
+    drawing = b"".join(
+        b"%.3f %d %.3f 1 re f\n" % (left + offset, y, min(4, length - offset))
+        for y in rows
+        for left, length in segments
+        for offset in range(0, ceil(length), 4)
+    )
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE, drawing + b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n"
+    )
+    with BytesIO(data) as stream, pdfplumber.open(stream) as pdf:
+        page = pdf.pages[1]
+        assert not page.lines and not page.curves and page.rects
+        assert all(rect["width"] <= 4.0 and rect["height"] == 1.0 for rect in page.rects)
+    return data
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+def test_r13_3_tiled_small_filled_rect_dashed_rules(r13_tiled_dashed_rule_pdf, local_ocr):
+    _assert_decorated_pdf_keeps_electronic_text(r13_tiled_dashed_rule_pdf, local_ocr)
+
+
 @pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
 def test_r9_f4_pdf_keeps_electronic_text_with_implicitly_closed_bars(local_ocr):
     data = _two_page_pdf(
@@ -1567,6 +1601,46 @@ def test_r12_2_hr_inside_segmented_contact_div_skips_logo(r8_eml_ocr):
     assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
 
 
+def test_r13_1_inline_span_caption_before_br_keeps_scan(r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(
+        '<footer><div>Invoice <span>scan</span><br><img src="cid:scan">'
+        '<br>Best regards<br>ACME<br>Tel: 123456</div></footer>',
+        image_name="scan",
+        text=amount,
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert (scan.status, recognize_image.call_count) == (
+        DocumentStatus.PARSED,
+        1,
+    ), scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert amount in scan.raw_text, scan.raw_text
+
+
+def test_r13_2_nested_div_around_hr_contact_skips_logo(r8_eml_ocr):
+    data = _mail_with_inline_png(
+        '<footer><div><div><hr><p>ACME</p><p>Tel: 123456</p></div></div>'
+        '<div><img src="cid:logo"></div></footer>',
+        image_name="logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert (logo.status, recognize_image.call_count) == (
+        DocumentStatus.SKIPPED_NOISE,
+        0,
+    ), logo.raw_text
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+
+
 def test_r9_f2_eml_reads_a_negative_amount_and_skips_bare_currency_logos(r8_eml_ocr):
     dispatcher, recognize_image = r8_eml_ocr
     logo_labels = {
@@ -1698,6 +1772,26 @@ def test_r12_4_shared_footer_table_with_earlier_invoice_notice_skips_logo(r8_eml
     data = _mail_with_inline_png(
         '<footer><table><tbody><tr><td><p>For invoice inquiries, please contact Accounts.</p>'
         '<p>Company logo</p></td></tr></tbody></table><div><img src="cid:logo"></div>'
+        'Best regards<br>ACME<br>Tel: 123456</footer>',
+        image_name="logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert (logo.status, recognize_image.call_count) == (
+        DocumentStatus.SKIPPED_NOISE,
+        0,
+    ), logo.raw_text
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+
+
+def test_r13_4_br_separated_invoice_notice_and_company_logo_skips_logo(r8_eml_ocr):
+    data = _mail_with_inline_png(
+        '<footer><table><tbody><tr><td><p>For invoice inquiries, please contact Accounts.'
+        '<br>Company logo</p></td></tr></tbody></table><div><img src="cid:logo"></div>'
         'Best regards<br>ACME<br>Tel: 123456</footer>',
         image_name="logo",
         text="ACME",
