@@ -3996,6 +3996,117 @@ def test_r26_footer_linear_inline_calls(r8_eml_ocr):
     assert call_counts == [12, 24, 48]
 
 
+@pytest.mark.parametrize("separator", ["<hr>", "-- \n"], ids=["hr", "dash"])
+def test_r27_a1_eml_stops_at_an_explicit_signature_landmark(separator, r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(
+        f'<footer>{separator}<section class="signature">Previous signature</section>'
+        '<div>Tel: 123456<img src="cid:scan"></div></footer>',
+        image_name="scan",
+        text=amount,
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=amount)
+
+
+@pytest.mark.parametrize(
+    ("image_name", "expected_text"),
+    [pytest.param("logo", None, id="logo"), pytest.param("scan", "USD 310.42", id="scan")],
+)
+def test_r27_eml_uses_an_explicit_signature_for_a_logo_in_the_same_landmark(
+    image_name, expected_text, r8_eml_ocr
+):
+    data = _mail_with_inline_png(
+        '<main><hr><div class="signature">Old sig</div><p>Tel: 123456</p>'
+        f'<img src="cid:{image_name}"></main>',
+        image_name=image_name,
+        text=expected_text or "ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, image = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(image, recognize_image, expected_text=expected_text)
+
+
+@pytest.mark.parametrize("separator", ["<hr>", "-- \n"], ids=["hr", "dash"])
+def test_r27_a2_eml_uses_a_footer_separator_outside_the_figure(separator, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        f'<footer>{separator}<figure>Tel: 123456<img src="cid:logo" alt="Company logo">'
+        '</figure></footer>',
+        image_name="logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(logo, recognize_image, expected_text=None)
+
+
+@pytest.mark.parametrize(
+    "signoff",
+    ["Best regards, Billing Team", "Best <span>regards, Billing Team</span>"],
+    ids=["single-node", "split-nodes"],
+)
+def test_r27_a3_eml_skips_a_logo_before_billing_team_signoff(signoff, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        '<footer><div><img src="cid:logo" alt="Company logo"><br>'
+        f'{signoff}<br>Tel: 123456</div></footer>',
+        image_name="logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(logo, recognize_image, expected_text=None)
+
+
+@pytest.mark.parametrize("line_break", [", ", "<br>"], ids=["same-line", "next-line"])
+def test_r27_eml_keeps_the_invoice_caption_before_billing_team_signoff(line_break, r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(
+        f'<footer><div><img src="cid:scan"><br>Invoice scan{line_break}'
+        'Best regards, Billing Team<br>Tel: 123456</div></footer>',
+        image_name="scan",
+        text=amount,
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=amount)
+
+
+@pytest.mark.parametrize("caption", ["账单", "Invoice"], ids=["chinese-caption", "english-caption"])
+def test_r27_b_chinese_signoff_locate_offset(caption):
+    from bs4 import BeautifulSoup
+
+    from shipping_billing_agent.parsers import eml_parser
+
+    body = BeautifulSoup(f'{caption}<br>此致敬礼<br>Tel: 123456<img src="cid:scan">', "html.parser")
+    _, _, text_layout, _ = eml_parser._collect_preceding_bill_captions(
+        body, {id(body.img)}, figure_captions={}
+    )
+    nodes = body.find_all(string=True)
+    chunks = [(index, node, 0, len(node)) for index, node in enumerate(nodes)]
+    visual_text = eml_parser._render_visual_chunks(chunks, text_layout)
+    assert visual_text == f"{caption}\n此致敬礼\nTel: 123456"
+
+    signoff = eml_parser._SIGNOFF.search(visual_text)
+    assert signoff is not None
+    newline_index = visual_text.index("\n")
+    assert signoff.start() == newline_index + 1
+    assert visual_text[signoff.start()] == "此"
+    assert nodes[1] == "此致敬礼"
+    for index in (signoff.start(), newline_index):
+        assert eml_parser._locate_visual_offset(chunks, text_layout, visual_text, index) == (1, 0)
+
+
 @pytest.mark.parametrize(
     "html_body",
     [

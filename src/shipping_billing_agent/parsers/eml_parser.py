@@ -454,6 +454,15 @@ def _signature_scope(node: Tag | NavigableString, body: Tag) -> Tag | None:
     return scope
 
 
+def _nearest_landmark(node: Tag | NavigableString, body: Tag) -> Tag:
+    for parent in node.parents:
+        if parent is body:
+            break
+        if parent.name in _CONTENT_LANDMARKS:
+            return parent
+    return body
+
+
 def _inside_footer(node: Tag, body: Tag) -> bool:
     if node.name == "footer":
         return True
@@ -476,13 +485,15 @@ def _preceding_signature_boundary(
     figure = markers[index][0].find_parent("figure") if isolate_figures else None
     for previous_index in range(index - 1, -1, -1):
         node, node_scope = markers[previous_index]
+        effective_scope = _nearest_landmark(node, body_scope) if node_scope is None else node_scope
+        if effective_scope is not scope and effective_scope is not body_scope:
+            return previous_index, None, None
         if node_scope is None:
             continue
-        other_landmark = node_scope is not scope and node_scope is not body_scope
-        if other_landmark:
-            return previous_index, None, None
-        if isolate_figures and node.find_parent("figure") is not figure:
-            continue
+        if isolate_figures:
+            node_figure = node.find_parent("figure")
+            if node_figure is not None and node_figure is not figure:
+                continue
         if isinstance(node, NavigableString):
             matches = list(_SIGNATURE_SEPARATOR.finditer(node))
             if matches:
@@ -523,10 +534,11 @@ def _in_post_separator_signature(
         preceding_chunks.append(suffix)
     for next_index in range(boundary + 1, len(markers)):
         node, node_scope = markers[next_index]
+        effective_scope = _nearest_landmark(node, body_scope) if node_scope is None else node_scope
+        if effective_scope is not scope and effective_scope is not body_scope:
+            break
         if node_scope is None:
             continue
-        if node_scope is not scope and node_scope is not body_scope:
-            break
         if isinstance(node, NavigableString):
             sep_match = _SIGNATURE_SEPARATOR.search(node)
             if node_scope is scope:
@@ -584,7 +596,8 @@ def _signature_context(
     body_scope: Tag,
     *,
     text_layout: dict[int, _TextLayout],
-) -> tuple[str, str, _SeparatorKind | None]:
+    image_source: str,
+) -> tuple[str, bool, _SeparatorKind | None]:
     start = max(0, index - _SIGNATURE_TAIL_SIZE)
     start_offset = 0
     boundary, separator_kind, separator_offset = _preceding_signature_boundary(
@@ -604,8 +617,11 @@ def _signature_context(
     trailing_start = index + 1
     for next_index in range(trailing_start, len(markers)):
         node, node_scope = markers[next_index]
-        if node_scope is not None and node_scope is not scope and node_scope is not body_scope:
+        effective_scope = _nearest_landmark(node, body_scope) if node_scope is None else node_scope
+        if effective_scope is not scope and effective_scope is not body_scope:
             break
+        if node_scope is None:
+            continue
         if isinstance(node, NavigableString):
             sep_match = _SIGNATURE_SEPARATOR.search(node)
             if sep_match is None:
@@ -621,9 +637,10 @@ def _signature_context(
     preceding_chunks: list[_TextChunk] = []
     if (suffix := _dash_suffix_chunk(markers, boundary, scope, separator_offset)) is not None:
         preceding_chunks.append(suffix)
+    preceding_markers = markers[start:index]
     preceding_chunks.extend(
         (marker_index, node, start_offset if marker_index == start else 0, len(node))
-        for marker_index, (node, node_scope) in enumerate(markers[start:index], start)
+        for marker_index, (node, node_scope) in enumerate(preceding_markers, start)
         if node_scope is scope and isinstance(node, NavigableString)
     )
     chunks = preceding_chunks.copy()
@@ -638,7 +655,14 @@ def _signature_context(
         chunks.append(trailing_chunk)
     context = _render_visual_chunks(chunks, text_layout)
     preceding_context = _render_visual_chunks(preceding_chunks, text_layout)
-    return context, preceding_context, separator_kind
+    has_signoff_before = _SIGNOFF.search(preceding_context) is not None
+    if separator_kind is not None and not has_signoff_before and _LOGO_CAPTION.search(image_source):
+        # A logo can follow a marked signature and its contact details in the same landmark.
+        has_signoff_before = any(
+            node_scope is None and _nearest_landmark(node, body_scope) is scope
+            for node, node_scope in preceding_markers
+        )
+    return context, has_signoff_before, separator_kind
 
 
 def _nearest_container(node: Tag | NavigableString, footer: Tag, inline_tag_ids: set[int]) -> Tag:
@@ -1025,19 +1049,31 @@ def _collect_preceding_bill_captions(
     pending_space = False
     line_has_text = False
 
+    def commit_after_line(after_buf: _VisualLineBuffer) -> bool:
+        normalized = " ".join("".join(after_buf.current_line).split())
+        after_buf.current_line.clear()
+        if not normalized:
+            return False
+        if (sig := _SIGNOFF.search(normalized)) is not None:
+            if prefix := normalized[:sig.start()].strip():
+                after_buf.lines.append(prefix)
+            return True
+        after_buf.lines.append(normalized)
+        return False
+
     def finalize_after() -> None:
         nonlocal pending_after
         if pending_after is not None:
             img_id, after_buf = pending_after
-            after_buf.flush()
+            commit_after_line(after_buf)
             followed_bill[img_id] = _lines_start_with_bill_caption(list(after_buf.lines))
             pending_after = None
 
     def flush_after() -> None:
         if pending_after is not None:
             after_buf = pending_after[1]
-            after_buf.flush()
-            if len(after_buf.lines) >= 2:
+            hit_signoff = commit_after_line(after_buf)
+            if hit_signoff or len(after_buf.lines) >= 2:
                 finalize_after()
 
     def break_line() -> None:
@@ -1344,9 +1380,8 @@ def _footer_signature_context(
     for idx in range(index - 1, -1, -1):
         marker = markers[idx]
         node, node_scope = marker
-        other_landmark = (
-            node_scope is not None and node_scope is not footer_tag and node_scope is not body_scope
-        )
+        effective_scope = _nearest_landmark(node, body_scope) if node_scope is None else node_scope
+        other_landmark = effective_scope is not footer_tag and effective_scope is not body_scope
         if other_landmark:
             sep_start = idx + 1
             break
@@ -1369,9 +1404,8 @@ def _footer_signature_context(
     for sep_end in range(index + 1, len(markers)):
         marker = markers[sep_end]
         node, node_scope = marker
-        other_landmark = (
-            node_scope is not None and node_scope is not footer_tag and node_scope is not body_scope
-        )
+        effective_scope = _nearest_landmark(node, body_scope) if node_scope is None else node_scope
+        other_landmark = effective_scope is not footer_tag and effective_scope is not body_scope
         if other_landmark:
             break
         if node.find_parent("figure") is not figure:
@@ -1532,7 +1566,7 @@ def _html_text(
                 _, separator_kind, _ = _preceding_signature_boundary(
                     markers, index, scope, body, isolate_figures=True
                 )
-                preceding_context = ""
+                has_signoff_before = False
                 context, footer_is_bill = _footer_signature_context(
                     markers,
                     index,
@@ -1545,15 +1579,14 @@ def _html_text(
                     preceded_bill=preceded_bill,
                 )
             else:
-                context, preceding_context, separator_kind = _signature_context(
-                    markers, index, scope, body, text_layout=text_layout
+                context, has_signoff_before, separator_kind = _signature_context(
+                    markers, index, scope, body, text_layout=text_layout, image_source=source
                 )
             if footer_is_bill:
                 classification = "body"
             else:
                 has_contact = _SIGNATURE_CONTACT.search(context) is not None
                 has_signoff = _SIGNOFF.search(context) is not None
-                has_signoff_before = _SIGNOFF.search(preceding_context) is not None
                 after_signoff = has_contact and separator_kind is not None and (
                     in_footer
                     or has_signoff_before
