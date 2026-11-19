@@ -38,10 +38,15 @@ _FOOTER_CONTAINERS = {
     "div", "p", "section", "article", "aside", "table", "tr", "td", "th", "li", "address", "footer",
 }
 _INLINE_TAGS = frozenset({
-    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "del",
-    "dfn", "em", "font", "i", "ins", "kbd", "label", "mark", "q", "s",
-    "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var", "wbr",
+    "a", "abbr", "audio", "b", "bdi", "bdo", "button", "canvas", "cite", "code", "data",
+    "del", "dfn", "em", "embed", "font", "i", "iframe", "input", "ins", "kbd", "label",
+    "mark", "meter", "object", "output", "picture", "progress", "q", "rp", "rt", "ruby", "s",
+    "samp", "select", "small", "span", "strong", "sub", "sup", "textarea", "time", "u", "var",
+    "video", "wbr",
 })
+_BLOCK_DISPLAYS = {"block", "flow-root", "flex", "grid", "list-item", "table"}
+_PREFORMATTED_WHITE_SPACE = {"pre", "pre-wrap", "pre-line", "break-spaces"}
+_CSS_IMPORTANT = re.compile(r"\s*!\s*important$")
 _SIGNATURE_BLOCK = re.compile(r"signature|foxmail", re.I)
 _SIGNATURE_SEPARATOR = re.compile(r"^[ \t]*--[ \t]+\r?$", re.MULTILINE)
 _SIGNATURE_CONTACT = re.compile(r"\b(?:tl|tel|web|email|fax)\s*[:：]", re.I)
@@ -375,6 +380,37 @@ def _minimal_signature_boxes(
             yield candidate
 
 
+def _inline_style_value(tag: Tag, property_name: str) -> str:
+    style = tag.get("style")
+    if not isinstance(style, str):
+        return ""
+
+    value = ""
+    is_important = False
+    for declaration in style.lower().split(";"):
+        name, _, raw_value = declaration.partition(":")
+        if name.strip() != property_name:
+            continue
+        raw_value = raw_value.strip()
+        priority = _CSS_IMPORTANT.search(raw_value)
+        if priority is not None:
+            raw_value = raw_value[:priority.start()]
+        if raw_value and (priority is not None or not is_important):
+            value = " ".join(raw_value.split())
+            is_important = priority is not None
+    return value
+
+
+def _is_inline_element(tag: Tag) -> bool:
+    display = _inline_style_value(tag, "display")
+    keywords = display.split()
+    if "inline" in keywords or display.startswith("inline-"):
+        return True
+    if "block" in keywords or display in _BLOCK_DISPLAYS or display.startswith("table-"):
+        return False
+    return tag.name in _INLINE_TAGS
+
+
 def _preceded_by_bill_caption(image: Tag, footer: Tag) -> bool:
     current_line: list[str] = []
     last_line = ""
@@ -392,8 +428,14 @@ def _preceded_by_bill_caption(image: Tag, footer: Tag) -> bool:
         current_line.clear()
         last_line = ""
 
-    def walk(node: Tag) -> None:
+    def walk(node: Tag, preformatted: bool = False) -> None:
         nonlocal stopped
+        white_space = _inline_style_value(node, "white-space")
+        if white_space in {"normal", "nowrap"}:
+            preformatted = False
+        elif node.name in {"pre", "textarea"} or white_space in _PREFORMATTED_WHITE_SPACE:
+            preformatted = True
+
         for child in node.children:
             if child is image:
                 stopped = True
@@ -402,10 +444,17 @@ def _preceded_by_bill_caption(image: Tag, footer: Tag) -> bool:
                 continue
             if isinstance(child, NavigableString):
                 raw = str(child)
+                if preformatted:
+                    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
                 parts = _SIGNATURE_SEPARATOR.split(raw)
                 if len(parts) > 1:
                     reset()
                     raw = parts[-1]
+                if preformatted:
+                    *lines, raw = raw.split("\n")
+                    for line in lines:
+                        current_line.append(line)
+                        flush()
                 if raw:
                     current_line.append(raw)
             elif isinstance(child, Tag):
@@ -415,10 +464,10 @@ def _preceded_by_bill_caption(image: Tag, footer: Tag) -> bool:
                 if child.name == "br":
                     flush()
                     continue
-                is_block = child.name not in _INLINE_TAGS
+                is_block = not _is_inline_element(child)
                 if is_block:
                     flush()
-                walk(child)
+                walk(child, preformatted)
                 if stopped:
                     return
                 if is_block:
@@ -440,16 +489,25 @@ def _can_climb_signature_wrapper(parent: Tag, box: Tag) -> bool:
         default=-1,
     )
     tail = descendants[last_hr + 1 :]
-    if not any(node is box for node in tail):
-        return False
     if any(isinstance(node, Tag) and node.name in {"img", "figure"} for node in tail):
         return False
-    tail_text = " ".join(
-        str(node).strip()
+    tail_text_nodes = [
+        node
         for node in tail
         if isinstance(node, NavigableString) and not isinstance(node, Comment) and node.strip()
+    ]
+    box_after_hr = any(node is box for node in tail)
+    if not box_after_hr:
+        if last_hr == -1 or not any(ancestor is box for ancestor in descendants[last_hr].parents):
+            return False
+        # With the separator inside the box, all post-separator text must belong to it.
+        if any(not any(ancestor is box for ancestor in node.parents) for node in tail_text_nodes):
+            return False
+
+    tail_text = " ".join(node.strip() for node in tail_text_nodes)
+    return not _is_bill_caption_text(tail_text) and (
+        box_after_hr or _SIGNATURE_CONTACT.search(tail_text) is not None
     )
-    return not _is_bill_caption_text(tail_text)
 
 
 def _image_in_adjacent_signature_slot(box: Tag, image: Tag, footer: Tag) -> bool:

@@ -17,6 +17,7 @@ from shipping_billing_agent.domain.models import ExtractionChannel, ParsedTable
 _MIN_TEXT_CHARACTERS = 15
 _OCR_RESOLUTION_DPI = 200
 _AXIS_TOL_PT = 0.5
+_RECT_TOL_PT = 0.01
 _DUPLICATE_VERTEX_TOL_PT = 1e-4
 _COLLINEAR_TOL_PT = 1.0
 _RULE_INTERVAL_TOL_PT = 1.0
@@ -239,32 +240,35 @@ def _straight_subpaths(path: list[tuple[Any, ...]]) -> Iterator[tuple[list[_Poin
 
 
 def _rectangle_bounds(points: list[_Point]) -> tuple[float, float, float, float] | None:
-    corners = points
-    while len(corners) >= 4:
-        reduced = []
-        for idx, (x, y) in enumerate(corners):
-            prev_x, prev_y = corners[idx - 1]
-            next_x, next_y = corners[(idx + 1) % len(corners)]
-            same_x = abs(prev_x - x) <= _AXIS_TOL_PT and abs(x - next_x) <= _AXIS_TOL_PT
-            same_y = abs(prev_y - y) <= _AXIS_TOL_PT and abs(y - next_y) <= _AXIS_TOL_PT
-            if not (same_x or same_y):
-                reduced.append((x, y))
-        if len(reduced) == len(corners):
-            break
-        corners = reduced
-
-    if len(corners) != 4:
+    if len(points) < 4:
         return None
-    xs, ys = zip(*corners, strict=True)
+    xs, ys = zip(*points, strict=True)
     x0, top, x1, bottom = min(xs), min(ys), max(xs), max(ys)
-    if x1 - x0 <= _AXIS_TOL_PT or bottom - top <= _AXIS_TOL_PT:
+    if x1 - x0 <= _RECT_TOL_PT or bottom - top <= _RECT_TOL_PT:
         return None
-    if set(corners) != {(x0, top), (x1, top), (x1, bottom), (x0, bottom)}:
-        return None
-    if any(
-        start[0] != end[0] and start[1] != end[1]
-        for start, end in pairwise(chain(corners, corners[:1]))
-    ):
+
+    def snap_to_edge(value: float, low: float, high: float) -> float:
+        edge = low if value - low <= high - value else high
+        return edge if abs(value - edge) <= _RECT_TOL_PT else value
+
+    vertices = [(snap_to_edge(x, x0, x1), snap_to_edge(y, top, bottom)) for x, y in points]
+    sides: list[tuple[str, float]] = []
+    for (ax, ay), (bx, by) in pairwise(chain(vertices, vertices[:1])):
+        if (ax, ay) == (bx, by):
+            continue
+        if ax == bx and ax in (x0, x1):
+            side = ("x", ax)
+        elif ay == by and ay in (top, bottom):
+            side = ("y", ay)
+        else:
+            return None
+        if not sides or side != sides[-1]:
+            sides.append(side)
+
+    # A path can start partway along a side. Each change of side must meet at a corner.
+    if len(sides) > 1 and sides[0] == sides[-1]:
+        sides.pop()
+    if len(sides) != 4 or len(set(sides)) != 4:
         return None
     return x0, top, x1, bottom
 

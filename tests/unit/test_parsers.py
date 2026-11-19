@@ -859,6 +859,51 @@ def test_r13_3_tiled_small_filled_rect_dashed_rules(r13_tiled_dashed_rule_pdf, l
 
 
 @pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
+def test_r14_3_implicitly_closed_tiles_keep_pdf_text(r13_tiled_dashed_rule_pdf, local_ocr):
+    with pdfplumber.open(BytesIO(r13_tiled_dashed_rule_pdf)) as pdf:
+        tiles = pdf.pages[1].rects
+    drawing = b"".join(
+        b"%.3f %.3f m %.3f %.3f l %.3f %.3f l %.3f %.3f l f\n"
+        % (
+            tile["x0"], tile["y0"], tile["x1"], tile["y0"],
+            tile["x1"], tile["y1"], tile["x0"], tile["y1"],
+        )
+        for tile in tiles
+    )
+    data = _two_page_pdf(
+        _PAYMENT_TERMS_PAGE, drawing + b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n"
+    )
+    with pdfplumber.open(BytesIO(data)) as pdf:
+        page = pdf.pages[1]
+        assert len(page.curves) == len(tiles)
+        assert not page.lines and not page.rects
+
+    _assert_decorated_pdf_keeps_electronic_text(data, local_ocr)
+
+
+@pytest.mark.parametrize(
+    ("points", "expected"),
+    [
+        pytest.param([(0, 0), (0.2, 0), (0.2, 1), (0, 1)], (0, 0, 0.2, 1), id="narrow"),
+        pytest.param([(0, 0), (1, 0), (1, 0.4), (0, 0.4)], (0, 0, 1, 0.4), id="short"),
+        pytest.param(
+            [(0, 0), (0.4, 0.005), (0.395, 1), (0.005, 0.995), (0.005, 0.005)],
+            (0, 0, 0.4, 1),
+            id="corner-tolerance",
+        ),
+        pytest.param([(0, 0), (0, 0), (0, 10), (0, 10)], None, id="zero-width"),
+        pytest.param([(0, 0), (0.01, 0), (0.01, 1), (0, 1)], None, id="width-at-tolerance"),
+        pytest.param([(0, 0), (0.4, 0), (0.4, 1), (0.02, 1)], None, id="slanted-closing-edge"),
+        pytest.param([(0, 0), (0.4, 0), (0, 1), (0.4, 1)], None, id="diagonal-edges"),
+    ],
+)
+def test_r14_3_rectangle_bounds_checks_all_four_sides(points, expected):
+    from shipping_billing_agent.parsers.pdf_parser import _rectangle_bounds
+
+    assert _rectangle_bounds(points) == expected
+
+
+@pytest.mark.parametrize("local_ocr", [None, RapidOcrFallback()], ids=["no-ocr", "rapidocr"])
 def test_r9_f4_pdf_keeps_electronic_text_with_implicitly_closed_bars(local_ocr):
     data = _two_page_pdf(
         _PAYMENT_TERMS_PAGE,
@@ -1641,6 +1686,120 @@ def test_r13_2_nested_div_around_hr_contact_skips_logo(r8_eml_ocr):
     assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
 
 
+def _assert_inline_image_ocr(document, recognize_image, *, expected_text: str | None) -> None:
+    if expected_text is None:
+        assert (document.status, recognize_image.call_count) == (
+            DocumentStatus.SKIPPED_NOISE,
+            0,
+        ), document.raw_text
+        assert document.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    else:
+        assert (document.status, recognize_image.call_count) == (
+            DocumentStatus.PARSED,
+            1,
+        ), document.error_message
+        assert document.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+        assert expected_text in document.raw_text, document.raw_text
+
+
+@pytest.mark.parametrize(
+    ("caption", "expect_ocr"),
+    [
+        pytest.param("Invoice <output>scan</output>", True, id="output"),
+        pytest.param("Invoice <ruby>scan<rp>(</rp><rt>scan</rt><rp>)</rp></ruby>", True, id="ruby"),
+        pytest.param('Invoice <div style="display:inline">scan</div>', True, id="inline-div"),
+        pytest.param('<div style="display:inline">Invoice</div> scan', True, id="inline-prefix"),
+        pytest.param(
+            'Invoice <div style="color:black; DISPLAY : Inline-Block ! IMPORTANT">scan</div>',
+            True,
+            id="inline-block-important",
+        ),
+        pytest.param('Invoice <div style="display:inline-flex">scan</div>', True, id="inline-flex"),
+        pytest.param('Invoice <span style="display:block">Company logo</span>', False, id="block"),
+        pytest.param(
+            'Invoice <span style="display:grid !important; display:inline">Company logo</span>',
+            False,
+            id="grid-important",
+        ),
+        pytest.param(
+            'Invoice <span style="display:inline; display:table-cell">Company logo</span>',
+            False,
+            id="table-cell",
+        ),
+    ],
+)
+def test_r14_1_display_controls_the_visual_caption_line(caption, expect_ocr, r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(
+        f'<footer><div>{caption}<br><img src="cid:scan">'
+        '<br>Best regards<br>ACME<br>Tel: 123456</div></footer>',
+        image_name="scan",
+        text=amount if expect_ocr else "ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert scan.sanitized_filename == "scan.png"
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=amount if expect_ocr else None)
+
+
+@pytest.mark.parametrize(
+    ("layout", "expect_ocr"),
+    [
+        pytest.param(
+            '<div id="wrap"><div><hr>{contact}</div>\n<!-- spacer --></div><div>{image}</div>',
+            False,
+            id="wrapped-contact",
+        ),
+        pytest.param(
+            "<div>" * 8 + "<div><hr>{contact}</div>" + "</div>" * 8 + "{image}",
+            False,
+            id="deeply-wrapped-contact",
+        ),
+        pytest.param(
+            '<div id="wrap"><div><hr>{contact}{image}</div></div>', False, id="image-in-box"
+        ),
+        pytest.param(
+            "<div><div>{contact}<hr>General update</div></div>{image}",
+            True,
+            id="contact-before-hr",
+        ),
+        pytest.param(
+            "<div><div><hr>{contact}Invoice scan</div></div>{image}", True, id="bill-caption"
+        ),
+        pytest.param(
+            "<div><div><hr>{contact}</div><span>ACME Logistics</span></div>{image}",
+            True,
+            id="text-outside-box-even-if-identical",
+        ),
+        pytest.param(
+            '<div><div><hr>{contact}</div><img src="other.png"></div>{image}',
+            True,
+            id="intervening-image",
+        ),
+        pytest.param(
+            "<div><div><hr>{contact}</div><figure></figure></div>{image}",
+            True,
+            id="intervening-figure",
+        ),
+    ],
+)
+def test_r14_2_contact_after_a_nested_hr_skips_only_the_adjacent_signature_image(
+    layout, expect_ocr, r8_eml_ocr
+):
+    html = layout.format(
+        contact="ACME Logistics<br>Tel: +86 21 5555 6666<br>", image='<img src="cid:sig">'
+    )
+    data = _mail_with_inline_png(f"<footer>{html}</footer>", image_name="sig", text="ACME")
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, image = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert image.sanitized_filename == "sig.png"
+    _assert_inline_image_ocr(image, recognize_image, expected_text="ACME" if expect_ocr else None)
+
+
 def test_r9_f2_eml_reads_a_negative_amount_and_skips_bare_currency_logos(r8_eml_ocr):
     dispatcher, recognize_image = r8_eml_ocr
     logo_labels = {
@@ -1806,6 +1965,65 @@ def test_r13_4_br_separated_invoice_notice_and_company_logo_skips_logo(r8_eml_oc
         0,
     ), logo.raw_text
     assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+
+
+@pytest.mark.parametrize(
+    ("caption", "expect_ocr"),
+    [
+        pytest.param("<pre>Invoice inquiries\nCompany logo</pre>", False, id="pre"),
+        pytest.param(
+            "<textarea>Invoice inquiries\r\nCompany logo</textarea>", False, id="textarea"
+        ),
+        pytest.param(
+            '<div style=" WHITE-SPACE : pre-line !IMPORTANT">'
+            "<span>Invoice inquiries\nCompany logo</span></div>",
+            False,
+            id="inherited-pre-line",
+        ),
+        pytest.param(
+            '<div style="white-space: break-spaces">Invoice inquiries&#13;'
+            "Company <span>logo</span></div>",
+            False,
+            id="break-spaces-with-lone-cr",
+        ),
+        pytest.param(
+            '<div style="white-space: pre-wrap">Earlier line\n-- \n'
+            "Invoice inquiries\nCompany logo</div>",
+            False,
+            id="pre-wrap-after-signature-separator",
+        ),
+        pytest.param(
+            "<pre>Invoice inquiries&#13;-- &#13;Company logo</pre>",
+            False,
+            id="separator-with-lone-cr",
+        ),
+        pytest.param("<pre>Company logo\nInvoice scan</pre>", True, id="bill-on-last-line"),
+        pytest.param(
+            '<pre>Invoice <span style="white-space: normal">\nscan</span></pre>',
+            True,
+            id="normal-overrides-pre",
+        ),
+        pytest.param(
+            '<textarea style="white-space: nowrap">Invoice\nscan</textarea>',
+            True,
+            id="nowrap-overrides-textarea",
+        ),
+    ],
+)
+def test_r14_4_preformatted_caption_uses_the_last_visual_line(caption, expect_ocr, r8_eml_ocr):
+    amount = "USD 310.42"
+    data = _mail_with_inline_png(
+        f'<footer><table><tbody><tr><td>{caption}</td></tr></tbody></table>'
+        '<div><img src="cid:logo"></div>Best regards<br>ACME<br>Tel: 123456</footer>',
+        image_name="logo",
+        text=amount if expect_ocr else "ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    assert logo.sanitized_filename == "logo.png"
+    _assert_inline_image_ocr(logo, recognize_image, expected_text=amount if expect_ocr else None)
 
 
 @pytest.mark.parametrize(
