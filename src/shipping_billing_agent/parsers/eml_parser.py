@@ -60,14 +60,15 @@ _SIGNATURE_CONTACT = re.compile(r"\b(?:tl|tel|web|email|fax)\s*[:：]", re.I)
 _HWS = r"[^\S\r\n]"
 _SIGNOFF_QUALIFIER = r"(?:best|warm(?:est)?|kind(?:est)?|many|all)"
 _SIGNOFF_THANKS = rf"(?:(?:many{_HWS}+)?thanks|thank{_HWS}+you)"
+_SIGNOFF_CONJ = rf"(?:{_HWS}*,)?(?:{_HWS}+(?:and|&))?{_HWS}+"
+_SIGNOFF_PREFIX = rf"(?:^{_HWS}*|{_HWS}*(?:[,;，；]{_HWS}+|[–—]{_HWS}*|(?:^|(?<=\s)|-)-{_HWS}*))"
 _SIGNOFF = re.compile(
-    rf"(?:^{_HWS}*|{_HWS}*[-–—,;.!，；。！]{_HWS}*)"
+    rf"{_SIGNOFF_PREFIX}"
     r"(?:"
-    rf"(?:(?:{_SIGNOFF_THANKS}(?:{_HWS}+(?:and|&))?{_HWS}+|with{_HWS}+)?"
-    rf"{_SIGNOFF_QUALIFIER}{_HWS}+regards"
-    rf"|{_SIGNOFF_THANKS}(?:{_HWS}+(?:and|&))?{_HWS}+regards"
+    rf"(?:(?:{_SIGNOFF_THANKS}{_SIGNOFF_CONJ}|with{_HWS}+)?{_SIGNOFF_QUALIFIER}{_HWS}+regards"
+    rf"|{_SIGNOFF_THANKS}{_SIGNOFF_CONJ}regards"
     rf"|yours{_HWS}+sincerely|sincerely{_HWS}+yours)\b"
-    rf"|(?:(?:with{_HWS}+)?regards|sincerely)\b(?={_HWS}*(?:[,!.:;，！。：]|\r?$))"
+    rf"|(?:(?:with{_HWS}+)?regards|sincerely)\b(?={_HWS}*(?:[,!.:;，！。：]{_HWS}*)?\r?$)"
     r")"
     r"|此致|敬上|敬礼",
     re.I | re.M,
@@ -362,19 +363,59 @@ def _related_root_start(part: _MimePart) -> int | None:
 _HtmlMarker = tuple[Tag | NavigableString, Tag | None]
 _SeparatorKind = Literal["dash", "hr"]
 _TextChunk = tuple[int, NavigableString, int, int]
+_LinePiece = tuple[int, str, int, int, bool]
+_CONTINUED_LINE_PREFIX = "\u2060 "
 
 
 @dataclass(frozen=True, slots=True)
 class _TextLayout:
     line_id: int
+    end_line_id: int
     preformatted: bool
     space_before: bool
+    continues_line: bool
 
 
 @dataclass(frozen=True, slots=True)
 class _VisualContext:
     text: str
-    positions: list[tuple[int, int]]
+    _line_pieces: list[tuple[bool, list[_LinePiece]]]
+
+    def locate(self, char_index: int) -> tuple[int, int] | None:
+        if not self._line_pieces:
+            return None
+
+        char_index = min(max(0, char_index), len(self.text) - 1)
+        line_no = self.text.count("\n", 0, char_index)
+        line_start = self.text.rfind("\n", 0, char_index) + 1
+        col = char_index - line_start
+        line_continues, pieces = self._line_pieces[line_no]
+        if line_continues:
+            col = max(0, col - len(_CONTINUED_LINE_PREFIX))
+
+        # Map collapsed spaces to the first whitespace character in their run.
+        emitted = 0
+        last_pos = None
+        pending_space_pos = None
+        for marker_idx, raw, seg_start, seg_end, prepend_space in pieces:
+            if prepend_space and emitted and pending_space_pos is None:
+                pending_space_pos = (marker_idx, seg_start)
+            for offset in range(seg_start, seg_end):
+                if raw[offset].isspace():
+                    if emitted and pending_space_pos is None:
+                        pending_space_pos = (marker_idx, offset)
+                    continue
+                if pending_space_pos is not None:
+                    if emitted == col:
+                        return pending_space_pos
+                    emitted += 1
+                    pending_space_pos = None
+                if emitted == col:
+                    return marker_idx, offset
+                emitted += 1
+                last_pos = (marker_idx, offset)
+        # A synthesized newline maps to the last character on its line.
+        return last_pos
 
 
 _SignatureBox = tuple[Tag, _VisualContext, re.Match[str] | None, re.Match[str]]
@@ -536,30 +577,32 @@ def _in_post_separator_signature(
     return _SIGNOFF.search(preceding_context) is not None
 
 
-def _start_of_inline_line(
+def _start_of_visual_line(
     markers: list[_HtmlMarker],
     start: int,
     boundary: int,
     scope: Tag,
     text_layout: dict[int, _TextLayout],
-) -> int:
+) -> tuple[int, int]:
     node, node_scope = markers[start]
     if node_scope is not scope or not isinstance(node, NavigableString):
-        return start
+        return start, 0
     target_line = text_layout.get(id(node))
-    if target_line is None or target_line.preformatted:
-        return start
+    if target_line is None:
+        return start, 0
 
     for previous_index in range(start - 1, boundary, -1):
         previous_node, previous_scope = markers[previous_index]
-        if not isinstance(previous_node, NavigableString):
+        if not isinstance(previous_node, NavigableString) or previous_scope is not scope:
             break
         previous_line = text_layout.get(id(previous_node))
-        if previous_line is None or previous_line.line_id != target_line.line_id:
+        if previous_line is None or previous_line.end_line_id != target_line.line_id:
             break
-        if previous_scope is scope and not previous_line.preformatted:
-            start = previous_index
-    return start
+        start = previous_index
+        if previous_line.line_id < target_line.line_id:
+            breaks = list(_LINE_BREAK_RE.finditer(previous_node))
+            return start, breaks[-1].end()
+    return start, 0
 
 
 def _signature_context(
@@ -571,6 +614,7 @@ def _signature_context(
     text_layout: dict[int, _TextLayout],
 ) -> tuple[str, str, _SeparatorKind | None]:
     start = max(0, index - _SIGNATURE_TAIL_SIZE)
+    start_offset = 0
     boundary, separator_kind, separator_offset = _preceding_signature_boundary(
         markers, index, scope, body_scope
     )
@@ -580,7 +624,9 @@ def _signature_context(
     else:
         start = max(start, boundary + 1)
         if start > boundary + 1:
-            start = _start_of_inline_line(markers, start, boundary, scope, text_layout)
+            start, start_offset = _start_of_visual_line(
+                markers, start, boundary, scope, text_layout
+            )
 
     trailing_chunk: _TextChunk | None = None
     trailing_start = index + 1
@@ -604,7 +650,7 @@ def _signature_context(
     if (suffix := _dash_suffix_chunk(markers, boundary, scope, separator_offset)) is not None:
         preceding_chunks.append(suffix)
     preceding_chunks.extend(
-        (marker_index, node, 0, len(node))
+        (marker_index, node, start_offset if marker_index == start else 0, len(node))
         for marker_index, (node, node_scope) in enumerate(markers[start:index], start)
         if node_scope is scope and isinstance(node, NavigableString)
     )
@@ -623,10 +669,12 @@ def _signature_context(
     return context, preceding_context, separator_kind
 
 
-def _nearest_container(node: Tag | NavigableString, footer: Tag) -> Tag:
+def _nearest_container(node: Tag | NavigableString, footer: Tag, inline_tag_ids: set[int]) -> Tag:
     if node is not footer:
         for parent in node.parents:
-            if parent is footer or parent.name in _FOOTER_CONTAINERS:
+            if parent is footer or (
+                parent.name in _FOOTER_CONTAINERS and id(parent) not in inline_tag_ids
+            ):
                 return parent
     return footer
 
@@ -671,6 +719,7 @@ def _minimal_signature_boxes(
     footer: Tag,
     text_chunks: list[_TextChunk],
     text_layout: dict[int, _TextLayout],
+    inline_tag_ids: set[int],
     *,
     require_signoff: bool = True,
 ) -> Iterator[_SignatureBox]:
@@ -679,8 +728,11 @@ def _minimal_signature_boxes(
     for chunk in text_chunks:
         _, node, _, _ = chunk
         for parent in node.parents:
-            if parent is footer or parent.name in _FOOTER_CONTAINERS:
-                by_container.setdefault(id(parent), (parent, []))[1].append(chunk)
+            parent_id = id(parent)
+            if parent is footer or (
+                parent.name in _FOOTER_CONTAINERS and parent_id not in inline_tag_ids
+            ):
+                by_container.setdefault(parent_id, (parent, []))[1].append(chunk)
             if parent is footer:
                 break
 
@@ -764,31 +816,33 @@ def _count_line_breaks(raw: str) -> int:
 def _render_visual_chunks(
     chunks: list[_TextChunk], text_layout: dict[int, _TextLayout]
 ) -> _VisualContext:
-    raw_line: list[tuple[str, int, int]] = []
-    lines_chars: list[str] = []
-    lines_pos: list[list[tuple[int, int]]] = []
+    raw_pieces: list[_LinePiece] = []
+    lines: list[str] = []
+    line_pieces: list[tuple[bool, list[_LinePiece]]] = []
+    line_continues = False
     current_line_id: int | None = None
     fallback_line_id = -1
 
+    def append_piece(marker_idx: int, raw: str, start: int, end: int, layout: _TextLayout) -> None:
+        nonlocal line_continues
+        if start >= end:
+            return
+        if not raw_pieces:
+            if not raw[start:end].strip():
+                return
+            line_continues = start == 0 and layout.continues_line
+        raw_pieces.append((marker_idx, raw, start, end, start == 0 and layout.space_before))
+
     def flush_line() -> None:
-        line_chars: list[str] = []
-        line_pos: list[tuple[int, int]] = []
-        pending_space_pos: tuple[int, int] | None = None
-        for ch, marker_idx, offset in raw_line:
-            if ch.isspace():
-                if line_chars and pending_space_pos is None:
-                    pending_space_pos = (marker_idx, offset)
-                continue
-            if pending_space_pos is not None:
-                line_chars.append(" ")
-                line_pos.append(pending_space_pos)
-                pending_space_pos = None
-            line_chars.append(ch)
-            line_pos.append((marker_idx, offset))
-        if line_chars:
-            lines_chars.append("".join(line_chars))
-            lines_pos.append(line_pos)
-        raw_line.clear()
+        joined = "".join(
+            (" " if space else "") + raw[start:end] for _, raw, start, end, space in raw_pieces
+        )
+        normalized = " ".join(joined.split())
+        if normalized:
+            # Keep a clipped continuation from matching the start of a line.
+            lines.append(_CONTINUED_LINE_PREFIX + normalized if line_continues else normalized)
+            line_pieces.append((line_continues, list(raw_pieces)))
+        raw_pieces.clear()
 
     for marker_idx, node, start_offset, end_offset in chunks:
         if start_offset >= end_offset:
@@ -796,7 +850,7 @@ def _render_visual_chunks(
         raw = str(node)
         layout = text_layout.get(id(node))
         if layout is None:
-            layout = _TextLayout(fallback_line_id, False, False)
+            layout = _TextLayout(fallback_line_id, fallback_line_id, False, False, False)
             fallback_line_id -= 1
 
         chunk_line_id = layout.line_id
@@ -805,39 +859,24 @@ def _render_visual_chunks(
         if current_line_id != chunk_line_id:
             flush_line()
         current_line_id = chunk_line_id
-        if start_offset == 0 and layout.space_before and raw_line:
-            raw_line.append((" ", marker_idx, 0))
 
         if not layout.preformatted:
-            raw_line.extend(
-                (raw[offset], marker_idx, offset) for offset in range(start_offset, end_offset)
-            )
+            append_piece(marker_idx, raw, start_offset, end_offset, layout)
             continue
 
-        offset = start_offset
+        seg_start = start_offset
         # A dash separator can consume the CR, which the prefix already counted.
-        if offset > 0 and raw[offset - 1 : offset + 1] == "\r\n":
-            offset += 1
-        while offset < end_offset:
-            ch = raw[offset]
-            if ch in "\r\n":
-                if ch == "\r" and offset + 1 < end_offset and raw[offset + 1] == "\n":
-                    offset += 1
-                flush_line()
-                current_line_id += 1
-            else:
-                raw_line.append((ch, marker_idx, offset))
-            offset += 1
+        if seg_start > 0 and raw[seg_start - 1 : seg_start + 1] == "\r\n":
+            seg_start += 1
+        for line_break in _LINE_BREAK_RE.finditer(raw, seg_start, end_offset):
+            append_piece(marker_idx, raw, seg_start, line_break.start(), layout)
+            flush_line()
+            current_line_id += 1
+            seg_start = line_break.end()
+        append_piece(marker_idx, raw, seg_start, end_offset, layout)
 
     flush_line()
-    text = "\n".join(lines_chars)
-    positions: list[tuple[int, int]] = []
-    for line_pos in lines_pos:
-        if positions:
-            positions.append((-1, 0))
-        positions.extend(line_pos)
-    assert len(text) == len(positions)
-    return _VisualContext(text, positions)
+    return _VisualContext("\n".join(lines), line_pieces)
 
 
 class _VisualLineBuffer:
@@ -951,23 +990,26 @@ def _visual_lines(
 
 def _collect_preceding_bill_captions(
     body: Tag, target_image_ids: set[int], *, figure_captions: dict[int, list[Tag]]
-) -> tuple[dict[int, bool], dict[int, _TextLayout]]:
+) -> tuple[dict[int, bool], dict[int, _TextLayout], set[int]]:
     if not target_image_ids:
-        return {}, {}
+        return {}, {}, set()
     result: dict[int, bool] = {}
     text_layout: dict[int, _TextLayout] = {}
+    inline_tag_ids: set[int] = set()
     line_id = 0
     pending_space = False
+    line_has_text = False
 
     def break_line() -> None:
-        nonlocal line_id, pending_space
+        nonlocal line_id, pending_space, line_has_text
         line_id += 1
         pending_space = False
+        line_has_text = False
 
     def walk(
         node: Tag, preformatted: bool, buffer: _VisualLineBuffer, *, in_figure: bool = False
     ) -> tuple[bool, bool]:
-        nonlocal line_id, pending_space
+        nonlocal line_id, pending_space, line_has_text
         preformatted = _node_preformatted(node, preformatted)
         had_reset = had_img = False
         for child in node.children:
@@ -975,14 +1017,29 @@ def _collect_preceding_bill_captions(
                 continue
             if isinstance(child, NavigableString):
                 raw = str(child)
-                if raw.strip():
-                    text_layout[id(child)] = _TextLayout(line_id, preformatted, pending_space)
+                has_text = bool(raw.strip())
+                breaks = _count_line_breaks(raw) if preformatted else 0
+                if has_text:
+                    text_layout[id(child)] = _TextLayout(
+                        line_id=line_id,
+                        end_line_id=line_id + breaks,
+                        preformatted=preformatted,
+                        space_before=pending_space,
+                        continues_line=line_has_text,
+                    )
+                dash_parts = _SIGNATURE_SEPARATOR.split(raw)
+                line_id += breaks
+                if len(dash_parts) > 1 or breaks:
+                    tail = dash_parts[-1]
+                    if preformatted:
+                        tail = _LINE_BREAK_RE.split(tail)[-1]
+                    line_has_text = bool(tail.strip())
+                    pending_space = False
+                elif has_text:
+                    line_has_text = True
                     pending_space = False
                 elif raw:
                     pending_space = True
-                if preformatted and (breaks := _count_line_breaks(raw)):
-                    line_id += breaks
-                    pending_space = False
                 had_reset |= buffer.append_text(raw, preformatted)
                 continue
             if child.name == "img":
@@ -1034,6 +1091,8 @@ def _collect_preceding_bill_captions(
             if is_block:
                 break_line()
                 buffer.flush()
+            else:
+                inline_tag_ids.add(id(child))
             child_reset, child_img = walk(child, preformatted, buffer, in_figure=in_figure)
             if is_block:
                 break_line()
@@ -1047,7 +1106,7 @@ def _collect_preceding_bill_captions(
         return had_reset, had_img
 
     walk(body, _initial_preformatted(body), _VisualLineBuffer(max_lines=2))
-    return result, text_layout
+    return result, text_layout, inline_tag_ids
 
 
 def _preceded_by_bill_caption(
@@ -1155,6 +1214,39 @@ def _image_in_adjacent_signature_slot(
     )
 
 
+def _image_blocked_by_caption_or_later_image(
+    box: Tag,
+    image: Tag,
+    index: int,
+    markers: list[_HtmlMarker],
+    images: list[tuple[int, Tag]],
+    visual: _VisualContext,
+    sig_match: re.Match[str],
+    *,
+    skip_figures: bool = False,
+) -> bool:
+    located = visual.locate(sig_match.start())
+    if located is None:
+        return False
+    first_sig_marker, sig_offset = located
+    if index >= first_sig_marker:
+        return False
+    if any(
+        idx > first_sig_marker and any(parent is box for parent in img.parents)
+        for idx, img in images
+    ):
+        return True
+    between_lines = _visual_lines(
+        box,
+        start_after=image,
+        stop_at=markers[first_sig_marker][0],
+        stop_offset=sig_offset,
+        stop_on_media=True,
+        skip_figures=skip_figures,
+    )
+    return _lines_start_with_bill_caption(between_lines)
+
+
 def _footer_signature_context(
     markers: list[_HtmlMarker],
     index: int,
@@ -1163,21 +1255,24 @@ def _footer_signature_context(
     image: Tag,
     *,
     text_layout: dict[int, _TextLayout],
+    inline_tag_ids: set[int],
     require_signoff: bool = True,
     preceded_bill: dict[int, bool] | None = None,
 ) -> str:
-    if (figure := image.find_parent("figure")) is not None:
-        return "\n".join(_visual_lines(figure, reset_on_media=False, skip_figures=True))
-
     sep_start = 0
+    sep_start_offset = 0
     for idx in range(index - 1, -1, -1):
         marker = markers[idx]
-        node, _ = marker
-        if _ends_footer_context(marker, footer_tag, body_scope) or (
-            isinstance(node, NavigableString) and _SIGNATURE_SEPARATOR.search(node)
-        ):
+        if _ends_footer_context(marker, footer_tag, body_scope):
             sep_start = idx + 1
             break
+        node, _ = marker
+        if isinstance(node, NavigableString):
+            matches = list(_SIGNATURE_SEPARATOR.finditer(node))
+            if matches:
+                sep_start = idx
+                sep_start_offset = matches[-1].end()
+                break
 
     separator = None
     for sep_end in range(index + 1, len(markers)):
@@ -1191,62 +1286,61 @@ def _footer_signature_context(
     else:
         sep_end = len(markers)
 
+    figure = image.find_parent("figure")
     text_chunks: list[_TextChunk] = []
     images: list[tuple[int, Tag]] = []
     for idx in range(sep_start, sep_end):
         node, scope = markers[idx]
-        if scope is not footer_tag or node.find_parent("figure") is not None:
+        if scope is not footer_tag or node.find_parent("figure") is not figure:
             continue
         if isinstance(node, NavigableString):
+            start_offset = sep_start_offset if idx == sep_start else 0
             end_offset = separator.start() if separator and idx == sep_end - 1 else len(node)
-            if end_offset > 0:
-                text_chunks.append((idx, node, 0, end_offset))
+            if start_offset < end_offset:
+                text_chunks.append((idx, node, start_offset, end_offset))
         elif node.name == "img":
             images.append((idx, node))
 
+    if figure is not None:
+        if _preceded_by_bill_caption(image, footer_tag, preceded_bill=preceded_bill):
+            return ""
+        visual = _render_visual_chunks(text_chunks, text_layout)
+        contact_match = _SIGNATURE_CONTACT.search(visual.text)
+        sig_match = _SIGNOFF.search(visual.text)
+        if sig_match is None and not require_signoff:
+            sig_match = contact_match
+        if (
+            contact_match is not None
+            and sig_match is not None
+            and _image_blocked_by_caption_or_later_image(
+                figure, image, index, markers, images, visual, sig_match, skip_figures=True
+            )
+        ):
+            return ""
+        return visual.text
+
     image_parent_ids = {id(parent) for parent in image.parents}
     for box, visual, signoff_match, contact_match in _minimal_signature_boxes(
-        footer_tag, text_chunks, text_layout, require_signoff=require_signoff
+        footer_tag, text_chunks, text_layout, inline_tag_ids, require_signoff=require_signoff
     ):
         if id(box) in image_parent_ids:
             if _preceded_by_bill_caption(image, footer_tag, preceded_bill=preceded_bill):
                 return ""
-            sig_match = signoff_match
-            if sig_match is None and not require_signoff:
-                sig_match = contact_match
-            if sig_match is not None:
-                sig_pos = sig_match.start()
-                first_sig_marker, sig_offset = visual.positions[sig_pos]
-                while first_sig_marker < 0 and sig_pos + 1 < len(visual.positions):
-                    sig_pos += 1
-                    first_sig_marker, sig_offset = visual.positions[sig_pos]
-                if index < first_sig_marker:
-                    has_img_after = any(
-                        idx > first_sig_marker and any(parent is box for parent in img.parents)
-                        for idx, img in images
-                    )
-                    if has_img_after:
-                        return ""
-                    between_lines = _visual_lines(
-                        box,
-                        start_after=image,
-                        stop_at=markers[first_sig_marker][0],
-                        stop_offset=sig_offset,
-                        stop_on_media=True,
-                    )
-                    if _lines_start_with_bill_caption(between_lines):
-                        return ""
+            if _image_blocked_by_caption_or_later_image(
+                box, image, index, markers, images, visual, signoff_match or contact_match
+            ):
+                return ""
         elif not _image_in_adjacent_signature_slot(
             box, image, footer_tag, preceded_bill=preceded_bill
         ):
             continue
         return visual.text
 
-    image_container = _nearest_container(image, footer_tag)
+    image_container = _nearest_container(image, footer_tag, inline_tag_ids)
     container_chunks = [
         chunk
         for chunk in text_chunks
-        if _nearest_container(chunk[1], footer_tag) is image_container
+        if _nearest_container(chunk[1], footer_tag, inline_tag_ids) is image_container
     ]
     return _render_visual_chunks(container_chunks, text_layout).text
 
@@ -1285,7 +1379,7 @@ def _html_text(
         and node.name == "img"
         and node.has_attr("src")
     }
-    preceded_bill, text_layout = _collect_preceding_bill_captions(
+    preceded_bill, text_layout, inline_tag_ids = _collect_preceding_bill_captions(
         body, target_image_ids, figure_captions=figure_captions
     )
 
@@ -1317,6 +1411,7 @@ def _html_text(
                     scope,
                     image,
                     text_layout=text_layout,
+                    inline_tag_ids=inline_tag_ids,
                     require_signoff=separator_kind is None,
                     preceded_bill=preceded_bill,
                 )

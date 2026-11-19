@@ -1,4 +1,5 @@
 import re
+import tracemalloc
 from base64 import b64encode
 from email import policy
 from email.message import EmailMessage
@@ -3334,8 +3335,8 @@ def test_r23_f1_eml_preserves_the_caption_before_a_split_signoff(html_body, r8_e
             id="footer-space-between-spans",
         ),
         pytest.param(
-            '<main><p>The carrier\nregards\nthis shipment as urgent.</p><p>Tel: 123456</p>'
-            '<img src="cid:quote_001">-- \n<p>Sender info</p></main>',
+            '<main><hr><p>The carrier\nregards\nthis shipment as urgent.</p><p>Tel: 123456</p>'
+            '<img src="cid:quote_001"></main>',
             "quote_001",
             id="main-source-newlines",
         ),
@@ -3397,8 +3398,8 @@ def test_r23_f2_eml_preserves_body_prose_on_one_visual_line(html_body, image_nam
             id="footer",
         ),
         pytest.param(
-            '<figure><figcaption>With regards to your booking, see below.<br>Tel: 123456'
-            '</figcaption><img src="cid:quote_001"></figure>',
+            '<figure><figcaption>Company logo<br>With regards to your booking, see below.'
+            '<br>Tel: 123456</figcaption><img src="cid:quote_001"></figure>',
             id="figure",
         ),
         pytest.param(
@@ -3457,6 +3458,159 @@ def test_r23_f4_eml_skips_logos_after_common_signoffs(signoff, r8_eml_ocr):
     _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
 
     _assert_inline_image_ocr(logo, recognize_image, expected_text=None)
+
+
+@pytest.mark.parametrize(
+    "paragraph",
+    [
+        pytest.param(
+            "We are sorry for the delay. Sincerely, we appreciate your patience.",
+            id="sentence-after-period",
+        ),
+        pytest.param("Please check www.regards.example/rates for details.", id="domain-name"),
+    ],
+)
+def test_r24_a1_eml_reads_quotes_near_dotted_prose(paragraph, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        f'<footer><p>{paragraph}</p><p>Tel: 123456</p><img src="cid:quote_001"></footer>',
+        image_name="quote_001",
+        text="USD 310.42",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, quote = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(quote, recognize_image, expected_text="USD 310.42")
+
+
+def test_r24_a1_eml_skips_logo_after_thanks_with_comma(r8_eml_ocr):
+    data = _mail_with_inline_png(
+        '<footer><div>Thanks, and best regards,<br>ACME<br>Tel: 123456'
+        '<img src="cid:sig_logo"></div></footer>',
+        image_name="sig_logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(logo, recognize_image, expected_text=None)
+
+
+@pytest.mark.parametrize(
+    "signoff", ["Kindest regards,", "Best <span>regards&nbsp;</span>"], ids=["plain", "split-span"]
+)
+def test_r24_a2_eml_reads_figure_scan_with_caption_before_signoff(signoff, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        f'<footer><figure><img src="cid:scan"><br>Invoice scan<br>{signoff}'
+        '<br>Tel: 123456</figure></footer>',
+        image_name="scan",
+        text="USD 310.42",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text="USD 310.42")
+
+
+@pytest.mark.parametrize(
+    "main_start",
+    [
+        pytest.param(
+            '<main style="white-space:pre-line">'
+            '<p>We thank you <em>sincerely</em>, and will send the quote today.</p>',
+            id="pre-line",
+        ),
+        pytest.param(
+            '<main><pre>Earlier line\nWe thank you <em>sincerely</em>, and will send '
+            'the quote today.</pre>',
+            id="pre",
+        ),
+    ],
+)
+def test_r24_a3_eml_keeps_the_start_of_a_preformatted_line(main_start, r8_eml_ocr):
+    data = _mail_with_inline_png(
+        main_start + "<p>Tel: 123456</p>" + "<p>Shipment update</p>" * 5
+        + '<img src="cid:InsertPic_001"></main>',
+        image_name="InsertPic_001",
+        text="USD 310.42",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, quote = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(quote, recognize_image, expected_text="USD 310.42")
+
+
+@pytest.mark.parametrize(
+    "html_body",
+    [
+        pytest.param(
+            '<footer><div style="display:inline">We thank you </div>sincerely, and will send '
+            'the quote today.<br>Tel: 123456<img src="cid:quote_001"></footer>',
+            id="line-start-inside-inline-div",
+        ),
+        pytest.param(
+            '<footer>We thank you <div style="display:inline">sincerely, and will send '
+            'the quote today.<br>Tel: 123456<img src="cid:quote_001"></div></footer>',
+            id="line-end-inside-inline-div",
+        ),
+    ],
+)
+def test_r24_a4_eml_keeps_inline_footer_text_on_one_line(html_body, r8_eml_ocr):
+    data = _mail_with_inline_png(html_body, image_name="quote_001", text="USD 310.42")
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, quote = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(quote, recognize_image, expected_text="USD 310.42")
+
+
+@pytest.mark.parametrize(
+    "html_body",
+    [
+        pytest.param(
+            '<footer><figure>Best regards,<br>Tel: 123456<img src="cid:sig_logo">'
+            '<pre>-- \nPrevious message</pre></figure></footer>',
+            id="figure-before-dash",
+        ),
+        pytest.param(
+            '<footer><pre>Body\n-- \nBest regards\nTel: 123456</pre>'
+            '<img src="cid:sig_logo"></footer>',
+            id="footer-after-dash-lf",
+        ),
+        pytest.param(
+            '<footer><pre>Body&#13;&#10;-- &#13;&#10;Best regards&#13;&#10;Tel: 123456</pre>'
+            '<img src="cid:sig_logo"></footer>',
+            id="footer-after-dash-crlf",
+        ),
+    ],
+)
+def test_r24_a5_eml_keeps_the_signature_in_the_images_segment(html_body, r8_eml_ocr):
+    data = _mail_with_inline_png(html_body, image_name="sig_logo", text="ACME")
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(logo, recognize_image, expected_text=None)
+
+
+def test_r24_b_memory_ceiling():
+    from shipping_billing_agent.parsers.eml_parser import ParsedEmail, _html_text
+
+    paragraph = "x" * (128 * 1024)
+    html = f'<p>{paragraph}</p><img src="cid:scan">'
+
+    tracemalloc.start()
+    try:
+        body = _html_text(html, ParsedEmail(headers={}))
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert body == paragraph
+    assert peak_bytes < 5 * 1024 * 1024, f"Peak: {peak_bytes / (1024 * 1024):.2f} MiB"
 
 
 @pytest.mark.parametrize(
