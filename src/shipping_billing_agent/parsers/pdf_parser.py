@@ -1,11 +1,11 @@
 """Extract PDF text and tables, with optional page-level OCR."""
 
-from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
 from io import BytesIO
 from itertools import chain, pairwise
-from typing import Any, Literal, NamedTuple, Protocol
+from math import dist, fsum, hypot
+from typing import Any, NamedTuple, Protocol
 
 import pdfplumber
 from pdfminer.pdfdocument import PDFEncryptionError
@@ -30,9 +30,6 @@ _BAR_RULE_MIN_ASPECT = 15.0
 _SCANLINE_MAX_GAP_PT = 6.0
 _SCANLINE_MIN_RUN = 4
 _Point = tuple[float, float]
-_CurveEdge = (
-    tuple[Literal["l"], _Point, _Point] | tuple[Literal["c"], _Point, _Point, _Point, _Point]
-)
 _RuleSegment = tuple[float, float, float]
 
 
@@ -67,7 +64,8 @@ class _CurveSubpath(NamedTuple):
     closed: bool
     has_bezier: bool
     has_unknown_op: bool
-    edges: list[_CurveEdge]
+    flattened: list[_Point]
+    area2_correction: float
 
 
 def _table_grid(table: Any) -> _TableGrid:
@@ -223,32 +221,118 @@ def _same_vertex(p1: _Point, p2: _Point) -> bool:
     )
 
 
-def _quantize_point(point: _Point) -> _Point:
-    return round(point[0], 4), round(point[1], 4)
+def _flatten_cubic_bezier(
+    p0: _Point, c1: _Point, c2: _Point, p3: _Point, *, tol: float = 0.005, max_depth: int = 8
+) -> list[_Point]:
+    flattened: list[_Point] = []
+
+    def is_flat(start: _Point, control_1: _Point, control_2: _Point, end: _Point) -> bool:
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        length = hypot(dx, dy)
+        if length <= tol:
+            return max(dist(control_1, start), dist(control_2, start)) <= tol
+        ux, uy = dx / length, dy / length
+        for x, y in (control_1, control_2):
+            px, py = x - start[0], y - start[1]
+            projection = min(length, max(0.0, px * ux + py * uy))
+            if hypot(px - projection * ux, py - projection * uy) > tol:
+                return False
+        return True
+
+    def midpoint(a: _Point, b: _Point) -> _Point:
+        return (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+
+    def split(start: _Point, control_1: _Point, control_2: _Point, end: _Point, depth: int) -> None:
+        if depth >= max_depth or is_flat(start, control_1, control_2, end):
+            flattened.append(end)
+            return
+        ab = midpoint(start, control_1)
+        bc = midpoint(control_1, control_2)
+        cd = midpoint(control_2, end)
+        abc = midpoint(ab, bc)
+        bcd = midpoint(bc, cd)
+        center = midpoint(abc, bcd)
+        split(start, ab, abc, center, depth + 1)
+        split(center, bcd, cd, end, depth + 1)
+
+    split(p0, c1, c2, p3, 0)
+    return flattened
 
 
-def _iter_curve_subpaths(path: list[tuple[Any, ...]], *, filled: bool) -> Iterator[_CurveSubpath]:
+def _winding_number(px: float, py: float, poly: list[_Point]) -> int:
+    winding = 0
+    for (x1, y1), (x2, y2) in pairwise(chain(poly, poly[:1])):
+        cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+        if y1 <= py < y2 and cross > 0:
+            winding += 1
+        elif y2 <= py < y1 and cross < 0:
+            winding -= 1
+    return winding
+
+
+def _signed_polygon_area2(points: list[_Point]) -> float:
+    return fsum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in pairwise(chain(points, points[:1])))
+
+
+def _cubic_chord_area2(p0: _Point, c1: _Point, c2: _Point, p3: _Point) -> float:
+    # Integral of x dy - y dx for the cubic, closed by its chord to p0.
+    ax, ay = c1[0] - p0[0], c1[1] - p0[1]
+    bx, by = c2[0] - p0[0], c2[1] - p0[1]
+    dx, dy = p3[0] - p0[0], p3[1] - p0[1]
+    return 0.3 * ((ax * by - ay * bx) + (ax * dy - ay * dx) + 2 * (bx * dy - by * dx))
+
+
+def _has_enclosed_area(poly: list[_Point], *, area2_correction: float = 0.0) -> bool:
     points: list[_Point] = []
-    edges: list[_CurveEdge] = []
+    for point in poly:
+        if not points or dist(points[-1], point) > _DUPLICATE_VERTEX_TOL_PT:
+            points.append(point)
+    if len(points) > 1 and dist(points[-1], points[0]) <= _DUPLICATE_VERTEX_TOL_PT:
+        points.pop()
+    if len(points) < 3:
+        return False
+
+    if abs(_signed_polygon_area2(points) + area2_correction) > 0.05:
+        return True
+
+    # Oppositely oriented lobes can cancel in the signed area of a self-crossing path.
+    for (x1, y1), (x2, y2) in pairwise(chain(points, points[:1])):
+        dx, dy = x2 - x1, y2 - y1
+        length = hypot(dx, dy)
+        if length <= 0.05:
+            continue
+        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+        step = min(0.05, length * 0.25)
+        nx, ny = -dy / length, dx / length
+        if _winding_number(mx + step * nx, my + step * ny, points) or _winding_number(
+            mx - step * nx, my - step * ny, points
+        ):
+            return True
+    return False
+
+
+def _iter_curve_subpaths(path: list[tuple[Any, ...]]) -> Iterator[_CurveSubpath]:
+    points: list[_Point] = []
+    flattened: list[_Point] = []
+    area2_correction = 0.0
     current: _Point | None = None
     closed_start: _Point | None = None
     has_bezier = False
     has_unknown_op = False
 
     def finish_subpath(closed: bool) -> _CurveSubpath:
-        if (closed or filled) and points and current is not None:
-            start = _quantize_point(points[0])
-            if current != start:
-                edges.append(("l", current, start))
-        return _CurveSubpath(points, closed, has_bezier, has_unknown_op, edges)
+        return _CurveSubpath(
+            points, closed, has_bezier, has_unknown_op, flattened, area2_correction
+        )
 
     for operator, *vertices in path:
         if operator == "m":
             if points or has_unknown_op:
                 yield finish_subpath(closed=False)
-            points = [vertices[0]]
-            edges = []
-            current = _quantize_point(vertices[0])
+            current = vertices[0]
+            points = [current]
+            flattened = [current]
+            area2_correction = 0.0
             closed_start = None
             has_bezier = False
             has_unknown_op = False
@@ -260,8 +344,9 @@ def _iter_curve_subpaths(path: list[tuple[Any, ...]], *, filled: bool) -> Iterat
                 points.pop()
             yield finish_subpath(closed=True)
             points = []
-            edges = []
-            current = _quantize_point(closed_start)
+            flattened = []
+            area2_correction = 0.0
+            current = closed_start
             has_bezier = False
             has_unknown_op = False
         elif operator in {"l", "c", "v", "y"}:
@@ -270,34 +355,28 @@ def _iter_curve_subpaths(path: list[tuple[Any, ...]], *, filled: bool) -> Iterat
             if not points and closed_start is not None:
                 # Drawing after closepath starts from the closed subpath's first vertex.
                 points = [closed_start]
-            end = _quantize_point(vertices[-1])
+                flattened = [closed_start]
+            end = vertices[-1]
             if operator == "l":
-                if current != end:
-                    edges.append(("l", current, end))
-                if not _same_vertex(points[-1], vertices[0]):
-                    points.append(vertices[0])
+                flattened.append(end)
+                if not _same_vertex(points[-1], end):
+                    points.append(end)
             else:
-                control_1 = current if operator == "v" else _quantize_point(vertices[0])
-                control_2 = end if operator == "y" else _quantize_point(vertices[-2])
-                edges.append(("c", current, control_1, control_2, end))
+                control_1 = current if operator == "v" else vertices[0]
+                control_2 = end if operator == "y" else vertices[-2]
+                segment = _flatten_cubic_bezier(current, control_1, control_2, end)
+                flattened.extend(segment)
+                # Independent subdivisions can leave a spurious signed area on a retraced arc.
+                cubic_area2 = _cubic_chord_area2(current, control_1, control_2, end)
+                area2_correction += cubic_area2 - _signed_polygon_area2([current, *segment])
                 has_bezier = True
-                points.extend(vertices)
+                points.append(end)
             current = end
         else:
             has_unknown_op = True
 
     if points or has_unknown_op:
         yield finish_subpath(closed=False)
-
-
-def _reverse_edge(edge: _CurveEdge) -> _CurveEdge:
-    if edge[0] == "l":
-        return "l", edge[2], edge[1]
-    return "c", edge[4], edge[3], edge[2], edge[1]
-
-
-def _is_self_retracing_edges(edges: list[_CurveEdge]) -> bool:
-    return Counter(edges) == Counter(_reverse_edge(edge) for edge in edges)
 
 
 def _rectangle_bounds(points: list[_Point]) -> tuple[float, float, float, float] | None:
@@ -375,15 +454,16 @@ def _process_curve(
 
     added = 0
     visible = False
-    for points, closed, has_bezier, has_unknown_op, edges in _iter_curve_subpaths(
-        path, filled=filled
-    ):
-        if has_unknown_op:
+    for subpath in _iter_curve_subpaths(path):
+        if subpath.has_unknown_op:
             return True, 0, True
-        if has_bezier:
-            if not stroked and (_is_collinear_subpath(points) or _is_self_retracing_edges(edges)):
+        if subpath.has_bezier:
+            if not stroked and not _has_enclosed_area(
+                subpath.flattened, area2_correction=subpath.area2_correction
+            ):
                 continue
             return True, 0, True
+        points, closed = subpath.points, subpath.closed
         if not closed and filled and len(points) >= 3:
             # PDF fills implicitly close open subpaths.
             if _same_vertex(points[0], points[-1]):
@@ -643,7 +723,7 @@ def _analyze_page_vectors(page: Page, table_grids: list[_TableGrid]) -> tuple[bo
 
 def _has_visible_page_content(image: Image.Image) -> bool:
     with image.convert("RGB") as rgb:
-        return any(low != high for low, high in rgb.getextrema())
+        return rgb.getextrema() != ((255, 255), (255, 255), (255, 255))
 
 
 def parse_pdf(
@@ -680,18 +760,15 @@ def parse_pdf(
                 text_source = f"[Page {page_number} | Text]"
                 source = text_source
                 if needs_ocr:
-                    missing_ocr = f"第 {page_number} 页为扫描图像页，未配置本地 OCR 引擎"
-                    if has_electronic_text and local_ocr is None:
-                        raise PdfParseError(missing_ocr)
                     with page.to_image(resolution=_OCR_RESOLUTION_DPI).original as image:
-                        if has_electronic_text or _has_visible_page_content(image):
+                        if _has_visible_page_content(image):
                             if local_ocr is None:
-                                raise PdfParseError(missing_ocr)
+                                raise PdfParseError(
+                                    f"第 {page_number} 页为扫描图像页，未配置本地 OCR 引擎"
+                                )
                             text, _ = local_ocr.recognize_pil_image(image, page=page_number)
                             channel = ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
                             source = f"[Page {page_number} | OCR]"
-                        else:
-                            text = ""
                 tables.extend(
                     ParsedTable(
                         rows=[[cell or "" for cell in row] for row in grid], source=text_source

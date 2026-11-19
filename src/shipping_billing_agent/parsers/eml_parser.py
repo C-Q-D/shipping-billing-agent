@@ -10,6 +10,7 @@ from email.message import Message
 from email.parser import BytesHeaderParser
 from mimetypes import guess_extension
 from quopri import decodestring
+from typing import Literal
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
@@ -58,6 +59,7 @@ _SIGNATURE_SEPARATOR = re.compile(r"^[ \t]*--[ \t]+\r?$", re.MULTILINE)
 _SIGNATURE_CONTACT = re.compile(r"\b(?:tl|tel|web|email|fax)\s*[:：]", re.I)
 _SIGNOFF = re.compile(r"\b(?:regards|sincerely)\b|此致|敬上|敬礼", re.I)
 _DECORATIVE_IMAGE = re.compile(r"_foxmail\.|insertpic_", re.I)
+_LOGO_CAPTION = re.compile(r"\blogo\b|徽标|徽標", re.I)
 _SIGNATURE_TAIL_SIZE = 8
 _MIME_HEADER_END = re.compile(rb"\r\n\r\n|\n\n|\r\r")
 _MIME_LINE_BREAK = re.compile(rb"\r\n|\r|\n")
@@ -84,6 +86,13 @@ def _normalize_pct_encoding(value: str) -> str:
     return _PCT_ENCODED.sub(normalize_escape, value)
 
 
+def _normalize_netloc(netloc: str) -> str:
+    if "@" in netloc:
+        userinfo, hostport = netloc.rsplit("@", 1)
+        return f"{_normalize_pct_encoding(userinfo)}@{hostport.lower()}"
+    return netloc.lower()
+
+
 def _normalize_location(value: str, *, base: str = "") -> str:
     value = value.strip()
     if not value:
@@ -98,10 +107,12 @@ def _normalize_location(value: str, *, base: str = "") -> str:
         return ""
 
     path = _normalize_pct_encoding(parsed.path)
+    query = _normalize_pct_encoding(parsed.query)
     if parsed.scheme or parsed.netloc:
-        return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, ""))
+        netloc = _normalize_netloc(parsed.netloc)
+        return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
     path = path.strip()
-    return f"{path}?{parsed.query}" if path and parsed.query else path
+    return f"{path}?{query}" if path and query else path
 
 
 def _classify_non_cid_source(source: str, *, base: str = "") -> tuple[str, str | None]:
@@ -112,16 +123,19 @@ def _classify_non_cid_source(source: str, *, base: str = "") -> tuple[str, str |
     except ValueError:
         return "", None
 
-    raw_path = unquote(raw_parsed.path).strip()
+    normalized_path = _normalize_pct_encoding(raw_parsed.path).strip()
     if (
         raw_parsed.scheme
         or raw_parsed.netloc
-        or raw_path.startswith("/")
+        or normalized_path.startswith("/")
         or resolved.scheme
         or resolved.netloc
     ):
         return location, None
-    filename = sanitize_filename(raw_path).casefold() if raw_path else None
+    segment = normalized_path.rsplit("/", 1)[-1]
+    if "%2F" not in segment and "%5C" not in segment:
+        segment = unquote(segment)
+    filename = sanitize_filename(segment).casefold() if segment else None
     return location, filename
 
 
@@ -153,6 +167,7 @@ class _MimePart:
     body_start: int
     end: int
     base_url: str = ""
+    related_group: int | None = None
 
     @classmethod
     def from_wire(
@@ -178,7 +193,7 @@ class _MimePart:
 
     @property
     def has_content_location(self) -> bool:
-        return bool(self.headers.get("Content-Location", "").strip())
+        return "Content-Location" in self.headers
 
     def resolve_location(self, fallback_base: str = "") -> str:
         raw = self.headers.get("Content-Location", "").strip()
@@ -239,7 +254,7 @@ class ParsedEmail:
     non_signature_filenames: set[str] = field(default_factory=set)
     signature_locations: set[str] = field(default_factory=set)
     non_signature_locations: set[str] = field(default_factory=set)
-    html_bases: set[str] = field(default_factory=set)
+    html_bases: dict[int | None, set[str]] = field(default_factory=dict)
 
     def is_signature_image(self, attachment: _MimePart, filename: str) -> bool:
         if _BILL_WORDS.search(filename):
@@ -256,7 +271,7 @@ class ParsedEmail:
                 and not attachment.headers.get("Content-Base", "").strip()
                 and not urlsplit(location).scheme
             ):
-                for html_base in self.html_bases:
+                for html_base in self.html_bases.get(attachment.related_group, ()):
                     if resolved := attachment.resolve_location(html_base):
                         locations.add(resolved)
 
@@ -312,6 +327,7 @@ def _related_root_start(part: _MimePart) -> int | None:
 
 
 _HtmlMarker = tuple[Tag | NavigableString, Tag | None]
+_SeparatorKind = Literal["dash", "hr"]
 
 
 def _is_bill_caption_text(text: str) -> bool:
@@ -342,14 +358,13 @@ def _lines_start_with_bill_caption(lines: list[str]) -> bool:
     )
 
 
-def _is_bill_image_tag(image: Tag) -> bool:
+def _is_bill_image_tag(image: Tag, figure_captions: dict[int, list[Tag]]) -> bool:
     labels = [image.get(attribute) for attribute in ("alt", "title", "aria-label")]
     if (figure := image.find_parent("figure")) is not None:
         labels.append(figure.get("aria-label"))
         labels.extend(
             " ".join(_visual_lines(caption, reset_on_media=False))
-            for caption in figure.find_all("figcaption")
-            if caption.find_parent("figure") is figure
+            for caption in figure_captions.get(id(figure), ())
         )
     label_texts = [str(label) for label in labels if label]
     return any(_is_bill_caption_text(label) for label in label_texts)
@@ -382,29 +397,35 @@ def _inside_footer(node: Tag, body: Tag) -> bool:
     return False
 
 
-def _in_post_separator_signature(
+def _preceding_signature_boundary(
     markers: list[_HtmlMarker], index: int, scope: Tag, body_scope: Tag
-) -> bool:
-    segment: list[str] = []
+) -> tuple[int, _SeparatorKind | None, str]:
     for previous_index in range(index - 1, -1, -1):
         node, node_scope = markers[previous_index]
         if node_scope is None:
             continue
         if node_scope is not scope and node_scope is not body_scope:
-            return False
+            return previous_index, None, ""
         if isinstance(node, NavigableString):
             parts = _SIGNATURE_SEPARATOR.split(node)
-            if len(parts) == 1:
-                continue
-            segment.append(parts[-1])
-        elif node.name != "hr":
-            continue
-        sep_start = previous_index + 1
-        break
-    else:
+            if len(parts) > 1:
+                return previous_index, "dash", parts[-1]
+        elif node.name == "hr":
+            return previous_index, "hr", ""
+    return -1, None, ""
+
+
+def _in_post_separator_signature(
+    markers: list[_HtmlMarker], index: int, scope: Tag, body_scope: Tag
+) -> bool:
+    boundary, separator_kind, separator_text = _preceding_signature_boundary(
+        markers, index, scope, body_scope
+    )
+    if separator_kind is None:
         return False
 
-    for next_index in range(sep_start, len(markers)):
+    segment = [separator_text] if separator_text else []
+    for next_index in range(boundary + 1, len(markers)):
         node, node_scope = markers[next_index]
         if node_scope is None:
             continue
@@ -418,7 +439,10 @@ def _in_post_separator_signature(
         elif node.name == "hr":
             break
 
-    return _SIGNATURE_CONTACT.search("\n".join(segment)) is not None
+    context = "\n".join(segment)
+    return _SIGNATURE_CONTACT.search(context) is not None and (
+        separator_kind == "dash" or _SIGNOFF.search(context) is not None
+    )
 
 
 def _signature_context(
@@ -426,29 +450,18 @@ def _signature_context(
     index: int,
     scope: Tag,
     body_scope: Tag,
-) -> tuple[str, bool]:
+) -> tuple[str, _SeparatorKind | None]:
     start = max(0, index - _SIGNATURE_TAIL_SIZE)
-    separator_text = ""
-    has_separator = False
-    for previous_index in range(index - 1, -1, -1):
-        node, node_scope = markers[previous_index]
-        if node_scope is None:
-            continue
-        if node_scope is not scope and node_scope is not body_scope:
-            # An intervening landmark bounds the preceding signature context.
-            start = max(start, previous_index + 1)
-            break
-        if isinstance(node, NavigableString):
-            parts = _SIGNATURE_SEPARATOR.split(node)
-            if len(parts) == 1:
-                continue
-            if node_scope is scope and previous_index >= start:
-                separator_text = parts[-1]
-        elif node.name != "hr":
-            continue
-        start = max(start, previous_index + 1)
-        has_separator = True
-        break
+    boundary, separator_kind, separator_text = _preceding_signature_boundary(
+        markers, index, scope, body_scope
+    )
+    if boundary < start or markers[boundary][1] is not scope:
+        separator_text = ""
+    if separator_kind == "hr":
+        # A signoff can precede several lines of contact details in the same section.
+        start = boundary + 1
+    else:
+        start = max(start, boundary + 1)
 
     trailing_text = ""
     for next_index in range(index + 1, len(markers)):
@@ -475,7 +488,7 @@ def _signature_context(
     )
     if trailing_text:
         text.append(trailing_text)
-    return "\n".join(text), has_separator
+    return "\n".join(text), separator_kind
 
 
 def _nearest_container(node: Tag | NavigableString, footer: Tag) -> Tag:
@@ -620,10 +633,11 @@ class _VisualLineBuffer:
         self.current_line.clear()
         self.lines.clear()
 
-    def append_text(self, raw: str, preformatted: bool) -> None:
+    def append_text(self, raw: str, preformatted: bool) -> bool:
         raw = raw.replace("\r\n", "\n").replace("\r", "\n")
         parts = _SIGNATURE_SEPARATOR.split(raw)
-        if len(parts) > 1:
+        did_reset = len(parts) > 1
+        if did_reset:
             self.reset()
             raw = parts[-1]
         if preformatted:
@@ -633,6 +647,7 @@ class _VisualLineBuffer:
                 self.flush()
         if raw:
             self.current_line.append(raw)
+        return did_reset
 
 
 def _visual_lines(
@@ -642,6 +657,7 @@ def _visual_lines(
     stop_at: Tag | NavigableString | None = None,
     stop_offset: int | None = None,
     reset_on_media: bool = True,
+    stop_on_media: bool = False,
 ) -> list[str]:
     buffer = _VisualLineBuffer()
     started = start_after is None
@@ -680,11 +696,14 @@ def _visual_lines(
                     buffer.append_text(str(child), preformatted)
             elif isinstance(child, Tag):
                 if (
-                    reset_on_media
+                    (reset_on_media or stop_on_media)
                     and child.name in {"hr", "img", "figure"}
-                    and not (child.name == "figure" and id(child) in boundary_ancestors)
+                    and id(child) not in boundary_ancestors
                 ):
                     if started:
+                        if stop_on_media:
+                            stopped = True
+                            return
                         buffer.reset()
                     continue
                 if child.name == "br":
@@ -706,42 +725,75 @@ def _visual_lines(
 
 
 def _collect_preceding_bill_captions(
-    scope: Tag, target_image_ids: set[int], target_ancestor_ids: set[int]
+    body: Tag, target_image_ids: set[int], *, figure_captions: dict[int, list[Tag]]
 ) -> dict[int, bool]:
-    buffer = _VisualLineBuffer(max_lines=2)
+    if not target_image_ids:
+        return {}
     result: dict[int, bool] = {}
 
-    def walk(node: Tag, preformatted: bool) -> None:
+    def walk(
+        node: Tag, preformatted: bool, buffer: _VisualLineBuffer, *, in_figure: bool = False
+    ) -> tuple[bool, bool]:
         preformatted = _node_preformatted(node, preformatted)
+        had_reset = had_img = False
         for child in node.children:
             if isinstance(child, Comment):
                 continue
             if isinstance(child, NavigableString):
-                buffer.append_text(str(child), preformatted)
+                had_reset |= buffer.append_text(str(child), preformatted)
                 continue
             if child.name == "img":
                 if id(child) in target_image_ids:
                     buffer.flush()
                     result[id(child)] = _lines_end_with_bill_caption(list(buffer.lines))
                 buffer.reset()
+                had_reset = had_img = True
                 continue
-            if child.name in {"figure", "hr"}:
-                if child.name == "figure" and id(child) in target_ancestor_ids:
-                    buffer.flush()
-                    walk(child, preformatted)
+            if child.name == "hr":
                 buffer.reset()
+                had_reset = True
                 continue
             if child.name == "br":
                 buffer.flush()
                 continue
+            if child.name == "figure":
+                if in_figure or id(child) in figure_captions:
+                    figure_buffer = _VisualLineBuffer(max_lines=2)
+                else:
+                    buffer.flush()
+                    figure_buffer = buffer
+                _, child_img = walk(child, preformatted, figure_buffer, in_figure=True)
+                buffer.reset()
+                had_reset = True
+                had_img |= child_img
+                continue
+            if child.name in _CONTENT_LANDMARKS:
+                buffer.flush()
+                child_buffer = _VisualLineBuffer(max_lines=2)
+                child_reset, child_img = walk(
+                    child, preformatted, child_buffer, in_figure=in_figure
+                )
+                child_buffer.flush()
+                if child_reset:
+                    buffer.reset()
+                    had_reset = True
+                had_img |= child_img
+                buffer.lines.extend(child_buffer.lines)
+                continue
             is_block = not _is_inline_element(child)
             if is_block:
                 buffer.flush()
-            walk(child, preformatted)
-            if is_block:
+            child_reset, child_img = walk(child, preformatted, buffer, in_figure=in_figure)
+            had_reset |= child_reset
+            had_img |= child_img
+            if child.name == "p" and child_img:
+                buffer.reset()
+                had_reset = True
+            elif is_block:
                 buffer.flush()
+        return had_reset, had_img
 
-    walk(scope, _initial_preformatted(scope))
+    walk(body, _initial_preformatted(body), _VisualLineBuffer(max_lines=2))
     return result
 
 
@@ -811,13 +863,29 @@ def _image_in_adjacent_signature_slot(
         or img_slot is slot_b
         or img_slot.name == "figure"
         or img_slot.find("figure") is not None
-        or _has_text(img_slot)
     ):
         return False
 
     siblings = _non_empty_children(parent)
     pos_b = next(idx for idx, sibling in enumerate(siblings) if sibling is slot_b)
     pos_img = next(idx for idx, sibling in enumerate(siblings) if sibling is img_slot)
+    if _has_text(img_slot):
+        # A logo caption can share its paragraph with the image immediately before a signoff.
+        if (
+            pos_img != pos_b - 1
+            or img_slot.name != "p"
+            or slot_b.name != "p"
+            or slot_b.find("hr") is not None
+            or len(img_slot.find_all("img", limit=2)) != 1
+        ):
+            return False
+        caption_lines = _visual_lines(img_slot, start_after=image, stop_on_media=True)
+        return (
+            bool(caption_lines)
+            and _LOGO_CAPTION.search(caption_lines[0]) is not None
+            and not _lines_start_with_bill_caption(caption_lines)
+            and not _preceded_by_bill_caption(image, footer, preceded_bill=preceded_bill)
+        )
     if pos_img == pos_b + 1:
         return not _preceded_by_bill_caption(image, footer, preceded_bill=preceded_bill)
     return (
@@ -920,6 +988,7 @@ def _footer_signature_context(
                     start_after=image,
                     stop_at=markers[first_sig_marker][0],
                     stop_offset=sig_offset,
+                    stop_on_media=True,
                 )
                 if has_img_after or _lines_start_with_bill_caption(between_lines):
                     return ""
@@ -937,7 +1006,9 @@ def _footer_signature_context(
     )
 
 
-def _html_text(html: str, email: ParsedEmail, *, base_url: str = "") -> str:
+def _html_text(
+    html: str, email: ParsedEmail, *, base_url: str = "", related_group: int | None = None
+) -> str:
     soup = BeautifulSoup(html, "html.parser")
     effective_base = base_url
     if (base_tag := soup.find("base", href=True)) is not None:
@@ -945,36 +1016,33 @@ def _html_text(html: str, email: ParsedEmail, *, base_url: str = "") -> str:
         if href and (resolved := _normalize_location(href, base=base_url)):
             effective_base = resolved
     if effective_base:
-        email.html_bases.add(effective_base)
+        email.html_bases.setdefault(related_group, set()).add(effective_base)
     for tag in soup.find_all(["script", "style", "head"]):
         tag.decompose()
     body = soup.body or soup
-    markers = [
-        (node, _signature_scope(node, body))
-        for node in soup.descendants
-        if (isinstance(node, Tag) and node.name in {"img", "hr"})
-        or (isinstance(node, NavigableString) and not isinstance(node, Comment) and node.strip())
-    ]
-
-    targets_by_scope: dict[int, tuple[Tag, set[int], set[int]]] = {}
-    for node, scope in markers:
-        if (
-            scope is None
-            or not isinstance(node, Tag)
-            or node.name != "img"
-            or not node.has_attr("src")
+    markers: list[_HtmlMarker] = []
+    figure_captions: dict[int, list[Tag]] = {}
+    for node in soup.descendants:
+        if isinstance(node, Tag) and node.name == "figcaption":
+            if (figure := node.find_parent("figure")) is not None:
+                # Index captions here so the precedence scan never searches a figure's subtree.
+                figure_captions.setdefault(id(figure), []).append(node)
+        elif (isinstance(node, Tag) and node.name in {"img", "hr"}) or (
+            isinstance(node, NavigableString) and not isinstance(node, Comment) and node.strip()
         ):
-            continue
-        _, image_ids, ancestor_ids = targets_by_scope.setdefault(id(scope), (scope, set(), set()))
-        image_ids.add(id(node))
-        for parent in node.parents:
-            if parent is scope or id(parent) in ancestor_ids:
-                break
-            ancestor_ids.add(id(parent))
+            markers.append((node, _signature_scope(node, body)))
 
-    preceded_bill: dict[int, bool] = {}
-    for scope, image_ids, ancestor_ids in targets_by_scope.values():
-        preceded_bill.update(_collect_preceding_bill_captions(scope, image_ids, ancestor_ids))
+    target_image_ids = {
+        id(node)
+        for node, scope in markers
+        if scope is not None
+        and isinstance(node, Tag)
+        and node.name == "img"
+        and node.has_attr("src")
+    }
+    preceded_bill = _collect_preceding_bill_captions(
+        body, target_image_ids, figure_captions=figure_captions
+    )
 
     for index, (image, scope) in enumerate(markers):
         if not isinstance(image, Tag) or image.name != "img":
@@ -984,14 +1052,16 @@ def _html_text(html: str, email: ParsedEmail, *, base_url: str = "") -> str:
             continue
         source = str(src).strip()
         in_footer = scope is not None and (scope.name == "footer" or _inside_footer(image, body))
-        if _is_bill_image_tag(image):
+        if _is_bill_image_tag(image, figure_captions):
             classification = "body"
         elif scope is None:
             classification = "signature"
+        elif not in_footer and scope.name == "main":
+            classification = "body"
         elif preceded_bill.get(id(image), False):
             classification = "body"
         elif len(markers) - index <= _SIGNATURE_TAIL_SIZE:
-            context, has_separator = _signature_context(markers, index, scope, body)
+            context, separator_kind = _signature_context(markers, index, scope, body)
             if in_footer:
                 context = _footer_signature_context(
                     markers,
@@ -999,12 +1069,14 @@ def _html_text(html: str, email: ParsedEmail, *, base_url: str = "") -> str:
                     body,
                     scope,
                     image,
-                    require_signoff=not has_separator,
+                    require_signoff=separator_kind is None,
                     preceded_bill=preceded_bill,
                 )
             has_contact = _SIGNATURE_CONTACT.search(context) is not None
             has_signoff = _SIGNOFF.search(context) is not None
-            after_signoff = has_separator and has_contact
+            after_signoff = has_contact and (
+                separator_kind == "dash" or (separator_kind == "hr" and (in_footer or has_signoff))
+            )
             footer_signature = in_footer and has_contact and has_signoff
             decorative = (
                 _DECORATIVE_IMAGE.search(source) is not None and (has_contact or has_signoff)
@@ -1012,7 +1084,8 @@ def _html_text(html: str, email: ParsedEmail, *, base_url: str = "") -> str:
             if after_signoff or footer_signature or decorative:
                 classification = "signature"
             elif not in_footer and (
-                not has_separator or not _in_post_separator_signature(markers, index, scope, body)
+                separator_kind is None
+                or not _in_post_separator_signature(markers, index, scope, body)
             ):
                 classification = "body"
             else:
@@ -1041,14 +1114,16 @@ def _html_text(html: str, email: ParsedEmail, *, base_url: str = "") -> str:
     return soup.get_text("\n", strip=True)
 
 
-def _read_body(part: _MimePart, email: ParsedEmail, *, base_url: str) -> EmailBody:
+def _read_body(
+    part: _MimePart, email: ParsedEmail, *, base_url: str, related_group: int | None
+) -> EmailBody:
     data = part.read_bytes()
     try:
         text = data.decode(part.headers.get_content_charset() or "utf-8", errors="replace")
     except LookupError:
         text = data.decode("utf-8", errors="replace")
     if part.media_type == "text/html":
-        text = _html_text(text, email, base_url=base_url)
+        text = _html_text(text, email, base_url=base_url, related_group=related_group)
     return EmailBody(text, data, part.media_type)
 
 
@@ -1064,7 +1139,11 @@ def parse_eml(data: bytes, *, max_children: int) -> ParsedEmail:
     body_reserved = False
 
     def collect(
-        part: _MimePart, *, related_resource: bool = False, inherited_base: str = ""
+        part: _MimePart,
+        *,
+        related_resource: bool = False,
+        inherited_base: str = "",
+        related_group: int | None = None,
     ) -> list[EmailBody]:
         nonlocal slots, body_reserved
         if related_resource or _is_attachment(part.headers):
@@ -1073,7 +1152,9 @@ def parse_eml(data: bytes, *, max_children: int) -> ParsedEmail:
             else:
                 # Keep the wire range only. The dispatcher checks the shared budget again
                 # before loading the payload, after any earlier nested mail has expanded.
-                email.attachments.append(replace(part, base_url=inherited_base))
+                email.attachments.append(
+                    replace(part, base_url=inherited_base, related_group=related_group)
+                )
                 slots -= 1
             return []
 
@@ -1084,7 +1165,7 @@ def parse_eml(data: bytes, *, max_children: int) -> ParsedEmail:
         part_base = _normalize_location(candidate, base=inherited_base) or inherited_base
         media_type = part.media_type
         if media_type in _TEXT_TYPES:
-            body = _read_body(part, email, base_url=part_base)
+            body = _read_body(part, email, base_url=part_base, related_group=related_group)
             if not body.text.strip():
                 return []
             if not body_reserved:
@@ -1095,13 +1176,17 @@ def parse_eml(data: bytes, *, max_children: int) -> ParsedEmail:
                 slots -= 1
             return [body]
 
-        related_root = _related_root_start(part) if media_type == "multipart/related" else None
+        related_root = None
+        if media_type == "multipart/related":
+            related_root = _related_root_start(part)
+            related_group = part.start
         groups: list[list[EmailBody]] = []
         for child in part.iter_parts():
             bodies = collect(
                 child,
                 related_resource=related_root not in {None, child.start},
                 inherited_base=part_base,
+                related_group=related_group,
             )
             if bodies:
                 groups.append(bodies)
