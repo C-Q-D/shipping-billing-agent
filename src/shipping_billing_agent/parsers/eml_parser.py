@@ -20,6 +20,7 @@ _TEXT_TYPES = {"text/plain", "text/html"}
 _BILL_WORDS = re.compile(
     r"invoice|bill|charge|statement|freight|账单|帳單|发票|發票|费用|費用", re.I
 )
+_CONTENT_LANDMARKS = {"article", "aside", "footer", "header", "main", "section"}
 _SIGNATURE_BLOCK = re.compile(r"signature|foxmail", re.I)
 _SIGNATURE_SEPARATOR = re.compile(r"^[ \t]*--[ \t]+\r?$", re.MULTILINE)
 _SIGNATURE_CONTACT = re.compile(r"\b(?:tl|tel|web|email|fax)\s*[:：]", re.I)
@@ -182,23 +183,56 @@ def _related_root_start(part: _MimePart) -> int | None:
 
 def _signature_scope(node: Tag | NavigableString, body: Tag) -> int | None:
     """Return the content block identity, or None inside an explicit signature."""
-    layout_block = body
-    section = None
+    scope = body
     for parent in node.parents:
-        if parent.name == "footer" or any(
+        if any(
             _SIGNATURE_BLOCK.search(str(parent.get(attribute, "")))
             for attribute in ("id", "class")
         ):
             return None
         if parent is body:
             break
-        if parent.name in {"article", "aside", "header", "main", "section"}:
-            if section is None:
-                section = parent
-        elif parent.name in {"address", "blockquote", "div", "table"}:
-            # Mail clients can wrap the image and contact details in sibling layout divs.
-            layout_block = parent
-    return id(section if section is not None else layout_block)
+        if scope is body and parent.name in _CONTENT_LANDMARKS:
+            scope = parent
+    return id(scope)
+
+
+def _signature_context(
+    markers: list[tuple[Tag | NavigableString, int | None]],
+    index: int,
+    scope: int,
+    body_scope: int,
+) -> tuple[str, bool]:
+    start = max(0, index - _SIGNATURE_TAIL_SIZE)
+    separator_text = ""
+    has_separator = False
+    for previous_index in range(index - 1, -1, -1):
+        node, node_scope = markers[previous_index]
+        if node_scope is None:
+            continue
+        if node_scope not in (scope, body_scope):
+            # An intervening landmark bounds the preceding signature context.
+            start = max(start, previous_index + 1)
+            break
+        if isinstance(node, NavigableString):
+            parts = _SIGNATURE_SEPARATOR.split(node)
+            if len(parts) == 1:
+                continue
+            if node_scope == scope and previous_index >= start:
+                separator_text = parts[-1]
+        elif node.name != "hr":
+            continue
+        start = max(start, previous_index + 1)
+        has_separator = True
+        break
+
+    text = [separator_text] if separator_text else []
+    text.extend(
+        node
+        for node, node_scope in markers[start:]
+        if node_scope == scope and isinstance(node, NavigableString)
+    )
+    return "\n".join(text), has_separator
 
 
 def _html_text(html: str, email: ParsedEmail) -> str:
@@ -206,37 +240,24 @@ def _html_text(html: str, email: ParsedEmail) -> str:
     for tag in soup.find_all(["script", "style", "head"]):
         tag.decompose()
     body = soup.body or soup
+    body_scope = id(body)
     markers = [
-        node
+        (node, _signature_scope(node, body))
         for node in soup.descendants
         if (isinstance(node, Tag) and node.name in {"img", "hr"})
         or (isinstance(node, NavigableString) and not isinstance(node, Comment) and node.strip())
     ]
-    separators: dict[int, int] = {}
-    for index, node in enumerate(markers):
-        if (isinstance(node, Tag) and node.name == "hr") or (
-            isinstance(node, NavigableString) and _SIGNATURE_SEPARATOR.search(node)
-        ):
-            if (scope := _signature_scope(node, body)) is not None:
-                separators[scope] = index
 
-    for index, image in enumerate(markers):
+    for index, (image, scope) in enumerate(markers):
         if not isinstance(image, Tag) or image.name != "img" or not image.get("src"):
             continue
         source = str(image["src"]).strip()
-        scope = _signature_scope(image, body)
         if scope is not None:
             if len(markers) - index > _SIGNATURE_TAIL_SIZE:
                 continue
-            # A body-level separator can precede a separate signature layout block.
-            separator = max(separators.get(id(body), -1), separators.get(scope, -1))
-            context = "\n".join(
-                node
-                for node in markers[max(0, separator, index - _SIGNATURE_TAIL_SIZE) :]
-                if isinstance(node, NavigableString) and _signature_scope(node, body) == scope
-            )
+            context, has_separator = _signature_context(markers, index, scope, body_scope)
             has_contact = _SIGNATURE_CONTACT.search(context) is not None
-            after_signoff = 0 <= separator < index and has_contact
+            after_signoff = has_separator and has_contact
             decorative = _DECORATIVE_IMAGE.search(source) and (
                 has_contact or _SIGNOFF.search(context)
             )

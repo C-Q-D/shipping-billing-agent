@@ -39,7 +39,13 @@ def parse_pdf(
                 text = page.extract_text() or ""
                 sparse_text = sum(not char.isspace() for char in text) < _MIN_TEXT_CHARACTERS
                 has_visual_objects = bool(page.images or page.curves or page.rects or page.lines)
-                if (sparse_text and bool(page.images)) or (not text.strip() and has_visual_objects):
+                needs_ocr = sparse_text and (
+                    bool(page.images)
+                    or bool(page.curves)
+                    or (len(page.lines) + len(page.rects) >= 8)
+                    or (not text.strip() and has_visual_objects)
+                )
+                if needs_ocr:
                     if local_ocr is None:
                         raise PdfParseError(f"第 {page_number} 页为扫描图像页，未配置本地 OCR 引擎")
                     with page.to_image(resolution=_OCR_RESOLUTION_DPI).original as image:

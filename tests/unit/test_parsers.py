@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from docx import Document
 from openpyxl import Workbook
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from shipping_billing_agent.config.limits import ResourceLimits
 from shipping_billing_agent.config.settings import AppSettings
@@ -287,7 +287,7 @@ def test_doc_rejects_encrypted_flag():
         parse_word(bytes(data), "encrypted.doc")
 
 
-def _two_page_text_pdf(first_line: bytes, second_line: bytes) -> bytes:
+def _two_page_pdf(first_page: bytes, second_page: bytes) -> bytes:
     page = (
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] "
         b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>"
@@ -297,9 +297,8 @@ def _two_page_text_pdf(first_line: bytes, second_line: bytes) -> bytes:
         b"<< /Type /Pages /Count 2 /Kids [4 0 R 6 0 R] >>",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
-    for text in (first_line, second_line):
+    for stream in (first_page, second_page):
         objects.append(page % (len(objects) + 2))
-        stream = b"BT /F1 12 Tf 24 160 Td (" + text + b") Tj ET\n"
         objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"endstream")
 
     pdf = bytearray(b"%PDF-1.4\n")
@@ -318,10 +317,46 @@ def _two_page_text_pdf(first_line: bytes, second_line: bytes) -> bytes:
     return bytes(pdf)
 
 
+def _vector_fee_pdf() -> bytes:
+    # Draw the fee using PDF path operators, leaving only the page number as text.
+    glyphs = {
+        "F": b"0 0 m 0 23 l 12 23 l 0 12 m 10 12 l S",
+        "R": b"0 0 m 0 23 l 6 23 l 15 23 15 12 6 12 c 0 12 l 6 12 m 12 0 l S",
+        "E": b"12 23 m 0 23 l 0 0 l 12 0 l 0 12 m 10 12 l S",
+        "I": b"0 0 m 5 0 l 2.5 0 m 2.5 23 l 0 23 m 5 23 l S",
+        "G": b"12 19 m 8 27 0 23 0 15 c 0 6 l 0 -2 12 -2 12 5 c 12 10 l 7 10 l S",
+        "H": b"0 0 m 0 23 l 12 0 m 12 23 l 0 12 m 12 12 l S",
+        "T": b"0 23 m 12 23 l 6 23 m 6 0 l S",
+        "U": b"0 23 m 0 7 l 0 -2 12 -2 12 7 c 12 23 l S",
+        "S": b"12 20 m 4 28 -6 17 4 13 c 8 11 l 20 5 7 -5 0 3 c S",
+        "D": b"0 0 m 0 23 l 4 23 l 16 23 16 0 4 0 c h S",
+        "3": b"0 21 m 12 28 18 15 6 12 c 18 9 12 -5 0 2 c S",
+        "1": b"0 18 m 4 23 l 4 0 l 0 0 m 8 0 l S",
+        "0": b"6 23 m 15 23 15 0 6 0 c -2 0 -2 23 6 23 c S",
+        ".": b"0 0 2.3 2.3 re f",
+        "4": b"9 0 m 9 23 l 0 8 l 13 8 l S",
+        "2": b"0 18 m 0 26 12 25 12 18 c 12 13 4 8 0 0 c 12 0 l S",
+    }
+    paths = bytearray(b"BT /F1 18 Tf 146 34 Td (2) Tj ET\n2.3 w 1 J 1 j\n")
+    x = 24
+    for char in "FREIGHT USD 310.42":
+        if char == " ":
+            x += 8
+        else:
+            paths.extend(b"q 1 0 0 1 %d 105 cm %s Q\n" % (x, glyphs[char]))
+            x += {"I": 9, "1": 12, ".": 7}.get(char, 16)
+    return _two_page_pdf(
+        b"BT /F1 12 Tf 24 160 Td (Payment terms: net thirty days.) Tj ET\n", bytes(paths)
+    )
+
+
 def test_pdf_without_local_ocr_reads_the_complete_short_text_page():
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
-    data = _two_page_text_pdf(b"Payment terms: net thirty days.", b"USD 245.00")
+    data = _two_page_pdf(
+        b"BT /F1 12 Tf 24 160 Td (Payment terms: net thirty days.) Tj ET\n",
+        b"BT /F1 12 Tf 24 160 Td (USD 245.00) Tj ET\n",
+    )
     dispatcher = DocumentParserDispatcher(
         ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=None
     )
@@ -332,6 +367,26 @@ def test_pdf_without_local_ocr_reads_the_complete_short_text_page():
     assert document.raw_text == (
         "[Page 1 | Text]\nPayment terms: net thirty days.\n\n[Page 2 | Text]\nUSD 245.00"
     )
+
+
+def test_pdf_reads_vector_fee_and_page_number_with_real_ocr():
+    from shipping_billing_agent.parsers.pdf_parser import parse_pdf
+
+    text, _, channel = parse_pdf(_vector_fee_pdf(), local_ocr=RapidOcrFallback())
+
+    first_page, source, second_page = text.partition("[Page 2 | OCR]\n")
+    assert source, text
+    assert first_page.strip() == "[Page 1 | Text]\nPayment terms: net thirty days."
+    assert "FREIGHT USD 310.42" in second_page, second_page
+    assert "2" in second_page.splitlines(), second_page
+    assert channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+
+
+def test_pdf_without_local_ocr_fails_at_the_vector_fee_page():
+    from shipping_billing_agent.parsers.pdf_parser import PdfParseError, parse_pdf
+
+    with pytest.raises(PdfParseError, match="^第 2 页为扫描图像页，未配置本地 OCR 引擎$"):
+        parse_pdf(_vector_fee_pdf(), local_ocr=None)
 
 
 def test_pdf_renders_only_sparse_scan_page_and_keeps_text_page_tables():
@@ -598,6 +653,68 @@ def test_eml_parses_inline_bill_images_instead_of_skipping_them(filename, html):
     assert local.images == [(image_data, filename)]
 
 
+def test_eml_reads_bill_image_in_an_unmarked_footer():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    message = _mail("Body")
+    message.add_alternative(
+        '<article><p>Body</p><footer>Balance due USD 310.42 <img src="cid:scan"></footer>'
+        "</article>",
+        subtype="html",
+    )
+    with Image.new("RGB", (460, 140), "white") as image, BytesIO() as buffer:
+        font = ImageFont.load_default(size=58)
+        ImageDraw.Draw(image).text((24, 28), "USD 310.42", font=font, fill="black")
+        image.save(buffer, format="PNG")
+        image_data = buffer.getvalue()
+    message.get_payload()[-1].add_related(
+        image_data, maintype="image", subtype="png", cid="<scan>", filename="scan.png"
+    )
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RapidOcrFallback()
+    )
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert scan.status is DocumentStatus.PARSED, scan.error_message
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert "USD 310.42" in scan.raw_text, scan.raw_text
+
+
+@pytest.mark.parametrize(
+    "signoff",
+    [
+        "<hr><div>Best regards<br>ACME<br>Tel: 123456</div>",
+        "<div>-- \nBest regards\nACME\nTel: 123456</div>",
+    ],
+    ids=["hr", "dash-line"],
+)
+def test_eml_skips_signature_logo_across_sibling_layout_divs(signoff):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    message = _mail("Body")
+    message.add_alternative(
+        f'<body><p>Body</p>{signoff}<div><img src="cid:logo"></div></body>', subtype="html"
+    )
+    logo_data = b"synthetic signature logo"
+    message.get_payload()[-1].add_related(
+        logo_data, maintype="image", subtype="png", cid="<logo>", filename="logo.png"
+    )
+    local = RecordingLocalOcr()
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=local
+    )
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    assert logo.raw_bytes == logo_data
+    assert local.images == []
+
+
 def test_eml_footer_contact_does_not_skip_a_cid_image_in_the_main_body():
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
@@ -688,9 +805,9 @@ def test_eml_stops_at_the_fourth_nested_mail_and_preserves_parent_links():
 
 @pytest.mark.parametrize("depth_args", [{}, {"depth": 1}], ids=["omitted", "too-shallow"])
 def test_eml_retry_inherits_depth_without_expanding_the_fourth_mail(depth_args):
-    from shipping_billing_agent.parsers import dispatcher
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
-    parser = dispatcher.DocumentParserDispatcher()
+    parser = DocumentParserDispatcher()
     documents = parser.parse_batch([("first.eml", _four_level_mail().as_bytes())])
     rejected = documents[-1]
     retry_target = dict(existing_doc_id=rejected.doc_id, parent_doc_id=rejected.parent_doc_id)
@@ -703,9 +820,9 @@ def test_eml_retry_inherits_depth_without_expanding_the_fourth_mail(depth_args):
             **depth_args,
         )
 
-    depth, slots = dispatcher.compute_retry_context(list(reversed(documents)), rejected.doc_id)
+    depth, slots = parser.compute_retry_context(list(reversed(documents)), rejected.doc_id)
     assert (depth, slots) == (4, 113)
-    assert dispatcher.compute_retry_context(documents, documents[0].doc_id) == (1, 119)
+    assert parser.compute_retry_context(documents, documents[0].doc_id) == (1, 119)
     (retried,) = parser.retry_single_document(
         rejected.original_filename,
         rejected.raw_bytes,
@@ -722,25 +839,25 @@ def test_eml_retry_inherits_depth_without_expanding_the_fourth_mail(depth_args):
 
 
 def test_eml_retry_inherits_remaining_expansion_slots():
-    from shipping_billing_agent.parsers import dispatcher
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
     limits = ResourceLimits(max_expanded_documents=3)
-    parser = dispatcher.DocumentParserDispatcher(limits=limits)
+    dispatcher = DocumentParserDispatcher(limits=limits)
     parent_mail = _mail(" ")
     child_mail = _wide_mail((FIXTURES / "b01_merged.xls").read_bytes(), attachment_count=1)
     parent_mail.add_attachment(child_mail, filename="second.eml")
-    documents = parser.parse_batch([("first.eml", parent_mail.as_bytes())])
+    documents = dispatcher.parse_batch([("first.eml", parent_mail.as_bytes())])
     parent, old_child, old_body = documents
     assert old_body.parent_doc_id == old_child.doc_id
     retry_target = dict(existing_doc_id=old_child.doc_id, parent_doc_id=parent.doc_id)
     with pytest.raises(ValueError, match="必须显式传入 remaining_expanded_slots"):
-        parser.retry_single_document(
+        dispatcher.retry_single_document(
             old_child.original_filename, old_child.raw_bytes, depth=2, **retry_target
         )
 
-    depth, slots = dispatcher.compute_retry_context(documents, old_child.doc_id, limits)
+    depth, slots = dispatcher.compute_retry_context(documents, old_child.doc_id)
     assert (depth, slots) == (2, 1)
-    root, body = parser.retry_single_document(
+    retried = dispatcher.retry_single_document(
         old_child.original_filename,
         old_child.raw_bytes,
         depth=depth,
@@ -748,12 +865,27 @@ def test_eml_retry_inherits_remaining_expansion_slots():
         **retry_target,
     )
 
+    updated_documents = [parent, *retried]
+    assert len(updated_documents) == 3
+    root, body = retried
     assert (root.doc_id, root.parent_doc_id) == (old_child.doc_id, parent.doc_id)
     assert root.status is DocumentStatus.FAILED
     assert root.error_message == "单批展开文档数超过 3 项上限，部分子件已截断"
     assert body.parent_doc_id == root.doc_id
     assert body.status is DocumentStatus.PARSED
     assert body.raw_text.strip() == "Many charges"
+
+
+def test_compute_retry_context_requires_explicit_limits_without_dispatcher():
+    from shipping_billing_agent.parsers.dispatcher import (
+        DocumentParserDispatcher,
+        compute_retry_context,
+    )
+
+    documents = DocumentParserDispatcher().parse_batch([("mail.eml", _mail("Charges").as_bytes())])
+
+    with pytest.raises(TypeError, match="limits"):
+        compute_retry_context(documents, documents[0].doc_id)
 
 
 @pytest.mark.parametrize(

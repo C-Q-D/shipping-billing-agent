@@ -133,7 +133,7 @@ def validate_batch_inputs(
 def compute_retry_context(
     existing_documents: Sequence[ParsedDocument],
     target_doc_id: str,
-    limits: ResourceLimits = _DEFAULT_LIMITS,
+    limits: ResourceLimits,
 ) -> tuple[int, int]:
     """Return the target's depth and child slots after releasing its old descendants."""
     parents = {doc.doc_id: doc.parent_doc_id for doc in existing_documents}
@@ -245,6 +245,11 @@ class DocumentParserDispatcher:
             self._parse_file(_new_file(name, data), data, batch, depth=1)
         batch.documents.extend(self._parse_url(url) for url in public_urls)
         return batch.documents
+
+    def compute_retry_context(
+        self, existing_documents: Sequence[ParsedDocument], target_doc_id: str
+    ) -> tuple[int, int]:
+        return compute_retry_context(existing_documents, target_doc_id, limits=self._limits)
 
     def retry_single_document(
         self,
