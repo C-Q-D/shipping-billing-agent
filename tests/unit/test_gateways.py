@@ -37,6 +37,19 @@ OCR_BANK_FIELDS = {
     "swiftCode": "BOFAUS3NXXX",
     "iban": "GB82WEST12345698765432",
 }
+PDF1_BANK_FIELDS = {
+    "ABA #": "104052342",
+    "ACH:": "205063453",
+    "ABA/ROUTING WIRE#:": "306074564",
+    "ACCT #:": "407085675",
+    "Account Number": "508096786",
+}
+OCR_BUSINESS_FIELDS = {
+    "invoiceNumber": "DC-108478",
+    "mblNumber": "ORFR1618731",
+    "total": "1310.40",
+    "chargeList": [{"amount": "1310.40", "currency": "USD", "unitPrice": "655.20", "quantity": 2}],
+}
 
 
 def _unexpected_dns(host: str, port: int) -> list[tuple]:
@@ -179,6 +192,7 @@ def test_sanitizer_hides_presigned_credentials_and_keeps_invoice_query() -> None
         "ACH:",
         "WIRE / ACH ##:",
         "ACCT / ACCOUNT #:",
+        "ACCT #:",
         "Account Number",
         "ROUTING: / WIRE #",
     ],
@@ -209,6 +223,9 @@ def test_sanitizer_masks_pdf_remittance_label_variations(label: str) -> None:
         ("swift_code", "BOFAUS3NXXX"),
         ("bic", "BOFAUS3NXXX"),
         ("iban", "GB82WEST12345698765432"),
+        ("routing_number\t#：=", 21000021),
+        ("SWIFT/BIC Code:", "BOFAUS3NXXX"),
+        ("iban_number", "GB82WEST12345698765432"),
     ],
 )
 def test_sanitizer_preserves_json_and_masks_bank_fields(key: str, value: int | str) -> None:
@@ -473,9 +490,8 @@ def loopback_gateway(monkeypatch: pytest.MonkeyPatch):
                             "list": [
                                 {
                                     **OCR_BANK_FIELDS,
-                                    "invoiceNumber": "DC-108478",
-                                    "mblNumber": "ORFR1618731",
-                                    "chargeList": [{"amount": "1310.40", "currency": "USD"}],
+                                    **OCR_BUSINESS_FIELDS,
+                                    "other": PDF1_BANK_FIELDS,
                                 }
                             ]
                         }
@@ -632,7 +648,11 @@ async def test_llm_sync_and_async_bypass_env_proxy_and_sanitize_outgoing_message
     client = llm_client.OpenAICompatibleLlmClient(_llm_settings(f"{origin}/v1"))
     messages = [
         ("system", "Return a JSON invoice. Do not send Routing: 021000021."),
-        ("human", "Account No: 123456789012; Total USD 1,310.40; MBL ORFR1618731"),
+        (
+            "human",
+            "Account No: 123456789012; AccountNo: 401234567890; AcctNo: 502345678901; "
+            "AccountNumber: 603456789012; Total USD 1,310.40; MBL ORFR1618731",
+        ),
     ]
     try:
         sync_result = client.invoke_structured(messages, _ExtractedInvoice)
@@ -654,10 +674,17 @@ async def test_llm_sync_and_async_bypass_env_proxy_and_sanitize_outgoing_message
         },
         {
             "role": "user",
-            "content": "Account No: [REDACTED_BANK_ACCT]; Total USD 1,310.40; MBL ORFR1618731",
+            "content": (
+                "Account No: [REDACTED_BANK_ACCT]; AccountNo: [REDACTED_BANK_ACCT]; "
+                "AcctNo: [REDACTED_BANK_ACCT]; AccountNumber: [REDACTED_BANK_ACCT]; "
+                "Total USD 1,310.40; MBL ORFR1618731"
+            ),
         },
     ]
-    assert [body["messages"] for _, body, _ in requests] == [expected_messages] * 2
+    received = [body["messages"] for _, body, _ in requests]
+    masked_counts = [messages[1]["content"].count("[REDACTED_BANK_ACCT]") for messages in received]
+    assert masked_counts == [4, 4], "sync, async"
+    assert received == [expected_messages] * 2
     assert sync_result == async_result
     assert sync_result.parsed == _ExtractedInvoice(invoice_number="DC-108478")
     assert sync_result.raw_text == '{"invoice_number":"DC-108478"}'
@@ -674,8 +701,11 @@ async def test_ocr_formatted_invoice_is_sanitized_at_both_llm_receivers(loopback
     ocr = ocr_client.PltPltOcrClient(_ocr_settings(ocr_gateway_url=f"{origin}/ocr-bank-fields"))
     dispatcher = DocumentParserDispatcher(remote_ocr=ocr, url_validator=validate_public_url)
     (document,) = dispatcher.parse_batch([], [PUBLIC_FILE])
-    raw_fields = json.loads(document.raw_text)
-    assert {key: raw_fields[key] for key in OCR_BANK_FIELDS} == OCR_BANK_FIELDS
+    assert json.loads(document.raw_text) == {
+        **OCR_BANK_FIELDS,
+        **OCR_BUSINESS_FIELDS,
+        "other": PDF1_BANK_FIELDS,
+    }
 
     client = llm_client.OpenAICompatibleLlmClient(_llm_settings(f"{origin}/v1"))
     try:
@@ -691,15 +721,21 @@ async def test_ocr_formatted_invoice_is_sanitized_at_both_llm_receivers(loopback
         "/v1/chat/completions",
         "/v1/chat/completions",
     ]
-    for mode, (_, request, _) in zip(("sync", "async"), requests[1:], strict=True):
-        (message,) = request["messages"]
-        content = message["content"]
-        assert all(value not in content for value in OCR_BANK_FIELDS.values()), mode
+    received = {
+        mode: request["messages"][0]["content"]
+        for mode, (_, request, _) in zip(("sync", "async"), requests[1:], strict=True)
+    }
+    bank_fields = OCR_BANK_FIELDS | PDF1_BANK_FIELDS
+    leaked_keys = {
+        mode: [key for key, value in bank_fields.items() if value in content]
+        for mode, content in received.items()
+    }
+    assert leaked_keys == {"sync": [], "async": []}
+    for mode, content in received.items():
         assert json.loads(content) == {
             **dict.fromkeys(OCR_BANK_FIELDS, "[REDACTED_BANK_ACCT]"),
-            "invoiceNumber": "DC-108478",
-            "mblNumber": "ORFR1618731",
-            "chargeList": [{"amount": "1310.40", "currency": "USD"}],
+            **OCR_BUSINESS_FIELDS,
+            "other": dict.fromkeys(PDF1_BANK_FIELDS, "[REDACTED_BANK_ACCT]"),
         }, mode
 
 

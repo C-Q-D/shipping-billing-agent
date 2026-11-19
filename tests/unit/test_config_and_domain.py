@@ -419,55 +419,104 @@ def test_raw_extraction_rejects_non_finite_charge_amount(domain_models) -> None:
     assert error.value.errors()[0]["loc"] == ("charges", 0, "amount")
 
 
-def test_domain_imports_no_io_or_agent_frameworks() -> None:
-    domain_dir = Path(__file__).resolve().parents[2] / "src/shipping_billing_agent/domain"
-    nodes = [
-        node
-        for path in domain_dir.rglob("*.py")
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
-    ]
-    import_roots = {
-        alias.name.partition(".")[0]
-        for node in nodes
-        if isinstance(node, ast.Import)
-        for alias in node.names
-    } | {
-        node.module.partition(".")[0]
-        for node in nodes
-        if isinstance(node, ast.ImportFrom) and node.module and not node.level
-    }
-    forbidden_modules = {
-        "httpx",
-        "sqlite3",
-        "fastapi",
-        "langchain",
-        "langchain_core",
-        "langchain_openai",
-    }
+# Internal dependency allowlist from arch-contract.md §2.2.
+_ALLOWED_LAYER_IMPORTS = {
+    "domain": {"domain"},
+    "config": {"config", "domain"},
+    "parsers": {"parsers", "domain", "config"},
+    "gateways": {"gateways", "domain", "config"},
+    "storage": {"storage", "domain", "config"},
+    "agent": {"agent", "gateways", "domain", "config"},
+    "services": {"services", "agent", "parsers", "gateways", "storage", "domain", "config"},
+    "harness": {
+        "harness",
+        "services",
+        "agent",
+        "parsers",
+        "gateways",
+        "storage",
+        "domain",
+        "config",
+    },
+    "api": {"api", "services", "harness", "gateways", "domain", "config"},
+    "cli": {"cli", "services", "harness", "gateways", "domain", "config"},
+}
+_DOMAIN_FORBIDDEN_MODULES = {
+    "httpx",
+    "sqlite3",
+    "fastapi",
+    "langchain",
+    "langchain_core",
+    "langchain_openai",
+}
 
-    assert not import_roots & forbidden_modules
 
-
-def test_parsers_only_use_injected_gateways_and_do_not_import_outer_layers() -> None:
-    parsers = Path(__file__).resolve().parents[2] / "src/shipping_billing_agent/parsers"
-    forbidden = {"gateways", "agent", "storage", "api", "cli"}
-    violations = []
-
-    for path in parsers.rglob("*.py"):
-        package = ["shipping_billing_agent", "parsers", *path.relative_to(parsers).parts[:-1]]
+def find_layer_import_violations(package_root: Path) -> list[tuple[Path, int, str]]:
+    violations: list[tuple[Path, int, str]] = []
+    for path in sorted(package_root.rglob("*.py")):
+        relative_path = path.relative_to(package_root)
+        package = (package_root.name, *relative_path.parent.parts)
+        source_layer = package[1] if len(package) > 1 else ""
+        allowed_layers = _ALLOWED_LAYER_IMPORTS.get(source_layer, ())
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
             if isinstance(node, ast.Import):
                 imports = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom):
-                prefix = package[: len(package) - node.level + 1] if node.level else []
+                if node.level > len(package):
+                    continue
+                prefix = package[: len(package) - node.level + 1] if node.level else ()
                 if node.module:
-                    prefix.extend(node.module.split("."))
+                    prefix += tuple(node.module.split("."))
                 imports = [".".join([*prefix, alias.name]) for alias in node.names]
             else:
                 continue
             for name in imports:
                 root, _, module = name.partition(".")
-                if root == "shipping_billing_agent" and module.partition(".")[0] in forbidden:
-                    violations.append((path.name, node.lineno, name))
+                target_layer = module.partition(".")[0]
+                # The package root exposes metadata such as __version__ without a layer import.
+                forbidden_internal = (
+                    root == package_root.name
+                    and module not in {"", "__version__"}
+                    and target_layer not in allowed_layers
+                )
+                forbidden_external = source_layer == "domain" and root in _DOMAIN_FORBIDDEN_MODULES
+                if forbidden_internal or forbidden_external:
+                    violations.append((relative_path, node.lineno, name))
+    return violations
 
-    assert not violations
+
+def test_shipping_billing_agent_imports_follow_architecture_layers() -> None:
+    package_root = Path(__file__).resolve().parents[2] / "src/shipping_billing_agent"
+
+    assert find_layer_import_violations(package_root) == []
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "statement", "expected_import"),
+    [
+        ("domain/nested/check.py", "from ... import parsers", "example_agent.parsers"),
+        ("domain/check.py", "import example_agent.config as settings", "example_agent.config"),
+        (
+            "parsers/check.py",
+            "from example_agent.services import runner",
+            "example_agent.services.runner",
+        ),
+        (
+            "parsers/check.py",
+            "from ..gateways import ocr_client",
+            "example_agent.gateways.ocr_client",
+        ),
+    ],
+    ids=["domain-to-parsers", "domain-to-config", "parsers-to-services", "parsers-to-gateways"],
+)
+def test_layer_import_gate_catches_forbidden_imports_inside_functions(
+    tmp_path: Path, relative_path: str, statement: str, expected_import: str
+) -> None:
+    package_root = tmp_path / "example_agent"
+    source = package_root / relative_path
+    source.parent.mkdir(parents=True)
+    source.write_text(f"def load():\n    {statement}\n", encoding="utf-8")
+
+    assert find_layer_import_violations(package_root) == [
+        (Path(relative_path), 2, expected_import)
+    ]

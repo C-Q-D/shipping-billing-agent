@@ -41,18 +41,23 @@ def _read_docx(data: bytes) -> tuple[str, list[ParsedTable]]:
         tables.append(parsed)
         # Keep the cell proxies alive while tracking XML identities across merged rows.
         grids = [(row.grid_cols_before, row.cells, row.grid_cols_after) for row in block.rows]
-        seen_tcs: set[int] = set()
+        tc_text_cache: dict[int, str] = {}
         for before, cells, after in grids:
             row_values = [""] * before
             row_line = row_values.copy()
+            prev_cell_id = None
             for cell in cells:
                 cell_id = id(cell._tc)
-                if cell_id in seen_tcs:
+                if cell_id == prev_cell_id:
                     row_values.append("")
                     row_line.append("")
                     continue
+                prev_cell_id = cell_id
+                if (cached_text := tc_text_cache.get(cell_id)) is not None:
+                    row_values.append(cached_text)
+                    row_line.append(cached_text)
+                    continue
 
-                seen_tcs.add(cell_id)
                 paragraphs: list[str] = []
                 line_paragraphs: list[str] = []
                 for child in cell.iter_inner_content():
@@ -66,7 +71,9 @@ def _read_docx(data: bytes) -> tuple[str, list[ParsedTable]]:
                         append_table(child, location)
                         row_line = [""] * len(row_values)
                         line_paragraphs.clear()
-                row_values.append("\n".join(paragraphs))
+                cell_text = "\n".join(paragraphs)
+                tc_text_cache[cell_id] = cell_text
+                row_values.append(cell_text)
                 row_line.append("\n".join(line_paragraphs))
             parsed.rows.append(row_values + [""] * after)
             lines.append("\t".join(row_line + [""] * after))

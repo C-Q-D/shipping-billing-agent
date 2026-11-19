@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from urllib.parse import unquote_plus
 
@@ -21,14 +22,20 @@ _QUERY_KEYS = {
 }
 _QUERY_PREFIXES = ("x_amz_", "x_goog_", "x_oss_")
 
-_REMITTANCE_LABEL = r"(?:ach|wire|aba|routing|acct\.?|account|a/c)(?!\w)"
+_REMITTANCE_LABEL = r"(?:ach|wire|aba|routing|acct\.?|account|a/c)"
+_LABEL_WORD_SEPARATOR = r"[ \t_-]*"
 _ACCOUNT_LABEL = (
-    rf"\b(?:(?:bank|beneficiary)[ \t]+)?{_REMITTANCE_LABEL}"
-    rf"(?:[ \t/#:：=]*{_REMITTANCE_LABEL})*(?:[ \t]*(?:no\.?|number|code)(?!\w))?"
+    rf"\b(?:(?:bank|beneficiary){_LABEL_WORD_SEPARATOR})?{_REMITTANCE_LABEL}"
+    rf"(?:[ \t/#:：=_-]*{_REMITTANCE_LABEL})*"
+    rf"(?:{_LABEL_WORD_SEPARATOR}(?:no\.?|number|code))?(?!\w)"
     r"|(?:银行|汇款|收款)(?:账号|帐号|账户)"
 )
-_BIC_LABEL = r"\b(?:swift(?:[ \t]*/[ \t]*bic)?|bic)(?:[ \t]+(?:code|no\.?|number))?(?!\w)"
-_FIELD_SEPARATOR = r"[ \t/:：#=]*(?:\r?\n[ \t]*)?"
+_BIC_LABEL = (
+    rf"\b(?:swift(?:[ \t/_-]*bic)?|bic)(?:{_LABEL_WORD_SEPARATOR}(?:code|no\.?|number))?(?!\w)"
+)
+_IBAN_LABEL = rf"\biban(?:{_LABEL_WORD_SEPARATOR}(?:no\.?|number))?(?!\w)"
+_INLINE_FIELD_SEPARATOR = r"[ \t/:：#=]*"
+_FIELD_SEPARATOR = rf"{_INLINE_FIELD_SEPARATOR}(?:\r?\n[ \t]*)?"
 _BANK_FIELDS = re.compile(
     rf"(?P<label>{_ACCOUNT_LABEL}){_FIELD_SEPARATOR}"
     r"(?P<value>(?=(?:[0-9][ \t-]?){4}[0-9])[0-9]+"
@@ -41,19 +48,21 @@ _BIC_FIELD = re.compile(
     re.IGNORECASE,
 )
 _IBAN_FIELD = re.compile(
-    rf"(?P<label>\biban(?:[ \t]+(?:no\.?|number))?(?!\w)){_FIELD_SEPARATOR}"
+    rf"(?P<label>{_IBAN_LABEL}){_FIELD_SEPARATOR}"
     r"(?P<value>[A-Z]{2}[0-9]{2}(?:[A-Z0-9]{11,30}"
     r"|(?:[ \t]+(?!(?:rate|date|bill)\b)[A-Z0-9]{4}(?!\w|[.,][0-9])){2,7}"
     r"(?:[ \t]+(?=[A-Z0-9]*[0-9])[A-Z0-9]{1,3})?))(?!\w|[.,][0-9])",
     re.IGNORECASE,
 )
-_JSON_BANK_FIELD = re.compile(
-    r'(?P<key>(?<!\\)"(?:(?:bank[_ -]?)?account(?:[_ -]?(?:no|number))?'
-    r"|routing(?:[_ -]?(?:no|number))?|aba(?:[_ -]?routing(?:[_ -]?number)?)?"
-    r'|ach(?:[_ -]?number)?|swift(?:[_ -]?code)?|bic|iban)"\s*:\s*)'
-    r'(?:"(?:[^"\\]|\\.)*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)'
-    r"(?=\s*(?:[,}\]]|\Z))",
+_JSON_BANK_LABEL = re.compile(
+    rf"(?:{_ACCOUNT_LABEL}|{_BIC_LABEL}|{_IBAN_LABEL}){_INLINE_FIELD_SEPARATOR}",
     re.IGNORECASE,
+)
+_JSON_STRING = r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
+_JSON_BANK_FIELD = re.compile(
+    rf"(?<!\\)(?P<prefix>(?P<key>{_JSON_STRING})\s*:\s*)"
+    rf"(?:{_JSON_STRING}|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"
+    r"(?=\s*(?:[,}\]]|\Z))",
 )
 _BANK_HEADING = re.compile(
     r"^[ \t]*(?:(?:(?:beneficiary|intermediary)\s+)?bank\b|remit(?:tance)?\s+to\b"
@@ -87,6 +96,13 @@ def _mask_field_value(match: re.Match[str]) -> str:
     return match.string[match.start() : match.start("value")] + _BANK_MASK
 
 
+def _mask_json_bank_field(match: re.Match[str]) -> str:
+    # Escaped whitespace and punctuation in JSON keys use the same labels as plain text.
+    if _JSON_BANK_LABEL.fullmatch(json.loads(match["key"])):
+        return f'{match["prefix"]}"{_BANK_MASK}"'
+    return match[0]
+
+
 def _mask_unlabeled_accounts(text: str) -> str:
     lines: list[str] = []
     in_remittance_section = False
@@ -111,7 +127,7 @@ def _mask_unlabeled_accounts(text: str) -> str:
 
 
 def sanitize_for_llm(text: str) -> str:
-    text = _JSON_BANK_FIELD.sub(rf'\g<key>"{_BANK_MASK}"', text)
+    text = _JSON_BANK_FIELD.sub(_mask_json_bank_field, text)
     text = HTTP_URL_PATTERN.sub(_sanitize_signed_url, text)
     text = _BANK_FIELDS.sub(_mask_field_value, text)
     text = _BIC_FIELD.sub(_mask_field_value, text)

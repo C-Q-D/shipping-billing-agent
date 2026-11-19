@@ -85,6 +85,17 @@ def _mail(body: str) -> EmailMessage:
     return message
 
 
+def _four_level_mail() -> EmailMessage:
+    fourth = _mail("Level four")
+    third = _mail("Level three")
+    third.add_attachment(fourth, filename="fourth.eml")
+    second = _mail("Level two")
+    second.add_attachment(third, filename="third.eml")
+    first = _mail("Level one")
+    first.add_attachment(second, filename="second.eml")
+    return first
+
+
 def _word_stream_start(data: bytes | bytearray) -> int:
     entry = data.index("WordDocument\0".encode("utf-16-le"))
     (sector,) = unpack_from("<I", data, entry + 116)
@@ -143,6 +154,23 @@ def test_docx_reads_interleaved_paragraphs_and_tables_with_header_footer():
     ]
 
 
+def test_docx_keeps_the_merged_fee_name_on_both_amount_rows():
+    from shipping_billing_agent.parsers.word_parser import parse_word
+
+    word = Document()
+    charges = word.add_table(rows=2, cols=2)
+    charges.cell(0, 0).merge(charges.cell(1, 0)).text = "FREIGHT"
+    charges.cell(0, 1).text = "65.00"
+    charges.cell(1, 1).text = "310.42"
+    with BytesIO() as stream:
+        word.save(stream)
+        text, (table,) = parse_word(stream.getvalue(), "freight.docx")
+
+    expected_rows = [["FREIGHT", "65.00"], ["FREIGHT", "310.42"]]
+    assert table.rows == expected_rows
+    assert [line.split("\t") for line in text.splitlines()] == expected_rows
+
+
 def test_docx_preserves_nested_table_and_cell_paragraph_order_through_a_merge():
     from shipping_billing_agent.parsers.word_parser import parse_word
 
@@ -160,13 +188,15 @@ def test_docx_preserves_nested_table_and_cell_paragraph_order_through_a_merge():
         text, tables = parse_word(stream.getvalue(), "nested.docx")
 
     assert [table.rows for table in tables] == [
-        [["Before charges\nAfter charges", ""], ["", ""]],
+        [["Before charges\nAfter charges", ""], ["Before charges\nAfter charges", ""]],
         [["FREIGHT", "187.65"]],
     ]
     assert [line.strip() for line in text.splitlines() if line.strip()] == [
         "Statement",
         "Before charges",
         "FREIGHT\t187.65",
+        "After charges",
+        "Before charges",
         "After charges",
         "End of statement",
     ]
@@ -255,6 +285,53 @@ def test_doc_rejects_encrypted_flag():
 
     with pytest.raises(WordParseError, match="加密"):
         parse_word(bytes(data), "encrypted.doc")
+
+
+def _two_page_text_pdf(first_line: bytes, second_line: bytes) -> bytes:
+    page = (
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] "
+        b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>"
+    )
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Count 2 /Kids [4 0 R 6 0 R] >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    for text in (first_line, second_line):
+        objects.append(page % (len(objects) + 2))
+        stream = b"BT /F1 12 Tf 24 160 Td (" + text + b") Tj ET\n"
+        objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"endstream")
+
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, obj in enumerate(objects, 1):
+        offsets.append(len(pdf))
+        pdf.extend(b"%d 0 obj\n" % number + obj + b"\nendobj\n")
+    xref_offset = len(pdf)
+    pdf.extend(b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1))
+    for offset in offsets:
+        pdf.extend(b"%010d 00000 n \n" % offset)
+    pdf.extend(
+        b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+        % (len(objects) + 1, xref_offset)
+    )
+    return bytes(pdf)
+
+
+def test_pdf_without_local_ocr_reads_the_complete_short_text_page():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    data = _two_page_text_pdf(b"Payment terms: net thirty days.", b"USD 245.00")
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=None
+    )
+    (document,) = dispatcher.parse_batch([("electronic.pdf", data)])
+
+    assert document.status is DocumentStatus.PARSED, document.error_message
+    assert document.extraction_channel is ExtractionChannel.LOCAL_PDF_TEXT_FALLBACK
+    assert document.raw_text == (
+        "[Page 1 | Text]\nPayment terms: net thirty days.\n\n[Page 2 | Text]\nUSD 245.00"
+    )
 
 
 def test_pdf_renders_only_sparse_scan_page_and_keeps_text_page_tables():
@@ -521,6 +598,38 @@ def test_eml_parses_inline_bill_images_instead_of_skipping_them(filename, html):
     assert local.images == [(image_data, filename)]
 
 
+def test_eml_footer_contact_does_not_skip_a_cid_image_in_the_main_body():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    message = _mail("Charges attached")
+    message.add_alternative(
+        '<main><p>Charges attached</p><hr><img src="cid:scan"></main>'
+        '<footer class="signature">Tel: 123456<img src="cid:logo"></footer>',
+        subtype="html",
+    )
+    html = message.get_payload()[-1]
+    scan_data = b"synthetic invoice scan"
+    logo_data = b"synthetic signature logo"
+    html.add_related(scan_data, maintype="image", subtype="png", cid="<scan>", filename="scan.png")
+    html.add_related(logo_data, maintype="image", subtype="png", cid="<logo>", filename="logo.png")
+    local = RecordingLocalOcr()
+    dispatcher = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=local
+    )
+
+    _, _, scan, logo = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    assert scan.sanitized_filename == "scan.png"
+    assert scan.status is DocumentStatus.PARSED
+    assert scan.extraction_channel is ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+    assert scan.raw_text == "Image 246.00"
+    assert local.images == [(scan_data, "scan.png")]
+    assert logo.sanitized_filename == "logo.png"
+    assert logo.status is DocumentStatus.SKIPPED_NOISE
+    assert logo.extraction_channel is ExtractionChannel.SKIPPED_SIGNATURE
+    assert logo.raw_bytes == logo_data
+
+
 @pytest.mark.parametrize("encoded", [False, True])
 def test_eml_preserves_exact_bytes_of_nested_rfc822(encoded):
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
@@ -551,14 +660,9 @@ def test_eml_preserves_exact_bytes_of_nested_rfc822(encoded):
 def test_eml_stops_at_the_fourth_nested_mail_and_preserves_parent_links():
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
-    fourth = _mail("Level four")
-    third = _mail("Level three")
-    third.add_attachment(fourth, filename="fourth.eml")
-    second = _mail("Level two")
-    second.add_attachment(third, filename="third.eml")
-    first = _mail("Level one")
-    first.add_attachment(second, filename="second.eml")
-    documents = DocumentParserDispatcher().parse_batch([("first.eml", first.as_bytes())])
+    documents = DocumentParserDispatcher().parse_batch(
+        [("first.eml", _four_level_mail().as_bytes())]
+    )
 
     root, first_body, child, second_body, grandchild, third_body, rejected = documents
     assert [doc.raw_text.strip() for doc in (first_body, second_body, third_body)] == [
@@ -582,43 +686,99 @@ def test_eml_stops_at_the_fourth_nested_mail_and_preserves_parent_links():
     assert rejected.content_sha256 == sha256(rejected.raw_bytes).hexdigest()
 
 
-def test_eml_retry_inherits_depth_without_expanding_the_fourth_mail():
-    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+@pytest.mark.parametrize("depth_args", [{}, {"depth": 1}], ids=["omitted", "too-shallow"])
+def test_eml_retry_inherits_depth_without_expanding_the_fourth_mail(depth_args):
+    from shipping_billing_agent.parsers import dispatcher
 
-    (retried,) = DocumentParserDispatcher().retry_single_document(
-        "fourth.eml",
-        _mail("Level four").as_bytes(),
-        existing_doc_id="fourth",
-        parent_doc_id="third",
-        depth=4,
+    parser = dispatcher.DocumentParserDispatcher()
+    documents = parser.parse_batch([("first.eml", _four_level_mail().as_bytes())])
+    rejected = documents[-1]
+    retry_target = dict(existing_doc_id=rejected.doc_id, parent_doc_id=rejected.parent_doc_id)
+    with pytest.raises(ValueError, match="重试嵌套子文档时必须显式传入原父链 depth"):
+        parser.retry_single_document(
+            rejected.original_filename,
+            rejected.raw_bytes,
+            remaining_expanded_slots=113,
+            **retry_target,
+            **depth_args,
+        )
+
+    depth, slots = dispatcher.compute_retry_context(list(reversed(documents)), rejected.doc_id)
+    assert (depth, slots) == (4, 113)
+    assert dispatcher.compute_retry_context(documents, documents[0].doc_id) == (1, 119)
+    (retried,) = parser.retry_single_document(
+        rejected.original_filename,
+        rejected.raw_bytes,
+        depth=depth,
+        remaining_expanded_slots=slots,
+        **retry_target,
     )
 
-    assert (retried.doc_id, retried.parent_doc_id) == ("fourth", "third")
+    assert retried.doc_id == rejected.doc_id
+    assert retried.parent_doc_id == rejected.parent_doc_id
     assert retried.status is DocumentStatus.FAILED
     assert retried.extraction_channel is ExtractionChannel.FAILED
     assert retried.error_message == "邮件嵌套深度超过 3 层"
 
 
 def test_eml_retry_inherits_remaining_expansion_slots():
-    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+    from shipping_billing_agent.parsers import dispatcher
 
-    wire = _wide_mail((FIXTURES / "b01_merged.xls").read_bytes(), attachment_count=1).as_bytes()
+    limits = ResourceLimits(max_expanded_documents=3)
+    parser = dispatcher.DocumentParserDispatcher(limits=limits)
+    parent_mail = _mail(" ")
+    child_mail = _wide_mail((FIXTURES / "b01_merged.xls").read_bytes(), attachment_count=1)
+    parent_mail.add_attachment(child_mail, filename="second.eml")
+    documents = parser.parse_batch([("first.eml", parent_mail.as_bytes())])
+    parent, old_child, old_body = documents
+    assert old_body.parent_doc_id == old_child.doc_id
+    retry_target = dict(existing_doc_id=old_child.doc_id, parent_doc_id=parent.doc_id)
+    with pytest.raises(ValueError, match="必须显式传入 remaining_expanded_slots"):
+        parser.retry_single_document(
+            old_child.original_filename, old_child.raw_bytes, depth=2, **retry_target
+        )
 
-    root, body = DocumentParserDispatcher().retry_single_document(
-        "second.eml",
-        wire,
-        existing_doc_id="second",
-        parent_doc_id="parent",
-        depth=2,
-        remaining_expanded_slots=1,
+    depth, slots = dispatcher.compute_retry_context(documents, old_child.doc_id, limits)
+    assert (depth, slots) == (2, 1)
+    root, body = parser.retry_single_document(
+        old_child.original_filename,
+        old_child.raw_bytes,
+        depth=depth,
+        remaining_expanded_slots=slots,
+        **retry_target,
     )
 
-    assert (root.doc_id, root.parent_doc_id) == ("second", "parent")
+    assert (root.doc_id, root.parent_doc_id) == (old_child.doc_id, parent.doc_id)
     assert root.status is DocumentStatus.FAILED
-    assert root.error_message == "单批展开文档数超过 120 项上限，部分子件已截断"
+    assert root.error_message == "单批展开文档数超过 3 项上限，部分子件已截断"
     assert body.parent_doc_id == root.doc_id
     assert body.status is DocumentStatus.PARSED
     assert body.raw_text.strip() == "Many charges"
+
+
+@pytest.mark.parametrize(
+    ("filename", "media_type"),
+    [("mail.eml", None), ("forward.bin", "message/rfc822")],
+)
+def test_top_level_eml_retry_requires_remaining_expansion_slots(filename, media_type):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    with pytest.raises(ValueError, match="必须显式传入 remaining_expanded_slots"):
+        DocumentParserDispatcher().retry_single_document(
+            filename, _mail("Charges").as_bytes(), existing_doc_id="mail", media_type=media_type
+        )
+
+
+def test_force_parse_requires_original_depth_for_nested_signature_images():
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    parser = DocumentParserDispatcher(
+        ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK, local_ocr=RecordingLocalOcr()
+    )
+    with pytest.raises(ValueError, match="重试嵌套子文档时必须显式传入原父链 depth"):
+        parser.force_parse_skipped_document(
+            "logo.png", b"skipped signature", existing_doc_id="logo", parent_doc_id="mail"
+        )
 
 
 def _wide_mail(attachment_data: bytes, attachment_count: int) -> EmailMessage:
@@ -697,6 +857,33 @@ def test_eml_with_zero_remaining_slots_reports_cutoff_and_retains_later_top_leve
     assert last.status is DocumentStatus.PARSED
 
 
+@pytest.mark.parametrize("limit", [120, 121])
+@pytest.mark.parametrize(
+    ("subtype", "content"),
+    [("html", "<html><body><div> </div></body></html>"), ("plain", "  ")],
+)
+def test_eml_empty_body_does_not_report_truncation_at_capacity(limit, subtype, content):
+    from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
+
+    data = (FIXTURES / "b01_merged.xls").read_bytes()
+    empty = _mail("")
+    empty.set_content(content, subtype=subtype, cte="base64")
+    dispatcher = DocumentParserDispatcher(limits=ResourceLimits(max_expanded_documents=limit))
+
+    documents = dispatcher.parse_batch(
+        [
+            ("wide.eml", _wide_mail(data, attachment_count=117).as_bytes()),
+            ("empty.eml", empty.as_bytes()),
+        ]
+    )
+
+    assert len(documents) == 120
+    assert documents[0].status is DocumentStatus.PARSED, documents[0].error_message
+    assert documents[-1].sanitized_filename == "empty.eml"
+    assert documents[-1].status is DocumentStatus.PARSED, documents[-1].error_message
+    assert documents[-1].error_message is None
+
+
 def test_eml_budget_stops_before_building_or_decoding_overflow_mime_payloads(monkeypatch):
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
@@ -761,6 +948,7 @@ def test_eml_bad_attachment_is_isolated_from_sibling_and_later_top_level_file():
         workbook,
         existing_doc_id=broken.doc_id,
         parent_doc_id=broken.parent_doc_id,
+        depth=2,
     )
     assert retried.doc_id == broken.doc_id
     assert retried.parent_doc_id == root.doc_id

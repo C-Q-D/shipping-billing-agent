@@ -77,6 +77,7 @@ def test_original_eml_deduplicates_body_and_keeps_all_attachment_bytes(dispatche
         signature.raw_bytes,
         existing_doc_id=signature.doc_id,
         parent_doc_id=signature.parent_doc_id,
+        depth=2,
     )
     assert forced.doc_id == signature.doc_id
     assert forced.parent_doc_id == root.doc_id

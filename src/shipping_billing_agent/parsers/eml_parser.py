@@ -28,7 +28,6 @@ _DECORATIVE_IMAGE = re.compile(r"_foxmail\.|insertpic_", re.I)
 _SIGNATURE_TAIL_SIZE = 8
 _MIME_HEADER_END = re.compile(rb"\r\n\r\n|\n\n|\r\r")
 _MIME_LINE_BREAK = re.compile(rb"\r\n|\r|\n")
-_NONBLANK_BYTE = re.compile(rb"\S")
 
 
 class EmlParseError(ValueError):
@@ -108,9 +107,6 @@ class _MimePart:
     def wire_bytes(self) -> bytes:
         return self.source[self.start : self.end]
 
-    def has_body_bytes(self) -> bool:
-        return _NONBLANK_BYTE.search(self.source, self.body_start, self.end) is not None
-
     def read_bytes(self) -> bytes:
         if self.media_type == "message/rfc822":
             encoding = self.headers.get("Content-Transfer-Encoding", "").lower()
@@ -184,46 +180,68 @@ def _related_root_start(part: _MimePart) -> int | None:
     return first.start
 
 
+def _signature_scope(node: Tag | NavigableString, body: Tag) -> int | None:
+    """Return the content block identity, or None inside an explicit signature."""
+    layout_block = body
+    section = None
+    for parent in node.parents:
+        if parent.name == "footer" or any(
+            _SIGNATURE_BLOCK.search(str(parent.get(attribute, "")))
+            for attribute in ("id", "class")
+        ):
+            return None
+        if parent is body:
+            break
+        if parent.name in {"article", "aside", "header", "main", "section"}:
+            if section is None:
+                section = parent
+        elif parent.name in {"address", "blockquote", "div", "table"}:
+            # Mail clients can wrap the image and contact details in sibling layout divs.
+            layout_block = parent
+    return id(section if section is not None else layout_block)
+
+
 def _html_text(html: str, email: ParsedEmail) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(["script", "style", "head"]):
         tag.decompose()
+    body = soup.body or soup
     markers = [
         node
         for node in soup.descendants
         if (isinstance(node, Tag) and node.name in {"img", "hr"})
         or (isinstance(node, NavigableString) and not isinstance(node, Comment) and node.strip())
     ]
-    separator = -1
+    separators: dict[int, int] = {}
     for index, node in enumerate(markers):
         if (isinstance(node, Tag) and node.name == "hr") or (
             isinstance(node, NavigableString) and _SIGNATURE_SEPARATOR.search(node)
         ):
-            separator = index
+            if (scope := _signature_scope(node, body)) is not None:
+                separators[scope] = index
 
     for index, image in enumerate(markers):
         if not isinstance(image, Tag) or image.name != "img" or not image.get("src"):
             continue
         source = str(image["src"]).strip()
-        explicit = image.find_parent(id=_SIGNATURE_BLOCK) or image.find_parent(
-            class_=_SIGNATURE_BLOCK
-        )
-        tail = len(markers) - index <= _SIGNATURE_TAIL_SIZE
-        context = (
-            "\n".join(
+        scope = _signature_scope(image, body)
+        if scope is not None:
+            if len(markers) - index > _SIGNATURE_TAIL_SIZE:
+                continue
+            # A body-level separator can precede a separate signature layout block.
+            separator = max(separators.get(id(body), -1), separators.get(scope, -1))
+            context = "\n".join(
                 node
                 for node in markers[max(0, separator, index - _SIGNATURE_TAIL_SIZE) :]
-                if isinstance(node, NavigableString)
+                if isinstance(node, NavigableString) and _signature_scope(node, body) == scope
             )
-            if tail
-            else ""
-        )
-        after_signoff = separator >= 0 and index > separator and _SIGNATURE_CONTACT.search(context)
-        decorative = _DECORATIVE_IMAGE.search(source) and (
-            _SIGNATURE_CONTACT.search(context) or _SIGNOFF.search(context)
-        )
-        if not (explicit or after_signoff or decorative):
-            continue
+            has_contact = _SIGNATURE_CONTACT.search(context) is not None
+            after_signoff = 0 <= separator < index and has_contact
+            decorative = _DECORATIVE_IMAGE.search(source) and (
+                has_contact or _SIGNOFF.search(context)
+            )
+            if not (after_signoff or decorative):
+                continue
         if source.lower().startswith("cid:"):
             if cid := _content_id(source[4:]):
                 email.signature_cids.add(cid)
@@ -269,13 +287,13 @@ def parse_eml(data: bytes, *, max_children: int) -> ParsedEmail:
 
         media_type = part.media_type
         if media_type in _TEXT_TYPES:
-            if not body_reserved and slots == 0:
-                email.truncated = part.has_body_bytes()
-                return []
             body = _read_body(part, email)
             if not body.text.strip():
                 return []
             if not body_reserved:
+                if slots == 0:
+                    email.truncated = True
+                    return []
                 body_reserved = True
                 slots -= 1
             return [body]

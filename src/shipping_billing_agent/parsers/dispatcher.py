@@ -130,6 +130,39 @@ def validate_batch_inputs(
     return issues
 
 
+def compute_retry_context(
+    existing_documents: Sequence[ParsedDocument],
+    target_doc_id: str,
+    limits: ResourceLimits = _DEFAULT_LIMITS,
+) -> tuple[int, int]:
+    """Return the target's depth and child slots after releasing its old descendants."""
+    parents = {doc.doc_id: doc.parent_doc_id for doc in existing_documents}
+    if target_doc_id not in parents:
+        raise ValueError("目标文档不在当前批次中")
+    if len(parents) != len(existing_documents):
+        raise ValueError("当前批次包含重复的文档 ID")
+
+    parent_chain = {target_doc_id}
+    parent_id = parents[target_doc_id]
+    while parent_id is not None:
+        if parent_id in parent_chain or parent_id not in parents:
+            raise ValueError("目标文档父链无效")
+        parent_chain.add(parent_id)
+        parent_id = parents[parent_id]
+
+    children_by_parent: dict[str, list[str]] = {}
+    for doc_id, parent_id in parents.items():
+        if parent_id is not None:
+            children_by_parent.setdefault(parent_id, []).append(doc_id)
+    descendants = list(children_by_parent.get(target_doc_id, ()))
+    kept_count = len(parents)
+    while descendants:
+        descendant_id = descendants.pop()
+        kept_count -= 1
+        descendants.extend(children_by_parent.get(descendant_id, ()))
+    return len(parent_chain), max(0, limits.max_expanded_documents - kept_count)
+
+
 @dataclass(slots=True)
 class _Batch:
     child_slots: int
@@ -222,10 +255,16 @@ class DocumentParserDispatcher:
         parent_doc_id: str | None = None,
         media_type: str | None = None,
         public_url: str | None = None,
-        depth: int = 1,
+        depth: int | None = None,
         remaining_expanded_slots: int | None = None,
     ) -> list[ParsedDocument]:
-        """Reparse in place, using the given depth and remaining slots for new child nodes."""
+        """Reparse in place, requiring the original depth for children and child slots for mail."""
+        if parent_doc_id is not None and (depth is None or depth < 2):
+            raise ValueError("重试嵌套子文档时必须显式传入原父链 depth（>= 2）")
+        if depth is None:
+            depth = 1
+        if depth < 1:
+            raise ValueError("depth 必须从 1 开始")
         if public_url is not None:
             return [
                 self._parse_url(
@@ -237,14 +276,6 @@ class DocumentParserDispatcher:
             ]
         if data is None:
             raise ValueError("重试本地文件需要原始字节")
-        if depth < 1:
-            raise ValueError("depth 必须从 1 开始")
-        child_slots = max(0, self._limits.max_expanded_documents - 1)
-        if remaining_expanded_slots is not None:
-            if remaining_expanded_slots < 0:
-                raise ValueError("remaining_expanded_slots 不能为负数")
-            child_slots = min(child_slots, remaining_expanded_slots)
-        batch = _Batch(child_slots)
         document = _new_file(
             filename,
             data,
@@ -252,6 +283,18 @@ class DocumentParserDispatcher:
             parent_doc_id=parent_doc_id,
             media_type=media_type,
         )
+        if remaining_expanded_slots is None:
+            if document.source_kind is SourceKind.EML:
+                raise ValueError(
+                    "重试可能展开子件的邮件文档时必须显式传入 remaining_expanded_slots"
+                )
+            child_slots = 0
+        else:
+            if remaining_expanded_slots < 0:
+                raise ValueError("remaining_expanded_slots 不能为负数")
+            max_child_slots = max(0, self._limits.max_expanded_documents - 1)
+            child_slots = min(max_child_slots, remaining_expanded_slots)
+        batch = _Batch(child_slots)
         self._parse_file(document, data, batch, depth=depth)
         return batch.documents
 
@@ -263,6 +306,7 @@ class DocumentParserDispatcher:
         existing_doc_id: str,
         parent_doc_id: str | None = None,
         media_type: str | None = None,
+        depth: int | None = None,
     ) -> ParsedDocument:
         """Reparse a skipped image from its retained bytes outside MIME signature detection."""
         return self.retry_single_document(
@@ -271,6 +315,7 @@ class DocumentParserDispatcher:
             existing_doc_id=existing_doc_id,
             parent_doc_id=parent_doc_id,
             media_type=media_type,
+            depth=depth,
         )[0]
 
     def _parse_file(self, doc: ParsedDocument, data: bytes, batch: _Batch, *, depth: int) -> None:
