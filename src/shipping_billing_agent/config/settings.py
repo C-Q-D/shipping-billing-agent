@@ -29,7 +29,7 @@ class AppSettings(BaseSettings):
     llm_trust_env: bool = False
     llm_proxy_url: str = ""
     llm_timeout_seconds: float = 90.0
-    llm_max_retries: int = 1
+    llm_max_retries: int = 0
 
     ocr_gateway_url: str = DEFAULT_OCR_GATEWAY_URL
     ocr_trust_env: bool = False

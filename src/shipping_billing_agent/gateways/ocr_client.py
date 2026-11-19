@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass
+from decimal import InvalidOperation
 from typing import Any, Protocol
 
 import httpx
 from pydantic import ValidationError
 
 from shipping_billing_agent.config.settings import AppSettings
-from shipping_billing_agent.domain.models import OcrListItem, OcrStructuredPayload
+from shipping_billing_agent.domain.models import (
+    OcrListItem,
+    OcrStructuredPayload,
+    dumps_decimal_json,
+    loads_decimal_json,
+)
 from shipping_billing_agent.gateways.url_guard import (
     install_http_url_log_filter,
     redact_url_queries_in_text,
@@ -120,9 +125,9 @@ def _parse_item(value: Any) -> OcrListItem:
 
 
 def _format_item(item: OcrListItem) -> str:
-    fields = item.model_dump(mode="json", by_alias=True, exclude_unset=True)
+    fields = item.model_dump(mode="python", by_alias=True, exclude_unset=True)
     page = next((fields[key] for key in _PAGE_FIELDS if _has_content(fields.get(key))), None)
-    body = json.dumps(fields, ensure_ascii=False, indent=2)
+    body = dumps_decimal_json(fields)
     return body if page is None else f"[Page {page}]\n{body}"
 
 
@@ -130,8 +135,8 @@ def _parse_response(response: httpx.Response) -> OcrRecognitionResult:
     if not response.is_success:
         raise OcrGatewayError(f"OCR 网关返回 HTTP {response.status_code}")
     try:
-        raw_payload = response.json()
-    except ValueError:
+        raw_payload = loads_decimal_json(response.text)
+    except (ValueError, InvalidOperation, RecursionError):
         raise OcrGatewayError("OCR 网关响应不是有效 JSON") from None
     if not isinstance(raw_payload, dict):
         raise OcrGatewayError("OCR 网关响应 JSON 应为对象")

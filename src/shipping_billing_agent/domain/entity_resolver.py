@@ -5,64 +5,102 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 from unicodedata import normalize
 
+from .charge_normalizer import (
+    normalize_charge_item,
+    normalize_document_date,
+    normalize_payment_term,
+)
+from .currency import normalize_currency
 from .models import (
     AccountingEntityProfile,
     AlertCode,
+    ChargeDictionaryItem,
+    DocumentExtractionBundle,
     ExistingBillRecord,
-    MatchLevel,
     OperationType,
     PostingType,
     ProcessedBillingRecord,
     ReviewStatus,
+    ShipmentRefs,
+    SourceRefValue,
     ValidationAlert,
+    parse_decimal_strict,
 )
 
 _BRANCH_SUFFIX = re.compile(r"(?:\s*\([^()]*\))+[\W_]*$")
 _PARTY_WORDS = re.compile(r"[^\W_]+")
-_CREDIT_DOCUMENT = re.compile(r"\bcredit\b|\bc\s*/\s*n\b|贷项|貸項", re.IGNORECASE)
-_SOURCE_FIELDS = {
-    "document_type",
-    "reference_no",
-    "document_date",
-    "issuer",
-    "recipient",
-    "payer_hint",
-    "payee_hint",
-    "charge_item",
-    "raw_charge_name",
-    "quantity",
-    "unit_price",
-    "amount",
-    "currency",
-    "payment_term",
-    "debit_credit",
-    "shipment_refs",
+_CREDIT_DOCUMENT = re.compile(
+    r"\bcredit\s+(?:note|memo|invoice|advice|voucher|adjustment)\b|\bc\s*/\s*n\b|\bcn\b|"
+    r"贷项|貸項|红字|紅字",
+    re.IGNORECASE,
+)
+PARTY_FIELDS = {"issuer", "recipient", "payer_hint", "payee_hint"}
+_NUMERIC_FIELDS = {"quantity", "unit_price", "amount"}
+_TEXT_OVERRIDES = {"document_type", "reference_no", "raw_charge_name", "charge_item", *PARTY_FIELDS}
+_OVERRIDE_CODES = {
+    "currency": AlertCode.INVALID_OR_MISSING_CURRENCY,
+    "document_date": AlertCode.INVALID_DOCUMENT_DATE,
+    **dict.fromkeys(_NUMERIC_FIELDS, AlertCode.OCR_NUMERIC_CONFUSION),
 }
-_TRANSPORT_OVERRIDES = {"mbl_no", "hbl_no", "booking_no", "container_nos"}
+FIELD_FORMAT_ALERT_CODES = {*_OVERRIDE_CODES.values(), AlertCode.LLM_EXTRACTION_FAILED}
+TRANSPORT_FIELDS = {
+    "mbl_no": "mbl_nos",
+    "hbl_no": "hbl_no",
+    "booking_no": "booking_no",
+    "container_nos": "container_nos",
+}
+_SCALAR_OVERRIDES = (
+    _TEXT_OVERRIDES | _OVERRIDE_CODES.keys() | {"payment_term", "posting_type", "debit_credit"}
+)
+_REQUIRED_OVERRIDES = {"amount", "currency", "charge_item", "posting_type"}
+_ENTITY_OVERRIDES = {"posting_type", "matched_existing_bill_id", "force_create_new"}
+_PartyKey = tuple[str, tuple[str, ...]]
+
+
+def _party_words(name: str) -> str:
+    return " ".join(_PARTY_WORDS.findall(name.replace(".", "")))
+
+
+def _party_key(name: str | None) -> _PartyKey:
+    text = normalize("NFKC", name or "").casefold()
+    if branch := _BRANCH_SUFFIX.search(text):
+        suffixes = re.findall(r"\(([^()]*)\)", branch[0])
+        return _party_words(text[: branch.start()]), tuple(map(_party_words, suffixes))
+    return _party_words(text), ()
 
 
 def normalize_party_name(name: str | None) -> str:
-    normalized = normalize("NFKC", name or "").casefold()
-    without_branch = _BRANCH_SUFFIX.sub("", normalized)
-    return " ".join(_PARTY_WORDS.findall(without_branch.replace(".", "")))
+    stem, branches = _party_key(name)
+    return " ".join((stem, *(f"({branch})" for branch in branches))).strip()
 
 
-def _canonical_party(name: str, profiles: Sequence[AccountingEntityProfile]) -> str | None:
-    if not name:
-        return None
-    matching_aliases = set()
-    for profile in profiles:
-        canonical = normalize_party_name(profile.canonical_name)
-        if name == canonical:
-            return name
-        if canonical and any(name == normalize_party_name(alias) for alias in profile.aliases):
-            matching_aliases.add(canonical)
-    if len(matching_aliases) > 1:
-        return None
-    return next(iter(matching_aliases), name)
+def _resolve_party_key(
+    name: _PartyKey, configured_names: dict[_PartyKey, set[_PartyKey]]
+) -> tuple[_PartyKey | None, bool]:
+    if name in configured_names:
+        return name, True
+    exact_aliases = {key for key, aliases in configured_names.items() if name in aliases}
+    if exact_aliases:
+        return (next(iter(exact_aliases)), True) if len(exact_aliases) == 1 else (None, False)
+
+    stem, branches = name
+    by_stem = {
+        key: {entry[1] for entry in {key, *aliases} if entry[0] == stem}
+        for key, aliases in configured_names.items()
+    }
+    candidates = {key: suffixes for key, suffixes in by_stem.items() if suffixes}
+    if len(candidates) > 1:
+        return (name if branches else None), False
+    if candidates:
+        key, suffixes = next(iter(candidates.items()))
+        if not branches or not suffixes - {()}:
+            return key, False
+    return name, False
 
 
 def entity_matches(
@@ -70,9 +108,33 @@ def entity_matches(
     target_entity: str,
     profiles: Sequence[AccountingEntityProfile] = (),
 ) -> bool:
-    party = _canonical_party(normalize_party_name(party_name), profiles)
-    target = _canonical_party(normalize_party_name(target_entity), profiles)
-    return party is not None and party == target
+    party = _party_key(party_name)
+    target = _party_key(target_entity)
+    if not party[0] or not target[0]:
+        return False
+    if not profiles:
+        return party == target or (party[0] == target[0] and not (party[1] and target[1]))
+
+    configured_names: dict[_PartyKey, set[_PartyKey]] = {}
+    for profile in profiles:
+        configured_names.setdefault(_party_key(profile.canonical_name), set()).update(
+            _party_key(alias) for alias in profile.aliases
+        )
+    party_key, exact_party = _resolve_party_key(party, configured_names)
+    target_key, exact_target = _resolve_party_key(target, configured_names)
+    conflicting_branches = (
+        party[0] == target[0] and party[1] and target[1] and party[1] != target[1]
+    )
+    return (
+        party_key is not None
+        and party_key == target_key
+        and (not conflicting_branches or exact_party and exact_target)
+    )
+
+
+def is_credit_document(document_type: str | None, debit_credit: str) -> bool:
+    normalized_type = normalize("NFKC", document_type or "").replace("_", " ")
+    return debit_credit == "CREDIT" or bool(_CREDIT_DOCUMENT.search(normalized_type))
 
 
 @dataclass(slots=True)
@@ -122,14 +184,13 @@ def resolve_entity_perspective(
         alerts.append(ValidationAlert.from_code(AlertCode.ENTITY_NOT_MATCHED, reason))
         reasoning.append(reason)
 
-    normalized_type = normalize("NFKC", document_type or "").replace("_", " ")
-    is_credit = debit_credit == "CREDIT" or bool(_CREDIT_DOCUMENT.search(normalized_type))
+    is_credit = is_credit_document(document_type, debit_credit)
     raw_amount_abs = raw_amount.copy_abs() if raw_amount is not None else None
     amount = raw_amount
     if is_credit and posting_type is not None and raw_amount_abs is not None:
         amount = raw_amount_abs.copy_negate()
         reasoning.append(f"贷项冲减：对应台账余额减少 {raw_amount_abs:f}")
-    if not is_credit and raw_amount is not None and raw_amount < 0:
+    if not is_credit and raw_amount is not None and raw_amount.is_finite() and raw_amount < 0:
         alerts.append(
             ValidationAlert.from_code(
                 AlertCode.NEGATIVE_NON_CREDIT_AMOUNT,
@@ -142,75 +203,184 @@ def resolve_entity_perspective(
     return EntityPerspective(posting_type, is_credit, raw_amount_abs, amount, alerts, reasoning)
 
 
-def _restore_source_record(
-    record: ProcessedBillingRecord, new_entity: str, profiles: Sequence[AccountingEntityProfile]
-) -> ProcessedBillingRecord:
-    values = record.model_dump()
-    values.update(
-        {key: value for key, value in record.inherited_fields.items() if key in _SOURCE_FIELDS}
-    )
-    if record.raw_explicit_amount is not None:
-        values["amount"] = record.raw_explicit_amount
-    for field in record.raw_invalid_fields.keys() & _SOURCE_FIELDS:
-        values.pop(field, None)
+def _override_text(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("需要非空文本")
+    return value.strip()
 
-    overrides = {
-        key: value
-        for key, value in record.human_overrides.items()
-        if key in _SOURCE_FIELDS or key in _TRANSPORT_OVERRIDES
-    }
-    values.update({key: value for key, value in overrides.items() if key in _SOURCE_FIELDS})
-    if values.get("shipment_refs") is None:
-        values.pop("shipment_refs", None)
-    if _TRANSPORT_OVERRIDES.intersection(overrides):
-        refs = dict(values.get("shipment_refs", {}))
-        for field in ("hbl_no", "booking_no", "container_nos"):
-            if field in overrides:
-                refs[field] = overrides[field]
-        if refs.get("container_nos") is None:
-            refs["container_nos"] = []
-        if "mbl_no" in overrides:
-            mbl_no = overrides["mbl_no"]
-            refs["mbl_nos"] = [{"value": mbl_no, "source": "人工修订"}] if mbl_no else []
-        values["shipment_refs"] = refs
 
-    values.update(
-        accounting_entity=new_entity,
-        operation=OperationType.PENDING_REVIEW,
-        review_status=ReviewStatus.NEEDS_REVIEW,
-        match_level=MatchLevel.NONE,
-        posting_type=None,
-        matched_existing_bill_id=None,
-        matched_bill_ref=None,
-        candidate_bills=[],
-        field_diffs=[],
-        validation_alerts=[],
-        ai_reasoning=[],
-        inherited_fields={},
-        human_overrides=overrides,
-        reject_reason=None,
+def _scalar_override(field: str, value: Any) -> Any:
+    if value is None and field not in _REQUIRED_OVERRIDES and field != "debit_credit":
+        return None
+    if field in _NUMERIC_FIELDS:
+        return parse_decimal_strict(value)
+    if field == "document_date":
+        if isinstance(value, datetime):
+            value = value.date()
+        day, error = normalize_document_date(
+            value.isoformat() if isinstance(value, date) else _override_text(value)
+        )
+        if error:
+            raise ValueError(error)
+        return day
+    text = _override_text(value)
+    if field == "currency":
+        currency, reason = normalize_currency(text)
+        if currency is None:
+            raise ValueError(reason or "需要有效币种")
+        return currency
+    if field == "payment_term":
+        term = normalize_payment_term(text)
+        if term is None:
+            raise ValueError("需要有效付款方式")
+        return term
+    if field == "posting_type":
+        return PostingType(text.upper())
+    if field == "debit_credit" and text not in {"DEBIT", "CREDIT", "UNKNOWN"}:
+        raise ValueError("需要有效借贷方向")
+    return text
+
+
+def _transport_override(field: str, value: Any) -> Any:
+    if field == "shipment_refs":
+        if isinstance(value, dict) and value.keys() - ShipmentRefs.model_fields.keys():
+            raise ValueError("运输引用含未知字段")
+        refs = ShipmentRefs.model_validate({} if value is None else value)
+        for token in (refs.hbl_no, refs.booking_no, *(ref.value for ref in refs.mbl_nos)):
+            if token is not None:
+                _override_text(token)
+        return refs
+    if field == "container_nos":
+        if value is None:
+            return []
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("需要箱号列表")
+        return [_override_text(item) for item in value]
+    token = None if value is None else _override_text(value)
+    if field == "mbl_no":
+        return [SourceRefValue(value=token, source="人工修订")] if token else []
+    return token
+
+
+def apply_human_overrides(
+    record: ProcessedBillingRecord, charge_dictionary: Sequence[ChargeDictionaryItem] | None = None
+) -> tuple[ProcessedBillingRecord, set[str], list[ValidationAlert]]:
+    updates: dict[str, Any] = {}
+    corrected = set()
+    issues = []
+    original_values = record.source_values_before_overrides.copy()
+    refs = record.shipment_refs
+    overrides = record.human_overrides
+    for field, value in overrides.items():
+        if field not in _SCALAR_OVERRIDES:
+            continue
+        try:
+            updates[field] = _scalar_override(field, value)
+            corrected.add(field)
+        except ValueError:
+            updates[field] = None if field != "debit_credit" else "UNKNOWN"
+            issues.append(_invalid_override(field, value))
+
+    for field in ("shipment_refs", *TRANSPORT_FIELDS):
+        if field not in overrides:
+            continue
+        attr = TRANSPORT_FIELDS.get(field, field)
+        try:
+            effective = _transport_override(field, overrides[field])
+            corrected.add(field)
+            if field == "shipment_refs":
+                corrected.update(
+                    field
+                    for field, attr in TRANSPORT_FIELDS.items()
+                    if overrides["shipment_refs"] is None or attr in effective.model_fields_set
+                )
+        except ValueError:
+            corrected.discard(field)
+            effective = (
+                getattr(ShipmentRefs(), attr) if field != "shipment_refs" else ShipmentRefs()
+            )
+            issues.append(_invalid_override(field, overrides[field]))
+        refs = effective if field == "shipment_refs" else refs.model_copy(update={attr: effective})
+    if refs != record.shipment_refs:
+        updates["shipment_refs"] = refs
+
+    raw_name = updates.get("raw_charge_name", record.raw_charge_name)
+    edited_raw_name = "raw_charge_name" in overrides
+    normalize_charge = (
+        charge_dictionary is not None
+        and raw_name is not None
+        or edited_raw_name
+        and (raw_name != record.raw_charge_name or "raw_charge_name" not in original_values)
     )
-    source = ProcessedBillingRecord.model_validate(values)
-    perspective = resolve_entity_perspective(
-        new_entity,
-        issuer=source.issuer,
-        recipient=source.recipient,
-        payer_hint=source.payer_hint,
-        payee_hint=source.payee_hint,
-        document_type=source.document_type,
-        debit_credit=source.debit_credit,
-        raw_amount=source.amount,
-        profiles=profiles,
+    if "charge_item" not in overrides and normalize_charge:
+        updates["charge_item"], updates["matched_from_dictionary"] = normalize_charge_item(
+            raw_name, charge_dictionary or ()
+        )
+    if (
+        "charge_item" not in overrides
+        and "raw_charge_name" in corrected
+        and updates.get("charge_item", record.charge_item)
+    ):
+        corrected.add("charge_item")
+    if "charge_item" in overrides:
+        updates["matched_from_dictionary"] = False
+
+    # Store what was present before the first edit so removing an override can restore it.
+    edited_fields = set(overrides)
+    if edited_fields.intersection(TRANSPORT_FIELDS):
+        edited_fields.add("shipment_refs")
+    if edited_raw_name or "charge_item" in overrides:
+        edited_fields.update(("charge_item", "matched_from_dictionary"))
+    for field in updates.keys() & edited_fields:
+        original = record.inherited_fields.get(field, getattr(record, field))
+        original_values.setdefault(field, original)
+    if updates:
+        record = record.model_copy(
+            update={**updates, "source_values_before_overrides": original_values}
+        )
+    return record, corrected, issues
+
+
+def _invalid_override(field: str, value: Any) -> ValidationAlert:
+    return ValidationAlert.from_code(
+        _OVERRIDE_CODES.get(field, AlertCode.LLM_EXTRACTION_FAILED),
+        "人工修订值无效，待复核",
+        field=field,
+        actual=str(value),
     )
-    return source.model_copy(
-        update={
-            "posting_type": perspective.posting_type,
-            "amount": perspective.amount,
-            "is_credit": perspective.is_credit,
-            "raw_amount_abs": perspective.raw_amount_abs,
-            "validation_alerts": [*source.raw_parse_issues, *perspective.validation_alerts],
-            "ai_reasoning": perspective.ai_reasoning,
-        }
+
+
+def source_format_alerts(
+    record: ProcessedBillingRecord, corrected: set[str]
+) -> list[ValidationAlert]:
+    invalid = record.raw_invalid_fields
+    alerts = [
+        issue
+        for issue in record.raw_parse_issues
+        if issue.code not in FIELD_FORMAT_ALERT_CODES
+        or (
+            issue.field not in corrected
+            and (issue.field not in invalid or issue.actual == invalid[issue.field])
+        )
+    ]
+    blocked = {alert.field for alert in alerts}
+    for field, original in invalid.items():
+        if field in corrected or field in blocked:
+            continue
+        alerts.append(
+            ValidationAlert.from_code(
+                _OVERRIDE_CODES.get(field, AlertCode.LLM_EXTRACTION_FAILED),
+                "源单字段值无效，待复核",
+                field=field,
+                actual=original,
+            )
+        )
+    return alerts
+
+
+def has_explicit_parties(record: ProcessedBillingRecord) -> bool:
+    return bool(record.explicit_fields & PARTY_FIELDS) or (
+        not record.explicit_fields and any(getattr(record, field) for field in PARTY_FIELDS)
     )
 
 
@@ -225,22 +395,44 @@ def recalculate_for_entity(
     | None = None,
     validator_fn: Callable[[list[ProcessedBillingRecord]], list[ProcessedBillingRecord]]
     | None = None,
+    *,
+    charge_dictionary: Sequence[ChargeDictionaryItem] | None = None,
+    bundles: Sequence[DocumentExtractionBundle] = (),
 ) -> tuple[list[ProcessedBillingRecord], int]:
     """Restore source values, then call the batch matcher and the batch validator in order."""
-    if all(entity_matches(record.accounting_entity, new_entity, profiles) for record in records):
-        return list(records), 0
+    from .matcher import _prepare_record, match_and_inherit_batch
+    from .validators import validate_batch
 
     reset_approval_count = sum(
         record.review_status in (ReviewStatus.APPROVED, ReviewStatus.REJECTED) for record in records
     )
-    updated = [_restore_source_record(record, new_entity, profiles) for record in records]
-    if matcher_fn is not None:
+    updated = []
+    for record in records:
+        overrides = record.human_overrides
+        if not entity_matches(record.accounting_entity, new_entity, profiles):
+            overrides = {
+                field: value for field, value in overrides.items() if field not in _ENTITY_OVERRIDES
+            }
+        source = record.model_copy(
+            update={
+                "accounting_entity": new_entity,
+                "operation": OperationType.PENDING_REVIEW,
+                "review_status": ReviewStatus.NEEDS_REVIEW,
+                "human_overrides": overrides,
+                "validation_alerts": [],
+                "ai_reasoning": [],
+                "reject_reason": None,
+            }
+        )
+        updated.append(_prepare_record(source, profiles, charge_dictionary, recompute_entity=True))
+    if matcher_fn is None or matcher_fn is match_and_inherit_batch:
+        updated = match_and_inherit_batch(updated, existing_bills, profiles, charge_dictionary)
+    else:
         scoped_bills = [
             bill
             for bill in existing_bills
             if entity_matches(bill.accounting_entity, new_entity, profiles)
         ]
         updated = matcher_fn(updated, scoped_bills)
-    if validator_fn is not None:
-        updated = validator_fn(updated)
+    updated = validate_batch(updated, bundles) if validator_fn is None else validator_fn(updated)
     return updated, reset_approval_count

@@ -7,6 +7,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Never, Self, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
     AliasChoices,
@@ -83,6 +84,16 @@ def dumps_decimal_json(obj: Any) -> str:
     if isinstance(obj, (list, tuple)):
         return "[" + ",".join(dumps_decimal_json(value) for value in obj) + "]"
     return json.dumps(obj, ensure_ascii=False, allow_nan=False)
+
+
+def sanitize_source_path(path: str | None) -> str | None:
+    if not path or not path.lstrip().lower().startswith(("http://", "https://")):
+        return path
+    try:
+        url = urlsplit(path)
+    except ValueError:
+        return path.partition("?")[0].partition("#")[0]
+    return urlunsplit((url.scheme, url.netloc, url.path, "", ""))
 
 
 DecimalValue = Annotated[Decimal, BeforeValidator(parse_decimal_strict)]
@@ -431,6 +442,16 @@ class SourceEvidence(BaseModel):
     extraction_channel: ExtractionChannel | None = None
     snippet: str | None = None
 
+    def with_sanitized_paths(self) -> SourceEvidence:
+        return self.model_copy(
+            update={
+                "source_file": sanitize_source_path(self.source_file),
+                "source_paths": list(
+                    dict.fromkeys(sanitize_source_path(path) for path in self.source_paths)
+                ),
+            }
+        )
+
 
 class HumanReviewAction(BaseModel):
     action: str
@@ -496,6 +517,34 @@ class RawExtractionEnvelope(_RawFieldAudit):
         return self.extraction.total_currency
 
 
+class SourceDocTotalsSnapshot(BaseModel):
+    source_doc_id: str
+    subtotal_amount: DecimalValue | None = None
+    tax_amount: DecimalValue | None = None
+    total_amount: DecimalValue | None = None
+    total_currency: str | None = None
+    totals_by_currency: dict[str, DecimalValue] = Field(default_factory=dict)
+    has_explicit_total: bool = False
+
+    @classmethod
+    def from_extraction(
+        cls, source_doc_id: str, extraction: RawExtractionEnvelope
+    ) -> SourceDocTotalsSnapshot:
+        return cls(
+            source_doc_id=source_doc_id,
+            subtotal_amount=extraction.subtotal_amount,
+            tax_amount=extraction.tax_amount,
+            total_amount=extraction.total_amount,
+            total_currency=extraction.total_currency,
+            totals_by_currency=extraction.totals_by_currency,
+            has_explicit_total=(
+                extraction.has_explicit_total
+                or extraction.total_amount is not None
+                or bool(extraction.totals_by_currency)
+            ),
+        )
+
+
 class ProcessedBillingRecord(_RawFieldAudit):
     id: str
     batch_id: str | None = None
@@ -533,12 +582,14 @@ class ProcessedBillingRecord(_RawFieldAudit):
     raw_quantity_text: str | None = None
     shipment_refs: ShipmentRefs = Field(default_factory=ShipmentRefs)
     source_evidence: SourceEvidence = Field(default_factory=SourceEvidence)
+    source_doc_totals: SourceDocTotalsSnapshot | None = None
     field_diffs: list[FieldDiff] = Field(default_factory=list)
     validation_alerts: list[ValidationAlert] = Field(default_factory=list)
     ai_reasoning: list[str] = Field(default_factory=list)
     excluded_clauses: list[ExcludedClause] = Field(default_factory=list)
     # Values before matching, keyed by the billing fields that inheritance changed.
     inherited_fields: dict[str, Any] = Field(default_factory=dict)
+    source_values_before_overrides: dict[str, Any] = Field(default_factory=dict)
     human_overrides: dict[str, Any] = Field(default_factory=dict)
     human_review_history: list[HumanReviewAction] = Field(default_factory=list)
     reject_reason: str | None = None

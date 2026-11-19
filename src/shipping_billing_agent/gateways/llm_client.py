@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from threading import Lock
 from traceback import format_exception
 from typing import Any, Generic, Protocol, TypeVar
 
@@ -31,6 +34,57 @@ class LlmNotConfiguredError(RuntimeError):
 
 class LlmGatewayError(RuntimeError):
     pass
+
+
+class LlmBudgetExhaustedError(LlmGatewayError):
+    pass
+
+
+@dataclass(slots=True)
+class _RequestBudget:
+    acquire_sync: Callable[[], bool]
+    acquire_async: Callable[[], Awaitable[bool]]
+    initial_slots: int
+    lock: Lock = field(default_factory=Lock)
+
+    def consume_initial_slot(self) -> bool:
+        with self.lock:
+            if self.initial_slots == 0:
+                return False
+            self.initial_slots -= 1
+            return True
+
+
+_REQUEST_BUDGET: ContextVar[_RequestBudget | None] = ContextVar("llm_request_budget", default=None)
+
+
+@contextmanager
+def llm_request_budget(
+    acquire_sync: Callable[[], bool],
+    acquire_async: Callable[[], Awaitable[bool]],
+    *,
+    initial_slots: int = 0,
+) -> Iterator[None]:
+    """Charge each HTTP attempt against a caller's budget, including SDK retries."""
+    if initial_slots < 0:
+        raise ValueError("initial_slots must be non-negative")
+    token = _REQUEST_BUDGET.set(_RequestBudget(acquire_sync, acquire_async, initial_slots))
+    try:
+        yield
+    finally:
+        _REQUEST_BUDGET.reset(token)
+
+
+def _charge_request(_request: httpx.Request) -> None:
+    budget = _REQUEST_BUDGET.get()
+    if budget and not budget.consume_initial_slot() and not budget.acquire_sync():
+        raise LlmBudgetExhaustedError("已用完 LLM HTTP 请求额度")
+
+
+async def _charge_async_request(_request: httpx.Request) -> None:
+    budget = _REQUEST_BUDGET.get()
+    if budget and not budget.consume_initial_slot() and not await budget.acquire_async():
+        raise LlmBudgetExhaustedError("已用完 LLM HTTP 请求额度")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +129,13 @@ def _sanitize_messages(messages: LlmMessages) -> list[BaseMessage]:
 
 
 class OpenAICompatibleLlmClient:
-    def __init__(self, settings: AppSettings) -> None:
+    def __init__(
+        self,
+        settings: AppSettings,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        async_transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         credentials = settings.resolve_validated_llm_credentials()
         if credentials is None:
             raise LlmNotConfiguredError("当前 LLM 端点未配置有效地址或可用密钥")
@@ -92,18 +152,29 @@ class OpenAICompatibleLlmClient:
         }
         http_client = None
         try:
-            http_client = httpx.Client(**http_options)
-            async_client = httpx.AsyncClient(**http_options)
-            chat = ChatOpenAI(
+            http_client = httpx.Client(
+                **http_options, transport=transport, event_hooks={"request": [_charge_request]}
+            )
+            async_client = httpx.AsyncClient(
+                **http_options,
+                transport=async_transport,
+                event_hooks={"request": [_charge_async_request]},
+            )
+            chat_options = dict(
                 model=settings.llm_model,
                 base_url=endpoint,
                 api_key=api_key,
                 timeout=settings.llm_timeout_seconds,
-                max_retries=settings.llm_max_retries,
                 openai_proxy=None,
                 http_socket_options=(),
                 http_client=http_client,
                 http_async_client=async_client,
+            )
+            chat = ChatOpenAI(**chat_options, max_retries=0)
+            budgeted_chat = (
+                ChatOpenAI(**chat_options, max_retries=settings.llm_max_retries)
+                if settings.llm_max_retries
+                else chat
             )
         except Exception as exc:
             if http_client is not None:
@@ -113,6 +184,7 @@ class OpenAICompatibleLlmClient:
             self._http_client = http_client
             self._http_async_client = async_client
             self._chat = chat
+            self._budgeted_chat = budgeted_chat
             return
         raise error from None
 
@@ -125,6 +197,13 @@ class OpenAICompatibleLlmClient:
         return redact_url_queries_in_text(self._redact_keys(text))
 
     def _gateway_error(self, context: str, cause: Exception) -> LlmGatewayError:
+        current: BaseException | None = cause
+        seen = set()
+        while current is not None and id(current) not in seen:
+            if isinstance(current, LlmBudgetExhaustedError):
+                return current
+            seen.add(id(current))
+            current = current.__cause__ or current.__context__
         details = self._redact_response_text(str(cause))
         error = LlmGatewayError(f"{context}（{type(cause).__name__}）：{details}")
         # Retain diagnostics without exposing SDK exceptions that hold request credentials.
@@ -154,9 +233,9 @@ class OpenAICompatibleLlmClient:
     ) -> StructuredLlmResponse[_SchemaT]:
         try:
             with tracing_context(enabled=False):
-                model = self._chat.with_structured_output(
-                    schema, method="json_mode", include_raw=True
-                )
+                # A caller with its own reservation but no HTTP budget gets one attempt.
+                chat = self._budgeted_chat if _REQUEST_BUDGET.get() is not None else self._chat
+                model = chat.with_structured_output(schema, method="json_mode", include_raw=True)
                 result = model.invoke(_sanitize_messages(messages))
             return self._structured_response(result)
         except Exception as exc:
@@ -168,9 +247,8 @@ class OpenAICompatibleLlmClient:
     ) -> StructuredLlmResponse[_SchemaT]:
         try:
             with tracing_context(enabled=False):
-                model = self._chat.with_structured_output(
-                    schema, method="json_mode", include_raw=True
-                )
+                chat = self._budgeted_chat if _REQUEST_BUDGET.get() is not None else self._chat
+                model = chat.with_structured_output(schema, method="json_mode", include_raw=True)
                 result = await model.ainvoke(_sanitize_messages(messages))
             return self._structured_response(result)
         except Exception as exc:

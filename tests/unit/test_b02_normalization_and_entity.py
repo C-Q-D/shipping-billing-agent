@@ -377,7 +377,9 @@ def test_zim_sample_resolves_both_accounting_perspectives(
 
 def test_party_matching_does_not_use_unconfigured_short_names_or_ambiguous_aliases() -> None:
     neptune = "NEPTUNE SHIPPING LIMITED"
-    assert normalize_party_name("NEPTUNE Shipping Limited, (LAX).") == "neptune shipping limited"
+    assert normalize_party_name("NEPTUNE Shipping Limited, (LAX).") == (
+        "neptune shipping limited (lax)"
+    )
     assert entity_matches("Neptune Shipping Limited (LAX)", neptune)
     assert not entity_matches("NEPTUNE", neptune)
     assert not entity_matches("NEPTUNE SHIPPING HOLDINGS LIMITED", neptune)
@@ -388,6 +390,26 @@ def test_party_matching_does_not_use_unconfigured_short_names_or_ambiguous_alias
     assert entity_matches("Neptune", neptune, [profile])
     assert entity_matches(neptune, "Neptune", [profile])
     assert not entity_matches("NEPTUNE", neptune, [profile, other])
+
+
+def test_branch_fallback_requires_a_unique_compatible_configured_profile() -> None:
+    uk = AccountingEntityProfile(canonical_name="Atlas Shipping (UK)", aliases=["Atlas London"])
+    hk = AccountingEntityProfile(canonical_name="Atlas Shipping (HK)", aliases=["Atlas Hong Kong"])
+    for profile in (uk, hk):
+        assert entity_matches(profile.aliases[0], profile.canonical_name, [uk, hk])
+        assert entity_matches("Atlas Shipping", profile.canonical_name, [profile])
+        assert not entity_matches("Atlas Shipping", profile.canonical_name, [uk, hk])
+    assert not entity_matches(uk.canonical_name, hk.canonical_name, [uk, hk])
+    assert entity_matches("ATLAS Shipping (EU)", "Atlas Shipping (EU)", [uk, hk])
+    assert not entity_matches("Atlas Shipping (EU)", uk.canonical_name, [uk, hk])
+    assert not entity_matches(uk.canonical_name, hk.canonical_name, [uk])
+    assert not entity_matches(uk.canonical_name, hk.canonical_name)
+    single = AccountingEntityProfile(canonical_name="Atlas Shipping")
+    assert entity_matches(hk.canonical_name, single.canonical_name, [single])
+    assert not entity_matches(uk.canonical_name, hk.canonical_name, [single])
+    registered_alias = uk.model_copy(update={"aliases": [hk.canonical_name]})
+    assert entity_matches(hk.canonical_name, uk.canonical_name, [registered_alias])
+    assert not entity_matches(hk.canonical_name, uk.canonical_name, [registered_alias, hk])
 
 
 def test_explicit_payer_and_payee_take_precedence_over_issuer_and_recipient() -> None:
@@ -485,6 +507,17 @@ def test_negative_non_credit_amount_keeps_its_sign_and_blocks_the_record() -> No
     assert [(alert.code, alert.severity) for alert in result.validation_alerts] == [
         (AlertCode.NEGATIVE_NON_CREDIT_AMOUNT, AlertSeverity.BLOCKER)
     ]
+
+
+@pytest.mark.parametrize("document_type", ["Credit Card Invoice", "Letter of Credit"])
+def test_credit_in_non_credit_titles_never_negates_a_charge(document_type: str) -> None:
+    result = resolve_entity_perspective(
+        ZIM, issuer=ZIM, document_type=document_type, raw_amount=Decimal("30")
+    )
+    assert result.posting_type is PostingType.AR
+    assert not result.is_credit
+    assert result.amount == Decimal("30")
+    assert result.validation_alerts == []
 
 
 def test_switching_entity_resets_approvals_links_and_inherited_values_before_rematching() -> None:
@@ -608,7 +641,7 @@ def test_switching_entity_resets_approvals_links_and_inherited_values_before_rem
     assert rejected.reject_reason == "旧主体驳回"
 
 
-def test_switching_without_callbacks_keeps_a_credit_pending_validation() -> None:
+def test_recalculation_without_callbacks_validates_credit_under_both_entities() -> None:
     previous = ProcessedBillingRecord(
         id="cn-1",
         source_doc_id="credit-note",
@@ -616,22 +649,50 @@ def test_switching_without_callbacks_keeps_a_credit_pending_validation() -> None
         issuer=ZIM,
         recipient=ALL_AMERICA,
         document_type="Credit Note",
+        charge_item="Handling Charge",
         amount="-40.00",
+        currency="USD",
         raw_explicit_amount="40.00",
         review_status=ReviewStatus.APPROVED,
         posting_type=PostingType.AR,
         matched_existing_bill_id="old-1",
     )
-    assert recalculate_for_entity([previous], ZIM) == ([previous], 0)
-    (current,), reset_count = recalculate_for_entity([previous], ALL_AMERICA)
-    assert reset_count == 1
-    assert current.operation is OperationType.PENDING_REVIEW
-    assert current.review_status is ReviewStatus.NEEDS_REVIEW
-    assert current.posting_type is PostingType.AP
-    assert current.is_credit
-    assert current.amount == Decimal("-40.00")
-    assert current.raw_explicit_amount == current.raw_amount_abs == Decimal("40.00")
-    assert current.matched_existing_bill_id is None
+    for entity, direction in [(ZIM, PostingType.AR), (ALL_AMERICA, PostingType.AP)]:
+        (current,), reset_count = recalculate_for_entity([previous], entity)
+        assert reset_count == 1
+        assert current.operation is OperationType.CREATE
+        assert current.review_status is ReviewStatus.AUTO_READY
+        assert current.posting_type is direction
+        assert current.is_credit
+        assert current.amount == Decimal("-40.00")
+        assert current.raw_explicit_amount == current.raw_amount_abs == Decimal("40.00")
+        assert current.matched_existing_bill_id is None
+
+
+def test_recalculating_same_entity_after_alias_removal_drops_old_posting_and_approval() -> None:
+    profile = AccountingEntityProfile(canonical_name=ZIM, aliases=["ZIM US"])
+    source = ProcessedBillingRecord(
+        id="invoice",
+        source_doc_id="invoice",
+        accounting_entity=ZIM,
+        issuer="ZIM US",
+        recipient=ALL_AMERICA,
+        charge_item="Handling Charge",
+        amount="30",
+        currency="USD",
+    )
+    (ready,), _ = recalculate_for_entity([source], ZIM, [profile])
+    assert (ready.posting_type, ready.review_status) == (PostingType.AR, ReviewStatus.AUTO_READY)
+    approved = ready.model_copy(update={"review_status": ReviewStatus.APPROVED})
+
+    (blocked,), reset = recalculate_for_entity(
+        [approved], ZIM, [profile.model_copy(update={"aliases": []})]
+    )
+
+    assert reset == 1
+    assert blocked.posting_type is None
+    assert blocked.operation is OperationType.PENDING_REVIEW
+    assert [alert.code for alert in blocked.validation_alerts] == [AlertCode.ENTITY_NOT_MATCHED]
 
 
 def test_document_bundle_and_failure_summary_keep_contract_fields() -> None:
@@ -689,6 +750,11 @@ def test_domain_does_not_import_io_or_use_file_primitives() -> None:
             if isinstance(node, ast.Import):
                 imports = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                if node.module == "urllib.parse" and {alias.name for alias in node.names} <= {
+                    "urlsplit",
+                    "urlunsplit",
+                }:
+                    continue
                 imports = [node.module]
             for imported in imports:
                 root = imported.partition(".")[0]

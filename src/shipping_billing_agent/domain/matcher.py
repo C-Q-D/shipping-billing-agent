@@ -11,13 +11,24 @@ from unicodedata import normalize
 
 from .charge_normalizer import normalize_charge_item, normalize_document_date
 from .currency import is_valid_iso4217
-from .entity_resolver import entity_matches, normalize_party_name
+from .entity_resolver import (
+    FIELD_FORMAT_ALERT_CODES,
+    PARTY_FIELDS,
+    TRANSPORT_FIELDS,
+    apply_human_overrides,
+    entity_matches,
+    has_explicit_parties,
+    is_credit_document,
+    resolve_entity_perspective,
+    source_format_alerts,
+)
 from .models import (
     DECIMAL_TOLERANCE,
     AccountingEntityProfile,
     AlertCode,
     AlertSeverity,
     CandidateBillSummary,
+    ChargeDictionaryItem,
     ExistingBillRecord,
     FieldDiff,
     MatchLevel,
@@ -54,19 +65,12 @@ _DIFF_FIELDS = (
     "recipient",
     "posting_type",
 )
-_TRANSPORT_FIELDS = {
-    "mbl_no": "mbl_nos",
-    "hbl_no": "hbl_no",
-    "booking_no": "booking_no",
-    "container_nos": "container_nos",
-}
-_INVALID_FIELD_CODES = {
-    "currency": AlertCode.INVALID_OR_MISSING_CURRENCY,
-    "document_date": AlertCode.INVALID_DOCUMENT_DATE,
-    "amount": AlertCode.OCR_NUMERIC_CONFUSION,
-    "quantity": AlertCode.OCR_NUMERIC_CONFUSION,
-    "unit_price": AlertCode.OCR_NUMERIC_CONFUSION,
-}
+_AUTOMATIC_LEVELS = (
+    MatchLevel.L1_DOC_CHARGE,
+    MatchLevel.L2_BL_CHARGE_CURR,
+    MatchLevel.L3_BOOKING_CHARGE_CURR,
+    MatchLevel.L4_CNTR_PARTY_DATE_AMT,
+)
 _AMOUNT_TOLERANCE = Fraction(DECIMAL_TOLERANCE)
 _BillPool = tuple[ExistingBillRecord, ...]
 
@@ -80,70 +84,67 @@ def _container_keys(values: Sequence[str]) -> set[str]:
     return {key for value in values if (key := _reference_key(value))}
 
 
-def _source_alerts(record: ProcessedBillingRecord) -> list[ValidationAlert]:
-    # An earlier ambiguous match is recomputed against the current baseline and overrides.
+def _source_alerts(
+    record: ProcessedBillingRecord, corrected: set[str], override_issues: list[ValidationAlert]
+) -> list[ValidationAlert]:
+    raw_issues = source_format_alerts(record, corrected)
+    rebuilt_fields = record.raw_invalid_fields.keys() | record.human_overrides.keys()
     alerts = [
         alert
         for alert in record.validation_alerts
-        if not (
-            record.match_level is MatchLevel.AMBIGUOUS_MULTI
-            and alert.code is AlertCode.AMBIGUOUS_EXISTING_BILL
-            and alert.severity is not AlertSeverity.RESOLVED
+        if alert.severity is AlertSeverity.RESOLVED
+        or (
+            alert.code
+            not in (AlertCode.AMBIGUOUS_EXISTING_BILL, AlertCode.NEGATIVE_NON_CREDIT_AMOUNT)
+            and not (alert.field in rebuilt_fields and alert.code in FIELD_FORMAT_ALERT_CODES)
+            and alert not in record.raw_parse_issues
         )
     ]
-    for issue in record.raw_parse_issues:
-        if not any(
-            (alert.code, alert.field, alert.actual) == (issue.code, issue.field, issue.actual)
-            for alert in alerts
-        ):
-            alerts.append(issue)
-    blocked_fields = {alert.field for alert in alerts if alert.severity is AlertSeverity.BLOCKER}
-    for field, original in record.raw_invalid_fields.items():
-        if field not in blocked_fields:
-            alerts.append(
-                ValidationAlert.from_code(
-                    _INVALID_FIELD_CODES.get(field, AlertCode.LLM_EXTRACTION_FAILED),
-                    "源单字段值无效，待复核",
-                    field=field,
-                    actual=original,
-                )
-            )
-    return alerts
+    return [*alerts, *raw_issues, *override_issues]
 
 
-def _prepare_record(record: ProcessedBillingRecord) -> ProcessedBillingRecord:
-    values = record.model_dump()
-    inherited = values["inherited_fields"]
-    for field in (*_BILL_FIELDS, "shipment_refs"):
-        if field in inherited:
-            values[field] = inherited[field]
+def _prepare_record(
+    record: ProcessedBillingRecord,
+    profiles: Sequence[AccountingEntityProfile],
+    charge_dictionary: Sequence[ChargeDictionaryItem] | None,
+    *,
+    recompute_entity: bool = False,
+) -> ProcessedBillingRecord:
+    values = record.model_dump(warnings=False)
+    values.update(values["inherited_fields"])
+    values.update(values["source_values_before_overrides"])
     invalid = record.raw_invalid_fields
-    overrides = record.human_overrides
-    amount_before_overrides = values["amount"]
-
-    for field in (*_BILL_FIELDS, "payer_hint", "payee_hint"):
-        if field in invalid:
-            values[field] = None
-        elif field in overrides:
-            values[field] = overrides[field]
-
+    for field in invalid.keys() & {*_BILL_FIELDS, *PARTY_FIELDS}:
+        values[field] = None
+    if "debit_credit" in invalid:
+        values["debit_credit"] = "UNKNOWN"
+    if recompute_entity:
+        values["posting_type"] = None
+    if (
+        (recompute_entity or record.is_credit)
+        and record.raw_explicit_amount is not None
+        and "amount" not in invalid
+    ):
+        values["amount"] = record.raw_explicit_amount
+    if (
+        record.raw_explicit_amount is None
+        and values["amount"] is not None
+        and ("amount" in record.explicit_fields or not record.explicit_fields)
+    ):
+        try:
+            values["raw_explicit_amount"] = parse_decimal_strict(
+                record.raw_amount_text or values["amount"]
+            )
+        except ValueError:
+            # Malformed raw text remains available to the OCR validator.
+            values["raw_explicit_amount"] = None
     refs = dict(values["shipment_refs"] or {})
     if "shipment_refs" in invalid:
         refs = {}
     else:
-        if "shipment_refs" in overrides:
-            refs = ShipmentRefs.model_validate(overrides["shipment_refs"] or {}).model_dump()
-        for field, attribute in _TRANSPORT_FIELDS.items():
+        for field, attribute in TRANSPORT_FIELDS.items():
             if field in invalid:
                 refs.pop(attribute, None)
-            elif field in overrides:
-                value = overrides[field]
-                if field == "mbl_no":
-                    refs[attribute] = [{"value": value, "source": "人工修订"}] if value else []
-                elif field == "container_nos":
-                    refs[attribute] = [] if value is None else value
-                else:
-                    refs[attribute] = value
 
     values.update(
         shipment_refs=refs,
@@ -153,33 +154,81 @@ def _prepare_record(record: ProcessedBillingRecord) -> ProcessedBillingRecord:
         candidate_bills=[],
         field_diffs=[],
         inherited_fields={},
-        validation_alerts=_source_alerts(record),
+        source_values_before_overrides={},
     )
     prepared = ProcessedBillingRecord.model_validate(values)
-    if (
-        prepared.raw_explicit_amount is not None
-        or amount_before_overrides is None
-        or "amount" in invalid
-    ):
-        return prepared
-
-    # Older callers may supply a typed source amount without explicit field metadata.
-    has_source_amount = "amount" in record.explicit_fields or (
-        not record.explicit_fields
-        and (
-            record.raw_amount_text
-            or "amount" not in overrides
-            or parse_decimal_strict(amount_before_overrides) != prepared.amount
-        )
+    prepared, corrected, override_issues = apply_human_overrides(prepared, charge_dictionary)
+    alerts = _source_alerts(prepared, corrected, override_issues)
+    party_edits = PARTY_FIELDS & (prepared.human_overrides.keys() | invalid.keys())
+    unresolved_entity = any(alert.code is AlertCode.ENTITY_NOT_MATCHED for alert in alerts)
+    needs_initial_resolution = (
+        values["posting_type"] is None and not unresolved_entity and has_explicit_parties(prepared)
     )
-    if has_source_amount:
-        raw_amount = parse_decimal_strict(record.raw_amount_text or amount_before_overrides)
-        prepared = prepared.model_copy(update={"raw_explicit_amount": raw_amount})
-    return prepared
+    if recompute_entity or party_edits or needs_initial_resolution:
+        perspective = resolve_entity_perspective(
+            prepared.accounting_entity,
+            issuer=prepared.issuer,
+            recipient=prepared.recipient,
+            payer_hint=prepared.payer_hint,
+            payee_hint=prepared.payee_hint,
+            profiles=profiles,
+        )
+        manual_posting = "posting_type" in prepared.human_overrides
+        if not manual_posting:
+            prepared = prepared.model_copy(update={"posting_type": perspective.posting_type})
+        alerts = [alert for alert in alerts if alert.code is not AlertCode.ENTITY_NOT_MATCHED]
+        if perspective.posting_type is None and (
+            has_explicit_parties(prepared) or prepared.posting_type is None
+        ):
+            alerts.extend(perspective.validation_alerts)
+        if recompute_entity:
+            prepared = prepared.model_copy(update={"ai_reasoning": perspective.ai_reasoning})
+    return _with_credit(prepared.model_copy(update={"validation_alerts": alerts}))
+
+
+def _with_credit(record: ProcessedBillingRecord) -> ProcessedBillingRecord:
+    is_credit = is_credit_document(record.document_type, record.debit_credit)
+    amount = record.amount
+    reasoning = [
+        reason
+        for reason in record.ai_reasoning
+        if not reason.startswith("贷项冲减：对应台账余额减少 ")
+    ]
+    if is_credit and amount is not None and record.posting_type is not None:
+        amount = amount.copy_abs().copy_negate()
+        reasoning.append(f"贷项冲减：对应台账余额减少 {amount.copy_abs():f}")
+    raw = record.raw_explicit_amount
+    alerts = [
+        alert
+        for alert in record.validation_alerts
+        if alert.code is not AlertCode.NEGATIVE_NON_CREDIT_AMOUNT
+        or alert.severity is AlertSeverity.RESOLVED
+    ]
+    if not is_credit and amount is not None and amount < 0:
+        alerts.append(
+            ValidationAlert.from_code(
+                AlertCode.NEGATIVE_NON_CREDIT_AMOUNT,
+                "非贷项单据含负数金额，待复核",
+                field="amount",
+                actual=str(amount),
+            )
+        )
+    return record.model_copy(
+        update={
+            "amount": amount,
+            "is_credit": is_credit,
+            "raw_amount_abs": raw.copy_abs() if raw is not None else record.raw_amount_abs,
+            "ai_reasoning": reasoning,
+            "validation_alerts": alerts,
+        }
+    )
 
 
 def _find_bill_pool(
-    record: ProcessedBillingRecord, bills: Sequence[ExistingBillRecord], charge_item: str | None
+    record: ProcessedBillingRecord,
+    bills: Sequence[ExistingBillRecord],
+    charge_item: str | None,
+    profiles: Sequence[AccountingEntityProfile],
 ) -> tuple[MatchLevel, _BillPool]:
     refs = record.shipment_refs
     if charge_item:
@@ -194,8 +243,9 @@ def _find_bill_pool(
                 return MatchLevel.L1_DOC_CHARGE, pool
 
         currency = record.currency
-        if "currency" not in record.raw_invalid_fields and (
-            currency is None or is_valid_iso4217(currency)
+        if is_valid_iso4217(currency) or (
+            currency is None
+            and "currency" not in (record.raw_invalid_fields.keys() | record.human_overrides.keys())
         ):
             # With omitted currency, retain every BL/booking candidate for the ambiguity check.
             eligible = [
@@ -220,8 +270,7 @@ def _find_bill_pool(
                     return MatchLevel.L3_BOOKING_CHARGE_CURR, pool
 
     containers = _container_keys(refs.container_nos)
-    issuer = normalize_party_name(record.issuer)
-    recipient = normalize_party_name(record.recipient)
+    issuer, recipient = record.issuer, record.recipient
     date, _ = normalize_document_date(record.document_date)
     if containers and issuer and recipient and date and record.amount is not None:
         amount = Fraction(record.amount)
@@ -229,8 +278,8 @@ def _find_bill_pool(
             bill
             for bill in bills
             if containers.intersection(_container_keys(bill.container_nos))
-            and normalize_party_name(bill.issuer) == issuer
-            and normalize_party_name(bill.recipient) == recipient
+            and entity_matches(bill.issuer, issuer, profiles)
+            and entity_matches(bill.recipient, recipient, profiles)
             and normalize_document_date(bill.document_date)[0] == date
             and abs(amount - Fraction(bill.amount)) <= _AMOUNT_TOLERANCE
         )
@@ -240,10 +289,10 @@ def _find_bill_pool(
 
 
 def _pairing_currency(record: ProcessedBillingRecord, currencies: set[str]) -> str | None:
-    if "currency" in record.raw_invalid_fields:
-        return None
     if record.currency is not None:
         return record.currency if is_valid_iso4217(record.currency) else None
+    if "currency" in record.raw_invalid_fields or "currency" in record.human_overrides:
+        return None
     if len(currencies) == 1:
         return next(iter(currencies))
     return None
@@ -316,7 +365,8 @@ def _ambiguous(
             CandidateBillSummary(
                 id=bill.id,
                 label=(
-                    f"{bill.external_bill_key or bill.id} | {shipment_ref} | {bill.charge_item} | "
+                    f"{bill.reference_no or bill.external_bill_key or bill.id} | "
+                    f"{shipment_ref} | {bill.charge_item} | "
                     f"{bill.amount:f} {bill.currency} | {bill.document_date or '-'}"
                 ),
                 reference_no=bill.reference_no,
@@ -382,28 +432,39 @@ def _inherit_shipment_refs(
     return refs.model_copy(update=updates) if updates else refs
 
 
-def _comparison_value(field: str, value: Any) -> Any:
+def _same_bill_value(
+    field: str, old: Any, new: Any, profiles: Sequence[AccountingEntityProfile]
+) -> bool:
     if field in ("issuer", "recipient"):
-        return normalize_party_name(value)
+        return (
+            old == new or (not old and not new) or bool(new and entity_matches(old, new, profiles))
+        )
     if field == "document_date":
-        return normalize_document_date(value)[0]
-    return value
+        return normalize_document_date(old)[0] == normalize_document_date(new)[0]
+    return old == new
 
 
 def _inherit_and_compare(
-    record: ProcessedBillingRecord, bill: ExistingBillRecord, level: MatchLevel
+    record: ProcessedBillingRecord,
+    bill: ExistingBillRecord,
+    level: MatchLevel,
+    profiles: Sequence[AccountingEntityProfile],
 ) -> ProcessedBillingRecord:
     locked = record.human_overrides.keys() | record.raw_invalid_fields.keys()
+    missing_parties = not has_explicit_parties(record) and not (locked & PARTY_FIELDS)
+    entity_alert = any(
+        alert.code is AlertCode.ENTITY_NOT_MATCHED for alert in record.validation_alerts
+    )
     updates: dict[str, Any] = {}
     originals: dict[str, Any] = {}
     for field in _BILL_FIELDS:
-        if field in locked:
+        if field in locked or field == "posting_type" and entity_alert and not missing_parties:
             continue
         current, historical = getattr(record, field), getattr(bill, field)
         if (
             historical is not None
-            and historical != current
             and not _source_supplied(record, field, current)
+            and (historical != current or field in ("amount", "quantity", "unit_price"))
         ):
             updates[field] = historical
             originals[field] = current
@@ -412,16 +473,33 @@ def _inherit_and_compare(
         updates["shipment_refs"] = refs
         originals["shipment_refs"] = record.shipment_refs.model_dump()
 
+    merged = _with_credit(record.model_copy(update=updates))
+    if entity_alert and missing_parties and merged.posting_type is not None:
+        merged = merged.model_copy(
+            update={
+                "validation_alerts": [
+                    alert
+                    for alert in merged.validation_alerts
+                    if alert.code is not AlertCode.ENTITY_NOT_MATCHED
+                ],
+                "ai_reasoning": [
+                    reason
+                    for reason in merged.ai_reasoning
+                    if reason != "当前记账主体无法唯一匹配单据的收款方或付款方"
+                ]
+                + ["沿用当前记账主体历史账单的交易双方和应收或应付台账"],
+            }
+        )
+
     diffs = []
     for field in _DIFF_FIELDS:
         old = getattr(bill, field)
-        new = updates.get(field, getattr(record, field))
-        if _comparison_value(field, old) != _comparison_value(field, new):
+        new = getattr(merged, field)
+        if not _same_bill_value(field, old, new, profiles):
             diffs.append(FieldDiff(field=field, old_value=old, new_value=new, changed=True))
     return _with_decision(
-        record,
+        merged,
         OperationType.UPDATE if diffs else OperationType.NO_CHANGE,
-        **updates,
         inherited_fields=originals,
         field_diffs=diffs,
         match_level=level,
@@ -436,17 +514,21 @@ def inherit_existing_bill(
     *,
     match_level: MatchLevel = MatchLevel.NONE,
     profiles: Sequence[AccountingEntityProfile] = (),
+    charge_dictionary: Sequence[ChargeDictionaryItem] | None = None,
 ) -> ProcessedBillingRecord:
     """Merge a selected historical bill and compute its business-field changes."""
     if not entity_matches(bill.accounting_entity, record.accounting_entity, profiles):
         raise ValueError("历史账单不属于当前记账主体")
-    return _inherit_and_compare(_prepare_record(record), bill, match_level)
+    return _inherit_and_compare(
+        _prepare_record(record, profiles, charge_dictionary), bill, match_level, profiles
+    )
 
 
 def match_and_inherit_batch(
     records: Sequence[ProcessedBillingRecord],
     existing_bills: Sequence[ExistingBillRecord],
     profiles: Sequence[AccountingEntityProfile] = (),
+    charge_dictionary: Sequence[ChargeDictionaryItem] | None = None,
 ) -> list[ProcessedBillingRecord]:
     """Match within each source document while preserving the input line order.
 
@@ -461,7 +543,7 @@ def match_and_inherit_batch(
         ]
         for entity in dict.fromkeys(record.accounting_entity for record in records)
     }
-    prepared = [_prepare_record(record) for record in records]
+    prepared = [_prepare_record(record, profiles, charge_dictionary) for record in records]
     results = prepared.copy()
     groups: dict[
         tuple[str, str | None, MatchLevel, tuple[str, ...]], tuple[_BillPool, list[int]]
@@ -483,15 +565,9 @@ def match_and_inherit_batch(
                 continue
 
         charge_item, _ = normalize_charge_item(record.charge_item)
-        level, pool = _find_bill_pool(record, bills, charge_item)
+        level, pool = _find_bill_pool(record, bills, charge_item, profiles)
         if not pool:
             results[index] = _with_decision(record, OperationType.CREATE)
-        elif (
-            level in (MatchLevel.L2_BL_CHARGE_CURR, MatchLevel.L3_BOOKING_CHARGE_CURR)
-            and record.currency is None
-            and len({bill.currency for bill in pool}) > 1
-        ):
-            results[index] = _ambiguous(record, level, pool, "源单省略币种，历史候选含多种币种")
         else:
             group = (record.source_doc_id, charge_item, level, tuple(bill.id for bill in pool))
             groups.setdefault(group, (pool, []))[1].append(index)
@@ -499,18 +575,47 @@ def match_and_inherit_batch(
     for claimed in manual_claims.values():
         for index, bill in claimed:
             if len(claimed) == 1:
-                results[index] = _inherit_and_compare(prepared[index], bill, MatchLevel.NONE)
+                results[index] = _inherit_and_compare(
+                    prepared[index], bill, MatchLevel.NONE, profiles
+                )
             else:
                 results[index] = _ambiguous(prepared[index], MatchLevel.NONE, (bill,), ambiguity)
 
-    for (doc_id, _, level, _), (pool, indexes) in groups.items():
-        available = tuple(bill for bill in pool if (doc_id, bill.id) not in manual_claims)
-        pairs = _pair_group(prepared, indexes, available)
-        for index in indexes:
-            if bill := pairs.get(index):
-                results[index] = _inherit_and_compare(prepared[index], bill, level)
-            else:
-                results[index] = _ambiguous(prepared[index], level, pool, ambiguity)
+    occupied = set(manual_claims)
+    for level in _AUTOMATIC_LEVELS:
+        proposals: dict[tuple[str, str], list[int]] = defaultdict(list)
+        pending = {}
+        for (doc_id, _, group_level, _), (pool, indexes) in groups.items():
+            if group_level is not level:
+                continue
+            available = tuple(bill for bill in pool if (doc_id, bill.id) not in occupied)
+            forbidden_by_currency = (
+                level in (MatchLevel.L2_BL_CHARGE_CURR, MatchLevel.L3_BOOKING_CHARGE_CURR)
+                and len({bill.currency for bill in available}) > 1
+            )
+            eligible = [
+                index
+                for index in indexes
+                if not (forbidden_by_currency and prepared[index].currency is None)
+            ]
+            pairs = _pair_group(prepared, eligible, available)
+            for index in indexes:
+                bill = pairs.get(index)
+                if bill is not None:
+                    proposals[doc_id, bill.id].append(index)
+                pending[index] = (doc_id, available, bill, index not in eligible)
+
+        for index, (doc_id, available, bill, missing_currency) in pending.items():
+            if bill is not None and len(proposals[doc_id, bill.id]) == 1:
+                results[index] = _inherit_and_compare(prepared[index], bill, level, profiles)
+                occupied.add((doc_id, bill.id))
+                continue
+            message = ambiguity
+            if missing_currency:
+                message = "源单省略币种，历史候选含多种币种"
+            elif not available:
+                message = "符合条件的历史账单已由同一源单的其他费用行占用"
+            results[index] = _ambiguous(prepared[index], level, available, message)
     return results
 
 
@@ -518,6 +623,7 @@ def match_record(
     record: ProcessedBillingRecord,
     existing_bills: Sequence[ExistingBillRecord],
     profiles: Sequence[AccountingEntityProfile] = (),
+    charge_dictionary: Sequence[ChargeDictionaryItem] | None = None,
 ) -> ProcessedBillingRecord:
     """Match a single line using the same rules as the batch matcher."""
-    return match_and_inherit_batch([record], existing_bills, profiles)[0]
+    return match_and_inherit_batch([record], existing_bills, profiles, charge_dictionary)[0]

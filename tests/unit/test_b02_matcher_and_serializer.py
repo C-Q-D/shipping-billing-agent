@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, date, datetime
 from decimal import Decimal, localcontext
 from functools import partial
 from itertools import permutations
@@ -7,6 +8,7 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
+from shipping_billing_agent.agent import run_billing_pipeline
 from shipping_billing_agent.domain import (
     AccountingEntityProfile,
     AlertCode,
@@ -18,6 +20,7 @@ from shipping_billing_agent.domain import (
     HumanReviewAction,
     MatchLevel,
     OperationType,
+    ParsedDocument,
     PaymentTerm,
     PostingType,
     ProcessedBillingRecord,
@@ -26,12 +29,14 @@ from shipping_billing_agent.domain import (
     SourceEvidence,
     SourceRefValue,
     ValidationAlert,
+    dumps_decimal_json,
     match_and_inherit_batch,
     match_record,
     recalculate_for_entity,
     serialize_export_bundle,
     serialize_records,
     serialize_records_json,
+    validate_record,
 )
 
 ENTITY = "NEPTUNE SHIPPING LIMITED"
@@ -89,9 +94,14 @@ def test_dn_202609_001_payment_only_update_vs_already_updated_baseline() -> None
         charge_item="H/C",
         explicit_fields={"reference_no", "raw_charge_name", "payment_term"},
         payment_term="CC",
+        validation_alerts=[ValidationAlert.from_code(AlertCode.ENTITY_NOT_MATCHED, "尚无交易双方")],
     )
     first_baseline = _bill(
-        reference_no="DN-202609-001", payment_term="PP", external_bill_key="DN-202609-001-HC"
+        reference_no="DN-202609-001",
+        payment_term="PP",
+        external_bill_key="DN-202609-001-HC",
+        issuer=ENTITY,
+        recipient=RECIPIENT,
     )
     second_baseline = first_baseline.model_copy(
         update={"payment_term": PaymentTerm.CC, "version": 2}
@@ -107,8 +117,12 @@ def test_dn_202609_001_payment_only_update_vs_already_updated_baseline() -> None
         assert result.amount == Decimal("30.00")
         assert result.currency == "USD"
         assert result.posting_type is PostingType.AR
+        assert (result.issuer, result.recipient) == (ENTITY, RECIPIENT)
+        assert result.validation_alerts == []
         assert result.raw_explicit_amount is None
-        assert result.inherited_fields == {"amount": None, "currency": None, "posting_type": None}
+        assert result.inherited_fields == dict.fromkeys(
+            ("amount", "currency", "posting_type", "issuer", "recipient")
+        )
     assert updated.operation is OperationType.UPDATE
     assert updated.field_diffs == [
         FieldDiff(
@@ -118,6 +132,114 @@ def test_dn_202609_001_payment_only_update_vs_already_updated_baseline() -> None
     assert repeated.operation is OperationType.NO_CHANGE
     assert repeated.field_diffs == []
     assert source.amount is source.currency is source.posting_type is None
+
+
+@pytest.mark.parametrize("term, operation", [("PP", "UPDATE"), ("CC", "NO_CHANGE")])
+def test_pipeline_inherits_omitted_parties_and_historical_amounts_without_blocking(
+    term: str, operation: str
+) -> None:
+    doc = ParsedDocument(
+        doc_id="notice",
+        original_filename="notice.eml",
+        sanitized_filename="notice.eml",
+        source_kind="EML_BODY",
+        extraction_channel="EML_TEXT_PARSER",
+        status="PARSED",
+        content_sha256="a" * 64,
+        raw_text="Debit Note DN-202609-001\nCharge: Handling Charge\nChange payment term to CC",
+    )
+    old = _bill(
+        reference_no="DN-202609-001",
+        issuer="Vendor",
+        recipient="Buyer",
+        accounting_entity="Vendor",
+        quantity="2",
+        unit_price="10",
+        payment_term=term,
+    )
+
+    (record,) = run_billing_pipeline([doc], "Vendor", existing_bills=[old]).records
+
+    assert record.explicit_fields.isdisjoint(
+        {"issuer", "recipient", "payer_hint", "payee_hint", "amount", "currency"}
+    )
+    assert (record.issuer, record.recipient, record.posting_type) == ("Vendor", "Buyer", "AR")
+    assert (record.operation, record.review_status) == (operation, ReviewStatus.AUTO_READY)
+    assert record.raw_explicit_amount is None and record.amount == Decimal("30.00")
+    assert record.validation_alerts == []
+    (item,) = serialize_records([record])
+    assert item["operation"] == operation
+
+
+@pytest.mark.parametrize(
+    "parties, overrides",
+    [
+        ({"issuer": "Other Vendor", "recipient": "Other Buyer"}, {}),
+        ({"payee_hint": "Other Vendor", "payer_hint": "Other Buyer"}, {}),
+        ({"issuer": "Other Vendor"}, {"posting_type": "AR"}),
+        ({}, {"issuer": None}),
+        ({}, {"posting_type": "unrecognized"}),
+    ],
+)
+def test_matched_notice_keeps_actual_party_conflicts_or_invalid_manual_posting(
+    parties: dict, overrides: dict
+) -> None:
+    source = _line(
+        reference_no="DN-202609-001",
+        payment_term="CC",
+        **parties,
+        explicit_fields={"reference_no", "payment_term", *parties},
+        human_overrides=overrides,
+        validation_alerts=[ValidationAlert.from_code(AlertCode.ENTITY_NOT_MATCHED, "主体未匹配")],
+    )
+    old = _bill(reference_no=source.reference_no, issuer=ENTITY, recipient=RECIPIENT)
+
+    matched = match_record(source, [old])
+    validated = validate_record(matched)
+
+    assert matched.matched_existing_bill_id == old.id
+    assert matched.operation is validated.operation is OperationType.PENDING_REVIEW
+    assert any(alert.code is AlertCode.ENTITY_NOT_MATCHED for alert in validated.validation_alerts)
+    assert serialize_records([validated]) == []
+
+
+def test_historical_bill_search_never_crosses_registered_atlas_branches() -> None:
+    uk = AccountingEntityProfile(canonical_name="Atlas Shipping (UK)", aliases=["Atlas London"])
+    hk = AccountingEntityProfile(canonical_name="Atlas Shipping (HK)", aliases=["Atlas Hong Kong"])
+    profiles = [uk, hk]
+    bills = [
+        _bill("uk", accounting_entity=uk.canonical_name, reference_no="shared"),
+        _bill("hk", accounting_entity=hk.aliases[0], reference_no="shared"),
+    ]
+
+    for profile, other, expected in ((uk, hk, "uk"), (hk, uk, "hk")):
+        source = _line(accounting_entity=profile.canonical_name, reference_no="shared")
+        assert match_record(source, bills, profiles).matched_existing_bill_id == expected
+        foreign = [
+            bill
+            for bill in bills
+            if bill.accounting_entity in {other.canonical_name, *other.aliases}
+        ]
+        assert match_record(source, foreign, profiles).matched_existing_bill_id is None
+
+
+@pytest.mark.parametrize("new_amount", [None, "30.00", "-30.00"])
+def test_matching_inherits_credit_note_and_recalculates_amount_sign(new_amount: str | None) -> None:
+    old = _bill(
+        reference_no="CN-1", document_type="Credit Note", amount="-30.00", payment_term="PP"
+    )
+    source = _line(
+        reference_no="CN-1",
+        amount=new_amount,
+        payment_term="CC",
+        explicit_fields={"reference_no", "payment_term", "amount"},
+    )
+
+    record = validate_record(match_record(source, [old]))
+
+    assert record.document_type == "Credit Note"
+    assert record.is_credit and record.amount == Decimal("-30.00")
+    assert record.operation is OperationType.UPDATE and record.validation_alerts == []
 
 
 def test_dc_108478_exact_and_changed_lines_keep_distinct_references_under_every_bill_order() -> (
@@ -409,6 +531,59 @@ def test_human_choice_resolves_matching_ambiguity_on_retry() -> None:
     assert result.validation_alerts == []
 
 
+@pytest.mark.parametrize("higher_priority", ["manual", "L1"])
+def test_same_document_reserves_bill_before_a_lower_level_can_claim_it(
+    higher_priority: str,
+) -> None:
+    party_fields = dict(issuer=ENTITY, recipient=RECIPIENT, document_date="2026-10-24")
+    old = _bill(reference_no="notice", container_nos=["JXLU4504463"], **party_fields)
+    higher = _line(
+        "higher",
+        reference_no="notice",
+        human_overrides={"matched_existing_bill_id": old.id} if higher_priority == "manual" else {},
+    )
+    lower = _line(
+        "lower",
+        charge_item="Storage Charge",
+        amount="30.01",
+        currency="USD",
+        shipment_refs=ShipmentRefs(container_nos=["JXLU4504463"]),
+        **party_fields,
+    )
+    independent = lower.model_copy(update={"id": "independent", "source_doc_id": "another"})
+
+    for rows in ([higher, lower, independent], [independent, lower, higher]):
+        by_id = {row.id: row for row in match_and_inherit_batch(rows, [old])}
+        assert by_id["higher"].matched_existing_bill_id == old.id
+        _assert_ambiguous(by_id["lower"], [])
+        assert by_id["independent"].matched_existing_bill_id == old.id
+        assert by_id["independent"].match_level is MatchLevel.L4_CNTR_PARTY_DATE_AMT
+
+
+def test_same_level_competing_groups_are_ambiguous_and_show_business_reference() -> None:
+    party_fields = dict(issuer=ENTITY, recipient=RECIPIENT, document_date="2026-10-24")
+    old = _bill(
+        reference_no="DN-RECEIVED",
+        external_bill_key="external-key",
+        container_nos=["JXLU4504463"],
+        **party_fields,
+    )
+    lines = [
+        _line(
+            charge,
+            charge_item=charge,
+            amount="30",
+            currency="USD",
+            shipment_refs=ShipmentRefs(container_nos=["JXLU4504463"]),
+            **party_fields,
+        )
+        for charge in ("Storage Charge", "Trucking Charge")
+    ]
+    for line in match_and_inherit_batch(lines, [old]):
+        _assert_ambiguous(line, [old.id])
+        assert line.candidate_bills[0].label.startswith("DN-RECEIVED | ")
+
+
 @pytest.mark.parametrize("source_amount", ["32.00", None])
 def test_human_amount_override_does_not_change_the_original_amount(
     source_amount: str | None,
@@ -587,7 +762,14 @@ def test_three_export_modes_pass_the_real_schema_and_keep_exact_json_numbers(
         charge_item=None,
         review_status="APPROVED",
     )
-    rejected = _line("rejected", review_status="REJECTED")
+    rejected = _line(
+        "rejected",
+        operation="UPDATE",
+        review_status="REJECTED",
+        currency="ZZZ",
+        raw_invalid_fields={"currency": "ZZZ"},
+        reject_reason="原始单据作废",
+    )
     needs_review = created.model_copy(
         update={"id": "status-pending", "review_status": ReviewStatus.NEEDS_REVIEW}
     )
@@ -598,15 +780,17 @@ def test_three_export_modes_pass_the_real_schema_and_keep_exact_json_numbers(
     assert export == {
         "mode": mode,
         "total_records": 6,
-        "included_count": 3 if mode == "official" else 5,
+        "included_count": {"official": 3, "full_standard": 5, "audit": 6}[mode],
         "excluded_pending_count": 2 if mode == "official" else 0,
-        "excluded_rejected_count": 1,
+        "excluded_rejected_count": int(mode != "audit"),
         "items": items,
     }
     output_validator.validate(items)
-    assert [item["operation"] for item in items] == ["CREATE", "UPDATE", "NO_CHANGE"] + (
-        [] if mode == "official" else ["PENDING_REVIEW", "CREATE"]
-    )
+    assert [item["operation"] for item in items] == ["CREATE", "UPDATE", "NO_CHANGE"] + {
+        "official": [],
+        "full_standard": ["PENDING_REVIEW", "CREATE"],
+        "audit": ["PENDING_REVIEW", "PENDING_REVIEW", "CREATE"],
+    }[mode]
     for item in items:
         assert set(item) == _STANDARD_KEYS
         assert item["audit_trail"]["ai_reasoning"]
@@ -629,6 +813,11 @@ def test_three_export_modes_pass_the_real_schema_and_keep_exact_json_numbers(
 
     trail = decoded[1]["audit_trail"]
     if mode == "audit":
+        rejected_item = decoded[4]
+        assert rejected_item["audit_trail"]["review_status"] == "REJECTED"
+        assert rejected_item["audit_trail"]["reject_reason"] == "原始单据作废"
+        assert rejected_item["audit_trail"]["raw_invalid_fields"] == {"currency": "ZZZ"}
+        assert rejected_item["charge_details"]["currency"] is None
         assert trail["record_id"] == "updated"
         assert trail["source_doc_id"] == "document"
         assert trail["review_status"] == "APPROVED"
@@ -671,3 +860,68 @@ def test_update_export_uses_a_real_historical_id_when_the_reference_is_unset() -
     assert item["audit_trail"]["matched_bill_ref"] == "old-id"
     with pytest.raises(ValueError, match="缺少历史账单引用"):
         serialize_records([record.model_copy(update={"matched_existing_bill_id": None})])
+
+
+def test_audit_serializes_dates_and_invalid_numbers_without_invalid_json(
+    output_validator: Draft202012Validator,
+) -> None:
+    corrected_on = datetime(2026, 11, 19, 8, 0, tzinfo=UTC)
+    record = _line(
+        posting_type="AR",
+        currency="USD",
+        review_status="AUTO_READY",
+        operation="CREATE",
+        human_overrides={"metadata": {"date": date(2026, 11, 19), "raw_amount": Decimal("NaN")}},
+        field_diffs=[
+            FieldDiff(
+                field="date", old_value=Decimal("Infinity"), new_value=corrected_on, changed=True
+            )
+        ],
+    ).model_copy(
+        update={
+            "amount": Decimal("NaN"),
+            "quantity": "malformed",
+            "unit_price": Decimal("-Infinity"),
+        }
+    )
+    with pytest.raises(ValueError):
+        serialize_records_json([record], "official")
+    with pytest.raises(ValueError, match="有限"):
+        dumps_decimal_json(Decimal("NaN"))
+
+    pending = validate_record(record)
+    assert pending.operation is OperationType.PENDING_REVIEW
+    for mode in ("full_standard", "audit"):
+        data = json.loads(serialize_records_json([pending], mode))
+        output_validator.validate(data)
+        (item,) = data
+        assert {
+            field: item["charge_details"][field] for field in ("amount", "quantity", "unit_price")
+        } == dict.fromkeys(("amount", "quantity", "unit_price"))
+    audit = item["audit_trail"]
+    assert audit["human_overrides"]["metadata"] == {"date": "2026-11-19", "raw_amount": "NaN"}
+    assert audit["field_diffs"][0]["old_value"] == "Infinity"
+    assert audit["field_diffs"][0]["new_value"] == corrected_on.isoformat()
+
+
+def test_export_strips_signed_query_and_fragment_from_both_source_locations() -> None:
+    signed = "https://example.test/invoice.pdf?signature=synthetic-secret#private-evidence"
+    path = "https://example.test/invoice.pdf"
+    record = _line(
+        currency="USD",
+        amount="30",
+        posting_type="AR",
+        review_status="AUTO_READY",
+        operation="CREATE",
+        source_evidence=SourceEvidence(
+            source_file=signed, source_paths=[signed, "Mail.eml/bill#2.pdf"]
+        ),
+    )
+    for mode in ("official", "full_standard", "audit"):
+        encoded = serialize_records_json([record], mode)
+        assert "synthetic-secret" not in encoded and "private-evidence" not in encoded
+        assert json.loads(encoded)[0]["audit_trail"]["source_file"] == path
+    assert json.loads(encoded)[0]["audit_trail"]["source_evidence"]["source_paths"] == [
+        path,
+        "Mail.eml/bill#2.pdf",
+    ]

@@ -6,6 +6,7 @@ import json
 import logging
 import socket
 import traceback
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from threading import Thread
@@ -18,7 +19,10 @@ from langsmith.utils import get_env_var
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 
+from shipping_billing_agent.agent import arun_billing_pipeline
+from shipping_billing_agent.config.limits import ResourceLimits
 from shipping_billing_agent.config.settings import AppSettings
+from shipping_billing_agent.domain.models import ParsedDocument
 from shipping_billing_agent.gateways import llm_client, local_ocr, ocr_client
 from shipping_billing_agent.gateways.text_sanitizer import sanitize_for_llm
 from shipping_billing_agent.gateways.url_guard import (
@@ -331,6 +335,43 @@ async def test_ocr_async_preserves_metadata_without_inventing_charges() -> None:
     assert item.charge_list == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+async def test_ocr_preserves_remote_json_decimal_in_response_and_formatted_text(
+    use_async: bool,
+) -> None:
+    body = (
+        b'{"success":true,"data":{"list":[{"pageNo":1,"invoiceNumber":"INV-1",'
+        b'"chargeList":[{"amount":9007199254740991.01,"currency":"USD"}]}]}}'
+    )
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, content=body))
+    client = ocr_client.PltPltOcrClient(
+        _ocr_settings(), transport=transport, async_transport=transport
+    )
+
+    result = (
+        await client.arecognize_url(PUBLIC_FILE) if use_async else client.recognize_url(PUBLIC_FILE)
+    )
+
+    amount = result.payload.items[0].charge_list[0]["amount"]
+    assert isinstance(amount, Decimal)
+    assert amount.as_tuple() == Decimal("9007199254740991.01").as_tuple()
+    assert result.raw_payload["data"]["list"][0]["chargeList"][0]["amount"] == amount
+    header, _, formatted_json = result.formatted_text.partition("\n")
+    assert header == "[Page 1]"
+    assert '"amount":9007199254740991.01' in formatted_json
+    formatted_amount = json.loads(formatted_json, parse_float=Decimal)["chargeList"][0]["amount"]
+    assert formatted_amount.as_tuple() == amount.as_tuple()
+
+
+@pytest.mark.parametrize("body", [b"<html>not JSON</html>", b'{"amount":NaN}'])
+def test_ocr_reports_non_json_and_nonfinite_json_as_gateway_errors(body: bytes) -> None:
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, content=body))
+    client = ocr_client.PltPltOcrClient(_ocr_settings(), transport=transport)
+    with pytest.raises(ocr_client.OcrGatewayError, match="不是有效 JSON"):
+        client.recognize_url(PUBLIC_FILE)
+
+
 @pytest.mark.parametrize(
     ("status", "response", "expected_error"),
     [
@@ -630,6 +671,116 @@ def _llm_settings(base_url: str, **overrides) -> AppSettings:
         llm_max_retries=0,
     )
     return AppSettings(_env_file=None, **(options | overrides))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("budget", [1, 2])
+@pytest.mark.parametrize("reserved", [0, 1])
+async def test_llm_retries_charge_actual_http_attempts(
+    use_async: bool, budget: int, reserved: int
+) -> None:
+    requests = []
+    acquisitions = []
+    consumed = reserved
+
+    def acquire() -> bool:
+        nonlocal consumed
+        if consumed == budget:
+            return False
+        consumed += 1
+        return True
+
+    def acquire_sync() -> bool:
+        acquisitions.append("sync")
+        return acquire()
+
+    async def acquire_async() -> bool:
+        acquisitions.append("async")
+        return acquire()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(503, headers={"retry-after-ms": "1"}, json={"error": "retry"})
+        return httpx.Response(
+            200,
+            json={
+                "id": "test-completion",
+                "model": "loopback-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": '{"invoice_number":"RETRIED"}'},
+                    }
+                ],
+            },
+        )
+
+    transport = httpx.MockTransport(respond)
+    client = llm_client.OpenAICompatibleLlmClient(
+        _llm_settings("https://llm.example.test", llm_max_retries=2),
+        transport=transport,
+        async_transport=transport,
+    )
+
+    async def invoke():
+        if use_async:
+            return await client.ainvoke_structured("Extract invoice", _ExtractedInvoice)
+        return client.invoke_structured("Extract invoice", _ExtractedInvoice)
+
+    try:
+        with llm_client.llm_request_budget(acquire_sync, acquire_async, initial_slots=reserved):
+            if budget == 1:
+                with pytest.raises(llm_client.LlmBudgetExhaustedError):
+                    await invoke()
+            else:
+                reply = await invoke()
+                assert reply.parsed == _ExtractedInvoice(invoice_number="RETRIED")
+        assert consumed == budget
+        assert [request.method for request in requests] == ["POST"] * budget
+        assert acquisitions == ["async" if use_async else "sync"] * (2 - reserved)
+        # Leaving the context restores direct calls with no budget acquisition.
+        assert (await invoke()).parsed == _ExtractedInvoice(invoice_number="RETRIED")
+        assert len(requests) == budget + 1
+        assert consumed == budget
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_billing_graph_reservation_allows_only_one_http_post_without_retry_context() -> None:
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, headers={"retry-after-ms": "1"}, json={"error": "retry"})
+
+    doc = ParsedDocument(
+        doc_id="bill",
+        original_filename="bill.pdf",
+        sanitized_filename="bill.pdf",
+        source_kind="PDF",
+        extraction_channel="PLTPLT_OCR",
+        status="PARSED",
+        content_sha256="a" * 64,
+        raw_text="Invoice INV-1\nIssuer: Vendor\nHandling Charge 30 USD",
+    )
+    client = llm_client.OpenAICompatibleLlmClient(
+        _llm_settings("https://llm.example.test", llm_max_retries=2),
+        async_transport=httpx.MockTransport(respond),
+    )
+    try:
+        result = await arun_billing_pipeline(
+            [doc], "Vendor", llm_client=client, limits=ResourceLimits(max_llm_calls_per_batch=1)
+        )
+    finally:
+        await client.aclose()
+
+    assert AppSettings.model_fields["llm_max_retries"].default == 0
+    assert result.llm_calls_used == 1
+    assert [request.method for request in requests] == ["POST"]
 
 
 @pytest.mark.asyncio
