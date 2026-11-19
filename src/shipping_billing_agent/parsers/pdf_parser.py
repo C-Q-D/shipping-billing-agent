@@ -1,10 +1,11 @@
 """Extract PDF text and tables, with optional page-level OCR."""
 
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
 from io import BytesIO
 from itertools import chain, pairwise
-from typing import Any, NamedTuple, Protocol
+from typing import Any, Literal, NamedTuple, Protocol
 
 import pdfplumber
 from pdfminer.pdfdocument import PDFEncryptionError
@@ -29,6 +30,9 @@ _BAR_RULE_MIN_ASPECT = 15.0
 _SCANLINE_MAX_GAP_PT = 6.0
 _SCANLINE_MIN_RUN = 4
 _Point = tuple[float, float]
+_CurveEdge = (
+    tuple[Literal["l"], _Point, _Point] | tuple[Literal["c"], _Point, _Point, _Point, _Point]
+)
 _RuleSegment = tuple[float, float, float]
 
 
@@ -56,6 +60,14 @@ class _RuleTile(NamedTuple):
     span_lo: float
     span_hi: float
     index: int
+
+
+class _CurveSubpath(NamedTuple):
+    points: list[_Point]
+    closed: bool
+    has_bezier: bool
+    has_unknown_op: bool
+    edges: list[_CurveEdge]
 
 
 def _table_grid(table: Any) -> _TableGrid:
@@ -211,18 +223,32 @@ def _same_vertex(p1: _Point, p2: _Point) -> bool:
     )
 
 
-def _iter_curve_subpaths(
-    path: list[tuple[Any, ...]],
-) -> Iterator[tuple[list[_Point], bool, bool, bool]]:
+def _quantize_point(point: _Point) -> _Point:
+    return round(point[0], 4), round(point[1], 4)
+
+
+def _iter_curve_subpaths(path: list[tuple[Any, ...]], *, filled: bool) -> Iterator[_CurveSubpath]:
     points: list[_Point] = []
+    edges: list[_CurveEdge] = []
+    current: _Point | None = None
     closed_start: _Point | None = None
     has_bezier = False
     has_unknown_op = False
+
+    def finish_subpath(closed: bool) -> _CurveSubpath:
+        if (closed or filled) and points and current is not None:
+            start = _quantize_point(points[0])
+            if current != start:
+                edges.append(("l", current, start))
+        return _CurveSubpath(points, closed, has_bezier, has_unknown_op, edges)
+
     for operator, *vertices in path:
         if operator == "m":
             if points or has_unknown_op:
-                yield points, False, has_bezier, has_unknown_op
+                yield finish_subpath(closed=False)
             points = [vertices[0]]
+            edges = []
+            current = _quantize_point(vertices[0])
             closed_start = None
             has_bezier = False
             has_unknown_op = False
@@ -232,28 +258,46 @@ def _iter_curve_subpaths(
             closed_start = points[0]
             if not has_bezier and len(points) > 1 and _same_vertex(closed_start, points[-1]):
                 points.pop()
-            yield points, True, has_bezier, has_unknown_op
+            yield finish_subpath(closed=True)
             points = []
+            edges = []
+            current = _quantize_point(closed_start)
             has_bezier = False
             has_unknown_op = False
-        elif operator == "l":
-            if not points:
-                if closed_start is None:
-                    continue
-                # A line after closepath starts from the closed subpath's first vertex.
-                points = [closed_start]
-            if not _same_vertex(points[-1], vertices[0]):
-                points.append(vertices[0])
-        elif operator in {"c", "v", "y"}:
+        elif operator in {"l", "c", "v", "y"}:
+            if current is None:
+                continue
             if not points and closed_start is not None:
+                # Drawing after closepath starts from the closed subpath's first vertex.
                 points = [closed_start]
-            has_bezier = True
-            points.extend(vertices)
+            end = _quantize_point(vertices[-1])
+            if operator == "l":
+                if current != end:
+                    edges.append(("l", current, end))
+                if not _same_vertex(points[-1], vertices[0]):
+                    points.append(vertices[0])
+            else:
+                control_1 = current if operator == "v" else _quantize_point(vertices[0])
+                control_2 = end if operator == "y" else _quantize_point(vertices[-2])
+                edges.append(("c", current, control_1, control_2, end))
+                has_bezier = True
+                points.extend(vertices)
+            current = end
         else:
             has_unknown_op = True
 
     if points or has_unknown_op:
-        yield points, False, has_bezier, has_unknown_op
+        yield finish_subpath(closed=False)
+
+
+def _reverse_edge(edge: _CurveEdge) -> _CurveEdge:
+    if edge[0] == "l":
+        return "l", edge[2], edge[1]
+    return "c", edge[4], edge[3], edge[2], edge[1]
+
+
+def _is_self_retracing_edges(edges: list[_CurveEdge]) -> bool:
+    return Counter(edges) == Counter(_reverse_edge(edge) for edge in edges)
 
 
 def _rectangle_bounds(points: list[_Point]) -> tuple[float, float, float, float] | None:
@@ -331,11 +375,13 @@ def _process_curve(
 
     added = 0
     visible = False
-    for points, closed, has_bezier, has_unknown_op in _iter_curve_subpaths(path):
+    for points, closed, has_bezier, has_unknown_op, edges in _iter_curve_subpaths(
+        path, filled=filled
+    ):
         if has_unknown_op:
             return True, 0, True
         if has_bezier:
-            if not stroked and _is_collinear_subpath(points):
+            if not stroked and (_is_collinear_subpath(points) or _is_self_retracing_edges(edges)):
                 continue
             return True, 0, True
         if not closed and filled and len(points) >= 3:
@@ -595,6 +641,11 @@ def _analyze_page_vectors(page: Page, table_grids: list[_TableGrid]) -> tuple[bo
     return has_glyph_strokes, has_visible_vectors
 
 
+def _has_visible_page_content(image: Image.Image) -> bool:
+    with image.convert("RGB") as rgb:
+        return any(low != high for low, high in rgb.getextrema())
+
+
 def parse_pdf(
     data: bytes, *, local_ocr: PdfPageOcr | None = None
 ) -> tuple[str, list[ParsedTable], ExtractionChannel]:
@@ -610,6 +661,7 @@ def parse_pdf(
             for page in pdf.pages:
                 page_number = page.page_number
                 text = page.extract_text() or ""
+                has_electronic_text = bool(text.strip())
                 sparse_text = sum(not char.isspace() for char in text) < _MIN_TEXT_CHARACTERS
                 valid_tables: list[tuple[Any, list[list[str | None]]]] = []
                 for table in page.find_tables() or []:
@@ -623,17 +675,23 @@ def parse_pdf(
                 needs_ocr = sparse_text and (
                     bool(page.images)
                     or has_glyph_strokes
-                    or (not text.strip() and has_visual_objects)
+                    or (not has_electronic_text and has_visual_objects)
                 )
                 text_source = f"[Page {page_number} | Text]"
                 source = text_source
                 if needs_ocr:
-                    if local_ocr is None:
-                        raise PdfParseError(f"第 {page_number} 页为扫描图像页，未配置本地 OCR 引擎")
+                    missing_ocr = f"第 {page_number} 页为扫描图像页，未配置本地 OCR 引擎"
+                    if has_electronic_text and local_ocr is None:
+                        raise PdfParseError(missing_ocr)
                     with page.to_image(resolution=_OCR_RESOLUTION_DPI).original as image:
-                        text, _ = local_ocr.recognize_pil_image(image, page=page_number)
-                    channel = ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
-                    source = f"[Page {page_number} | OCR]"
+                        if has_electronic_text or _has_visible_page_content(image):
+                            if local_ocr is None:
+                                raise PdfParseError(missing_ocr)
+                            text, _ = local_ocr.recognize_pil_image(image, page=page_number)
+                            channel = ExtractionChannel.LOCAL_RAPIDOCR_FALLBACK
+                            source = f"[Page {page_number} | OCR]"
+                        else:
+                            text = ""
                 tables.extend(
                     ParsedTable(
                         rows=[[cell or "" for cell in row] for row in grid], source=text_source
