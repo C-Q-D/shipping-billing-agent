@@ -3038,6 +3038,88 @@ def test_r18_b1_nested_sections_linear_scan(r8_eml_ocr):
     )
 
 
+def test_r19_a2_main_real_signature_skips_logo(r8_eml_ocr):
+    data = _mail_with_inline_png(
+        '<main><p>Body</p><hr>Best regards<br>ACME<br>Tel: 123456<img src="cid:logo"></main>',
+        image_name="logo",
+        text="ACME",
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_inline_image_ocr(logo, recognize_image, expected_text=None)
+
+
+@pytest.mark.parametrize(
+    ("bill_src", "location", "expected_text"),
+    [
+        pytest.param(
+            "http://example.test:80/scan.png",
+            "http://example.test/scan.png",
+            "USD 310.42",
+            id="http-default-port",
+        ),
+        pytest.param(
+            "http://%65xample.test/scan.png",
+            "http://example.test/scan.png",
+            "USD 310.42",
+            id="escaped-host",
+        ),
+        pytest.param(
+            "https://example.test:443/scan.png",
+            "https://example.test/scan.png",
+            "USD 310.42",
+            id="https-default-port",
+        ),
+        pytest.param(
+            "http://example.test:8080/scan.png",
+            "http://example.test/scan.png",
+            None,
+            id="non-default-port",
+        ),
+        pytest.param(
+            "http://Alice@example.test:80/scan.png",
+            "http://alice@example.test/scan.png",
+            None,
+            id="userinfo-case-with-default-port",
+        ),
+    ],
+)
+def test_r19_a3_default_port_and_escaped_host_match(bill_src, location, expected_text, r8_eml_ocr):
+    message = _mail("Body")
+    message.add_alternative(
+        f'<main><img src="{bill_src}"></main><div class="signature"><img src="cid:logo"></div>',
+        subtype="html",
+    )
+    _add_related_png(
+        message.get_payload()[-1],
+        filename="scan.png",
+        text="USD 310.42",
+        cid="<logo>",
+        location=location,
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan = dispatcher.parse_batch([("mail.eml", message.as_bytes())])
+
+    _assert_inline_image_ocr(scan, recognize_image, expected_text=expected_text)
+
+
+def test_r19_a6_nested_figure_inside_figcaption_does_not_leak(r8_eml_ocr):
+    data = _mail_with_scan_and_logo(
+        '<figure><img src="cid:logo"><figcaption>'
+        "Company logo<br>Best regards<br>ACME<br>Tel: 123456"
+        '<figure><img src="cid:scan"><figcaption>Invoice scan</figcaption></figure>'
+        "</figcaption></figure>"
+    )
+    dispatcher, recognize_image = r8_eml_ocr
+
+    _, _, scan, logo = dispatcher.parse_batch([("mail.eml", data)])
+
+    _assert_invoice_and_skipped_logo(scan, logo, recognize_image)
+
+
 @pytest.mark.parametrize(
     "html_body",
     [

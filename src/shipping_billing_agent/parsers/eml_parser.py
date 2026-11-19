@@ -67,6 +67,7 @@ _RFC3986_UNRESERVED = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 )
 _PCT_ENCODED = re.compile(r"%([0-9a-fA-F]{2})")
+_DEFAULT_PORTS = {"http": "80", "https": "443"}
 
 
 class EmlParseError(ValueError):
@@ -86,11 +87,28 @@ def _normalize_pct_encoding(value: str) -> str:
     return _PCT_ENCODED.sub(normalize_escape, value)
 
 
-def _normalize_netloc(netloc: str) -> str:
+def _normalize_netloc(netloc: str, scheme: str) -> str:
     if "@" in netloc:
         userinfo, hostport = netloc.rsplit("@", 1)
-        return f"{_normalize_pct_encoding(userinfo)}@{hostport.lower()}"
-    return netloc.lower()
+        prefix = f"{_normalize_pct_encoding(userinfo)}@"
+    else:
+        hostport = netloc
+        prefix = ""
+
+    host, port = hostport, ""
+    if hostport.startswith("[") and "]" in hostport:
+        end = hostport.index("]")
+        if hostport[end + 1 :].startswith(":"):
+            host, port = hostport[: end + 1], hostport[end + 2 :]
+    elif ":" in hostport:
+        host, port = hostport.rsplit(":", 1)
+
+    normalized_host = _normalize_pct_encoding(host).lower()
+    if port and port != _DEFAULT_PORTS.get(scheme):
+        normalized_hostport = f"{normalized_host}:{port}"
+    else:
+        normalized_hostport = normalized_host
+    return f"{prefix}{normalized_hostport}"
 
 
 def _normalize_location(value: str, *, base: str = "") -> str:
@@ -109,7 +127,7 @@ def _normalize_location(value: str, *, base: str = "") -> str:
     path = _normalize_pct_encoding(parsed.path)
     query = _normalize_pct_encoding(parsed.query)
     if parsed.scheme or parsed.netloc:
-        netloc = _normalize_netloc(parsed.netloc)
+        netloc = _normalize_netloc(parsed.netloc, parsed.scheme.lower())
         return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
     path = path.strip()
     return f"{path}?{query}" if path and query else path
@@ -363,11 +381,25 @@ def _is_bill_image_tag(image: Tag, figure_captions: dict[int, list[Tag]]) -> boo
     if (figure := image.find_parent("figure")) is not None:
         labels.append(figure.get("aria-label"))
         labels.extend(
-            " ".join(_visual_lines(caption, reset_on_media=False))
+            " ".join(_visual_lines(caption, reset_on_media=False, skip_figures=True))
             for caption in figure_captions.get(id(figure), ())
         )
     label_texts = [str(label) for label in labels if label]
     return any(_is_bill_caption_text(label) for label in label_texts)
+
+
+def _has_signature_figure_caption(image: Tag, figure_captions: dict[int, list[Tag]]) -> bool:
+    figure = image.find_parent("figure")
+    if figure is None:
+        return False
+    for caption in figure_captions.get(id(figure), ()):
+        lines = _visual_lines(caption, reset_on_media=False, skip_figures=True)
+        if not lines or _LOGO_CAPTION.search(lines[0]) is None:
+            continue
+        context = "\n".join(lines)
+        if _SIGNOFF.search(context) is not None and _SIGNATURE_CONTACT.search(context) is not None:
+            return True
+    return False
 
 
 def _signature_scope(node: Tag | NavigableString, body: Tag) -> Tag | None:
@@ -441,7 +473,7 @@ def _in_post_separator_signature(
 
     context = "\n".join(segment)
     return _SIGNATURE_CONTACT.search(context) is not None and (
-        separator_kind == "dash" or _SIGNOFF.search(context) is not None
+        (separator_kind == "dash" and scope.name != "main") or _SIGNOFF.search(context) is not None
     )
 
 
@@ -658,6 +690,7 @@ def _visual_lines(
     stop_offset: int | None = None,
     reset_on_media: bool = True,
     stop_on_media: bool = False,
+    skip_figures: bool = False,
 ) -> list[str]:
     buffer = _VisualLineBuffer()
     started = start_after is None
@@ -695,6 +728,8 @@ def _visual_lines(
                 if started:
                     buffer.append_text(str(child), preformatted)
             elif isinstance(child, Tag):
+                if skip_figures and child.name == "figure":
+                    continue
                 if (
                     (reset_on_media or stop_on_media)
                     and child.name in {"hr", "img", "figure"}
@@ -1056,10 +1091,10 @@ def _html_text(
             classification = "body"
         elif scope is None:
             classification = "signature"
-        elif not in_footer and scope.name == "main":
-            classification = "body"
         elif preceded_bill.get(id(image), False):
             classification = "body"
+        elif not in_footer and _has_signature_figure_caption(image, figure_captions):
+            classification = "signature"
         elif len(markers) - index <= _SIGNATURE_TAIL_SIZE:
             context, separator_kind = _signature_context(markers, index, scope, body)
             if in_footer:
@@ -1074,8 +1109,8 @@ def _html_text(
                 )
             has_contact = _SIGNATURE_CONTACT.search(context) is not None
             has_signoff = _SIGNOFF.search(context) is not None
-            after_signoff = has_contact and (
-                separator_kind == "dash" or (separator_kind == "hr" and (in_footer or has_signoff))
+            after_signoff = has_contact and separator_kind is not None and (
+                in_footer or has_signoff or (separator_kind == "dash" and scope.name != "main")
             )
             footer_signature = in_footer and has_contact and has_signoff
             decorative = (
