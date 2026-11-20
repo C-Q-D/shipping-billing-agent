@@ -52,8 +52,15 @@ _OVERRIDE_CODES = {
 }
 FIELD_FORMAT_ALERT_CODES = {*_OVERRIDE_CODES.values(), AlertCode.LLM_EXTRACTION_FAILED}
 _EXTRACTION_CONFLICT_FIELDS = {
-    "issuer", "recipient", "reference_no", "document_type", "charge_item",
+    "issuer", "recipient", "reference_no", "document_date", "document_type", "charge_item",
 }
+LLM_FIELD_CONFLICT_MESSAGE = "模型提取的字段与原文不符"
+LLM_PARTY_CONFLICT_MESSAGE = "模型给出的结算主体与原文收付证据不符"
+LLM_CHARGE_MISSING_EVIDENCE_MESSAGE = "模型另报的费用在源单明细中缺少费用名称和金额的对应证据"
+LLM_CHARGE_MISMATCH_MESSAGE = "模型提取的 {name} 费用行与原文金额或行数不符"
+_LLM_CHARGE_MISMATCH_PREFIX, _LLM_CHARGE_MISMATCH_SUFFIX = LLM_CHARGE_MISMATCH_MESSAGE.split(
+    "{name}"
+)
 PRINTED_CURRENCY_CONFLICT_MESSAGE = "费用明细行标明了不同的币种"
 TRANSPORT_FIELDS = {
     "mbl_no": "mbl_nos",
@@ -435,12 +442,42 @@ def _is_currency_conflict(issue: ValidationAlert) -> bool:
     return issue.code is AlertCode.CROSS_DOCUMENT_CONFLICT and issue.field == "currency"
 
 
-def _confirmed_extraction_issue(issue: ValidationAlert, corrected: set[str]) -> bool:
+def _is_llm_charge_mismatch_alert(issue: ValidationAlert) -> bool:
+    if issue.code is not AlertCode.AMOUNT_TOTAL_MISMATCH or issue.field != "reported_charge_amount":
+        return False
+    message = issue.message
+    return message == LLM_CHARGE_MISSING_EVIDENCE_MESSAGE or (
+        message.startswith(_LLM_CHARGE_MISMATCH_PREFIX)
+        and message.endswith(_LLM_CHARGE_MISMATCH_SUFFIX)
+        and len(message) > len(_LLM_CHARGE_MISMATCH_PREFIX) + len(_LLM_CHARGE_MISMATCH_SUFFIX)
+    )
+
+
+def _is_llm_grounding_conflict(issue: ValidationAlert) -> bool:
+    if issue.code is AlertCode.CROSS_DOCUMENT_CONFLICT:
+        return issue.message in (LLM_FIELD_CONFLICT_MESSAGE, LLM_PARTY_CONFLICT_MESSAGE)
+    return _is_llm_charge_mismatch_alert(issue)
+
+
+def _confirmed_extraction_issue(
+    issue: ValidationAlert, corrected: set[str], record: ProcessedBillingRecord
+) -> bool:
+    if not _is_llm_grounding_conflict(issue):
+        return False
     if issue.code is AlertCode.CROSS_DOCUMENT_CONFLICT:
         if issue.field in _EXTRACTION_CONFLICT_FIELDS:
             return issue.field in corrected
-        return issue.field in {"payee_hint", "payer_hint"} and bool(
-            {"issuer", "recipient", "posting_type"} & corrected
+        if issue.field == "payee_hint":
+            party_field = "issuer"
+        elif issue.field == "payer_hint":
+            party_field = "recipient"
+        else:
+            return False
+        party = getattr(record, party_field)
+        return ("posting_type" in corrected and record.posting_type is not None) or (
+            party_field in corrected
+            and bool(party and issue.expected)
+            and normalize_party_name(party) == normalize_party_name(issue.expected)
         )
     return (
         issue.code is AlertCode.AMOUNT_TOTAL_MISMATCH
@@ -465,7 +502,7 @@ def source_format_alerts(
                 and "payment_term" in corrected
                 and record.payment_term is not None
             )
-            or (corrected and _confirmed_extraction_issue(issue, corrected))
+            or (corrected and _confirmed_extraction_issue(issue, corrected, record))
         )
         and (
             issue.code not in FIELD_FORMAT_ALERT_CODES

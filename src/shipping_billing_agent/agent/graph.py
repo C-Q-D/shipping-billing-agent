@@ -52,9 +52,13 @@ from shipping_billing_agent.domain import (
 from shipping_billing_agent.domain.charge_normalizer import _CHARGE_NAMES
 from shipping_billing_agent.domain.entity_resolver import (
     FIELD_FORMAT_ALERT_CODES,
+    LLM_CHARGE_MISMATCH_MESSAGE,
+    LLM_CHARGE_MISSING_EVIDENCE_MESSAGE,
+    LLM_FIELD_CONFLICT_MESSAGE,
+    LLM_PARTY_CONFLICT_MESSAGE,
     _match_ledger_records,
+    _party_key,
     is_credit_document_type,
-    normalize_party_name,
 )
 from shipping_billing_agent.domain.models import DocumentStatus, SourceKind, sanitize_source_path
 from shipping_billing_agent.domain.validators import _document_parse_issues, _validate_batch
@@ -98,6 +102,8 @@ _SHEET_ROW = re.compile(r"^\[Sheet: (.+?) \| Row (\d+)\] \[Row (\d+)\]")
 _TABLE_ROW = re.compile(r"^\[[^]]+\] \[Row (\d+)\]")
 _EMAIL_SETTLEMENT_TYPES = frozenset({"email", "email settlement", "email settlement instruction"})
 _AGENCY_DECLARATION = re.compile(r"(?P<agent>.+?) as agents? for (?P<principal>.+)")
+_AGENCY_LEGAL_SUFFIXES = frozenset({"co", "ltd", "inc", "llc"})
+_AGENCY_MIN_COMPACT_NAME_LENGTH = 8
 _SiblingSources = Sequence[tuple[ParsedDocument, RawExtractionEnvelope]]
 
 
@@ -421,7 +427,7 @@ def _ground_printed_fields(
 def _printed_field_conflict(field: str, printed: str, proposed: str) -> ValidationAlert:
     return ValidationAlert.from_code(
         AlertCode.CROSS_DOCUMENT_CONFLICT,
-        "模型提取的字段与原文不符",
+        LLM_FIELD_CONFLICT_MESSAGE,
         field=field,
         expected=printed,
         actual=proposed,
@@ -480,6 +486,7 @@ def _ground_charge(
     document_type: str | None,
     document_issues: list[ValidationAlert],
     *,
+    amount_matched: bool = False,
     use_printed_name: bool = False,
 ) -> RawChargeEnvelope:
     printed, model = observed.charge, proposed.charge
@@ -502,7 +509,7 @@ def _ground_charge(
     if bare_dollar or printed.currency or conflicting_currency_tokens:
         updates["currency"] = printed.currency
     issues = []
-    # Check the printed equation even when the proposed amount matched within tolerance.
+    # Use the printed amount on a tolerance match or to check a complete printed equation.
     printed_numbers: set[str] = set()
     for field in ("quantity", "unit_price", "amount"):
         value = getattr(printed, field)
@@ -510,7 +517,11 @@ def _ground_charge(
             value is None
             or field not in observed.explicit_fields
             or field in observed.raw_invalid_fields
-            or (field == "amount" and not {"quantity", "unit_price"} <= printed_numbers)
+            or (
+                field == "amount"
+                and not amount_matched
+                and not {"quantity", "unit_price"} <= printed_numbers
+            )
         ):
             continue
         printed_numbers.add(field)
@@ -663,8 +674,27 @@ def _ground_charges(
                 indexes[name].append(index)
         return indexes
 
-    def amounts_text(rows: Sequence[RawChargeEnvelope], indexes: Sequence[int]) -> str:
-        return ", ".join(rows[index].raw_amount_text or "缺失" for index in indexes) or "无费用行"
+    def amount_text(row: RawChargeEnvelope) -> str:
+        amount = row.charge.amount
+        return row.raw_amount_text or (str(amount) if amount is not None else "缺失")
+
+    def amount_mismatch(name: str, expected: str, actual: str) -> ValidationAlert:
+        return ValidationAlert.from_code(
+            AlertCode.AMOUNT_TOTAL_MISMATCH,
+            LLM_CHARGE_MISMATCH_MESSAGE.format(name=name),
+            field="reported_charge_amount",
+            expected=expected,
+            actual=actual,
+        )
+
+    def missing_amount_evidence(row: RawChargeEnvelope, expected: str) -> ValidationAlert:
+        return ValidationAlert.from_code(
+            AlertCode.AMOUNT_TOTAL_MISMATCH,
+            LLM_CHARGE_MISSING_EVIDENCE_MESSAGE,
+            field="reported_charge_amount",
+            expected=expected,
+            actual=f"{row.charge.raw_charge_name} {row.raw_amount_text or '金额缺失'}",
+        )
 
     def exact_key(
         amount: Fraction, currency: str, row: RawChargeEnvelope
@@ -748,13 +778,6 @@ def _ground_charges(
 
     for name, source_indexes in source_groups.items():
         pairs = pairs_by_name[name]
-        model_indexes = [
-            index for index in model_groups.get(name, []) if index not in variant_proposals
-        ]
-        model_indexes.extend(
-            model_index for source_index, model_index in pairs.items()
-            if source_index in variant_pairs
-        )
         corroborating_rows = []
         if len(source_indexes) == 1:
             printed = observed[source_indexes[0]].charge
@@ -769,30 +792,50 @@ def _ground_charges(
                         for field in comparable_fields
                     ):
                         corroborating_rows.append(rows[indexes[0]])
-        for source_index, model_index in pairs.items():
-            grounded[model_index] = _ground_charge(
-                proposed[model_index], observed[source_index], corroborating_rows,
-                document_type, issues, use_printed_name=source_index in variant_pairs,
+        missing_source_amounts = []
+        for source_index in source_indexes:
+            source = observed[source_index]
+            model_index = pairs.get(source_index)
+            if model_index is None:
+                if source.raw_invalid_fields or source.raw_parse_issues:
+                    issue = amount_mismatch(name, amount_text(source), "无费用行")
+                    grounded.append(source.model_copy(update={
+                        "raw_parse_issues": [*source.raw_parse_issues, issue],
+                    }))
+                elif source.charge.amount is not None:
+                    missing_source_amounts.append(amount_text(source))
+                continue
+
+            model = proposed[model_index]
+            amount_matched = source_index in amount_matched_sources
+            row = _ground_charge(
+                model, source, corroborating_rows, document_type, issues,
+                amount_matched=amount_matched,
+                use_printed_name=source_index in variant_pairs,
             )
-        unpaired_audited_rows = [
-            observed[index]
-            for index in source_indexes
-            if index not in pairs
-            and (observed[index].raw_invalid_fields or observed[index].raw_parse_issues)
-        ]
-        grounded.extend(unpaired_audited_rows)
-        unmatched_amount = any(
-            index not in amount_matched_sources and observed[index].charge.amount is not None
-            for index in source_indexes
-        )
-        if unmatched_amount or len(model_indexes) > len(source_indexes) or unpaired_audited_rows:
+            if not amount_matched and source.charge.amount is not None:
+                row.raw_parse_issues.append(
+                    amount_mismatch(name, amount_text(source), amount_text(model))
+                )
+                # An operand has no line-amount evidence, even after pairing the fee by name.
+                reported_amount = model.charge.amount
+                if reported_amount is not None and any(
+                    field in source.explicit_fields
+                    and field not in source.raw_invalid_fields
+                    and getattr(source.charge, field) == reported_amount
+                    for field in ("quantity", "unit_price")
+                ):
+                    issues.append(
+                        missing_amount_evidence(
+                            model,
+                            f"源单 {name} 的印刷行金额为 {amount_text(source)}，请核对数量或单价",
+                        )
+                    )
+            grounded[model_index] = row
+        if missing_source_amounts:
             issues.append(
-                ValidationAlert.from_code(
-                    AlertCode.AMOUNT_TOTAL_MISMATCH,
-                    f"模型提取的 {name} 费用行与原文金额或行数不符",
-                    field="reported_charge_amount",
-                    expected=amounts_text(observed, source_indexes),
-                    actual=amounts_text(proposed, model_indexes),
+                amount_mismatch(
+                    name, f"源单 {name}: {', '.join(missing_source_amounts)}", "模型缺少对应费用行"
                 )
             )
     unpaired = [index for index in range(len(proposed)) if index not in paired_proposals]
@@ -811,7 +854,8 @@ def _ground_charges(
         for entry in observed
         for line in (entry.charge.source_text or "").splitlines()
     }
-    unsupported = set()
+    discard_unsupported = not observed and _has_billing_summary(rules)
+    discarded = set()
     for index in unpaired:
         entry = grounded[index]
         charge = entry.charge
@@ -846,13 +890,7 @@ def _ground_charges(
             ]
         else:
             row_alerts = [
-                ValidationAlert.from_code(
-                    AlertCode.AMOUNT_TOTAL_MISMATCH,
-                    "模型另报的费用在源单明细中缺少费用名称和金额的对应证据",
-                    field="reported_charge_amount",
-                    expected="同一源单中的费用名称和金额",
-                    actual=f"{charge.raw_charge_name} {entry.raw_amount_text or '金额缺失'}",
-                )
+                missing_amount_evidence(entry, f"源单缺少对应费用行：{charge.raw_charge_name}")
             ]
             if index not in non_billing and (
                 rate := _matching_charge_evidence(
@@ -866,26 +904,43 @@ def _ground_charges(
                         charge.currency or "缺失",
                     )
                 )
+        # Unsupported fees require document review even when their row audit is retained.
         issues.extend(row_alerts)
-        unsupported.add(index)
+        if discard_unsupported:
+            discarded.add(index)
+            continue
         grounded[index] = entry.model_copy(
             update={"raw_parse_issues": [*entry.raw_parse_issues, *row_alerts]}
         )
-    if unsupported and not observed and _has_billing_summary(rules):
-        grounded = [entry for index, entry in enumerate(grounded) if index not in unsupported]
+    if discarded:
+        grounded = [entry for index, entry in enumerate(grounded) if index not in discarded]
     return grounded, issues
 
 
 def _matches_agency_declaration(model: str, printed: str) -> bool:
-    # Keep the entity's branch suffix intact when separating the agency declaration.
     text = " ".join(normalize("NFKC", model).casefold().replace(",", " ").split())
     declaration = _AGENCY_DECLARATION.fullmatch(text)
-    printed_name = normalize_party_name(printed)
-    return bool(
-        declaration
-        and printed_name
-        and normalize_party_name(declaration["agent"]) == printed_name
-        and any(character.isalnum() for character in declaration["principal"])
+    if not declaration or not any(character.isalnum() for character in declaration["principal"]):
+        return False
+    agent_name, agent_branches = _party_key(declaration["agent"])
+    printed_name, printed_branches = _party_key(printed)
+    if not printed_name or agent_branches != printed_branches:
+        return False
+    if agent_name == printed_name:
+        return True
+    if agent_name.replace(" ", "") != printed_name.replace(" ", ""):
+        return False
+
+    def compact_body(name: str) -> str:
+        words = name.split()
+        while words and words[-1] in _AGENCY_LEGAL_SUFFIXES:
+            words.pop()
+        return "".join(words)
+
+    printed_body = compact_body(printed_name)
+    return (
+        len(printed_body) >= _AGENCY_MIN_COMPACT_NAME_LENGTH
+        and printed_body == compact_body(agent_name)
     )
 
 
@@ -936,7 +991,7 @@ def _ground_parties(
             issues.append(
                 ValidationAlert.from_code(
                     AlertCode.CROSS_DOCUMENT_CONFLICT,
-                    "模型给出的结算主体与原文收付证据不符",
+                    LLM_PARTY_CONFLICT_MESSAGE,
                     field=field,
                     expected=printed or alternative,
                     actual=model,

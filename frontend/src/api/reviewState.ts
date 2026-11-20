@@ -55,10 +55,17 @@ export type ConfirmableRecordPatchField =
   | "booking_no"
   | "container_nos";
 
+export interface ConfirmedFieldSnapshot {
+  value: string;
+  recordUpdatedAt: string | null;
+}
+
+export type ConfirmedFieldMap = Record<string, ConfirmedFieldSnapshot>;
+
 export interface RecordDraftEntry {
   draftVersion: number;
   fields: Partial<RecordFormValues>;
-  confirmedFields?: Record<string, true>;
+  confirmedFields?: ConfirmedFieldMap;
 }
 
 export type RecordDraft = RecordDraftEntry;
@@ -79,7 +86,7 @@ export interface DocTotalsDraftEntry {
 export interface InFlightRecordSaveEntry {
   submittedVersion: number;
   submittedFields: Partial<RecordFormValues>;
-  submittedConfirmedFields?: Record<string, true>;
+  submittedConfirmedFields?: ConfirmedFieldMap;
   postSubmitTouched: Partial<Record<keyof RecordFormValues, true>>;
   postSubmitConfirmed?: Record<string, true>;
 }
@@ -368,11 +375,65 @@ export function extractServerRecordFormValues(
   };
 }
 
+const observedRecordsByStore = new WeakMap<
+  DraftStoreState,
+  Map<string, BillingRecordDetail>
+>();
+
+function rememberObservedRecord(
+  store: DraftStoreState,
+  batchId: string,
+  record: BillingRecordDetail
+): void {
+  let map = observedRecordsByStore.get(store);
+  if (!map) {
+    map = new Map<string, BillingRecordDetail>();
+    observedRecordsByStore.set(store, map);
+  }
+  map.set(makeRecordDraftKey(batchId, record.id), record);
+}
+
+function inheritObservedRecords(
+  prevStore: DraftStoreState,
+  nextStore: DraftStoreState,
+  batchId?: string,
+  record?: BillingRecordDetail
+): DraftStoreState {
+  if (prevStore !== nextStore) {
+    const prevMap = observedRecordsByStore.get(prevStore);
+    if (prevMap && prevMap.size > 0) {
+      observedRecordsByStore.set(nextStore, new Map(prevMap));
+    }
+  }
+  if (batchId && record) {
+    rememberObservedRecord(nextStore, batchId, record);
+  }
+  return nextStore;
+}
+
+function resolveObservedRecord(
+  store: DraftStoreState,
+  batchId: string,
+  recordId: string,
+  explicitRecord?: BillingRecordDetail | null
+): BillingRecordDetail | null {
+  if (explicitRecord) {
+    rememberObservedRecord(store, batchId, explicitRecord);
+    return explicitRecord;
+  }
+  return (
+    observedRecordsByStore
+      .get(store)
+      ?.get(makeRecordDraftKey(batchId, recordId)) ?? null
+  );
+}
+
 export function getEffectiveRecordFormValues(
   record: BillingRecordDetail,
   store: DraftStoreState,
   batchId: string
 ): RecordFormValues {
+  rememberObservedRecord(store, batchId, record);
   const server = extractServerRecordFormValues(record);
   const key = makeRecordDraftKey(batchId, record.id);
   const draft = store.recordDrafts[key];
@@ -446,7 +507,110 @@ export function normalizeConfirmedFieldName(
   return null;
 }
 
-function hasNonEmptyConfirmedMap(confirmed?: Record<string, true>): boolean {
+function patchFieldToFormKey(
+  field: ConfirmableRecordPatchField
+): keyof RecordFormValues {
+  return field === "container_nos" ? "container_nos_text" : field;
+}
+
+export function getCanonicalConfirmFieldValue(
+  values: RecordFormValues,
+  field: ConfirmableRecordPatchField
+): string {
+  switch (field) {
+    case "currency":
+      return values.currency.trim().toUpperCase();
+    case "payment_term":
+      return values.payment_term;
+    case "posting_type":
+      return values.posting_type;
+    case "container_nos":
+      return parseContainerNosInput(values.container_nos_text).join(", ");
+    case "charge_item":
+    case "quantity":
+    case "unit_price":
+    case "amount":
+    case "document_type":
+    case "reference_no":
+    case "document_date":
+    case "issuer":
+    case "recipient":
+    case "mbl_no":
+    case "hbl_no":
+    case "booking_no":
+      return values[field].trim();
+  }
+}
+
+export function isConfirmedFieldEntryValid(
+  field: ConfirmableRecordPatchField,
+  entry: ConfirmedFieldSnapshot | undefined,
+  record: BillingRecordDetail,
+  draftFields?: Partial<RecordFormValues>
+): boolean {
+  if (!entry || typeof entry.value !== "string") {
+    return false;
+  }
+  const serverValues = extractServerRecordFormValues(record);
+  const formKey = patchFieldToFormKey(field);
+  const effectiveValues = draftFields
+    ? { ...serverValues, ...draftFields }
+    : serverValues;
+  const currentEffectiveVal = getCanonicalConfirmFieldValue(
+    effectiveValues,
+    field
+  );
+  if (currentEffectiveVal !== entry.value) {
+    return false;
+  }
+
+  const hasExplicitFieldOverride = Boolean(
+    draftFields &&
+      Object.prototype.hasOwnProperty.call(draftFields, formKey) &&
+      draftFields[formKey] !== undefined &&
+      draftFields[formKey] !== serverValues[formKey]
+  );
+  if (!hasExplicitFieldOverride) {
+    const currentServerVal = getCanonicalConfirmFieldValue(serverValues, field);
+    if (currentServerVal !== entry.value) {
+      return false;
+    }
+    const currentUpdatedAt = record.updated_at ?? null;
+    if (entry.recordUpdatedAt !== currentUpdatedAt) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function filterValidConfirmedFields(
+  confirmed: ConfirmedFieldMap | undefined,
+  record: BillingRecordDetail | null,
+  draftFields?: Partial<RecordFormValues>
+): ConfirmedFieldMap {
+  if (!confirmed) {
+    return {};
+  }
+  const valid: ConfirmedFieldMap = {};
+  for (const [rawKey, snap] of Object.entries(confirmed)) {
+    const mapped = normalizeConfirmedFieldName(rawKey);
+    if (!mapped || !snap || typeof snap.value !== "string") {
+      continue;
+    }
+    if (
+      !record ||
+      isConfirmedFieldEntryValid(mapped, snap, record, draftFields)
+    ) {
+      valid[mapped] = {
+        value: snap.value,
+        recordUpdatedAt: snap.recordUpdatedAt ?? null,
+      };
+    }
+  }
+  return valid;
+}
+
+function hasNonEmptyConfirmedMap(confirmed?: ConfirmedFieldMap): boolean {
   return Boolean(confirmed && Object.keys(confirmed).length > 0);
 }
 
@@ -480,13 +644,13 @@ export function withPendingRecordConfirmation(
 interface DraftEntryShape<TFields extends object> {
   draftVersion: number;
   fields: Partial<TFields>;
-  confirmedFields?: Record<string, true>;
+  confirmedFields?: ConfirmedFieldMap;
 }
 
 interface InFlightSaveShape<TFields extends object> {
   submittedVersion: number;
   submittedFields: Partial<TFields>;
-  submittedConfirmedFields?: Record<string, true>;
+  submittedConfirmedFields?: ConfirmedFieldMap;
   postSubmitTouched: Partial<Record<keyof TFields, true>>;
   postSubmitConfirmed?: Record<string, true>;
 }
@@ -531,7 +695,12 @@ function finishDraftSaveSuccess<TFields extends object, TServer>(
   extractServer: (s: TServer) => TFields,
   pruneFields: (s: TFields, f: Partial<TFields>) => Partial<TFields> | null,
   updatedServer?: TServer,
-  expectedVersion?: number
+  expectedVersion?: number,
+  pruneConfirmed?: (
+    c: ConfirmedFieldMap | undefined,
+    s: TServer | undefined,
+    f: Partial<TFields>
+  ) => ConfirmedFieldMap | undefined
 ) {
   const inFlight = inFlightMap[key];
   if (!inFlight) {
@@ -552,9 +721,11 @@ function finishDraftSaveSuccess<TFields extends object, TServer>(
     }
     const nextServer = extractServer(updatedServer);
     const remaining = pruneFields(nextServer, current.fields);
-    const remainingConfirmed = hasNonEmptyConfirmedMap(current.confirmedFields)
-      ? { ...current.confirmedFields }
-      : undefined;
+    const remainingConfirmed = pruneConfirmed
+      ? pruneConfirmed(current.confirmedFields, updatedServer, remaining ?? {})
+      : hasNonEmptyConfirmedMap(current.confirmedFields)
+        ? { ...current.confirmedFields }
+        : undefined;
     const nextDrafts = { ...drafts };
     if (!remaining && !remainingConfirmed) {
       delete nextDrafts[key];
@@ -590,20 +761,13 @@ function finishDraftSaveSuccess<TFields extends object, TServer>(
     }
   });
 
-  const postConfirmedFields: Record<string, true> = {};
+  const rawPostConfirmed: ConfirmedFieldMap = {};
   if (inFlight.postSubmitConfirmed && current.confirmedFields) {
     for (const k of Object.keys(current.confirmedFields)) {
       if (inFlight.postSubmitConfirmed[k] === true) {
-        postConfirmedFields[k] = true;
+        rawPostConfirmed[k] = current.confirmedFields[k];
       }
     }
-  }
-  const hasPostConfirmed = Object.keys(postConfirmedFields).length > 0;
-
-  const nextDrafts = { ...drafts };
-  if (Object.keys(postTouchedFields).length === 0 && !hasPostConfirmed) {
-    delete nextDrafts[key];
-    return { nextDrafts, nextInFlight };
   }
 
   const remaining =
@@ -613,13 +777,23 @@ function finishDraftSaveSuccess<TFields extends object, TServer>(
         : postTouchedFields
       : null;
 
+  const validatedPostConfirmed = pruneConfirmed
+    ? pruneConfirmed(rawPostConfirmed, updatedServer, remaining ?? {})
+    : hasNonEmptyConfirmedMap(rawPostConfirmed)
+      ? rawPostConfirmed
+      : undefined;
+  const hasPostConfirmed = hasNonEmptyConfirmedMap(validatedPostConfirmed);
+
+  const nextDrafts = { ...drafts };
   if (!remaining && !hasPostConfirmed) {
     delete nextDrafts[key];
   } else {
     nextDrafts[key] = {
       draftVersion: current.draftVersion,
       fields: remaining ?? {},
-      ...(hasPostConfirmed ? { confirmedFields: postConfirmedFields } : {}),
+      ...(hasPostConfirmed && validatedPostConfirmed
+        ? { confirmedFields: validatedPostConfirmed }
+        : {}),
     };
   }
   return { nextDrafts, nextInFlight };
@@ -631,7 +805,12 @@ function finishDraftSaveError<TFields extends object, TServer>(
   key: string,
   extractServer: (s: TServer) => TFields,
   pruneFields: (s: TFields, f: Partial<TFields>) => Partial<TFields> | null,
-  serverEntity?: TServer
+  serverEntity?: TServer,
+  pruneConfirmed?: (
+    c: ConfirmedFieldMap | undefined,
+    s: TServer | undefined,
+    f: Partial<TFields>
+  ) => ConfirmedFieldMap | undefined
 ) {
   const nextInFlight = { ...inFlightMap };
   delete nextInFlight[key];
@@ -641,9 +820,11 @@ function finishDraftSaveError<TFields extends object, TServer>(
     return { nextDrafts: drafts, nextInFlight };
   }
   const remaining = pruneFields(extractServer(serverEntity), current.fields);
-  const remainingConfirmed = hasNonEmptyConfirmedMap(current.confirmedFields)
-    ? { ...current.confirmedFields }
-    : undefined;
+  const remainingConfirmed = pruneConfirmed
+    ? pruneConfirmed(current.confirmedFields, serverEntity, remaining ?? {})
+    : hasNonEmptyConfirmedMap(current.confirmedFields)
+      ? { ...current.confirmedFields }
+      : undefined;
   const nextDrafts = { ...drafts };
   if (!remaining && !remainingConfirmed) {
     delete nextDrafts[key];
@@ -657,13 +838,61 @@ function finishDraftSaveError<TFields extends object, TServer>(
   return { nextDrafts, nextInFlight };
 }
 
+function pruneConfirmedRecordMap(
+  confirmed: ConfirmedFieldMap | undefined,
+  record: BillingRecordDetail | undefined,
+  fields: Partial<RecordFormValues>
+): ConfirmedFieldMap | undefined {
+  const filtered = filterValidConfirmedFields(confirmed, record ?? null, fields);
+  return Object.keys(filtered).length > 0 ? filtered : undefined;
+}
+
 export function getConfirmedRecordFields(
   store: DraftStoreState,
   batchId: string,
-  recordId: string
-): Record<string, true> {
+  recordId: string,
+  record?: BillingRecordDetail | null
+): ConfirmedFieldMap {
   const entry = store.recordDrafts[makeRecordDraftKey(batchId, recordId)];
-  return entry?.confirmedFields ? { ...entry.confirmedFields } : {};
+  if (!entry?.confirmedFields) {
+    if (record) {
+      rememberObservedRecord(store, batchId, record);
+    }
+    return {};
+  }
+  const effectiveRecord = resolveObservedRecord(
+    store,
+    batchId,
+    recordId,
+    record
+  );
+  return filterValidConfirmedFields(
+    entry.confirmedFields,
+    effectiveRecord,
+    entry.fields
+  );
+}
+
+export function hasStaleConfirmedFields(
+  store: DraftStoreState,
+  batchId: string,
+  record: BillingRecordDetail
+): boolean {
+  rememberObservedRecord(store, batchId, record);
+  const entry = store.recordDrafts[makeRecordDraftKey(batchId, record.id)];
+  if (!entry?.confirmedFields) {
+    return false;
+  }
+  const rawKeys = Object.keys(entry.confirmedFields);
+  if (rawKeys.length === 0) {
+    return false;
+  }
+  const validMap = filterValidConfirmedFields(
+    entry.confirmedFields,
+    record,
+    entry.fields
+  );
+  return Object.keys(validMap).length < rawKeys.length;
 }
 
 export function markRecordFieldsConfirmed(
@@ -680,16 +909,27 @@ export function markRecordFieldsConfirmed(
     }
   }
   if (normalized.length === 0) {
+    rememberObservedRecord(store, batchId, record);
     return store;
   }
 
   const key = makeRecordDraftKey(batchId, record.id);
   const existing = store.recordDrafts[key];
-  const nextConfirmed: Record<string, true> = {
-    ...(existing?.confirmedFields ?? {}),
-  };
+  const existingFields = existing ? { ...existing.fields } : {};
+  const server = extractServerRecordFormValues(record);
+  const effective = { ...server, ...existingFields };
+  const recordUpdatedAt = record.updated_at ?? null;
+
+  const nextConfirmed: ConfirmedFieldMap = filterValidConfirmedFields(
+    existing?.confirmedFields,
+    record,
+    existingFields
+  );
   for (const f of normalized) {
-    nextConfirmed[f] = true;
+    nextConfirmed[f] = {
+      value: getCanonicalConfirmFieldValue(effective, f),
+      recordUpdatedAt,
+    };
   }
 
   const nextVersion = store.nextDraftVersion + 1;
@@ -697,7 +937,7 @@ export function markRecordFieldsConfirmed(
     ...store.recordDrafts,
     [key]: {
       draftVersion: nextVersion,
-      fields: existing ? { ...existing.fields } : {},
+      fields: existingFields,
       confirmedFields: nextConfirmed,
     },
   };
@@ -711,25 +951,35 @@ export function markRecordFieldsConfirmed(
     for (const f of normalized) {
       nextPostConfirmed[f] = true;
     }
-    return {
+    return inheritObservedRecords(
+      store,
+      {
+        ...store,
+        nextDraftVersion: nextVersion,
+        recordDrafts: nextRecordDrafts,
+        inFlightRecordSaves: {
+          ...inFlightMap,
+          [key]: {
+            ...inFlight,
+            postSubmitConfirmed: nextPostConfirmed,
+          },
+        },
+      },
+      batchId,
+      record
+    );
+  }
+
+  return inheritObservedRecords(
+    store,
+    {
       ...store,
       nextDraftVersion: nextVersion,
       recordDrafts: nextRecordDrafts,
-      inFlightRecordSaves: {
-        ...inFlightMap,
-        [key]: {
-          ...inFlight,
-          postSubmitConfirmed: nextPostConfirmed,
-        },
-      },
-    };
-  }
-
-  return {
-    ...store,
-    nextDraftVersion: nextVersion,
-    recordDrafts: nextRecordDrafts,
-  };
+    },
+    batchId,
+    record
+  );
 }
 
 export function setRecordDraftField<K extends keyof RecordFormValues>(
@@ -753,22 +1003,6 @@ export function setRecordDraftField<K extends keyof RecordFormValues>(
     draftVersion: store.nextDraftVersion,
     fields: {},
   };
-  const nextConfirmed: Record<string, true> = {
-    ...(existing.confirmedFields ?? {}),
-  };
-  const newlyConfirmed: ConfirmableRecordPatchField[] = [];
-  if (stagedConfirmed) {
-    for (const raw of stagedConfirmed) {
-      const mapped = normalizeConfirmedFieldName(raw);
-      if (mapped) {
-        nextConfirmed[mapped] = true;
-        if (!newlyConfirmed.includes(mapped)) {
-          newlyConfirmed.push(mapped);
-        }
-      }
-    }
-  }
-  const hasConfirmed = Object.keys(nextConfirmed).length > 0;
 
   const nextFields: Partial<RecordFormValues> = {
     ...existing.fields,
@@ -820,6 +1054,30 @@ export function setRecordDraftField<K extends keyof RecordFormValues>(
     }
   }
 
+  const finalEffective = { ...server, ...nextFields };
+  const recordUpdatedAt = record.updated_at ?? null;
+  const nextConfirmed: ConfirmedFieldMap = filterValidConfirmedFields(
+    existing.confirmedFields,
+    record,
+    nextFields
+  );
+  const newlyConfirmed: ConfirmableRecordPatchField[] = [];
+  if (stagedConfirmed) {
+    for (const raw of stagedConfirmed) {
+      const mapped = normalizeConfirmedFieldName(raw);
+      if (mapped) {
+        nextConfirmed[mapped] = {
+          value: getCanonicalConfirmFieldValue(finalEffective, mapped),
+          recordUpdatedAt,
+        };
+        if (!newlyConfirmed.includes(mapped)) {
+          newlyConfirmed.push(mapped);
+        }
+      }
+    }
+  }
+  const hasConfirmed = Object.keys(nextConfirmed).length > 0;
+
   const nextVersion = store.nextDraftVersion + 1;
   const nextRecordDrafts = { ...store.recordDrafts };
   const inFlightMap = store.inFlightRecordSaves ?? {};
@@ -840,19 +1098,24 @@ export function setRecordDraftField<K extends keyof RecordFormValues>(
     for (const cf of newlyConfirmed) {
       nextPostConfirmed[cf] = true;
     }
-    return {
-      ...store,
-      nextDraftVersion: nextVersion,
-      recordDrafts: nextRecordDrafts,
-      inFlightRecordSaves: {
-        ...inFlightMap,
-        [key]: {
-          ...inFlight,
-          postSubmitTouched: nextTouched,
-          postSubmitConfirmed: nextPostConfirmed,
+    return inheritObservedRecords(
+      store,
+      {
+        ...store,
+        nextDraftVersion: nextVersion,
+        recordDrafts: nextRecordDrafts,
+        inFlightRecordSaves: {
+          ...inFlightMap,
+          [key]: {
+            ...inFlight,
+            postSubmitTouched: nextTouched,
+            postSubmitConfirmed: nextPostConfirmed,
+          },
         },
       },
-    };
+      batchId,
+      record
+    );
   }
 
   const prunedFields = pruneRecordFields(server, nextFields);
@@ -865,11 +1128,16 @@ export function setRecordDraftField<K extends keyof RecordFormValues>(
   } else {
     delete nextRecordDrafts[key];
   }
-  return {
-    ...store,
-    nextDraftVersion: nextVersion,
-    recordDrafts: nextRecordDrafts,
-  };
+  return inheritObservedRecords(
+    store,
+    {
+      ...store,
+      nextDraftVersion: nextVersion,
+      recordDrafts: nextRecordDrafts,
+    },
+    batchId,
+    record
+  );
 }
 
 export function beginRecordSave(
@@ -880,7 +1148,7 @@ export function beginRecordSave(
   submittedFields?: Partial<RecordFormValues>
 ): DraftStoreState {
   const key = makeRecordDraftKey(batchId, recordId);
-  return {
+  return inheritObservedRecords(store, {
     ...store,
     inFlightRecordSaves: beginDraftSave(
       store.recordDrafts,
@@ -890,7 +1158,7 @@ export function beginRecordSave(
       version,
       submittedFields
     ),
-  };
+  });
 }
 
 export function finishRecordSaveSuccess(
@@ -908,13 +1176,19 @@ export function finishRecordSaveSuccess(
     extractServerRecordFormValues,
     pruneRecordFields,
     updatedRecord,
-    expectedVersion
+    expectedVersion,
+    pruneConfirmedRecordMap
   );
-  return {
-    ...store,
-    recordDrafts: nextDrafts,
-    inFlightRecordSaves: nextInFlight,
-  };
+  return inheritObservedRecords(
+    store,
+    {
+      ...store,
+      recordDrafts: nextDrafts,
+      inFlightRecordSaves: nextInFlight,
+    },
+    batchId,
+    updatedRecord
+  );
 }
 
 export function finishRecordSaveError(
@@ -930,13 +1204,19 @@ export function finishRecordSaveError(
     key,
     extractServerRecordFormValues,
     pruneRecordFields,
+    serverRecord,
+    pruneConfirmedRecordMap
+  );
+  return inheritObservedRecords(
+    store,
+    {
+      ...store,
+      recordDrafts: nextDrafts,
+      inFlightRecordSaves: nextInFlight,
+    },
+    batchId,
     serverRecord
   );
-  return {
-    ...store,
-    recordDrafts: nextDrafts,
-    inFlightRecordSaves: nextInFlight,
-  };
 }
 
 export function clearRecordDraft(
@@ -953,11 +1233,16 @@ export function clearRecordDraft(
     delete nextRecordDrafts[key];
     const nextInFlight = { ...inFlightMap };
     delete nextInFlight[key];
-    return {
-      ...store,
-      recordDrafts: nextRecordDrafts,
-      inFlightRecordSaves: nextInFlight,
-    };
+    return inheritObservedRecords(
+      store,
+      {
+        ...store,
+        recordDrafts: nextRecordDrafts,
+        inFlightRecordSaves: nextInFlight,
+      },
+      batchId,
+      updatedRecord
+    );
   }
   return finishRecordSaveSuccess(
     store,
@@ -971,14 +1256,29 @@ export function clearRecordDraft(
 export function hasRecordDraft(
   store: DraftStoreState,
   batchId: string,
-  recordId: string
+  recordId: string,
+  record?: BillingRecordDetail | null
 ): boolean {
   const entry = store.recordDrafts[makeRecordDraftKey(batchId, recordId)];
-  if (!entry) return false;
-  return (
-    Object.keys(entry.fields).length > 0 ||
-    hasNonEmptyConfirmedMap(entry.confirmedFields)
+  if (!entry) {
+    if (record) {
+      rememberObservedRecord(store, batchId, record);
+    }
+    return false;
+  }
+  if (Object.keys(entry.fields).length > 0) {
+    if (record) {
+      rememberObservedRecord(store, batchId, record);
+    }
+    return true;
+  }
+  const validConfirmed = getConfirmedRecordFields(
+    store,
+    batchId,
+    recordId,
+    record
   );
+  return Object.keys(validConfirmed).length > 0;
 }
 
 export function getDirtyRecordIds(
@@ -988,7 +1288,7 @@ export function getDirtyRecordIds(
 ): Set<string> {
   const dirty = new Set<string>();
   for (const rec of records) {
-    if (hasRecordDraft(store, batchId, rec.id)) {
+    if (hasRecordDraft(store, batchId, rec.id, rec)) {
       dirty.add(rec.id);
     }
   }
@@ -1344,158 +1644,152 @@ export function buildRecordDiffPatch(
     patch.review_note = trimmedNote;
   }
 
-  // Wave 13: Explicitly serialize validated current values for `confirmedFields`
-  // even when `effective === server`, and block invalid/empty confirmed values via `fieldErrors`.
-  const confirmedMap =
-    store.recordDrafts[makeRecordDraftKey(batchId, record.id)]?.confirmedFields;
-  if (confirmedMap) {
-    for (const rawKey of Object.keys(confirmedMap)) {
-      const confirmedField = normalizeConfirmedFieldName(rawKey);
-      if (!confirmedField || confirmedField in fieldErrors) {
-        continue;
-      }
+  // Wave 13 / 13B (F3): Explicitly serialize validated values for non-stale `confirmedFields`
+  // bound to exact confirmation-time value + record `updated_at`, and block invalid/empty values via `fieldErrors`.
+  const confirmedMap = getConfirmedRecordFields(
+    store,
+    batchId,
+    record.id,
+    record
+  );
+  for (const [rawKey, snap] of Object.entries(confirmedMap)) {
+    const confirmedField = normalizeConfirmedFieldName(rawKey);
+    if (!confirmedField || confirmedField in fieldErrors) {
+      continue;
+    }
 
-      switch (confirmedField) {
-        case "charge_item": {
-          const trimmed = effective.charge_item.trim();
-          if (!trimmed) {
-            delete patch.charge_item;
-            fieldErrors.charge_item = "请先填写非空标准费用名称后再确认保存";
-          } else if (patch.charge_item === undefined) {
-            patch.charge_item = trimmed;
-          }
-          break;
+    switch (confirmedField) {
+      case "charge_item": {
+        const trimmed = snap.value.trim();
+        if (!trimmed) {
+          delete patch.charge_item;
+          fieldErrors.charge_item = "请先填写非空标准费用名称后再确认保存";
+        } else if (patch.charge_item === undefined) {
+          patch.charge_item = trimmed;
         }
-        case "quantity":
-        case "unit_price":
-        case "amount": {
-          const raw = effective[confirmedField].trim();
-          if (!raw) {
-            delete patch[confirmedField];
+        break;
+      }
+      case "quantity":
+      case "unit_price":
+      case "amount": {
+        const raw = snap.value.trim();
+        if (!raw) {
+          delete patch[confirmedField];
+          fieldErrors[confirmedField] =
+            confirmedField === "amount"
+              ? "请先填写合法金额数值后再确认保存"
+              : "请先填写合法数值后再确认保存";
+        } else if (patch[confirmedField] === undefined) {
+          try {
+            patch[confirmedField] = rawDecimal(raw);
+          } catch (err) {
             fieldErrors[confirmedField] =
-              confirmedField === "amount"
-                ? "请先填写合法金额数值后再确认保存"
-                : "请先填写合法数值后再确认保存";
-          } else if (patch[confirmedField] === undefined) {
-            try {
-              patch[confirmedField] = rawDecimal(raw);
-            } catch (err) {
-              fieldErrors[confirmedField] =
-                err instanceof Error ? err.message : "非法十进制数值";
-            }
+              err instanceof Error ? err.message : "非法十进制数值";
           }
-          break;
         }
-        case "currency": {
-          const upper = effective.currency.trim().toUpperCase();
-          if (!upper || !isValidIso4217Currency(upper)) {
-            delete patch.currency;
-            fieldErrors.currency =
-              "币种须为有效 3 位大写 ISO 4217 代码（如 USD、CNY）";
-          } else if (patch.currency === undefined) {
-            patch.currency = upper;
-          }
-          break;
+        break;
+      }
+      case "currency": {
+        const upper = snap.value.trim().toUpperCase();
+        if (!upper || !isValidIso4217Currency(upper)) {
+          delete patch.currency;
+          fieldErrors.currency =
+            "币种须为有效 3 位大写 ISO 4217 代码（如 USD、CNY）";
+        } else if (patch.currency === undefined) {
+          patch.currency = upper;
         }
-        case "payment_term": {
-          if (
-            effective.payment_term !== "PP" &&
-            effective.payment_term !== "CC"
-          ) {
-            delete patch.payment_term;
-            fieldErrors.payment_term = "确认付款条款时须选择 PP 或 CC";
-          } else if (patch.payment_term === undefined) {
-            patch.payment_term = effective.payment_term;
-          }
-          break;
+        break;
+      }
+      case "payment_term": {
+        if (snap.value !== "PP" && snap.value !== "CC") {
+          delete patch.payment_term;
+          fieldErrors.payment_term = "确认付款条款时须选择 PP 或 CC";
+        } else if (patch.payment_term === undefined) {
+          patch.payment_term = snap.value;
         }
-        case "posting_type": {
-          if (
-            effective.posting_type !== "AR" &&
-            effective.posting_type !== "AP"
-          ) {
-            delete patch.posting_type;
-            fieldErrors.posting_type = "确认记账方向时须选择 AR 或 AP";
-          } else if (patch.posting_type === undefined) {
-            patch.posting_type = effective.posting_type;
-          }
-          break;
+        break;
+      }
+      case "posting_type": {
+        if (snap.value !== "AR" && snap.value !== "AP") {
+          delete patch.posting_type;
+          fieldErrors.posting_type = "确认记账方向时须选择 AR 或 AP";
+        } else if (patch.posting_type === undefined) {
+          patch.posting_type = snap.value;
         }
-        case "document_type": {
-          const trimmed = effective.document_type.trim();
-          if (!trimmed) {
-            delete patch.document_type;
-            fieldErrors.document_type = "请先填写非空单据类型后再确认保存";
-          } else if (patch.document_type === undefined) {
-            patch.document_type = trimmed;
-          }
-          break;
+        break;
+      }
+      case "document_type": {
+        const trimmed = snap.value.trim();
+        if (!trimmed) {
+          delete patch.document_type;
+          fieldErrors.document_type = "请先填写非空单据类型后再确认保存";
+        } else if (patch.document_type === undefined) {
+          patch.document_type = trimmed;
         }
-        case "reference_no": {
-          const trimmed = effective.reference_no.trim();
-          if (!trimmed) {
-            delete patch.reference_no;
-            fieldErrors.reference_no = "请先填写非空单据编号后再确认保存";
-          } else if (patch.reference_no === undefined) {
-            patch.reference_no = trimmed;
-          }
-          break;
+        break;
+      }
+      case "reference_no": {
+        const trimmed = snap.value.trim();
+        if (!trimmed) {
+          delete patch.reference_no;
+          fieldErrors.reference_no = "请先填写非空单据编号后再确认保存";
+        } else if (patch.reference_no === undefined) {
+          patch.reference_no = trimmed;
         }
-        case "document_date": {
-          const dateVal = effective.document_date.trim();
-          if (!dateVal || !isValidCalendarDate(dateVal)) {
-            delete patch.document_date;
-            fieldErrors.document_date = "单据日期格式须为合法 YYYY-MM-DD";
-          } else if (patch.document_date === undefined) {
-            patch.document_date = dateVal;
-          }
-          break;
+        break;
+      }
+      case "document_date": {
+        const dateVal = snap.value.trim();
+        if (!dateVal || !isValidCalendarDate(dateVal)) {
+          delete patch.document_date;
+          fieldErrors.document_date = "单据日期格式须为合法 YYYY-MM-DD";
+        } else if (patch.document_date === undefined) {
+          patch.document_date = dateVal;
         }
-        case "issuer": {
-          const trimmed = effective.issuer.trim();
-          if (!trimmed) {
-            delete patch.issuer;
-            fieldErrors.issuer = "请先填写非空签发方名称后再确认保存";
-          } else if (patch.issuer === undefined) {
-            patch.issuer = trimmed;
-          }
-          break;
+        break;
+      }
+      case "issuer": {
+        const trimmed = snap.value.trim();
+        if (!trimmed) {
+          delete patch.issuer;
+          fieldErrors.issuer = "请先填写非空签发方名称后再确认保存";
+        } else if (patch.issuer === undefined) {
+          patch.issuer = trimmed;
         }
-        case "recipient": {
-          const trimmed = effective.recipient.trim();
-          if (!trimmed) {
-            delete patch.recipient;
-            fieldErrors.recipient = "请先填写非空接收方名称后再确认保存";
-          } else if (patch.recipient === undefined) {
-            patch.recipient = trimmed;
-          }
-          break;
+        break;
+      }
+      case "recipient": {
+        const trimmed = snap.value.trim();
+        if (!trimmed) {
+          delete patch.recipient;
+          fieldErrors.recipient = "请先填写非空接收方名称后再确认保存";
+        } else if (patch.recipient === undefined) {
+          patch.recipient = trimmed;
         }
-        case "mbl_no":
-        case "hbl_no":
-        case "booking_no": {
-          const trimmed = effective[confirmedField].trim();
-          if (!trimmed) {
-            delete patch[confirmedField];
-            fieldErrors[confirmedField] = "请先填写非空运输单号后再确认保存";
-          } else if (patch[confirmedField] === undefined) {
-            patch[confirmedField] = trimmed;
-          }
-          break;
+        break;
+      }
+      case "mbl_no":
+      case "hbl_no":
+      case "booking_no": {
+        const trimmed = snap.value.trim();
+        if (!trimmed) {
+          delete patch[confirmedField];
+          fieldErrors[confirmedField] = "请先填写非空运输单号后再确认保存";
+        } else if (patch[confirmedField] === undefined) {
+          patch[confirmedField] = trimmed;
         }
-        case "container_nos": {
-          const nextContainers = parseContainerNosInput(
-            effective.container_nos_text
-          );
-          if (nextContainers.length === 0) {
-            delete patch.container_nos;
-            fieldErrors.container_nos =
-              "请先填写至少一个有效箱号后再确认保存";
-          } else if (patch.container_nos === undefined) {
-            patch.container_nos = nextContainers;
-          }
-          break;
+        break;
+      }
+      case "container_nos": {
+        const nextContainers = parseContainerNosInput(snap.value);
+        if (nextContainers.length === 0) {
+          delete patch.container_nos;
+          fieldErrors.container_nos =
+            "请先填写至少一个有效箱号后再确认保存";
+        } else if (patch.container_nos === undefined) {
+          patch.container_nos = nextContainers;
         }
+        break;
       }
     }
   }
@@ -1522,6 +1816,12 @@ const NON_FILLABLE_PLACEHOLDER_VALUES: ReadonlySet<string> = new Set([
   "none",
   "同一源单中的费用名称和金额",
 ]);
+
+export const ENTITY_NOT_MATCHED_GUIDANCE =
+  "请核对签发方、接收方名称是否包含当前记账主体/别名，或手工指定 AR/AP 台账方向（注意：仅在签发方与接收方不存在显式反向冲突时允许单改方向）";
+
+export const CONTEXT_INFERRED_WARNING_GUIDANCE =
+  "这是上下文推断软告警；核对金额与币种无误后，请直接在下方填写批准理由点击『人工批准』放行，仅保存修订（PATCH）不会自动消除推断告警";
 
 function parseFillableTextValue(raw: string | null | undefined): string | null {
   if (typeof raw !== "string") return null;
@@ -1551,18 +1851,150 @@ function parseFillableDecimalValue(
   }
 }
 
+function dedupeContainerTokens(tokens: ReadonlyArray<string>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const tok of tokens) {
+    if (!seen.has(tok)) {
+      seen.add(tok);
+      out.push(tok);
+    }
+  }
+  return out;
+}
+
 function parseFillableContainersValue(
   raw: string | null | undefined
 ): string | null {
   if (typeof raw !== "string") return null;
-  const tokens = parseContainerNosInput(raw);
+  const trimmed = raw.trim();
+  if (
+    !trimmed ||
+    NON_FILLABLE_PLACEHOLDER_VALUES.has(trimmed) ||
+    NON_FILLABLE_PLACEHOLDER_VALUES.has(trimmed.toLowerCase()) ||
+    trimmed.includes("同一源单中的")
+  ) {
+    return null;
+  }
+  const tokens = dedupeContainerTokens(parseContainerNosInput(trimmed));
   if (
     tokens.length === 0 ||
-    tokens.some((tok) => !/^[A-Z0-9]{4,15}$/.test(tok))
+    tokens.some((tok) => !/^(?=.*[A-Z0-9])[A-Z0-9_-]{4,20}$/.test(tok))
   ) {
     return null;
   }
   return tokens.join(", ");
+}
+
+export interface ContainerSuggestionResult {
+  nextValue: string;
+  alreadyResolved: boolean;
+  replacedActual: boolean;
+  appendedExpected: boolean;
+}
+
+export function applyContainerSuggestion(
+  currentText: string,
+  actualRaw: string | null | undefined,
+  expectedRaw: string | null | undefined
+): ContainerSuggestionResult {
+  const currentTokens = dedupeContainerTokens(
+    parseContainerNosInput(currentText)
+  );
+  const expectedTokens = dedupeContainerTokens(
+    parseContainerNosInput(expectedRaw ?? "")
+  );
+  if (expectedTokens.length === 0) {
+    return {
+      nextValue: currentTokens.join(", "),
+      alreadyResolved: true,
+      replacedActual: false,
+      appendedExpected: false,
+    };
+  }
+  if (currentTokens.length === 0) {
+    return {
+      nextValue: expectedTokens.join(", "),
+      alreadyResolved: false,
+      replacedActual: false,
+      appendedExpected: true,
+    };
+  }
+
+  const actualTokens = dedupeContainerTokens(
+    parseContainerNosInput(actualRaw ?? "")
+  );
+  if (actualTokens.length > 0) {
+    const actualSet = new Set(actualTokens);
+    const hasAnyActual = currentTokens.some((tok) => actualSet.has(tok));
+    if (!hasAnyActual) {
+      return {
+        nextValue: currentTokens.join(", "),
+        alreadyResolved: true,
+        replacedActual: false,
+        appendedExpected: false,
+      };
+    }
+    const replaced: string[] = [];
+    for (const tok of currentTokens) {
+      if (actualSet.has(tok)) {
+        replaced.push(...expectedTokens);
+      } else {
+        replaced.push(tok);
+      }
+    }
+    const dedupedNext = dedupeContainerTokens(replaced);
+    const currNorm = currentTokens.join(", ");
+    const nextNorm = dedupedNext.join(", ");
+    return {
+      nextValue: nextNorm,
+      alreadyResolved: currNorm === nextNorm,
+      replacedActual: currNorm !== nextNorm,
+      appendedExpected: false,
+    };
+  }
+
+  const currentSet = new Set(currentTokens);
+  const missingExpected = expectedTokens.filter((tok) => !currentSet.has(tok));
+  if (missingExpected.length === 0) {
+    return {
+      nextValue: currentTokens.join(", "),
+      alreadyResolved: true,
+      replacedActual: false,
+      appendedExpected: false,
+    };
+  }
+  return {
+    nextValue: dedupeContainerTokens([
+      ...currentTokens,
+      ...missingExpected,
+    ]).join(", "),
+    alreadyResolved: false,
+    replacedActual: false,
+    appendedExpected: true,
+  };
+}
+
+const PARTY_BRANCH_SUFFIX_RE = /(?:\s*\([^()]*\))+[^\p{L}\p{N}]*$/u;
+const PARTY_WORDS_RE = /[\p{L}\p{N}]+/gu;
+
+function extractPartyWords(text: string): string {
+  const matches = text.replace(/\./g, "").match(PARTY_WORDS_RE);
+  return matches ? matches.join(" ") : "";
+}
+
+function normalizePartyNameForComparison(raw: string): string {
+  const text = raw.normalize("NFKC").toLowerCase();
+  const branchMatch = PARTY_BRANCH_SUFFIX_RE.exec(text);
+  if (branchMatch && branchMatch.index !== undefined) {
+    const stem = extractPartyWords(text.slice(0, branchMatch.index));
+    const parenMatches = Array.from(
+      branchMatch[0].matchAll(/\(([^()]*)\)/g),
+      (m) => `(${extractPartyWords(m[1])})`
+    );
+    return [stem, ...parenMatches].filter(Boolean).join(" ").trim();
+  }
+  return extractPartyWords(text).trim();
 }
 
 interface DirectAlertFieldMeta {
@@ -1735,7 +2167,12 @@ export interface AlertActionButtonSpec {
 
 export interface ResolvedRecordAlertActions {
   locateButton: {
-    label: "定位字段" | "定位关联字段" | "定位单据汇总";
+    label:
+      | "定位字段"
+      | "定位关联字段"
+      | "定位金额字段"
+      | "定位主体与方向"
+      | "定位单据汇总";
     focusFieldKey: string;
     emptyFieldHint?: string;
   } | null;
@@ -1753,7 +2190,13 @@ export function resolveAlertFocusTargetKey(
   if (trimmed in DIRECT_ALERT_FIELD_TABLE) {
     return DIRECT_ALERT_FIELD_TABLE[trimmed].formKey;
   }
-  if (trimmed === "payee_hint") return "issuer";
+  if (
+    trimmed === "payee_hint" ||
+    trimmed === "accounting_entity" ||
+    trimmed === "transaction_party"
+  ) {
+    return "issuer";
+  }
   if (trimmed === "payer_hint") return "recipient";
   if (trimmed === "reported_charge_amount") return "amount";
   if (hasSourceDoc) {
@@ -1791,6 +2234,27 @@ export function resolveRecordAlertActions(
   options: { hasSourceDoc?: boolean } = {}
 ): ResolvedRecordAlertActions {
   const rawField = alert.field?.trim() ?? "";
+  const isEntityNotMatched = alert.code === "ENTITY_NOT_MATCHED";
+  const isContextInferredSoft =
+    alert.code === "CONTEXT_INFERRED_FIELD" && alert.severity === "WARNING";
+
+  if (isEntityNotMatched && !(rawField in DIRECT_ALERT_FIELD_TABLE)) {
+    const entityFocusTarget = !formValues.issuer.trim()
+      ? "issuer"
+      : !formValues.posting_type
+        ? "posting_type"
+        : "issuer";
+    return {
+      locateButton: {
+        label: "定位主体与方向",
+        focusFieldKey: entityFocusTarget,
+        emptyFieldHint: ENTITY_NOT_MATCHED_GUIDANCE,
+      },
+      helperNote: ENTITY_NOT_MATCHED_GUIDANCE,
+      actionButtons: [],
+    };
+  }
+
   if (!rawField) {
     return { locateButton: null, helperNote: null, actionButtons: [] };
   }
@@ -1798,10 +2262,22 @@ export function resolveRecordAlertActions(
   // 1. Direct editable record fields
   const directMeta = DIRECT_ALERT_FIELD_TABLE[rawField];
   if (directMeta) {
-    const locateButton: ResolvedRecordAlertActions["locateButton"] = {
-      label: "定位字段",
-      focusFieldKey: directMeta.formKey,
-    };
+    const locateButton: ResolvedRecordAlertActions["locateButton"] =
+      isEntityNotMatched
+        ? {
+            label: "定位主体与方向",
+            focusFieldKey: directMeta.formKey,
+            emptyFieldHint: ENTITY_NOT_MATCHED_GUIDANCE,
+          }
+        : {
+            label: "定位字段",
+            focusFieldKey: directMeta.formKey,
+          };
+    const helperNote = isEntityNotMatched
+      ? ENTITY_NOT_MATCHED_GUIDANCE
+      : isContextInferredSoft
+        ? CONTEXT_INFERRED_WARNING_GUIDANCE
+        : null;
     const actionButtons: AlertActionButtonSpec[] = [];
 
     if (alert.severity !== "RESOLVED") {
@@ -1809,23 +2285,17 @@ export function resolveRecordAlertActions(
       if (parsedExpected !== null) {
         let nextFormVal = parsedExpected;
         let isSameAsCurrent = false;
+        let containerAlreadyResolved = false;
 
         if (directMeta.patchKey === "container_nos") {
-          const actualToken = alert.actual?.trim() ?? "";
-          const currText = formValues.container_nos_text;
-          if (
-            actualToken &&
-            currText.toUpperCase().includes(actualToken.toUpperCase())
-          ) {
-            const escaped = actualToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            nextFormVal = currText.replace(
-              new RegExp(escaped, "i"),
-              parsedExpected
-            );
-          }
-          const currNorm = parseContainerNosInput(currText).join(", ");
-          const nextNorm = parseContainerNosInput(nextFormVal).join(", ");
-          isSameAsCurrent = currNorm.length > 0 && currNorm === nextNorm;
+          const containerRes = applyContainerSuggestion(
+            formValues.container_nos_text,
+            alert.actual,
+            parsedExpected
+          );
+          nextFormVal = containerRes.nextValue;
+          containerAlreadyResolved = containerRes.alreadyResolved;
+          isSameAsCurrent = containerRes.alreadyResolved;
         } else if (directMeta.patchKey === "currency") {
           isSameAsCurrent =
             formValues.currency.trim().toUpperCase() === parsedExpected;
@@ -1838,14 +2308,47 @@ export function resolveRecordAlertActions(
           actionButtons.push({
             kind: "apply_suggestion",
             label: "采用建议值",
-            title: `将填入建议值: ${parsedExpected}`,
+            title: `将填入建议值: ${nextFormVal}`,
             focusFieldKey: directMeta.formKey,
             updateField: {
               formKey: directMeta.formKey,
               value: nextFormVal,
             },
-            confirmFields: [directMeta.patchKey],
-            feedbackMessage: `已将 ${directMeta.label} 填入建议值（${parsedExpected}），请点击「保存修订并重验」`,
+            confirmFields: isContextInferredSoft ? [] : [directMeta.patchKey],
+            feedbackMessage: isContextInferredSoft
+              ? `已将 ${directMeta.label} 填入推断建议值（${nextFormVal}）；${CONTEXT_INFERRED_WARNING_GUIDANCE}`
+              : `已将 ${directMeta.label} 填入建议值（${nextFormVal}），请点击「保存修订并重验」`,
+          });
+        } else if (isContextInferredSoft) {
+          actionButtons.push({
+            kind: "confirm_current",
+            label: "已核对推断值（去批准）",
+            title: CONTEXT_INFERRED_WARNING_GUIDANCE,
+            focusFieldKey: directMeta.formKey,
+            confirmFields: [],
+            feedbackMessage: CONTEXT_INFERRED_WARNING_GUIDANCE,
+          });
+        } else if (
+          directMeta.patchKey === "container_nos" &&
+          containerAlreadyResolved
+        ) {
+          const currTokens = dedupeContainerTokens(
+            parseContainerNosInput(formValues.container_nos_text)
+          );
+          const currNorm = currTokens.join(", ");
+          const exactSingleMatch =
+            currTokens.length === 1 && currNorm === parsedExpected;
+          actionButtons.push({
+            kind: "confirm_current",
+            label: exactSingleMatch ? "确认采用原文值" : "确认当前箱号列表",
+            title: exactSingleMatch
+              ? `确认保留当前原文值: ${currNorm}`
+              : `目标箱号已手工修正，保留现有列表: ${currNorm}`,
+            focusFieldKey: directMeta.formKey,
+            confirmFields: ["container_nos"],
+            feedbackMessage: exactSingleMatch
+              ? `已标记确认当前原文值（${currNorm}），请点击下方「保存修订并重验」解除告警`
+              : `目标箱号已手工修正，保留现有列表（${currNorm}），请点击下方「保存修订并重验」解除告警`,
           });
         } else {
           actionButtons.push({
@@ -1873,76 +2376,70 @@ export function resolveRecordAlertActions(
       }
     }
 
-    return { locateButton, helperNote: null, actionButtons };
+    return { locateButton, helperNote, actionButtons };
   }
 
-  // 2. Indirect party evidence fields: payee_hint / payer_hint
+  // 2. Indirect party evidence fields: payee_hint / payer_hint (F4: NEVER overwrite issuer/recipient with payee/payer hint)
   if (rawField === "payee_hint" || rawField === "payer_hint") {
     const targetField: "issuer" | "recipient" =
       rawField === "payee_hint" ? "issuer" : "recipient";
     const targetLabel =
       rawField === "payee_hint" ? "签发方 (issuer)" : "接收方 (recipient)";
+    const confirmButtonLabel =
+      rawField === "payee_hint"
+        ? "确认当前签发方原文值"
+        : "确认当前接收方原文值";
     const helperNote =
       rawField === "payee_hint"
-        ? "关联字段说明：payee_hint 映射至「签发方 (issuer)」或「记账方向 (posting_type)」，确认当前签发方或台账方向并保存重验即可解除告警。"
-        : "关联字段说明：payer_hint 映射至「接收方 (recipient)」或「记账方向 (posting_type)」，确认当前接收方或台账方向并保存重验即可解除告警。";
+        ? "核对指引：payee_hint（收款方证据）仅关联「签发方 (issuer)」与「记账方向 (posting_type)」，不等同于直接覆写签发方；请按单据原文核对签发方、接收方，或明确选择 AR/AP 台账方向后保存重验。"
+        : "核对指引：payer_hint（付款方证据）仅关联「接收方 (recipient)」与「记账方向 (posting_type)」，不等同于直接覆写接收方；请按单据原文核对接收方、签发方，或明确选择 AR/AP 台账方向后保存重验。";
 
     const currentParty = formValues[targetField].trim();
+    const expectedParty = parseFillableTextValue(alert.expected);
+    const partyAlreadyMatchesExpected =
+      expectedParty !== null &&
+      currentParty.length > 0 &&
+      normalizePartyNameForComparison(currentParty) ===
+        normalizePartyNameForComparison(expectedParty);
+
+    const locateFocusKey =
+      !currentParty || partyAlreadyMatchesExpected
+        ? targetField
+        : !formValues.posting_type
+          ? "posting_type"
+          : targetField;
+
     const locateButton: ResolvedRecordAlertActions["locateButton"] = {
-      label: "定位关联字段",
-      focusFieldKey: targetField,
-      emptyFieldHint: currentParty
-        ? undefined
-        : `请先在输入框填写${targetLabel}（或核对记账方向），再点击「保存修订并重验」`,
+      label: "定位主体与方向",
+      focusFieldKey: locateFocusKey,
+      emptyFieldHint: !currentParty
+        ? `请对照单据原文填写${targetLabel}（切勿将收付款提示直接混填为开票/接收主体），并核对 AR/AP 台账方向后点击「保存修订并重验」`
+        : !partyAlreadyMatchesExpected
+          ? `当前${targetLabel}与 ${rawField} 提示不同，请按单据原文分别核对签发方、接收方及 AR/AP 台账方向后点击「保存修订并重验」`
+          : undefined,
     };
     const actionButtons: AlertActionButtonSpec[] = [];
 
-    if (alert.severity !== "RESOLVED") {
-      const expectedParty = parseFillableTextValue(alert.expected);
-      if (expectedParty !== null && currentParty !== expectedParty) {
-        actionButtons.push({
-          kind: "apply_suggestion",
-          label: "采用建议主体",
-          title: `将填入建议主体: ${expectedParty}`,
-          focusFieldKey: targetField,
-          updateField: {
-            formKey: targetField,
-            value: expectedParty,
-          },
-          confirmFields: [targetField],
-          feedbackMessage: `已将 ${targetLabel} 填入建议主体（${expectedParty}），请点击下方「保存修订并重验」`,
-        });
-      } else {
-        actionButtons.push({
-          kind: "confirm_current",
-          label: "确认关联主体",
-          title: currentParty
-            ? `确认保留当前${targetLabel}: ${currentParty}`
-            : `请先填写${targetLabel}后再确认`,
-          focusFieldKey: targetField,
-          confirmFields: [targetField],
-          missingRequiredCheck: currentParty
-            ? undefined
-            : {
-                focusKey: targetField,
-                fieldKey: targetField,
-                errorMessage: `请先填写非空${targetLabel}后再确认保存`,
-                feedbackMessage: `当前${targetLabel}尚未填写，已定位输入框，请补齐主体名称（或修订台账方向）后保存重验`,
-              },
-          feedbackMessage: `已标记确认当前${targetLabel}（${currentParty}），请点击下方「保存修订并重验」解除告警`,
-        });
-      }
+    if (alert.severity !== "RESOLVED" && partyAlreadyMatchesExpected) {
+      actionButtons.push({
+        kind: "confirm_current",
+        label: confirmButtonLabel,
+        title: `确认保留当前${targetLabel}: ${currentParty}`,
+        focusFieldKey: targetField,
+        confirmFields: [targetField],
+        feedbackMessage: `已标记确认当前${targetLabel}（${currentParty}），请点击下方「保存修订并重验」解除告警`,
+      });
     }
 
     return { locateButton, helperNote, actionButtons };
   }
 
-  // 3. Indirect charge evidence field: reported_charge_amount
+  // 3. Indirect charge evidence field: reported_charge_amount (F2: NEVER prefill row `amount` from document-level `expected`)
   if (rawField === "reported_charge_amount") {
     const helperNote =
       alert.code === "AMOUNT_TOTAL_MISMATCH"
-        ? "关联字段说明：此项为抽取阶段行与原文明细对比提示，请核对下方「金额 (amount)」与「标准费用名称 (charge_item)」后确认保存。"
-        : "关联字段说明：对应可编辑字段「金额 (amount)」与「标准费用名称 (charge_item)」。";
+        ? "关联字段说明：此项为源单级费用差异核对提示（严禁直接覆写当前行金额），请人工对照原件核对下方「金额 (amount)」与「标准费用名称 (charge_item)」后再确认或修改。"
+        : "关联字段说明：对应可编辑字段「金额 (amount)」与「标准费用名称 (charge_item)」，请人工核对原件后再确认保存。";
 
     const currAmt = formValues.amount.trim();
     const currCharge = formValues.charge_item.trim();
@@ -1950,8 +2447,8 @@ export function resolveRecordAlertActions(
     const hasValidCharge = currCharge.length > 0;
 
     const locateButton: ResolvedRecordAlertActions["locateButton"] = {
-      label: "定位关联字段",
-      focusFieldKey: !hasValidCharge ? "charge_item" : "amount",
+      label: "定位金额字段",
+      focusFieldKey: "amount",
       emptyFieldHint:
         !hasValidCharge || !hasValidAmt
           ? "请先补齐标准费用名称与合法金额，再点击「保存修订并重验」"
@@ -1960,22 +2457,6 @@ export function resolveRecordAlertActions(
     const actionButtons: AlertActionButtonSpec[] = [];
 
     if (alert.severity !== "RESOLVED") {
-      const parsedExpectedAmt = parseFillableDecimalValue(alert.expected);
-      if (parsedExpectedAmt !== null && currAmt !== parsedExpectedAmt) {
-        actionButtons.push({
-          kind: "apply_suggestion",
-          label: "采用建议值",
-          title: `将填入建议值: ${parsedExpectedAmt}`,
-          focusFieldKey: "amount",
-          updateField: {
-            formKey: "amount",
-            value: parsedExpectedAmt,
-          },
-          confirmFields: hasValidCharge ? ["amount", "charge_item"] : ["amount"],
-          feedbackMessage: `已将金额 (amount) 填入建议值（${parsedExpectedAmt}），请核对费用项后点击「保存修订并重验」`,
-        });
-      }
-
       actionButtons.push({
         kind: "confirm_current",
         label: "确认当前金额与费用项",

@@ -14,7 +14,13 @@ from shipping_billing_agent.domain import (
     ValidationAlert,
     serialize_records,
 )
-from shipping_billing_agent.domain.entity_resolver import source_format_alerts
+from shipping_billing_agent.domain.entity_resolver import (
+    LLM_CHARGE_MISMATCH_MESSAGE,
+    LLM_CHARGE_MISSING_EVIDENCE_MESSAGE,
+    LLM_FIELD_CONFLICT_MESSAGE,
+    LLM_PARTY_CONFLICT_MESSAGE,
+    source_format_alerts,
+)
 from shipping_billing_agent.domain.models import DocumentStatus, ExtractionChannel, SourceKind
 from shipping_billing_agent.gateways.llm_client import (
     FakeStructuredLlmClient,
@@ -56,6 +62,7 @@ def _model(**fields: object) -> FakeStructuredLlmClient:
     ("name", "amount", "currency", "blocked"),
     [
         (_VARIANT, "245.0000", "USD", False),
+        (_VARIANT, "245.02", "USD", False),
         ("OCA17 On Carriage US Additional", "245.02", "US$", False),
         (_VARIANT, "0.00", "USD", True),
         (_VARIANT, "240.00", "USD", True),
@@ -66,8 +73,9 @@ def _model(**fields: object) -> FakeStructuredLlmClient:
         (f"{_VARIANT} is waived", "245.0000", "USD", True),
     ],
     ids=[
-        "full-name", "word-subsequence-and-tolerance", "zero", "wrong-amount", "wrong-currency",
-        "missing-currency", "missing-amount", "partial-word", "non-billing",
+        "full-name", "preserves-printed-decimal", "word-subsequence-and-tolerance", "zero",
+        "wrong-amount", "wrong-currency", "missing-currency", "missing-amount", "partial-word",
+        "non-billing",
     ],
 )
 def test_charge_name_variant_requires_currency_amount_and_full_words(
@@ -95,9 +103,15 @@ def test_charge_name_variant_requires_currency_amount_and_full_words(
     else:
         assert not reported
         assert record.charge_item == _CHARGE
-        assert record.amount == Decimal(amount) and record.currency == "USD"
+        printed_amount = Decimal("245.0000")
+        assert record.amount.as_tuple() == printed_amount.as_tuple()
+        assert record.raw_explicit_amount.as_tuple() == printed_amount.as_tuple()
+        assert record.raw_amount_text == "245.0000"
+        assert record.currency == "USD"
         assert record.source_evidence.snippet == f"{_CHARGE} 245.0000 USD"
         assert record.review_status is ReviewStatus.AUTO_READY
+        (official,) = serialize_records(result.records, "official")
+        assert official["charge_details"]["amount"].as_tuple() == printed_amount.as_tuple()
 
 
 @pytest.mark.parametrize(
@@ -123,15 +137,60 @@ def test_charge_name_variant_cannot_reuse_or_choose_between_equal_lines(
     result = run_billing_pipeline([doc], _CARRIER, llm_client=client)
 
     assert len(result.records) == len(model_names)
-    assert all(
-        any(
+    reported_names = {
+        row.raw_charge_name
+        for row in result.records
+        if any(
             alert.code is AlertCode.AMOUNT_TOTAL_MISMATCH
             and alert.field == "reported_charge_amount"
             and alert.severity is AlertSeverity.BLOCKER
             for alert in row.validation_alerts
         )
-        for row in result.records
+    }
+    assert reported_names == set(model_names)
+    assert serialize_records(result.records, "official") == []
+
+
+def test_model_amount_mismatch_stays_on_its_paired_charge() -> None:
+    doc = _document(f"{_INVOICE}Handling Charge 100.00 USD\nTHC 50.00 USD")
+    client = _model(charges=[
+        {"raw_charge_name": "Handling Charge", "amount": "100.00", "currency": "USD"},
+        {"raw_charge_name": "THC", "amount": "60.00", "currency": "USD"},
+    ])
+
+    result = run_billing_pipeline([doc], _CARRIER, llm_client=client)
+
+    handling, thc = result.records
+    assert (handling.raw_charge_name, handling.amount) == ("Handling Charge", Decimal("100.00"))
+    assert (thc.raw_charge_name, thc.amount) == ("THC", Decimal("60.00"))
+    assert thc.raw_amount_text == "60.00"
+    (mismatch,) = thc.validation_alerts
+    assert (mismatch.code, mismatch.severity, mismatch.field) == (
+        AlertCode.AMOUNT_TOTAL_MISMATCH, AlertSeverity.BLOCKER, "reported_charge_amount",
     )
+    assert (mismatch.expected, mismatch.actual) == ("50.00", "60.00")
+    assert mismatch in thc.raw_parse_issues
+    assert mismatch not in result.documents[0].extraction.raw_parse_issues
+    assert not handling.raw_parse_issues and not handling.validation_alerts
+    assert handling.review_status is ReviewStatus.AUTO_READY
+    assert thc.review_status is ReviewStatus.NEEDS_REVIEW
+    (official,) = serialize_records(result.records, "official")
+    assert official["charge_details"]["amount"] == Decimal("100.00")
+
+
+def test_model_omission_names_the_missing_charge_in_the_document_alert() -> None:
+    doc = _document(f"{_INVOICE}Handling Charge 100.00 USD\nTHC 50.00 USD")
+    client = _model(charges=[
+        {"raw_charge_name": "Handling Charge", "amount": "100.00", "currency": "USD"},
+    ])
+
+    result = run_billing_pipeline([doc], _CARRIER, llm_client=client)
+
+    (handling,) = result.records
+    (mismatch,) = result.documents[0].extraction.raw_parse_issues
+    assert mismatch in handling.validation_alerts
+    assert mismatch.field == "reported_charge_amount"
+    assert mismatch.expected == "源单 Terminal Handling Charge: 50.00"
     assert serialize_records(result.records, "official") == []
 
 
@@ -184,6 +243,18 @@ def test_debit_note_keeps_the_blocker_for_a_different_document_type(model_type: 
             "ＺＩＭＡＭＥＲＩＣＡＮ Integrated  Shipping Services Co., LLC, as agent for ZIM",
             False,
         ),
+        (
+            _ZIM,
+            "Zim American Integrated Shipping Services Co., LLC As Agents for Zim Integrated "
+            "Shipping Services Ltd.",
+            False,
+        ),
+        (
+            f"{_ZIM} (HK)",
+            "Zim American Integrated Shipping Services Co., LLC (UK) As Agent for ZIM",
+            True,
+        ),
+        ("A BC Co LLC", "AB C Co LLC As Agent for ZIM", True),
         ("CMA CGM (HK)", "CMA CGM (HK) AS AGENT FOR ZIM", False),
         ("CMA CGM (HK)", "CMA CGM (UK)", True),
         ("CMA CGM (HK)", "CMA CGM (UK) AS AGENT FOR ZIM", True),
@@ -192,7 +263,8 @@ def test_debit_note_keeps_the_blocker_for_a_different_document_type(model_type: 
         ("CMA CGM", "NEPTUNE", True),
     ],
     ids=[
-        "agents-for", "agent-for-with-punctuation", "same-branch", "different-branch",
+        "agents-for", "agent-for-with-punctuation", "zim-space-variant",
+        "zim-space-variant-different-branch", "short-entity", "same-branch", "different-branch",
         "different-branch-with-agency", "longer-entity", "missing-principal", "unrelated-entity",
     ],
 )
@@ -255,10 +327,11 @@ def test_c08_cannot_approve_a_zeroed_charge_with_a_name_variant() -> None:
     ("corrected", "cleared"),
     [
         (set(), set()),
-        ({"recipient"}, {"recipient", "payer_hint", "payee_hint"}),
+        ({"recipient"}, {"recipient", "payer_hint"}),
+        ({"issuer"}, {"payee_hint"}),
         ({"posting_type"}, {"payer_hint", "payee_hint"}),
         ({"charge_item"}, {"charge_item", "reported_charge_amount"}),
-        ({"document_type"}, {"document_type"}),
+        ({"document_type", "document_date"}, {"document_type", "document_date"}),
         ({"payee_hint", "payer_hint"}, set()),
         ({"amount"}, {"reported_charge_amount"}),
     ],
@@ -268,20 +341,42 @@ def test_extraction_alerts_respect_the_confirmed_fields(
 ) -> None:
     issues = [
         ValidationAlert.from_code(
-            AlertCode.CROSS_DOCUMENT_CONFLICT, "抽取字段与原文不符", field=field
+            AlertCode.CROSS_DOCUMENT_CONFLICT, LLM_FIELD_CONFLICT_MESSAGE, field=field
         )
-        for field in ("recipient", "payer_hint", "payee_hint", "charge_item", "document_type")
+        for field in ("recipient", "charge_item", "document_type", "document_date")
     ] + [
         ValidationAlert.from_code(
-            AlertCode.AMOUNT_TOTAL_MISMATCH, "抽取金额与原文不符", field=field
+            AlertCode.CROSS_DOCUMENT_CONFLICT,
+            LLM_PARTY_CONFLICT_MESSAGE,
+            field=field,
+            expected=expected,
         )
-        for field in ("reported_charge_amount", "reported_total_amount")
+        for field, expected in (("payer_hint", "EXAMPLE CUSTOMER INC"), ("payee_hint", _CARRIER))
+    ] + [
+        ValidationAlert.from_code(
+            AlertCode.AMOUNT_TOTAL_MISMATCH, message, field=field
+        )
+        for message, field in (
+            (LLM_CHARGE_MISMATCH_MESSAGE.format(name="Handling Charge"), "reported_charge_amount"),
+            (LLM_CHARGE_MISSING_EVIDENCE_MESSAGE, "reported_charge_amount"),
+            ("模型报告的汇总值与原文不符", "reported_total_amount"),
+        )
     ]
+    rule_amount_conflict = ValidationAlert.from_code(
+        AlertCode.AMOUNT_TOTAL_MISMATCH, "源单金额不符", field="reported_charge_amount"
+    )
     record = ProcessedBillingRecord(
-        id="record", source_doc_id="invoice", accounting_entity=_CARRIER, raw_parse_issues=issues
+        id="record",
+        source_doc_id="invoice",
+        accounting_entity=_CARRIER,
+        issuer=_CARRIER,
+        recipient="Example Customer, Inc.",
+        posting_type="AR",
+        raw_parse_issues=[*issues, rule_amount_conflict],
     )
 
     assert source_format_alerts(record, corrected) == [
-        issue for issue in issues if issue.field not in cleared
+        *(issue for issue in issues if issue.field not in cleared),
+        rule_amount_conflict,
     ]
-    assert record.raw_parse_issues == issues
+    assert record.raw_parse_issues == [*issues, rule_amount_conflict]

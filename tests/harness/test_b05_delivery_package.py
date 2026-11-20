@@ -50,6 +50,16 @@ def delivery_zip(tmp_path: Path) -> Path:
     return output
 
 
+@pytest.fixture
+def delivery_copy(delivery_zip: Path, tmp_path: Path) -> tuple[Path, set[str]]:
+    source = tmp_path / "delivery-copy"
+    with ZipFile(delivery_zip) as archive:
+        archive.extractall(source)
+        names = set(archive.namelist())
+    assert not (source / ".git").exists()
+    return source, names
+
+
 def test_delivery_zip_is_clean_and_complete(delivery_zip: Path) -> None:
     required = {
         "README.md",
@@ -66,8 +76,20 @@ def test_delivery_zip_is_clean_and_complete(delivery_zip: Path) -> None:
         "frontend/package-lock.json",
         "frontend/index.html",
         "frontend/src/main.tsx",
+        "frontend/tsconfig.json",
+        "frontend/tsconfig.app.json",
+        "frontend/tsconfig.node.json",
+        "frontend/vite.config.ts",
         "scripts/package_delivery.py",
+        "scripts/verify_contracts.py",
         "src/shipping_billing_agent/cli/app.py",
+        "tests/fixtures/b01_empty_columns.doc",
+        "tests/fixtures/b01_encrypted.pdf",
+        "tests/fixtures/b01_interleaved.docx",
+        "tests/fixtures/b01_merged.xls",
+        "tests/fixtures/b01_merged.xlsx",
+        "tests/fixtures/b01_mixed.pdf",
+        "tests/fixtures/table-merges.doc",
         SCHEMA,
         "docs/workflow/contracts/openapi.yaml",
         "docs/workflow/contracts/schema.sql",
@@ -143,19 +165,66 @@ def test_delivery_documents_cover_evidence_and_submission(delivery_zip: Path) ->
     )
 
 
-def test_delivery_packer_rejects_secret_in_whitelisted_text(
-    delivery_zip: Path, tmp_path: Path
+@pytest.mark.parametrize("git_checkout", [False, True], ids=["clean-copy", "git-checkout"])
+def test_delivery_packer_ignores_files_outside_the_allowlist(
+    delivery_copy: tuple[Path, set[str]], tmp_path: Path, git_checkout: bool
 ) -> None:
-    source = tmp_path / "leak-probe"
-    with ZipFile(delivery_zip) as archive:
-        archive.extractall(source)
-    token = "sk-" + "A" * 24
-    (source / "examples" / "leak-probe.txt").write_text(token, encoding="utf-8")
+    source, expected = delivery_copy
+    for name in (
+        "examples/extra_note.txt",
+        "tests/fixtures/stray.pdf",
+        "tests/fixtures/scratch.py",
+        "scripts/scratch.txt",
+        "src/shipping_billing_agent/temp_notes.md",
+        "tests/unit/temp.note",
+        "docs/workflow/contracts/scratch.yaml",
+        "docs/workflow/diagrams/scratch.html",
+        "frontend/tsconfig.scratch.json",
+        "frontend/src/temp_notes.md",
+    ):
+        (source / name).write_text("ordinary local file\n", encoding="utf-8")
+    if git_checkout:
+        for args in (["init", "--quiet"], ["add", "--force", "--", "."]):
+            subprocess.run(["git", *args], cwd=source, capture_output=True, check=True, timeout=15)
+        (source / "src/shipping_billing_agent/untracked.py").write_text("# local only\n")
+
+    output = tmp_path / "repacked.zip"
+    result = _run_packer(source, output)
+    assert result.returncode == 0, result.stderr
+    with ZipFile(output) as archive:
+        assert archive.namelist() == sorted(expected)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "sk-" + "A" * 24,
+        "sk-ant-" + "B" * 24,
+        "AIza" + "C" * 27,
+        "ghp_" + "D" * 30,
+        "AKIA" + "E" * 16,
+        "-----BEGIN " + "PRIVATE KEY-----",
+        "-----BEGIN OPENSSH " + "PRIVATE KEY-----",
+        "LLM_API_KEY=" + "F" * 20,
+        "DEEPSEEK_API_KEY='" + "G" * 20 + "'",
+    ],
+    ids=[
+        "sk-token", "anthropic", "google", "github", "aws", "private-key", "openssh",
+        "llm-env-value", "deepseek-quoted-env-value",
+    ],
+)
+def test_delivery_packer_rejects_secret_in_whitelisted_text(
+    delivery_copy: tuple[Path, set[str]], tmp_path: Path, token: str
+) -> None:
+    source, _ = delivery_copy
+    name = "src/shipping_billing_agent/__init__.py"
+    with (source / name).open("a", encoding="utf-8") as code:
+        code.write(f'\n\n_LEAK_PROBE = """\n{token}\n"""\n')
 
     output = tmp_path / "rejected.zip"
     result = _run_packer(source, output)
     assert result.returncode != 0
-    assert "examples/leak-probe.txt" in result.stderr
+    assert name in result.stderr
     assert token not in (result.stdout + result.stderr)
     assert not output.exists()
 

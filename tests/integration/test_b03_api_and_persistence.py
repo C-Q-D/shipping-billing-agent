@@ -33,6 +33,11 @@ from shipping_billing_agent.api.app import create_app
 from shipping_billing_agent.cli.app import app as cli_app
 from shipping_billing_agent.config.settings import AppSettings
 from shipping_billing_agent.domain import validate_batch
+from shipping_billing_agent.domain.entity_resolver import (
+    LLM_CHARGE_MISMATCH_MESSAGE,
+    LLM_FIELD_CONFLICT_MESSAGE,
+    LLM_PARTY_CONFLICT_MESSAGE,
+)
 from shipping_billing_agent.domain.models import (
     AlertCode,
     BatchStage,
@@ -227,15 +232,33 @@ def test_review_confirmation_clears_only_the_reported_extraction_conflicts(
     assert original.reference_no == reference
     parse_issues = [
         ValidationAlert.from_code(
-            code, "模型提取的字段与原文不符", field=field, expected=expected, actual=actual
+            AlertCode.CROSS_DOCUMENT_CONFLICT,
+            LLM_FIELD_CONFLICT_MESSAGE,
+            field=field,
+            expected=expected,
+            actual=actual,
         )
-        for code, field, expected, actual in (
-            (AlertCode.CROSS_DOCUMENT_CONFLICT, "issuer", NEPTUNE, "CMA CGM"),
-            (AlertCode.CROSS_DOCUMENT_CONFLICT, "reference_no", reference, "MODEL-REF"),
-            (AlertCode.CROSS_DOCUMENT_CONFLICT, "payee_hint", NEPTUNE, "CMA CGM"),
-            (AlertCode.AMOUNT_TOTAL_MISMATCH, "reported_charge_amount", "100.00", "无费用行"),
+        for field, expected, actual in (
+            ("issuer", NEPTUNE, "CMA CGM"),
+            ("reference_no", reference, "MODEL-REF"),
         )
     ]
+    parse_issues.extend([
+        ValidationAlert.from_code(
+            AlertCode.CROSS_DOCUMENT_CONFLICT,
+            LLM_PARTY_CONFLICT_MESSAGE,
+            field="payee_hint",
+            expected=NEPTUNE,
+            actual="CMA CGM",
+        ),
+        ValidationAlert.from_code(
+            AlertCode.AMOUNT_TOTAL_MISMATCH,
+            LLM_CHARGE_MISMATCH_MESSAGE.format(name="Handling Charge"),
+            field="reported_charge_amount",
+            expected="100.00",
+            actual="90.00",
+        ),
+    ])
     seeded_rows = [
         row.model_copy(update={"raw_parse_issues": parse_issues}) if row.id == original.id else row
         for row in rows
@@ -290,6 +313,79 @@ def test_review_confirmation_clears_only_the_reported_extraction_conflicts(
         assert (exported["charge_details"]["amount"], exported["charge_details"]["currency"]) == (
             Decimal("100.00"), "USD",
         )
+
+
+@pytest.mark.parametrize(
+    ("conflicts", "confirmation", "remaining_fields"),
+    [
+        pytest.param(
+            [("document_date", LLM_FIELD_CONFLICT_MESSAGE, "2026-10-01", "2026-10-02")],
+            {"document_date": "2026-10-01"},
+            set(),
+            id="confirms-model-date",
+        ),
+        pytest.param(
+            [("reference_no", "同一文件提供了不同的源单字段值", "INV-A", "INV-B")],
+            {"reference_no": "INV-A"},
+            {"reference_no"},
+            id="preserves-rule-ocr-conflict",
+        ),
+        pytest.param(
+            [
+                ("payer_hint", LLM_PARTY_CONFLICT_MESSAGE, TARGETING, "Model Payer"),
+                ("payee_hint", LLM_PARTY_CONFLICT_MESSAGE, NEPTUNE, "Model Payee"),
+            ],
+            {"recipient": "Targeting A, Inc."},
+            {"payee_hint"},
+            id="recipient-confirms-payer-only",
+        ),
+    ],
+)
+def test_review_confirmation_respects_extraction_evidence(
+    client: TestClient,
+    settings: AppSettings,
+    conflicts: list[tuple[str, str, str, str]],
+    confirmation: dict[str, str],
+    remaining_fields: set[str],
+) -> None:
+    batch = _body(_upload(client, _invoice("INV-A")), 201)
+    batch_id = batch["id"]
+    repository = _open_repository(settings.sqlite_db_path)
+    (original,) = repository.list_billing_records(batch_id)
+    issues = [
+        ValidationAlert.from_code(
+            AlertCode.CROSS_DOCUMENT_CONFLICT,
+            message,
+            field=field,
+            expected=expected,
+            actual=actual,
+        )
+        for field, message, expected, actual in conflicts
+    ]
+    seeded = original.model_copy(update={"raw_parse_issues": issues})
+    repository.upsert_billing_records(batch_id, validate_batch([seeded]))
+    record_url = f"{BATCHES}/{batch_id}/records/{original.id}"
+    approval = {"reason": "已核对原始单据"}
+
+    assert _body(client.post(f"{record_url}/approve", json=approval), 422)["code"] == (
+        "HARD_BLOCKER_CANNOT_APPROVE"
+    )
+    (reviewed,) = _body(client.patch(record_url, json=confirmation))["records"]
+    assert {
+        alert["field"] for alert in reviewed["validation_alerts"] if alert["severity"] == "BLOCKER"
+    } == remaining_fields
+    saved = repository.get_billing_record(batch_id, original.id)
+    assert saved is not None
+    assert saved.human_overrides == confirmation
+    assert saved.raw_parse_issues == issues
+
+    response = client.post(f"{record_url}/approve", json=approval)
+    if remaining_fields:
+        assert _body(response, 422)["code"] == "HARD_BLOCKER_CANNOT_APPROVE"
+    else:
+        (approved,) = _body(response)["records"]
+        assert approved["review_status"] == "APPROVED"
+        assert approved["document_info"]["document_date"] == "2026-10-01"
 
 
 def _http_routes(routes: list) -> Iterator[APIRoute]:

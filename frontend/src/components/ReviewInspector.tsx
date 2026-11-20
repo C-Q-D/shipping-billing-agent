@@ -21,17 +21,20 @@ import {
   buildDocTotalsDiffPatch,
   buildRecordDiffPatch,
   countCodePoints,
+  ENTITY_NOT_MATCHED_GUIDANCE,
   extractServerRecordFormValues,
   getConfirmedRecordFields,
   getEffectiveDocTotalsValues,
   getEffectiveRecordFormValues,
   hasDocTotalsDraft,
   hasRecordDraft,
+  hasStaleConfirmedFields,
   resolveAlertFocusTargetKey,
   resolveRecordAlertActions,
   validateReviewReason,
   withPendingRecordConfirmation,
   type AlertActionButtonSpec,
+  type ConfirmedFieldMap,
   type DebitCreditOption,
   type DocTotalsFormValues,
   type DraftStoreState,
@@ -157,12 +160,12 @@ function getFieldProvenance(
   record: BillingRecordDetail,
   effective: RecordFormValues,
   server: RecordFormValues,
-  confirmedFields?: Record<string, true>
+  confirmedFields?: ConfirmedFieldMap
 ): ProvenanceKind {
   if (effective[formKey] !== server[formKey]) {
     return "draft";
   }
-  if (confirmedFields && confirmedFields[fieldKey] === true) {
+  if (confirmedFields && Boolean(confirmedFields[fieldKey])) {
     return "confirmed_draft";
   }
   const overrides = record.human_overrides ?? {};
@@ -311,7 +314,7 @@ export function ReviewInspector({
 
   const activeRecordDirty =
     batch && selectedRecord
-      ? hasRecordDraft(draftStore, batch.id, selectedRecord.id)
+      ? hasRecordDraft(draftStore, batch.id, selectedRecord.id, selectedRecord)
       : false;
 
   useEffect(() => {
@@ -320,6 +323,25 @@ export function ReviewInspector({
       setApproveReasonError(null);
     }
   }, [activeRecordDirty]);
+
+  useEffect(() => {
+    if (
+      !batch ||
+      !selectedRecord ||
+      savingRecord ||
+      !hasStaleConfirmedFields(draftStore, batch.id, selectedRecord)
+    ) {
+      return;
+    }
+    setAlertActionFeedback(
+      "服务端记录已更新，先前的待确认项因数值或版本变化已自动失效，请按最新内容重新核对。"
+    );
+    if (
+      !hasRecordDraft(draftStore, batch.id, selectedRecord.id, selectedRecord)
+    ) {
+      onResetRecordDraft(selectedRecord.id);
+    }
+  }, [batch, selectedRecord, draftStore, savingRecord, onResetRecordDraft]);
 
   const inspectedDoc = useMemo(() => {
     if (!batch || !inspectedDocId) return null;
@@ -453,6 +475,21 @@ export function ReviewInspector({
     }
 
     setAlertActionFeedback(spec.feedbackMessage);
+    if (
+      !spec.updateField &&
+      spec.confirmFields.length === 0 &&
+      !hasRecordDraft(draftStore, batch.id, selectedRecord.id, selectedRecord) &&
+      selectedRecord.review_status === "NEEDS_REVIEW" &&
+      !(selectedRecord.validation_alerts ?? []).some(
+        (a) => a.severity === "BLOCKER"
+      )
+    ) {
+      setApprovePanelOpen(true);
+      window.setTimeout(() => {
+        focusField("approve_reason");
+      }, 0);
+      return;
+    }
     focusField(spec.focusFieldKey);
   };
 
@@ -474,7 +511,9 @@ export function ReviewInspector({
 
   const handleConfirmApproveClick = async () => {
     if (!batch || !selectedRecord) return;
-    if (hasRecordDraft(draftStore, batch.id, selectedRecord.id)) {
+    if (
+      hasRecordDraft(draftStore, batch.id, selectedRecord.id, selectedRecord)
+    ) {
       setApproveReasonError("请先保存当前未保存修改，或放弃草稿后再执行批准/驳回");
       return;
     }
@@ -907,7 +946,7 @@ export function ReviewInspector({
   }
 
   const recordDirty = selectedRecord
-    ? hasRecordDraft(draftStore, batch.id, selectedRecord.id)
+    ? hasRecordDraft(draftStore, batch.id, selectedRecord.id, selectedRecord)
     : false;
   const serverValues = selectedRecord
     ? extractServerRecordFormValues(selectedRecord)
@@ -916,7 +955,12 @@ export function ReviewInspector({
     ? getEffectiveRecordFormValues(selectedRecord, draftStore, batch.id)
     : null;
   const confirmedFields = selectedRecord
-    ? getConfirmedRecordFields(draftStore, batch.id, selectedRecord.id)
+    ? getConfirmedRecordFields(
+        draftStore,
+        batch.id,
+        selectedRecord.id,
+        selectedRecord
+      )
     : {};
   const diffPreview = selectedRecord
     ? buildRecordDiffPatch(selectedRecord, draftStore, batch.id)
@@ -1009,11 +1053,29 @@ export function ReviewInspector({
                         ? `（期望 ${b.expected ?? "—"} / 实际 ${b.actual ?? "—"}）`
                         : ""}
                     </span>
-                    {b.field &&
-                    resolveAlertFocusTargetKey(
-                      b.field,
-                      Boolean(recordSourceDoc)
-                    ) !== null ? (
+                    {b.code === "ENTITY_NOT_MATCHED" ? (
+                      <LumnoButton
+                        variant="ghost"
+                        compact
+                        onClick={() => {
+                          setAlertActionFeedback(ENTITY_NOT_MATCHED_GUIDANCE);
+                          focusField(
+                            !formValues?.issuer.trim()
+                              ? "issuer"
+                              : !formValues?.posting_type
+                                ? "posting_type"
+                                : "issuer"
+                          );
+                        }}
+                        style={{ marginLeft: "6px" }}
+                      >
+                        定位主体与方向
+                      </LumnoButton>
+                    ) : b.field &&
+                      resolveAlertFocusTargetKey(
+                        b.field,
+                        Boolean(recordSourceDoc)
+                      ) !== null ? (
                       <LumnoButton
                         variant="ghost"
                         compact
@@ -1238,7 +1300,8 @@ export function ReviewInspector({
                         </div>
                       ) : null}
 
-                      {alert.severity === "WARNING" ? (
+                      {alert.severity === "WARNING" &&
+                      alert.code !== "CONTEXT_INFERRED_FIELD" ? (
                         <div style={{ fontSize: "11px", opacity: 0.85 }}>
                           软告警可通过修订对应字段保存重验，或直接在底部填写批准理由特例放行。
                         </div>
@@ -2142,6 +2205,30 @@ export function ReviewInspector({
                 <div className="wb-field-error">
                   存在未解除的 BLOCKER 硬性门禁阻断，人工批准按钮已锁定；请修正以上标红字段/单据总额，或通过“驳回排除”移出正式口径。
                 </div>
+              ) : !recordDirty && selectedRecord.review_status === "AUTO_READY" ? (
+                <div className="wb-notice-banner" role="status">
+                  <span
+                    className="wb-badge wb-badge--ok"
+                    style={{ marginRight: "6px" }}
+                  >
+                    已自动就绪（可直接正式导出）
+                  </span>
+                  <span>
+                    当前记录无阻断且无待审软告警，已自动纳入正式导出口径（official），无须再次点击「人工批准」，可直接前往顶部「导出标准 JSON」下载或同步基准库。
+                  </span>
+                </div>
+              ) : !recordDirty && selectedRecord.review_status === "APPROVED" ? (
+                <div className="wb-notice-banner" role="status">
+                  <span
+                    className="wb-badge wb-badge--ok"
+                    style={{ marginRight: "6px" }}
+                  >
+                    已人工批准（可直接正式导出）
+                  </span>
+                  <span>
+                    当前记录已完成人工批准并纳入正式导出口径（official），可直接前往顶部「导出标准 JSON」。
+                  </span>
+                </div>
               ) : null}
 
               {approvePanelOpen && !recordDirty ? (
@@ -2158,6 +2245,9 @@ export function ReviewInspector({
                     value={approveReason}
                     placeholder="例如：已核对原始提单与水单无误，确认特例批准入账"
                     aria-label="人工批准理由"
+                    ref={(node) => {
+                      fieldRefs.current.approve_reason = node;
+                    }}
                     onChange={(e) => {
                       setApproveReason(e.target.value);
                       if (!validateReviewReason(e.target.value)) {
@@ -2241,15 +2331,26 @@ export function ReviewInspector({
                         ? "请先保存当前未保存修改，或放弃草稿后再执行批准/驳回"
                         : hasBlockers
                           ? "存在未解决的硬性数值或平账阻断，禁止直接批准"
-                          : selectedRecord.review_status !== "NEEDS_REVIEW"
-                            ? "仅待复核（NEEDS_REVIEW）状态的记录需要人工批准"
-                            : "填写 2–500 字符核对理由后批准入账"
+                          : selectedRecord.review_status === "AUTO_READY"
+                            ? "已自动就绪（可直接正式导出）：当前记录无须再次人工批准，请直接前往顶部「导出标准 JSON」"
+                            : selectedRecord.review_status === "APPROVED"
+                              ? "当前记录已完成人工批准，可直接前往顶部「导出标准 JSON」"
+                              : selectedRecord.review_status !== "NEEDS_REVIEW"
+                                ? "仅待复核（NEEDS_REVIEW）状态的记录需要人工批准"
+                                : "填写 2–500 字符核对理由后批准入账"
                     }
                   >
                     <LumnoButton
                       variant="secondary"
                       icon="ri-check-double-line"
                       busy={approvingOrRejecting}
+                      title={
+                        selectedRecord.review_status === "AUTO_READY"
+                          ? "已自动就绪（可直接正式导出）：无须再次人工批准，请直接前往「导出标准 JSON」"
+                          : selectedRecord.review_status === "APPROVED"
+                            ? "当前记录已完成人工批准，可直接正式导出"
+                            : undefined
+                      }
                       disabled={
                         recordDirty ||
                         savingRecord ||
@@ -2258,7 +2359,13 @@ export function ReviewInspector({
                       }
                       onClick={() => setApprovePanelOpen((open) => !open)}
                     >
-                      {hasBlockers ? "红灯阻断禁批" : "人工批准"}
+                      {hasBlockers
+                        ? "红灯阻断禁批"
+                        : selectedRecord.review_status === "AUTO_READY"
+                          ? "已自动就绪（可直接正式导出）"
+                          : selectedRecord.review_status === "APPROVED"
+                            ? "已人工批准"
+                            : "人工批准"}
                     </LumnoButton>
                   </LumnoTooltip>
 

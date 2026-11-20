@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
-from fnmatch import fnmatchcase
+import subprocess
 from pathlib import Path, PurePosixPath
 from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISLNK, S_ISREG
 from tempfile import TemporaryDirectory
@@ -23,24 +23,15 @@ FIXED_FILES = {
     ".gitignore",
     "docs/harness-design.md",
     "docs/deep-thinking.md",
-    "frontend/index.html",
-    "frontend/package.json",
-    "frontend/package-lock.json",
-    "frontend/vite.config.ts",
-}
-SOURCE_DIRECTORIES = (
-    "examples",
-    "src",
-    "tests",
-    "scripts",
-    "docs/workflow/contracts",
-    "docs/workflow/diagrams",
-    "frontend/src",
-    "frontend/public",
-)
-REQUIRED_FILES = FIXED_FILES | {
     "examples/sample_debit_note.eml",
     "examples/existing_bills.json",
+    "tests/fixtures/b01_empty_columns.doc",
+    "tests/fixtures/b01_encrypted.pdf",
+    "tests/fixtures/b01_interleaved.docx",
+    "tests/fixtures/b01_merged.xls",
+    "tests/fixtures/b01_merged.xlsx",
+    "tests/fixtures/b01_mixed.pdf",
+    "tests/fixtures/table-merges.doc",
     "docs/workflow/contracts/billing-output.schema.json",
     "docs/workflow/contracts/openapi.yaml",
     "docs/workflow/contracts/schema.sql",
@@ -48,12 +39,23 @@ REQUIRED_FILES = FIXED_FILES | {
     "docs/workflow/diagrams/user-billing-flow.html",
     "docs/workflow/diagrams/pipeline-sequence.html",
     "docs/workflow/diagrams/operation-decision-flow.html",
+    "scripts/package_delivery.py",
+    "scripts/verify_contracts.py",
+    "frontend/index.html",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "frontend/vite.config.ts",
     "frontend/tsconfig.json",
     "frontend/tsconfig.app.json",
     "frontend/tsconfig.node.json",
+}
+SOURCE_SUFFIXES = {
+    "src": {".py"},
+    "tests": {".py"},
+    "frontend/src": {".ts", ".tsx", ".css", ".js"},
+}
+REQUIRED_FILES = FIXED_FILES | {
     "frontend/src/main.tsx",
-    "scripts/package_delivery.py",
-    "scripts/verify_contracts.py",
     "src/shipping_billing_agent/cli/app.py",
     "tests/harness/test_b05_delivery_package.py",
 }
@@ -73,32 +75,42 @@ EXCLUDED_NAMES = {
     "笔试题aiagent",
     "agents.md",
 }
-EXCLUDED_WORKFLOW_ENTRIES = {
-    "features",
-    "prototypes",
-    "index.md",
-    "backlog.md",
-    "releases",
-    "product-spec.md",
-    "arch-contract.md",
-}
-SECRET_PATTERN = re.compile(rb"sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{16,}")
+SECRET_PATTERN = re.compile(
+    rb"sk-(?:proj-|svcacct-|ant-)?[A-Za-z0-9_-]{16,}"
+    rb"|AIza[0-9A-Za-z_-]{20,}"
+    rb"|gh[pousr]_[A-Za-z0-9]{20,}"
+    rb"|AKIA[0-9A-Z]{16}"
+    rb"|-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+    rb"|(?im:^[ \t]*(?:LLM_API_KEY|DEEPSEEK_API_KEY)[ \t]*=[ \t]*"
+    rb"(?P<quote>[\"']?)[A-Za-z0-9_.-]{12,}(?P=quote)[ \t]*(?:#[^\r\n]*)?\r?$)"
+)
 
 
 def _is_excluded(name: str) -> bool:
     parts = PurePosixPath(name.casefold()).parts
-    return (
-        any(
-            part in EXCLUDED_NAMES
-            or part.startswith("ai_agent_")
-            or part.endswith((".pyc", ".pyo", ".db", ".tsbuildinfo"))
-            or ".sqlite" in part
-            or (part.startswith(".env.") and name != ".env.example")
-            for part in parts
-        )
-        or parts[:2] == ("docs", "workflow")
-        and len(parts) > 2
-        and parts[2] in EXCLUDED_WORKFLOW_ENTRIES
+    return any(
+        part in EXCLUDED_NAMES
+        or part.startswith("ai_agent_")
+        or part.endswith((".pyc", ".pyo", ".db", ".tsbuildinfo"))
+        or ".sqlite" in part
+        or (part.startswith(".env.") and name != ".env.example")
+        for part in parts
+    )
+
+
+def _is_allowed_file(name: str) -> bool:
+    if _is_excluded(name):
+        return False
+    if name in FIXED_FILES:
+        return True
+    path = PurePosixPath(name)
+    if path.is_absolute() or ".." in path.parts or path.is_relative_to("tests/fixtures"):
+        return False
+    if path.name == "py.typed" and path.is_relative_to("src"):
+        return True
+    return any(
+        path.is_relative_to(directory) and path.suffix in suffixes
+        for directory, suffixes in SOURCE_SUFFIXES.items()
     )
 
 
@@ -113,15 +125,18 @@ def _raise_walk_error(error: OSError) -> None:
     raise error
 
 
-def _collect_files() -> dict[str, Path]:
-    candidates = {ROOT / name for name in FIXED_FILES}
-    frontend = ROOT / "frontend"
-    if frontend.is_dir() and not _is_link(frontend):
-        candidates.update(
-            path for path in frontend.iterdir() if fnmatchcase(path.name, "tsconfig*.json")
-        )
+def _candidate_names() -> set[str]:
+    if (ROOT / ".git").exists():
+        try:
+            tracked = subprocess.run(
+                ["git", "ls-files", "-z"], cwd=ROOT, check=True, capture_output=True, timeout=10
+            )
+        except subprocess.SubprocessError as exc:
+            raise ValueError("无法读取 Git 跟踪的交付文件") from exc
+        return set(os.fsdecode(tracked.stdout).split("\0")) - {""}
 
-    for name in SOURCE_DIRECTORIES:
+    candidates = FIXED_FILES.copy()
+    for name in SOURCE_SUFFIXES:
         source = ROOT / name
         if not source.is_dir() or _is_link(source) or source.resolve() != source:
             continue
@@ -131,14 +146,22 @@ def _collect_files() -> dict[str, Path]:
                 child
                 for child in directories
                 if not _is_excluded((directory / child).relative_to(ROOT).as_posix())
+                and directory / child != ROOT / "tests/fixtures"
                 and not _is_link(directory / child)
             ]
-            candidates.update(directory / filename for filename in filenames)
+            candidates.update(
+                (directory / filename).relative_to(ROOT).as_posix() for filename in filenames
+            )
+    return candidates
 
+
+def _collect_files() -> dict[str, Path]:
     files = {}
-    for path in candidates:
-        name = path.relative_to(ROOT).as_posix()
-        if _is_excluded(name) or not path.exists() or _is_link(path):
+    for name in _candidate_names():
+        if not _is_allowed_file(name):
+            continue
+        path = ROOT / name
+        if not path.exists() or _is_link(path):
             continue
         if S_ISREG(path.lstat().st_mode) and path.resolve() == path:
             files[name] = path
@@ -154,7 +177,7 @@ def _verify_zip(path: Path, expected: list[str]) -> None:
     with ZipFile(path) as archive:
         names = archive.namelist()
         _require_files(set(names))
-        if names != expected or any(_is_excluded(name) for name in names):
+        if names != expected or any(not _is_allowed_file(name) for name in names):
             raise ValueError("ZIP 内的文件与交付白名单不一致")
         if invalid_entry := archive.testzip():
             raise ValueError(f"ZIP 条目未通过校验：{invalid_entry}")

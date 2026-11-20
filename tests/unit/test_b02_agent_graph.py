@@ -1454,9 +1454,10 @@ def test_grounding_accepts_reordered_same_name_rows_at_decimal_tolerance() -> No
     assert [
         (row.amount, row.payment_term, row.source_evidence.line_number) for row in result.records
     ] == [
-        (Decimal("70.02"), PaymentTerm.PP, 4),
+        (Decimal("70.00"), PaymentTerm.PP, 4),
         (Decimal("30.00"), PaymentTerm.CC, 3),
     ]
+    assert result.records[0].raw_amount_text == "70.00"
     assert all(row.review_status is ReviewStatus.AUTO_READY for row in result.records)
 
 

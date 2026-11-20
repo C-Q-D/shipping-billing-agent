@@ -51,6 +51,103 @@ const MODE_LABELS: Record<ExportMode, string> = {
   audit: "完整审计 (audit)",
 };
 
+export interface ExportCurrencySummaryItem {
+  currency: string;
+  count: number;
+  validCount: number;
+  missingCount: number;
+  formattedSum: string | null;
+  badgeText: string;
+}
+
+export function buildExportCurrencySummary(
+  records: ReadonlyArray<{
+    charge_details?: {
+      amount?: unknown;
+      currency?: string | null;
+    } | null;
+  }>
+): ExportCurrencySummaryItem[] {
+  if (!records || records.length === 0) {
+    return [];
+  }
+  const grouped = new Map<
+    string,
+    {
+      count: number;
+      validCount: number;
+      missingCount: number;
+      sum: string | null;
+    }
+  >();
+
+  for (const rec of records) {
+    const currency = (rec.charge_details?.currency ?? "").trim() || "未定币种";
+    const rawAmt = readDecimalString(rec.charge_details, "amount");
+    const trimmedAmt = rawAmt !== null ? rawAmt.trim() : "";
+    let validAmt: string | null = null;
+    if (trimmedAmt.length > 0) {
+      try {
+        addDecimalStrings("0", trimmedAmt);
+        validAmt = trimmedAmt;
+      } catch {
+        validAmt = null;
+      }
+    }
+
+    const prev = grouped.get(currency) ?? {
+      count: 0,
+      validCount: 0,
+      missingCount: 0,
+      sum: null,
+    };
+
+    if (validAmt === null) {
+      grouped.set(currency, {
+        count: prev.count + 1,
+        validCount: prev.validCount,
+        missingCount: prev.missingCount + 1,
+        sum: prev.sum,
+      });
+    } else {
+      const nextSum =
+        prev.sum === null ? validAmt : addDecimalStrings(prev.sum, validAmt);
+      grouped.set(currency, {
+        count: prev.count + 1,
+        validCount: prev.validCount + 1,
+        missingCount: prev.missingCount,
+        sum: nextSum,
+      });
+    }
+  }
+
+  return Array.from(grouped.entries()).map(([currency, meta]) => {
+    if (meta.validCount === 0 || meta.sum === null) {
+      return {
+        currency,
+        count: meta.count,
+        validCount: 0,
+        missingCount: meta.missingCount,
+        formattedSum: null,
+        badgeText: `${currency} 金额待补（${meta.missingCount} 条）`,
+      };
+    }
+    const formattedSum = formatDecimalLiteral(meta.sum, "0.00");
+    const badgeText =
+      meta.missingCount === 0
+        ? `${currency} ${formattedSum}（${meta.count} 条）`
+        : `${currency} ${formattedSum}（${meta.validCount} 条已计，${meta.missingCount} 条金额待补）`;
+    return {
+      currency,
+      count: meta.count,
+      validCount: meta.validCount,
+      missingCount: meta.missingCount,
+      formattedSum,
+      badgeText,
+    };
+  });
+}
+
 export function ExportAndSyncModal({
   open,
   batch,
@@ -157,33 +254,10 @@ export function ExportAndSyncModal({
     ? stringifyLosslessJson(activeExport.records, 2)
     : "";
 
-  const exportCurrencySummary = useMemo(() => {
-    if (!activeExport || activeExport.records.length === 0) {
-      return [];
-    }
-    const grouped = new Map<string, { count: number; sum: string }>();
-    for (const rec of activeExport.records) {
-      const currency = (rec.charge_details?.currency ?? "").trim() || "未定币种";
-      const amtStr = readDecimalString(rec.charge_details, "amount") ?? "0";
-      const prev = grouped.get(currency);
-      if (!prev) {
-        grouped.set(currency, { count: 1, sum: amtStr });
-      } else {
-        let nextSum = prev.sum;
-        try {
-          nextSum = addDecimalStrings(prev.sum, amtStr);
-        } catch {
-          // keep previous sum if malformed
-        }
-        grouped.set(currency, { count: prev.count + 1, sum: nextSum });
-      }
-    }
-    return Array.from(grouped.entries()).map(([currency, meta]) => ({
-      currency,
-      count: meta.count,
-      formattedSum: formatDecimalLiteral(meta.sum, "0.00"),
-    }));
-  }, [activeExport]);
+  const exportCurrencySummary = useMemo(
+    () => (activeExport ? buildExportCurrencySummary(activeExport.records) : []),
+    [activeExport]
+  );
 
   const handleCopyJson = async () => {
     if (!canCopy || !activeExport) return;
@@ -404,9 +478,11 @@ export function ExportAndSyncModal({
                     {exportCurrencySummary.map((item) => (
                       <span
                         key={item.currency}
-                        className="wb-badge wb-badge--info wb-tabular"
+                        className={`wb-badge wb-badge--${
+                          item.validCount === 0 ? "warn" : "info"
+                        } wb-tabular`}
                       >
-                        {item.currency} {item.formattedSum}（{item.count} 条）
+                        {item.badgeText}
                       </span>
                     ))}
                   </div>
