@@ -65,11 +65,12 @@ _NON_CURRENCY_WORDS = (
 # Preserve unknown uppercase currency codes without interpreting fee abbreviations as codes.
 _DETAIL_CURRENCY_SLOT = rf"(?:{_CURRENCY}|(?-i:(?!(?:{_NON_CURRENCY_WORDS}))[A-Z]{{3}}))"
 _TERM = r"(?:PP|CC|P|C|PREPAID|COLLECT)"
-_TERM_TAG = rf"(?:\(\s*{_TERM}\s*\)|{_TERM})"
+_PARENTHESIZED_TERMS = rf"\(\s*{_TERM}(?:\s*[,/]\s*{_TERM})*\s*\)"
+_TERM_TAG = rf"(?:{_PARENTHESIZED_TERMS}|{_TERM})"
 _TERM_SEPARATOR = r"(?:\s*[,/]\s*|\s+(?:and|or)\s+|\s+)"
 _TERM_LIST = rf"{_TERM_TAG}(?:(?:{_TERM_SEPARATOR}|(?=\()){_TERM_TAG})*"
 _TERM_TOKEN = re.compile(rf"\b{_TERM}\b", re.I)
-_END_TERM = rf"(?:{_TERM_SEPARATOR}{_TERM_TAG}|\s*\(\s*{_TERM}\s*\))"
+_END_TERM = rf"(?:{_TERM_SEPARATOR}{_TERM_TAG}|\s*{_PARENTHESIZED_TERMS})"
 _ROW_PUNCTUATION = r"\s*[.,;]*"
 _REF = r"(?=[A-Z0-9./-]*[0-9])[A-Z0-9][A-Z0-9./-]*"
 _BOX = re.compile(r"\b[A-Z]{3}[UJZ][0-9]{7}\b", re.I)
@@ -114,31 +115,36 @@ _CONDITIONAL = re.compile(
 _NON_BILLING_NOTE = re.compile(
     r"\b(?:(?:quotation|quote|estimate)\s+only|for\s+quotation|"
     r"already\s+(?:been\s+)?included|included\s+in|free\s+of\s+charge|no\s+charge|waived|"
+    r"partial\s+waiver|"
     r"for\s+(?:your\s+)?(?:reference|information)\s+only|non[-\s]billable|not\s+payable|"
     r"excluded|not\s+billed)\b|"
     r"[仅僅][供作](?:[报報][价價]|[参參]考|估[价價]|[资資][讯訊料]|信息)|估[价價]|"
-    r"已[经經]?(?:包含|含|[计計]入)|免收|[无無]需(?:支付|付款)|不[计計][费費]|不收[费費]",
+    r"已[经經]?(?:包含|含|[计計]入)|免收|[减減][免半]|[无無]需(?:支付|付款)|不[计計][费費]|不收[费費]",
     re.I,
 )
 _NOTE_NEGATION = (
-    r"\b(?:not|never|cannot|no\s+longer|"
+    r"(?:\b(?:not|never|cannot|no\s+longer|"
     r"(?:is|are|was|were|has|have|had|do|does|did|ca|wo|would|should|could|must)n['’]t)\s+"
     r"(?:(?:yet|currently|actually|still|already|be|been|being)\s+)*(?:a\s+)?"
+    r"|(?:不[予再可曾会會能得是]?|[并並][非未]|未曾?|[没沒]有|[无無]法)\s*)"
 )
 _NEGATED_NOTE_PREFIX = re.compile(rf"{_NOTE_NEGATION}$", re.I)
+_PARTIAL_NOTE = re.compile(
+    r"\d+(?:\.\d+)?\s*%|\b(?:half|partial(?:ly)?|in\s+part)\b|部分|[减減][免半]", re.I
+)
 _DEMONSTRATIVE_FEE = re.compile(
     r"^(?:this|that|these|those|the\s+(?:above|preceding|previous|listed))\s+"
     r"(?:charge|fee|item|line|amount)s?\b",
     re.I,
 )
 _PLURAL_FEE_REFERENCE = re.compile(
-    r"^(?:(?:remarks?|notes?|备注|備註|说明|說明)\s*[:：]\s*)?"
+    r"^(?:(?:remarks?|notes?)\s*[:：]\s*|(?:备注|備註|说明|說明)\s*[:：]?\s*)?"
     r"(?:(?:(?P<both>both)\s+(?:(?:of\s+)?(?:these|those|the(?:\s+above)?)\s+)?|"
     r"(?P<all>all)\s+(?:(?:of\s+)?(?:these|those|the)\s+)?(?:above\s+)?|"
     r"(?:these|those|the\s+(?:above|preceding|previous|listed))\s+(?:(?P<count>[\w-]+)\s+)?)"
     r"(?:charges|fees|items|lines|amounts)\b|"
-    r"(?:上述|以上|前述)\s*(?:(?P<cn_count>[\d一二两兩三四五六七八九十]+)\s*[项項笔筆]|"
-    r"(?P<cn_all>所有|全部)\s*(?:费用|費用|款项|款項)))",
+    r"(?:[这這那]|上述|以上|前述)\s*(?:(?P<cn_count>[\d一二两兩三四五六七八九十]+)\s*[项項笔筆]"
+    r"(?:\s*(?:费用|費用|款项|款項))?|(?P<cn_all>所有|全部)\s*(?:费用|費用|款项|款項))\s*均?)",
     re.I,
 )
 _FEE_COUNT_WORDS = {
@@ -156,6 +162,7 @@ _NEGATED_NOTE = rf"(?:{_NOTE_VERB.pattern}\s+)?{_NOTE_NEGATION}(?:{_NON_BILLING_
 _NON_BILLING_CONTINUATION = re.compile(rf"^{_NOTE_VERB.pattern}|^\(\s*waived\s*\)", re.I)
 _NOTE_REASON = "报价、已含、免收或其他非记账说明"
 _AMBIGUOUS_NOTE_SCOPE = "无法确定非记账说明对应的费用范围，待人工复核"
+_PARTIAL_NOTE_REASON = "无法确定部分减免后的应收金额，待人工复核"
 _BANK_REASON = "银行汇款信息"
 _CONDITIONAL_REASON = "条件收费或违约条款"
 _INSTRUCTION = re.compile(r"\bignore\s+(?:all|previous|prior)\b", re.I)
@@ -217,7 +224,7 @@ _DETAIL_MONEY = re.compile(
 _DETAIL_CURRENCY = re.compile(rf"(?<![^\W\d_]){_CURRENCY}(?![^\W\d_])")
 _PARENTHESIZED_CURRENCY = rf"\(\s*(?P<parenthesized_currency>{_CURRENCY_SLOT})\s*\)"
 _END_CURRENCY_TAG = re.compile(rf"{_PARENTHESIZED_CURRENCY}[\s.,;)]*$", re.I)
-_LINE_AMOUNT_LABEL = re.compile(r"\b(?:line\s+(?:amount|total)\s*[:=]?|amount\s*[:=])\s*", re.I)
+_LINE_AMOUNT_LABEL = re.compile(r"\b(?:line\s+(?:amount|total)\b\s*[:=]?|amount\s*[:=])\s*", re.I)
 _QUANTITY_MARKER = r"\b(?:qty\.?|quantity)(?!\w)\s*[:=#]?\s*"
 _QUANTITY_PREFIX = re.compile(rf"{_QUANTITY_MARKER}$", re.I)
 _QUANTITY_UNIT = re.compile(
@@ -231,9 +238,19 @@ _MARKED_RATE_CURRENCY = re.compile(
 )
 _UNIT_PRICE_PREFIX = re.compile(rf"{_RATE_MARKER}\s*$", re.I)
 _UNIT_PRICE_SUFFIX = re.compile(r"\s*(?:each\b|(?:per\s+|/\s*)[^\W\d_])", re.I)
-_MULTIPLIER_PREFIX = re.compile(r"(?:[×*]|(?<![^\W\d_])x)\s*$", re.I)
+_MULTIPLICATION_SIGN = r"(?:[×*]|(?<![^\W\d_])x)"
+_MULTIPLIER_PREFIX = re.compile(rf"{_MULTIPLICATION_SIGN}\s*$", re.I)
+_QUANTITY_MULTIPLIER_PREFIX = re.compile(
+    rf"(?<![\w.,/+-]){_NUMBER}(?:{_QUANTITY_UNIT.pattern})?\s*{_MULTIPLICATION_SIGN}\s*$", re.I
+)
 _PRE_RATE_SUFFIX = re.compile(
-    rf"\s*{_AT_RATE_MARKER}\s*(?:{_DETAIL_CURRENCY_SLOT}\s*)?{_NUMBER}", re.I
+    rf"\s*(?:{_AT_RATE_MARKER}|{_MULTIPLICATION_SIGN})\s*"
+    rf"(?:{_DETAIL_CURRENCY_SLOT}\s*)?{_NUMBER}", re.I
+)
+_UNPARSED_RATE = re.compile(
+    rf"{_QUANTITY_MARKER}|@|\b(?:rate|unit\s+price)\s*[:=]|"
+    rf"(?:{_RATE_MARKER}|{_MULTIPLICATION_SIGN})\s*(?=(?:{_DETAIL_CURRENCY_SLOT}\s*)?{_NUMBER}|$)",
+    re.I,
 )
 _SUMMARY_DUE_TO = re.compile(rf"^(?P<party>.+?)\s+(?=(?:{_CURRENCY}\s+)?{_NUMBER}(?:\s|$))", re.I)
 _SUMMARY_MAPS = {
@@ -289,12 +306,18 @@ _TEXT_ROW = re.compile(
     rf"{_DETAIL_AMOUNT}{_AMOUNT_TAIL.pattern}{_ROW_PUNCTUATION}$",
     re.I,
 )
+_LABELED_DETAIL_ROW = re.compile(
+    rf"^(?P<name>.+?)[ :\t]+{_LINE_AMOUNT_LABEL.pattern}"
+    rf"{_DETAIL_AMOUNT}{_AMOUNT_TAIL.pattern}{_ROW_PUNCTUATION}$",
+    re.I,
+)
 _RATE_UNIT = r"(?:/\s*[^\W\d_]+|\beach\b|\bper\s+(?:container|unit|teu|feu|box|shipment|bl|day)\b)"
 _RATE_MULTIPLIER = r"[x×*]\s*(?P<multiplier_qty>\d+(?:\.\d+)?)"
 # Parenthesized line totals can qualify the amount as net.
 _RATE_ROW = re.compile(
     rf"^(?P<name>.+?)(?:\s+(?:{_QUANTITY_MARKER}|for\s+(?={_NUMBER}{_QUANTITY_UNIT.pattern})"
-    rf"|(?={_NUMBER}\s*{_AT_RATE_MARKER}))(?P<quantity>{_NUMBER})(?:{_QUANTITY_UNIT.pattern})?)?"
+    rf"|(?={_NUMBER}(?:{_QUANTITY_UNIT.pattern})?\s*{_AT_RATE_MARKER}))"
+    rf"(?P<quantity>{_NUMBER})(?:{_QUANTITY_UNIT.pattern})?)?"
     rf"(?:\s*(?P<marker>{_RATE_MARKER})\s*|\s+)"
     rf"(?:(?P<rate_prefix>{_DETAIL_CURRENCY_SLOT})\s*)?(?P<rate>{_NUMBER})"
     rf"(?:\s*(?P<rate_suffix>{_DETAIL_CURRENCY_SLOT})(?!\w))?"
@@ -406,6 +429,7 @@ class _ChargeEvidence:
     text: str
     amount: Decimal
     currencies: frozenset[str]
+    payment_terms: tuple[PaymentTerm, ...]
     is_line_amount: bool
 
 
@@ -439,17 +463,26 @@ class _Evidence:
         clause = ExcludedClause(text=sanitize_for_llm(text), reason=reason, page=page)
         if clause not in self.clauses:
             self.clauses.append(clause)
+        if reason in (_AMBIGUOUS_NOTE_SCOPE, _PARTIAL_NOTE_REASON):
+            issue = ValidationAlert.from_code(
+                AlertCode.LLM_EXTRACTION_FAILED,
+                reason,
+                field="excluded_clauses",
+                actual=clause.text,
+            )
+            if issue not in self.issues:
+                self.issues.append(issue)
 
     def add_charge(
         self,
         row: dict[str, Any],
         *currency_tokens: str | None,
         payment_terms: Sequence[PaymentTerm] = (),
-        parse_issue: ValidationAlert | None = None,
+        parse_issues: Sequence[ValidationAlert | None] = (),
         invalid_fields: Mapping[str, str] | None = None,
     ) -> None:
         invalid = dict(invalid_fields or {})
-        issues = [parse_issue] if parse_issue is not None else []
+        issues = [issue for issue in parse_issues if issue is not None]
         tokens = [token for token in currency_tokens if token]
         if tokens:
             currency, conflicts = _printed_currency(tokens)
@@ -474,14 +507,7 @@ class _Evidence:
             if len(terms) > 1:
                 raw = " / ".join(terms)
                 invalid["payment_term"] = raw
-                issues.append(
-                    ValidationAlert.from_code(
-                        AlertCode.CROSS_DOCUMENT_CONFLICT,
-                        "费用明细行标明了相互矛盾的付款条款",
-                        field="payment_term",
-                        actual=raw,
-                    )
-                )
+                issues.append(_printed_payment_term_conflict(raw))
         if invalid:
             self.charge_invalid_fields[len(self.charges)] = invalid
         if issues:
@@ -562,7 +588,7 @@ def _non_billing_reason(text: str) -> str | None:
     if re.search(r"\bCARRIER\s+FREE\s+H\s*/?\s*C\b", text, re.I):
         return "承运方免收操作费"
     if _non_billing_note(text):
-        return _NOTE_REASON
+        return _PARTIAL_NOTE_REASON if _PARTIAL_NOTE.search(text) else _NOTE_REASON
     if _CONDITIONAL.search(text):
         return _CONDITIONAL_REASON
     return None
@@ -596,6 +622,15 @@ def _payment_terms(text: str) -> list[PaymentTerm]:
         for match in _TERM_TOKEN.finditer(text)
         if (term := normalize_payment_term(match[0])) is not None
     ]
+
+
+def _printed_payment_term_conflict(terms: str) -> ValidationAlert:
+    return ValidationAlert.from_code(
+        AlertCode.CROSS_DOCUMENT_CONFLICT,
+        "费用明细行标明了相互矛盾的付款条款",
+        field="payment_term",
+        actual=terms,
+    )
 
 
 def _payment_term_continuation(text: str) -> list[PaymentTerm]:
@@ -653,7 +688,7 @@ def _wrapped_clause(lines: Sequence[_Line], index: int) -> tuple[int, str | None
 def _note_fee_name(text: str) -> str | None:
     if label := _CHARGE_LABEL.fullmatch(text):
         text = label[1]
-    if row := _rate_row(text) or _TEXT_ROW.fullmatch(text):
+    if row := _rate_row(text) or _text_row(text, allow_table_name=True):
         text = row["name"]
     else:
         for pattern in (_NOTE_VERB, _NON_BILLING_NOTE, _DETAIL_MONEY):
@@ -742,17 +777,6 @@ def _preceding_fee_scope(
     return first
 
 
-def _record_uncertain_fee_scope(evidence: _Evidence, remark: str) -> None:
-    issue = ValidationAlert.from_code(
-        AlertCode.LLM_EXTRACTION_FAILED,
-        _AMBIGUOUS_NOTE_SCOPE,
-        field="excluded_clauses",
-        actual=sanitize_for_llm(remark),
-    )
-    if issue not in evidence.issues:
-        evidence.issues.append(issue)
-
-
 def _capture_clauses(
     lines: Sequence[_Line], evidence: _Evidence, *, bind_fee_scopes: bool = True
 ) -> set[int]:
@@ -771,7 +795,6 @@ def _capture_clauses(
             bound = _preceding_fee_scope(lines, index, skipped, scope) if bind_fee_scopes else None
             if bound is None:
                 reason = _AMBIGUOUS_NOTE_SCOPE
-                _record_uncertain_fee_scope(evidence, remark)
             else:
                 first = bound
         elif (
@@ -839,6 +862,7 @@ def _is_quantity_or_unit_price(text: str, money: re.Match[str]) -> bool:
         or _QUANTITY_UNIT.match(text, money.end("amount"))
         or _UNIT_PRICE_PREFIX.search(text, 0, start)
         or _UNIT_PRICE_SUFFIX.match(text, money.end())
+        or _QUANTITY_MULTIPLIER_PREFIX.search(text, 0, start)
     ):
         return True
     tokens = money.groupdict()
@@ -928,8 +952,10 @@ def _charge_evidence(
             row_currencies.extend(_MARKED_RATE_CURRENCY.findall(text))
         for match in matches:
             adjacent = [token for token in (match["prefix"], match["suffix"]) if token]
+            terms = ()
             if tail := _AMOUNT_TAIL.match(text, match.end()):
                 adjacent.extend(_amount_currency_tokens(tail["tail"]))
+                terms = tuple(dict.fromkeys(_row_payment_terms(tail)))
             if end_currency is not None and end_currency.start() >= match.end():
                 adjacent.append(end_currency["parenthesized_currency"])
             currency, conflicts = _printed_currency([*adjacent, *row_currencies])
@@ -950,6 +976,7 @@ def _charge_evidence(
                 text,
                 amount,
                 frozenset(token for token in (currency, *conflicts) if token),
+                terms,
                 is_line_amount,
             )
 
@@ -1510,7 +1537,6 @@ def _collect_ocr(doc: ParsedDocument, evidence: _Evidence) -> None:
                 if reason := _non_billing_reason(text):
                     if reason == _NOTE_REASON and _PLURAL_FEE_REFERENCE.match(text):
                         # Structured remarks have no physical line positions relative to charges.
-                        _record_uncertain_fee_scope(evidence, text)
                         reason = _AMBIGUOUS_NOTE_SCOPE
                     evidence.add_clause(text, reason, page)
                 else:
@@ -1529,7 +1555,8 @@ def _collect_ocr(doc: ParsedDocument, evidence: _Evidence) -> None:
             if not isinstance(name, str) or not name.strip():
                 continue
             text = str(row.get("sourceText") or row.get("source_text") or name)
-            if reason := _non_billing_reason(f"{name} {text}"):
+            printed_text = normalize("NFKC", text).strip()
+            if reason := _non_billing_reason(f"{name} {printed_text}"):
                 evidence.add_clause(text, reason, page)
                 continue
             if _SUMMARY.match(name):
@@ -1537,17 +1564,25 @@ def _collect_ocr(doc: ParsedDocument, evidence: _Evidence) -> None:
                     f"{name} {fields.get('currency', '')} {fields.get('amount', '')}", evidence
                 )
                 continue
+            row_currency = fields.get("currency")
             if item_currency is not None:
                 fields.setdefault("currency", item_currency)
             raw_term = fields.get("payment_term")
             terms = _payment_term_continuation(raw_term) if isinstance(raw_term, str) else []
-            if printed_row := _rate_row(text) or _text_row(text):
+            rate_row = _rate_row(printed_text)
+            if printed_row := rate_row or _text_row(printed_text):
                 terms = [*_row_payment_terms(printed_row), *terms]
             if not terms and item_term is not None:
                 fields.setdefault("payment_term", item_term)
+            charge = _charge_from_columns(fields, text, len(evidence.charges) + 1, page)
+            if rate_row is None:
+                evidence.add_charge(charge, payment_terms=terms)
+                continue
+            issues = _ground_ocr_rate(charge, rate_row)
             evidence.add_charge(
-                _charge_from_columns(fields, text, len(evidence.charges) + 1, page),
-                payment_terms=terms,
+                charge, *_rate_currency_tokens(rate_row),
+                row_currency if isinstance(row_currency, str) else None,
+                payment_terms=terms, parse_issues=issues,
             )
 
 
@@ -1660,13 +1695,27 @@ def _rate_row(text: str) -> re.Match[str] | None:
     return None
 
 
+def _line_amount_name(text: str, label: re.Match[str]) -> str:
+    name = text[: label.start()].strip(" :\t(")
+    return name if name and not _billing_heading(text) else ""
+
+
 def _text_row(text: str, *, allow_table_name: bool = False) -> re.Match[str] | None:
+    if label := _LINE_AMOUNT_LABEL.search(text):
+        name = _line_amount_name(text, label)
+        if (
+            name
+            and not _UNPARSED_RATE.search(name)
+            and (row := _LABELED_DETAIL_ROW.fullmatch(text))
+            and row.end("name") < label.start()
+        ):
+            return row
+        return None
     row = _TEXT_ROW.fullmatch(text)
     if row and (
         (_FEE.search(row["name"]) or (allow_table_name and "\t" in text))
         and not _TRANSPORT_LABEL.search(row["name"])
         and not _is_quantity_or_unit_price(text, row)
-        and not _LINE_AMOUNT_LABEL.search(text)
     ):
         return row
     return None
@@ -1682,6 +1731,10 @@ def _row_currency_tokens(row: re.Match[str]) -> tuple[str | None, ...]:
     return (row["prefix"], *_amount_currency_tokens(row["tail"]))
 
 
+def _rate_currency_tokens(row: re.Match[str]) -> tuple[str | None, ...]:
+    return (row["rate_prefix"], row["rate_suffix"], *_row_currency_tokens(row))
+
+
 def _row_payment_terms(row: re.Match[str]) -> list[PaymentTerm]:
     return [
         term
@@ -1693,6 +1746,14 @@ def _row_payment_terms(row: re.Match[str]) -> list[PaymentTerm]:
 
 def _text_charge_fields(row: re.Match[str]) -> dict[str, str | None]:
     return {"raw_charge_name": row["name"], "amount": row["amount"]}
+
+
+def _rate_numbers(row: re.Match[str]) -> dict[str, str | None]:
+    return {
+        "quantity": row["quantity"] or row["multiplier_qty"],
+        "unit_price": row["rate"],
+        "amount": row["amount"],
+    }
 
 
 def _quantity_conflict(row: re.Match[str]) -> ValidationAlert | None:
@@ -1712,6 +1773,34 @@ def _quantity_conflict(row: re.Match[str]) -> ValidationAlert | None:
         expected=quantity,
         actual=multiplier,
     )
+
+
+def _ground_ocr_rate(
+    charge: dict[str, Any], printed_row: re.Match[str]
+) -> list[ValidationAlert | None]:
+    issues = [_quantity_conflict(printed_row)]
+    for field_name, printed in _rate_numbers(printed_row).items():
+        if printed is None:
+            continue
+        structured = charge.get(field_name)
+        charge[field_name] = printed
+        if structured is None:
+            continue
+        try:
+            agrees = parse_decimal_strict(printed) == parse_decimal_strict(structured)
+        except ValueError:
+            agrees = False
+        if not agrees:
+            issues.append(
+                ValidationAlert.from_code(
+                    AlertCode.CROSS_DOCUMENT_CONFLICT,
+                    "OCR 结构化字段与费用行原文数字不一致",
+                    field=field_name,
+                    expected=printed,
+                    actual=sanitize_for_llm(str(structured)),
+                )
+            )
+    return issues
 
 
 @dataclass(slots=True)
@@ -1757,7 +1846,7 @@ def _collect_text_charges(
         line: _Line,
         *currencies: str | None,
         payment_terms: Sequence[PaymentTerm] = (),
-        parse_issue: ValidationAlert | None = None,
+        parse_issues: Sequence[ValidationAlert | None] = (),
         invalid_fields: Mapping[str, str] | None = None,
     ) -> None:
         nonlocal pending
@@ -1767,7 +1856,7 @@ def _collect_text_charges(
             _charge_from_columns(fields, line.text, line.number, line.page),
             *currencies,
             payment_terms=payment_terms,
-            parse_issue=parse_issue,
+            parse_issues=parse_issues,
             invalid_fields=invalid_fields,
         )
 
@@ -1804,7 +1893,7 @@ def _collect_text_charges(
             if (
                 _rate_row(label[1])
                 or (inline_row and any(_row_currency_tokens(inline_row)))
-                or (_FEE.search(label[1]) and _LINE_AMOUNT_LABEL.search(label[1]))
+                or _LINE_AMOUNT_LABEL.search(label[1])
             ):
                 text = label[1]
             else:
@@ -1845,19 +1934,11 @@ def _collect_text_charges(
             )
             add_row(fields, line)
         elif rate_row := _rate_row(text):
-            fields = {
-                **_text_charge_fields(rate_row),
-                "quantity": rate_row["quantity"] or rate_row["multiplier_qty"],
-                "unit_price": rate_row["rate"],
-            }
             add_row(
-                fields,
-                line,
-                rate_row["rate_prefix"],
-                rate_row["rate_suffix"],
-                *_row_currency_tokens(rate_row),
+                {"raw_charge_name": rate_row["name"], **_rate_numbers(rate_row)},
+                line, *_rate_currency_tokens(rate_row),
                 payment_terms=_row_payment_terms(rate_row),
-                parse_issue=_quantity_conflict(rate_row),
+                parse_issues=(_quantity_conflict(rate_row),),
             )
         elif row := _text_row(text):
             add_row(
@@ -1865,9 +1946,10 @@ def _collect_text_charges(
                 *_MARKED_RATE_CURRENCY.findall(row["name"]), *_row_currency_tokens(row),
                 payment_terms=_row_payment_terms(row),
             )
-        elif (label_amount := _LINE_AMOUNT_LABEL.search(text)) and _FEE.search(text):
-            name = text[: label_amount.start()].strip(" :\t(")
-            if detail := re.search(rf"{_QUANTITY_MARKER}|{_RATE_MARKER}", name, re.I):
+        elif label_amount := _LINE_AMOUNT_LABEL.search(text):
+            if not (name := _line_amount_name(text, label_amount)):
+                continue
+            if detail := _UNPARSED_RATE.search(name):
                 name = name[: detail.start()].strip() or name
             raw_amount = sanitize_for_llm(text[label_amount.end() :])
             issue = ValidationAlert.from_code(
@@ -1878,9 +1960,9 @@ def _collect_text_charges(
             )
             evidence.issues.append(issue)
             add_row(
-                {"raw_charge_name": name or text, "raw_amount_text": raw_amount},
+                {"raw_charge_name": name, "raw_amount_text": raw_amount},
                 line,
-                parse_issue=issue,
+                parse_issues=(issue,),
                 invalid_fields={"amount": raw_amount},
             )
         elif not pending.labeled and (

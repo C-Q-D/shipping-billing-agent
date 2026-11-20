@@ -1335,6 +1335,131 @@ def test_negated_waiver_keeps_both_payable_fees(
     assert client.sync_calls
 
 
+def _office_with_waiver(
+    dispatcher: DocumentParserDispatcher, extension: str, note: str
+) -> list[ParsedDocument]:
+    lines = (
+        "Invoice INV-WAIVER-16", f"Issuer: {VENDOR}",
+        "Handling Fee 30 USD", "Storage Fee 500 USD", note,
+    )
+    with BytesIO() as buffer:
+        if extension == "docx":
+            document = Document()
+            for line in lines:
+                document.add_paragraph(line)
+            document.save(buffer)
+        else:
+            workbook = Workbook()
+            for line in lines:
+                workbook.active.append([line])
+            workbook.save(buffer)
+            workbook.close()
+        return _parse_files(dispatcher, [(f"waiver.{extension}", buffer.getvalue())])
+
+
+@pytest.mark.parametrize("extension", ["docx", "xlsx"])
+@pytest.mark.parametrize(
+    ("note", "is_waived"),
+    [
+        ("仓储费不予免收", False),
+        ("仓储费不再免收", False),
+        ("仓储费并非免收", False),
+        ("仓储费并未免收", False),
+        ("仓储费未免收", False),
+        ("仓储费不是免收", False),
+        ("免收", True),
+        ("仓储费免收", True),
+    ],
+)
+def test_chinese_waiver_negation_is_respected_in_office_documents(
+    dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator,
+    extension: str, note: str, is_waived: bool,
+) -> None:
+    documents = _office_with_waiver(dispatcher, extension, note)
+    charges = [{"raw_charge_name": "Handling Fee", "amount": 30, "currency": "USD"}]
+    official = [("Handling Charge", 30, "USD")]
+    if not is_waived:
+        charges.append({"raw_charge_name": "Storage Fee", "amount": 500, "currency": "USD"})
+        official.append(("Storage Charge", 500, "USD"))
+    client = _model_reply(charges=charges)
+
+    for llm_client in (None, client):
+        result = run_billing_pipeline(documents, VENDOR, llm_client=llm_client)
+        _assert_official_charges(
+            billing_schema, result.records, *official, reference_no="INV-WAIVER-16"
+        )
+        clauses = result.documents[0].extraction.extraction.excluded_clauses
+        assert [clause.text for clause in clauses] == (
+            [f"Storage Fee 500 USD {note}"] if is_waived else []
+        )
+    assert client.sync_calls
+
+
+@pytest.mark.parametrize("note", ["这两项费用均免收", "这2项费用均免收", "上述两项费用均免收"])
+def test_chinese_plural_waiver_excludes_both_excel_fees(
+    dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator, note: str,
+) -> None:
+    documents = _office_with_waiver(dispatcher, "xlsx", note)
+    client = _model_reply(charges=[
+        {"raw_charge_name": "Handling Fee", "amount": 30, "currency": "USD"},
+        {"raw_charge_name": "Storage Fee", "amount": 500, "currency": "USD"},
+    ])
+
+    baseline = run_billing_pipeline(documents, VENDOR)
+    assert baseline.records == [] and not baseline.failed_doc_ids
+    assert baseline.documents[0].extraction.charges == []
+
+    proposed = run_billing_pipeline(documents, VENDOR, llm_client=client)
+    assert client.sync_calls and len(proposed.records) == 2
+    for row in proposed.records:
+        _assert_review_blocker(row, AlertCode.AMOUNT_TOTAL_MISMATCH)
+    for result in (baseline, proposed):
+        clauses = result.documents[0].extraction.extraction.excluded_clauses
+        assert [clause.text for clause in clauses] == [
+            f"Handling Fee 30 USD Storage Fee 500 USD {note}",
+        ]
+        assert _export(billing_schema, result.records)[1] == []
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "50% of the storage fee is waived",
+        "12.5% of the storage fee is waived",
+        "Half of the storage fee is waived",
+        "Storage Fee is partially waived",
+        "仓储费部分免收",
+        "仓储费减半",
+    ],
+)
+def test_partial_waiver_keeps_printed_fees_for_review_and_blocks_export(
+    dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator, note: str,
+) -> None:
+    documents = _office_with_waiver(dispatcher, "xlsx", note)
+    client = _model_reply(charges=[
+        {"raw_charge_name": "Handling Fee", "amount": 30, "currency": "USD"},
+        {"raw_charge_name": "Storage Fee", "amount": 500, "currency": "USD"},
+    ])
+
+    for llm_client in (None, client):
+        result = run_billing_pipeline(documents, VENDOR, llm_client=llm_client)
+        assert [(row.charge_item, row.amount, row.currency) for row in result.records] == [
+            ("Handling Charge", Decimal(30), "USD"), ("Storage Charge", Decimal(500), "USD"),
+        ]
+        extraction = result.documents[0].extraction
+        (clause,) = extraction.extraction.excluded_clauses
+        (issue,) = extraction.raw_parse_issues
+        assert clause.text == note and clause.reason == issue.message
+        assert (issue.code, issue.severity, issue.field, issue.actual) == (
+            AlertCode.LLM_EXTRACTION_FAILED, AlertSeverity.BLOCKER, "excluded_clauses", note,
+        )
+        for row in result.records:
+            _assert_review_blocker(row, AlertCode.LLM_EXTRACTION_FAILED)
+            assert issue in row.validation_alerts
+        assert _export(billing_schema, result.records)[1] == []
+    assert client.sync_calls
+
+
 @pytest.mark.parametrize(
     ("details", "note"),
     [
@@ -1618,14 +1743,18 @@ def test_model_cannot_bill_explicit_qty_without_a_line_total(
     [
         ("Wharfage @ USD 15 x 2", "Wharfage"),
         ("Storage Fee 2 @ 15 USD", "Storage Fee"),
+        ("Storage Fee 2 x USD 15", "Storage Fee"),
+        ("Storage Fee 2 x 15 USD", "Storage Fee"),
     ],
-    ids=["multiplier", "quantity-before-at-sign"],
+    ids=["multiplier", "quantity-before-at-sign", "currency-before-price", "currency-after-price"],
 )
+@pytest.mark.parametrize("proposed_amount", [2, 15], ids=["quantity", "price"])
 def test_bare_rate_operand_cannot_become_a_billed_amount(
     dispatcher: DocumentParserDispatcher,
     billing_schema: Draft202012Validator,
     detail: str,
     fee: str,
+    proposed_amount: int,
 ) -> None:
     invoice = _pdf("Invoice INV-RATE-15", f"Issuer: {VENDOR}", "Currency: USD", detail)
     documents = _parse_files(dispatcher, [("rate-operand.pdf", invoice)])
@@ -1634,13 +1763,15 @@ def test_bare_rate_operand_cannot_become_a_billed_amount(
     assert baseline.documents[0].extraction.charges == []
     assert not baseline.records and _export(billing_schema, baseline.records)[1] == []
 
-    client = _model_reply(charges=[{"raw_charge_name": fee, "amount": 2, "currency": "USD"}])
+    client = _model_reply(charges=[
+        {"raw_charge_name": fee, "amount": proposed_amount, "currency": "USD"},
+    ])
     result = run_billing_pipeline(documents, VENDOR, llm_client=client)
     (row,) = result.records
     assert client.sync_calls
     _assert_review_blocker(row, AlertCode.AMOUNT_TOTAL_MISMATCH)
     assert any(
-        (issue.field, issue.actual) == ("reported_charge_amount", f"{fee} 2")
+        (issue.field, issue.actual) == ("reported_charge_amount", f"{fee} {proposed_amount}")
         for issue in row.raw_parse_issues
     )
     assert _export(billing_schema, result.records)[1] == []
@@ -1652,8 +1783,9 @@ def test_bare_rate_operand_cannot_become_a_billed_amount(
         ("Wharfage @ USD 15 x 2", "Wharfage"),
         ("Wharfage qty 2 @ USD 15", "Wharfage"),
         ("Storage Fee 2 @ 15 USD", "Storage Fee"),
+        ("Storage Fee 2 days @ 15 USD", "Storage Fee"),
     ],
-    ids=["multiplier", "marked-quantity", "bare-quantity"],
+    ids=["multiplier", "marked-quantity", "bare-quantity", "bare-quantity-with-unit"],
 )
 @pytest.mark.parametrize(
     "proposal",
@@ -1706,35 +1838,86 @@ def test_printed_operands_gate_arithmetic_even_when_the_invoice_total_balances(
     "tail",
     ["(PP) (XYZ)", "(XYZ) (PP)", "(PP) XYZ", "XYZ (PP)", "(PP) (XYZ).", "(PP), (XYZ)"],
 )
+@pytest.mark.parametrize(
+    ("description", "fee", "charge_item"),
+    [
+        ("Storage Fee qty 2 @ 15 USD", "Storage Fee", "Storage Charge"),
+        ("Customs Clearance", "Customs Clearance", "Customs Clearance Fee"),
+    ],
+    ids=["rated-fee", "customs-without-rate"],
+)
 def test_amount_currency_conflict_is_detected_in_either_tag_order(
-    dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator, tail: str
+    dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator,
+    tail: str, description: str, fee: str, charge_item: str,
 ) -> None:
     invoice = _pdf(
         "Invoice INV-TOTAL-TAGS-14", f"Issuer: {VENDOR}", "Handling Fee 10 USD",
-        f"Storage Fee qty 2 @ 15 USD line total 30 USD {tail}", "Total (USD): 40",
+        f"{description} line total 30 USD {tail}", "Total (USD): 40",
     )
     documents = _parse_files(dispatcher, [("total-tags.pdf", invoice)])
     client = _model_reply(charges=[
         {"raw_charge_name": "Handling Fee", "amount": 10, "currency": "USD"},
-        {"raw_charge_name": "Storage Fee", "amount": 30, "currency": "USD"},
+        {"raw_charge_name": fee, "amount": 30, "currency": "USD"},
     ])
 
     for result in (
         run_billing_pipeline(documents, VENDOR),
         run_billing_pipeline(documents, VENDOR, llm_client=client),
     ):
-        handling, storage = result.records
-        assert (storage.charge_item, storage.amount, storage.payment_term) == (
-            "Storage Charge", Decimal(30), PaymentTerm.PP,
+        handling, detail = result.records
+        assert (detail.charge_item, detail.amount, detail.payment_term) == (
+            charge_item, Decimal(30), PaymentTerm.PP,
         )
-        assert storage.raw_invalid_fields["currency"] == "USD / XYZ"
-        for row in (handling, storage):
+        assert detail.raw_invalid_fields["currency"] == "USD / XYZ"
+        for row in (handling, detail):
             _assert_review_blocker(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
             assert any(
                 (issue.field, issue.expected, issue.actual) == ("currency", "USD", "XYZ")
                 for issue in row.validation_alerts
             )
         assert _export(billing_schema, result.records)[1] == []
+    assert client.sync_calls
+
+
+@pytest.mark.parametrize(
+    ("detail", "fee", "charge_item", "term"),
+    [
+        ("Storage Fee line total 30 USD", "Storage Fee", "Storage Charge", None),
+        (
+            "Customs Clearance line total 30 USD (PP).",
+            "Customs Clearance", "Customs Clearance Fee", "PP",
+        ),
+        (
+            "Customs Clearance line amount: USD 30",
+            "Customs Clearance", "Customs Clearance Fee", None,
+        ),
+        ("Customs Clearance amount: 30 USD", "Customs Clearance", "Customs Clearance Fee", None),
+    ],
+    ids=["storage-regression", "customs-total", "line-amount", "amount-label"],
+)
+def test_labeled_line_total_needs_no_printed_rate(
+    dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator,
+    detail: str, fee: str, charge_item: str, term: str | None,
+) -> None:
+    reference = "INV-LABELED-TOTAL-16"
+    invoice = _pdf(f"Invoice {reference}", f"Issuer: {VENDOR}", "Handling Fee 10 USD", detail)
+    documents = _parse_files(dispatcher, [("labeled-line-total.pdf", invoice)])
+    client = _model_reply(charges=[
+        {"raw_charge_name": "Handling Fee", "amount": 10, "currency": "USD"},
+        {"raw_charge_name": fee, "amount": 30, "currency": "USD"},
+    ])
+
+    for llm_client in (None, client):
+        result = run_billing_pipeline(documents, VENDOR, llm_client=llm_client)
+        _assert_official_charges(
+            billing_schema, result.records, ("Handling Charge", 10, "USD"),
+            (charge_item, 30, "USD"), reference_no=reference,
+        )
+        _, row = result.records
+        assert row.raw_charge_name == fee and row.quantity is row.unit_price is None
+        assert row.source_evidence.snippet == detail and row.validation_alerts == []
+        _, (_, official) = _export(billing_schema, result.records)
+        assert official["charge_details"]["payment_term"] == term
     assert client.sync_calls
 
 
@@ -1767,27 +1950,46 @@ def test_trailing_punctuation_keeps_the_printed_amount_and_term(
     assert client.sync_calls
 
 
+@pytest.mark.parametrize(
+    ("detail", "fee", "charge_item", "raw_amount"),
+    [
+        (
+            "Storage Fee qty 2 @ 15 USD line total 30 USD [unreadable]",
+            "Storage Fee", "Storage Charge", "30 USD [unreadable]",
+        ),
+        (
+            "Customs Clearance line total 30 USD [illegible]",
+            "Customs Clearance", "Customs Clearance Fee", "30 USD [illegible]",
+        ),
+        (
+            "Customs Clearance line total [illegible]",
+            "Customs Clearance", "Customs Clearance Fee", "[illegible]",
+        ),
+        ("Storage Fee x 2 line total 30 USD", "Storage Fee", "Storage Charge", "30 USD"),
+    ],
+    ids=["rated-row", "customs-unreadable-tail", "customs-unreadable-total", "unsplit-multiplier"],
+)
 def test_unparseable_labeled_line_total_stays_visible_and_blocks_export(
-    dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator
+    dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator,
+    detail: str, fee: str, charge_item: str, raw_amount: str,
 ) -> None:
-    detail = "Storage Fee qty 2 @ 15 USD line total 30 USD [unreadable]"
     invoice = _pdf(
         "Invoice INV-UNPARSED-15", f"Issuer: {VENDOR}", "Handling Fee 10 USD", detail,
     )
     documents = _parse_files(dispatcher, [("bad-line-total.pdf", invoice)])
     client = _model_reply(charges=[
         {"raw_charge_name": "Handling Fee", "amount": 10, "currency": "USD"},
-        {"raw_charge_name": "Storage Fee", "amount": 30, "currency": "USD"},
+        {"raw_charge_name": fee, "amount": 30, "currency": "USD"},
     ])
 
     for llm_client in (None, client):
         result = run_billing_pipeline(documents, VENDOR, llm_client=llm_client)
-        handling, storage = result.records
+        handling, unreadable = result.records
         assert handling.amount == Decimal(10)
-        assert (storage.charge_item, storage.amount) == ("Storage Charge", None)
-        assert storage.raw_amount_text == "30 USD [unreadable]"
-        assert storage.raw_invalid_fields["amount"] == storage.raw_amount_text
-        assert storage.source_evidence.snippet == detail
+        assert (unreadable.charge_item, unreadable.amount) == (charge_item, None)
+        assert unreadable.raw_amount_text == raw_amount
+        assert unreadable.raw_invalid_fields["amount"] == raw_amount
+        assert unreadable.source_evidence.snippet == detail
         for record in result.records:
             _assert_review_blocker(record, AlertCode.LLM_EXTRACTION_FAILED)
         assert _export(billing_schema, result.records)[1] == []
@@ -2490,10 +2692,16 @@ def test_multiple_charge_label_blocks_keep_their_own_amount_and_payment_term(
     [
         (("Storage Fee 30 USD (PP) (CC)",), "PP / CC"),
         (("Storage Fee 30 USD (CC) (PP)",), "CC / PP"),
+        (("Storage Fee 30 USD (PP/CC)",), "PP / CC"),
+        (("Storage Fee 30 USD (CC/PP)",), "CC / PP"),
+        (("Storage Fee 30 USD(PP, CC)",), "PP / CC"),
         (("Charge: Storage Fee", "Amount: 30 USD (PP)", "Payment Term: CC"), "PP / CC"),
         (("Charge: Storage Fee", "Amount: 30 USD", "Payment Terms: (CC) / (PP)"), "CC / PP"),
     ],
-    ids=["prepaid-first", "collect-first", "labeled-block", "labeled-list"],
+    ids=[
+        "prepaid-first", "collect-first", "slash-pp-cc", "slash-cc-pp", "comma-list",
+        "labeled-block", "labeled-list",
+    ],
 )
 def test_conflicting_printed_payment_terms_require_a_human_selection(
     dispatcher: DocumentParserDispatcher,
@@ -2503,12 +2711,16 @@ def test_conflicting_printed_payment_terms_require_a_human_selection(
 ) -> None:
     invoice = _pdf("Invoice INV-PAYMENT-15", f"Issuer: {VENDOR}", *details)
     documents = _parse_files(dispatcher, [("conflicting-payment.pdf", invoice)])
-    client = _model_reply(charges=[
-        {"raw_charge_name": "Storage Fee", "amount": 30, "currency": "USD", "payment_term": "CC"},
-    ])
+    clients = [
+        _model_reply(charges=[{
+            "raw_charge_name": "Storage Fee", "amount": 30, "currency": "USD", "payment_term": term,
+        }])
+        for term in ("PP", "CC")
+    ]
 
-    for llm_client in (None, client):
+    for llm_client in (None, *clients):
         result = run_billing_pipeline(documents, VENDOR, llm_client=llm_client)
+        assert llm_client is None or llm_client.sync_calls
         (storage,) = result.records
         assert storage.payment_term is None and "payment_term" in storage.explicit_fields
         assert storage.raw_invalid_fields["payment_term"] == conflict
@@ -2527,7 +2739,6 @@ def test_conflicting_printed_payment_terms_require_a_human_selection(
             assert (charge["amount"], charge["currency"], charge["payment_term"]) == (
                 30, "USD", "PP",
             )
-    assert client.sync_calls
 
 
 @pytest.mark.parametrize(
@@ -3290,6 +3501,57 @@ def _parse_mock_ocr(payload: bytes, file_url: str) -> ParsedDocument:
     assert document.status is DocumentStatus.PARSED
     assert document.extraction_channel is ExtractionChannel.PLTPLT_OCR
     return document
+
+
+@pytest.mark.parametrize(
+    ("amount", "proposal"),
+    [(45, None), (45, {}), (45, {"quantity": 3, "unit_price": 15}), (30, None), (30, {})],
+    ids=["rules-mismatch", "model-omits", "model-overwrites", "rules-valid", "model-valid"],
+)
+def test_structured_ocr_source_text_enforces_the_printed_equation(
+    billing_schema: Draft202012Validator, amount: int, proposal: dict[str, int] | None,
+) -> None:
+    reference = "INV-OCR-ARITHMETIC-16"
+    source = f"Wharfage @ USD 15 x 2 line total {amount} USD"
+    payload = {"data": {"list": [{
+        "fileType": "Invoice", "invoiceNumber": reference, "issuer": VENDOR,
+        "totalCurrency": "USD", "totalAmount": amount,
+        "chargeList": [{"name": "Wharfage", "amount": amount, "sourceText": source}],
+    }]}}
+    document = _parse_mock_ocr(json.dumps(payload).encode(), "https://93.184.216.34/ocr-rate.pdf")
+    client = None if proposal is None else _model_reply(charges=[{
+        "raw_charge_name": "Wharfage", "amount": amount, "currency": "USD", **proposal,
+    }])
+
+    result = run_billing_pipeline([document], VENDOR, llm_client=client)
+
+    assert client is None or client.sync_calls
+    (row,) = result.records
+    assert (row.quantity, row.unit_price, row.amount, row.currency) == (2, 15, amount, "USD")
+    assert (row.raw_quantity_text, row.raw_unit_price_text, row.raw_amount_text) == (
+        "2", "15", str(amount),
+    )
+    assert {"quantity", "unit_price", "amount"} <= row.explicit_fields
+    assert row.source_evidence.snippet == source
+    if amount == 30:
+        assert row.validation_alerts == []
+        _assert_official_charges(
+            billing_schema, result.records, ("Wharfage", 30, "USD"), reference_no=reference,
+        )
+    else:
+        _assert_review_blocker(row, AlertCode.LINE_ARITHMETIC_MISMATCH)
+        (arithmetic,) = [
+            alert for alert in row.validation_alerts
+            if alert.code is AlertCode.LINE_ARITHMETIC_MISMATCH
+        ]
+        assert (arithmetic.field, arithmetic.expected, arithmetic.actual) == ("amount", "30", "45")
+        if proposal:
+            (conflict,) = [
+                alert for alert in row.validation_alerts
+                if alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT
+            ]
+            assert (conflict.field, conflict.expected, conflict.actual) == ("quantity", "2", "3")
+        assert _export(billing_schema, result.records)[1] == []
 
 
 @pytest.mark.parametrize("field", ["invoiceNumber", "mblNumber", "amount"])

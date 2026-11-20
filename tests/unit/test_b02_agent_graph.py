@@ -1310,6 +1310,79 @@ def test_structured_ocr_term_cannot_hide_conflicting_source_terms() -> None:
     assert serialize_records([row], "official") == []
 
 
+@pytest.mark.parametrize(
+    ("source", "structured", "conflicts"),
+    [
+        (
+            "Wharfage @ USD 15 x 2 line total 45 USD",
+            {"amount": "30", "quantity": 3, "unitPrice": "22.50"},
+            {("amount", "45", "30"), ("quantity", "2", "3"), ("unit_price", "15", "22.50")},
+        ),
+        (
+            "Wharfage qty 2 @ 15 USD x 3 line total 45 USD",
+            {}, {("quantity", "2", "3")},
+        ),
+        (
+            "Wharfage @ EUR 15 x 2 line total 45 USD",
+            {}, {("currency", "EUR", "USD")},
+        ),
+        (
+            "Wharfage @ 15 EUR x 2 line total 45 USD",
+            {}, {("currency", "EUR", "USD")},
+        ),
+    ],
+    ids=["ocr-numbers", "two-printed-quantities", "currency-before-rate", "currency-after-rate"],
+)
+def test_structured_ocr_keeps_printed_numbers_and_reports_disagreements(
+    source: str, structured: dict[str, object], conflicts: set[tuple[str, str, str]],
+) -> None:
+    doc = _document(
+        "ocr-rate-conflict", f"Invoice INV-1\nIssuer: {_ENTITY}",
+        ocr_payload={"has_charges": True, "has_metadata": True, "items": [{"chargeList": [{
+            "name": "Wharfage", "amount": 45, "currency": "USD", "sourceText": source, **structured,
+        }]}]},
+    )
+
+    result = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only")
+
+    (row,) = result.records
+    assert (row.quantity, row.unit_price, row.amount) == (2, 15, 45)
+    assert (row.raw_quantity_text, row.raw_unit_price_text, row.raw_amount_text) == (
+        "2", "15", "45",
+    )
+    assert {"quantity", "unit_price", "amount"} <= row.explicit_fields
+    assert row.source_evidence.snippet == source
+    assert {
+        (issue.field, issue.expected, issue.actual)
+        for issue in row.validation_alerts
+        if issue.code is AlertCode.CROSS_DOCUMENT_CONFLICT
+        and issue.severity is AlertSeverity.BLOCKER
+    } == conflicts
+    (arithmetic,) = [
+        issue for issue in row.validation_alerts if issue.code is AlertCode.LINE_ARITHMETIC_MISMATCH
+    ]
+    assert (arithmetic.severity, arithmetic.expected, arithmetic.actual) == (
+        AlertSeverity.BLOCKER, "30", "45",
+    )
+    assert serialize_records(result.records, "official") == []
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "Line total [illegible]", "Line amount 30 USD", "Invoice line total 30 USD",
+        "Port of Loading line total [illegible]", "Grand Total line total [illegible]",
+        "Description\tLine Amount\tCurrency",
+    ],
+)
+def test_labeled_amount_without_a_fee_name_does_not_create_a_charge(heading: str) -> None:
+    doc = _document("amount-heading", f"Invoice INV-1\nIssuer: {_ENTITY}\n{heading}")
+
+    rules = extract_document_by_rules(doc)
+
+    assert rules.charges == []
+
+
 def test_rated_ocr_row_keeps_amount_after_an_unrecognized_cell() -> None:
     doc = _document(
         "rated-ocr-row",
@@ -1560,6 +1633,34 @@ def test_model_only_fee_is_grounded_in_a_same_document_alias_and_amount(channel:
     (row,) = result.records
     assert not result.failed_doc_ids and result.llm_calls_used == 1
     assert row.amount == Decimal("-1250.00") and row.review_status is ReviewStatus.AUTO_READY
+
+
+@pytest.mark.parametrize(("tag", "conflict"), [("(PP/CC)", "PP / CC"), ("(CC/PP)", "CC / PP")])
+@pytest.mark.parametrize("model_term", ["PP", "CC"])
+def test_model_only_fee_retains_conflicting_terms_from_its_grounding_line(
+    tag: str, conflict: str, model_term: str,
+) -> None:
+    detail = f"Customs Clearance 30 USD {tag}"
+    doc = _document("model-only-terms", f"Invoice INV-123\nIssuer: {_ENTITY}\n{detail}")
+    assert extract_document_by_rules(doc).charges == []
+    response = _response("unused", total=None, charges=[{
+        "raw_charge_name": "Customs Clearance", "amount": 30, "currency": "USD",
+        "payment_term": model_term,
+    }])
+    client = FakeStructuredLlmClient([response])
+
+    result = run_billing_pipeline([doc], _ENTITY, llm_client=client)
+
+    assert client.messages
+    (row,) = result.records
+    assert row.amount == 30 and row.currency == "USD" and row.payment_term is None
+    assert row.source_evidence.snippet == detail and "payment_term" in row.explicit_fields
+    assert row.raw_invalid_fields["payment_term"] == conflict
+    (issue,) = row.validation_alerts
+    assert (issue.code, issue.severity, issue.field, issue.actual) == (
+        AlertCode.CROSS_DOCUMENT_CONFLICT, AlertSeverity.BLOCKER, "payment_term", conflict,
+    )
+    assert serialize_records(result.records, "official") == []
 
 
 @pytest.mark.parametrize(

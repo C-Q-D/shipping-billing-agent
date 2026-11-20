@@ -125,6 +125,32 @@ def _assert_review(record: ProcessedBillingRecord, code: AlertCode) -> None:
     )
 
 
+def test_partial_waiver_blocks_balanced_amounts_on_revalidation() -> None:
+    issue = ValidationAlert.from_code(
+        AlertCode.LLM_EXTRACTION_FAILED,
+        "无法确定部分减免后的应收金额，待人工复核",
+        field="excluded_clauses",
+        actual="50% of the storage fee is waived",
+    )
+    bundle = _bundle(total_amount="530", total_currency="USD")
+    bundle.extraction.raw_parse_issues.append(issue)
+    rows = [
+        _line("handling", amount="30"),
+        _line("storage", charge_item="Storage Charge", amount="500"),
+    ]
+
+    checked = validate_batch(rows, [bundle])
+    saved = [ProcessedBillingRecord.model_validate_json(row.model_dump_json()) for row in checked]
+
+    for records in (checked, validate_batch(saved), validate_records(saved)):
+        assert [record.amount for record in records] == [Decimal(30), Decimal(500)]
+        for record in records:
+            _assert_review(record, AlertCode.LLM_EXTRACTION_FAILED)
+            assert record.raw_parse_issues == [issue]
+            assert record.validation_alerts == [issue]
+        assert serialize_records(records, "official") == []
+
+
 @pytest.mark.parametrize(
     ("raw_currencies", "pairs", "snippets"),
     [

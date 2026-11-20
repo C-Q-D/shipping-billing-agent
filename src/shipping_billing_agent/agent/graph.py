@@ -71,7 +71,9 @@ from .prompts import (
 )
 from .rule_extractor import (
     _charge_evidence,
+    _ChargeEvidence,
     _non_billing_reason,
+    _printed_payment_term_conflict,
     apply_sibling_context,
     extract_document_by_rules,
     transport_context,
@@ -558,10 +560,10 @@ def _charge_words(text: str) -> str:
 
 def _matching_charge_evidence(
     charge: RawChargeItem,
-    evidence_by_amount: dict[Decimal, set[tuple[str, frozenset[str]]]],
+    evidence_by_amount: dict[Decimal, set[tuple[str, _ChargeEvidence]]],
     dictionary: Sequence[ChargeDictionaryItem],
     used_rows: set[str],
-) -> tuple[str, frozenset[str]] | None:
+) -> tuple[str, _ChargeEvidence] | None:
     if charge.amount is None or not (evidence := evidence_by_amount.get(charge.amount.copy_abs())):
         return None
     name = charge.raw_charge_name
@@ -579,11 +581,16 @@ def _matching_charge_evidence(
     }
     return min(
         (
-            (text, currencies)
-            for text, currencies in evidence
-            if text not in used_rows and any(phrase in text for phrase in phrases)
+            (words, row)
+            for words, row in evidence
+            if words not in used_rows and any(phrase in words for phrase in phrases)
         ),
-        key=lambda row: (bool(row[1] - {charge.currency}), row[0], sorted(row[1])),
+        key=lambda match: (
+            bool(match[1].currencies - {charge.currency}),
+            match[0],
+            sorted(match[1].currencies),
+            match[1].text,
+        ),
         default=None,
     )
 
@@ -705,12 +712,12 @@ def _ground_charges(
     if not unpaired:
         return grounded, issues
 
-    evidence_by_amount: dict[Decimal, set[tuple[str, frozenset[str]]]] = defaultdict(set)
-    rate_currency_conflicts: dict[Decimal, set[tuple[str, frozenset[str]]]] = defaultdict(set)
+    evidence_by_amount: dict[Decimal, set[tuple[str, _ChargeEvidence]]] = defaultdict(set)
+    rate_currency_conflicts: dict[Decimal, set[tuple[str, _ChargeEvidence]]] = defaultdict(set)
     for row in _charge_evidence(doc, rules):
         words = f" {_charge_words(row.text)} "
         index = evidence_by_amount if row.is_line_amount else rate_currency_conflicts
-        index[row.amount].add((words, row.currencies))
+        index[row.amount].add((words, row))
     # A rule-recognized line cannot also substantiate a second model fee.
     used_rows = {
         f" {_charge_words(_TABLE_ROW.sub('', _SHEET_ROW.sub('', line)))} "
@@ -727,7 +734,21 @@ def _ground_charges(
             else _matching_charge_evidence(charge, evidence_by_amount, dictionary, used_rows)
         )
         if evidence:
-            words, currencies = evidence
+            words, printed = evidence
+            currencies = printed.currencies
+            if len(printed.payment_terms) > 1:
+                terms = " / ".join(printed.payment_terms)
+                entry = entry.model_copy(update={
+                    "charge": charge.model_copy(update={
+                        "payment_term": None, "source_text": printed.text,
+                    }),
+                    "explicit_fields": entry.explicit_fields | {"payment_term"},
+                    "raw_invalid_fields": {**entry.raw_invalid_fields, "payment_term": terms},
+                    "raw_parse_issues": [
+                        *entry.raw_parse_issues, _printed_payment_term_conflict(terms),
+                    ],
+                })
+                grounded[index] = entry
             if not currencies - {charge.currency}:
                 used_rows.add(words)
                 continue
@@ -753,7 +774,9 @@ def _ground_charges(
             ):
                 row_alerts.append(
                     _printed_field_conflict(
-                        "currency", " / ".join(sorted(rate[1])), charge.currency or "缺失"
+                        "currency",
+                        " / ".join(sorted(rate[1].currencies)),
+                        charge.currency or "缺失",
                     )
                 )
         issues.extend(row_alerts)
