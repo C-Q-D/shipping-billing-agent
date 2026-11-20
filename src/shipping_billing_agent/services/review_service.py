@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -56,6 +56,7 @@ from .batch_service import (
     _ocr_mode,
     _require_batch,
     _root_documents,
+    _shared_baseline_changes,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -255,6 +256,8 @@ def _restore_decisions(
     verified: Sequence[ProcessedBillingRecord],
     previous: Sequence[ProcessedBillingRecord],
     scope: _BatchScope,
+    *,
+    same_source_ids: Collection[str] = (),
 ) -> tuple[list[ProcessedBillingRecord], int]:
     old_by_id = {record.id: record for record in previous}
     restored = []
@@ -282,12 +285,19 @@ def _restore_decisions(
                     if same_basis and old.review_status is ReviewStatus.APPROVED
                     else ReviewStatus.AUTO_READY
                 )
-            if (
-                same_basis
-                and old.review_status is ReviewStatus.REJECTED
-                and set(map(_warning_key, old.validation_alerts)) == set(map(_warning_key, alerts))
+            same_source = record.id in same_source_ids
+            if old.review_status is ReviewStatus.REJECTED:
+                same_warnings = set(map(_warning_key, old.validation_alerts)) == set(
+                    map(_warning_key, alerts)
+                )
+                if same_source or (same_basis and same_warnings):
+                    review_status = ReviewStatus.REJECTED
+            elif (
+                same_source
+                and old.review_status is ReviewStatus.APPROVED
+                and review_status is not ReviewStatus.APPROVED
             ):
-                review_status = ReviewStatus.REJECTED
+                review_status = ReviewStatus.NEEDS_REVIEW
             record = record.model_copy(
                 update={
                     "validation_alerts": alerts,
@@ -312,19 +322,17 @@ def _recheck(
     scope: _BatchScope,
     previous: Sequence[ProcessedBillingRecord],
     *,
-    rematch: bool = True,
     reapply_dictionary: bool = False,
+    same_source_ids: Collection[str] = (),
 ) -> list[ProcessedBillingRecord]:
-    prepared = [_for_revalidation(record) for record in records]
-    if rematch:
-        prepared = match_and_inherit_batch(
-            prepared,
-            scope.existing_bills,
-            scope.profiles,
-            scope.charge_dictionary if reapply_dictionary else None,
-        )
+    prepared = match_and_inherit_batch(
+        [_for_revalidation(record) for record in records],
+        scope.existing_bills,
+        scope.profiles,
+        scope.charge_dictionary if reapply_dictionary else None,
+    )
     checked = validate_batch(prepared, bundles)
-    return _restore_decisions(checked, previous, scope)[0]
+    return _restore_decisions(checked, previous, scope, same_source_ids=same_source_ids)[0]
 
 
 def _with_action(
@@ -375,11 +383,15 @@ def _save_review(
     transaction: BillingRepository,
     batch: Mapping[str, Any],
     records: Sequence[ProcessedBillingRecord],
+    *,
+    scope: _BatchScope | None = None,
     **batch_changes: Any,
 ) -> dict[str, Any]:
     batch_id = batch["id"]
     transaction.upsert_billing_records(batch_id, records)
     changes = {"stage_message": batch["stage_message"], **batch_changes}
+    if scope is not None:
+        changes.update(_shared_baseline_changes(transaction, batch, scope))
     transaction.update_batch_with_version_check(batch_id, batch["version"], **changes)
     return _require_batch(transaction, batch_id)
 
@@ -557,9 +569,13 @@ def _retain_child_ids(
     return retained
 
 
-def _source_line_key(record: ProcessedBillingRecord) -> tuple[str, Decimal] | None:
+def _source_line_key(
+    record: ProcessedBillingRecord, *, same_source: bool
+) -> tuple[str, Decimal] | None:
     source = record.inherited_fields | record.source_values_before_overrides
     charge = source.get("charge_item", record.charge_item)
+    if same_source:
+        charge = source.get("raw_charge_name", record.raw_charge_name) or charge
     amount = source.get("amount", record.amount)
     if charge is None or amount is None:
         return None
@@ -570,28 +586,36 @@ def _source_line_key(record: ProcessedBillingRecord) -> tuple[str, Decimal] | No
 def _carry_line_edits(
     previous: Sequence[ProcessedBillingRecord],
     extracted: Sequence[ProcessedBillingRecord],
-    unchanged_docs: set[str],
+    same_sources: Mapping[str, str],
+    documents: Mapping[str, DocumentExtractionBundle],
 ) -> tuple[list[ProcessedBillingRecord], dict[str, str]]:
+    # Reserve lines from surviving content before matching edits to changed files.
+    destinations = {origin: doc_id for doc_id, origin in same_sources.items()}
     old_by_key = defaultdict(list)
     new_by_key = defaultdict(list)
     old_by_line = {}
     for row in previous:
-        old_by_key[_source_line_key(row)].append(row)
+        origin = row.source_doc_id if row.source_doc_id in destinations else None
+        key = _source_line_key(row, same_source=origin is not None)
+        old_by_key[origin, key].append(row)
         old_by_line[row.source_doc_id, row.source_line_index] = row
     for row in extracted:
-        new_by_key[_source_line_key(row)].append(row)
+        origin = same_sources.get(row.source_doc_id)
+        key = _source_line_key(row, same_source=origin is not None)
+        new_by_key[origin, key].append(row)
 
     carried = []
     ids = {}
     used = set()
     for row in extracted:
-        key = _source_line_key(row)
-        old = old_by_line.get((row.source_doc_id, row.source_line_index))
-        if not (row.source_doc_id in unchanged_docs and old and key == _source_line_key(old)):
-            candidates = old_by_key[key]
+        origin = same_sources.get(row.source_doc_id)
+        key = _source_line_key(row, same_source=origin is not None)
+        old = old_by_line.get((origin, row.source_line_index))
+        if old is None or key != _source_line_key(old, same_source=True):
+            candidates = old_by_key[origin, key]
             old = (
                 candidates[0]
-                if key is not None and len(candidates) == len(new_by_key[key]) == 1
+                if key is not None and len(candidates) == len(new_by_key[origin, key]) == 1
                 else None
             )
         changes = {"id": uuid4().hex}
@@ -608,13 +632,26 @@ def _carry_line_edits(
         carried.append(repaired)
         ids[row.id] = repaired.id
     # OCR cannot reproduce a genuinely missing line that a reviewer supplied for the same source.
-    carried.extend(
-        row
-        for row in previous
-        if row.id not in used
-        and row.source_doc_id in unchanged_docs
-        and any(action.action == _MANUAL_ADD for action in row.human_review_history)
-    )
+    for row in previous:
+        doc_id = destinations.get(row.source_doc_id)
+        if (
+            row.id in used
+            or doc_id is None
+            or not any(action.action == _MANUAL_ADD for action in row.human_review_history)
+        ):
+            continue
+        if doc_id != row.source_doc_id:
+            doc = documents[doc_id].document
+            evidence = row.source_evidence.model_copy(
+                update={
+                    "source_doc_id": doc_id,
+                    "source_file": doc.original_filename,
+                    "source_paths": [doc.original_filename],
+                    "extraction_channel": doc.extraction_channel,
+                }
+            )
+            row = row.model_copy(update={"source_doc_id": doc_id, "source_evidence": evidence})
+        carried.append(row)
     return carried, ids
 
 
@@ -643,7 +680,9 @@ class ReviewService:
                 bundles=[_document_bundle(row) for row in batch["documents"]],
             )
             records, reset = _restore_decisions(records, prior, scope)
-            updated = _save_review(transaction, batch, records, accounting_entity=entity)
+            updated = _save_review(
+                transaction, batch, records, scope=scope, accounting_entity=entity
+            )
         return {
             "batch": _batch_detail(updated),
             "reset_approval_count": reset,
@@ -664,7 +703,7 @@ class ReviewService:
                 batch["records"],
                 reapply_dictionary=True,
             )
-            updated = _save_review(transaction, batch, records)
+            updated = _save_review(transaction, batch, records, scope=scope)
         return _batch_detail(updated)
 
     def patch_record(
@@ -719,7 +758,7 @@ class ReviewService:
                 scope,
                 batch["records"],
             )
-            updated = _save_review(transaction, batch, records)
+            updated = _save_review(transaction, batch, records, scope=scope)
             _audit(transaction, _require_record(updated, record_id), before)
         return _batch_detail(updated)
 
@@ -802,7 +841,7 @@ class ReviewService:
             outcome = _batch_outcome(
                 [bundle.document for bundle in bundles], verified, batch["failed_document_alerts"]
             )
-            updated = _save_review(transaction, batch, verified, **outcome)
+            updated = _save_review(transaction, batch, verified, scope=scope, **outcome)
             _audit(transaction, _require_record(updated, manual.id))
         return _batch_detail(updated)
 
@@ -959,8 +998,8 @@ class ReviewService:
                 else record
                 for record in batch["records"]
             ]
-            checked = _recheck(records, bundles, scope, batch["records"], rematch=False)
-            updated = _save_review(transaction, batch, checked)
+            checked = _recheck(records, bundles, scope, batch["records"])
+            updated = _save_review(transaction, batch, checked, scope=scope)
         return _batch_detail(updated)
 
     def retry_or_replace_document(
@@ -1059,9 +1098,9 @@ class ReviewService:
         parsed = _retain_child_ids(
             parsed, [document for document in documents if document.doc_id in replaced_ids], doc_id
         )
+        previous_bundles = {bundle.document.doc_id: bundle for bundle in bundles}
         unchanged = {}
         if file is None and public_url is None:
-            previous_bundles = {bundle.document.doc_id: bundle for bundle in bundles}
             for index, doc in enumerate(parsed):
                 previous_bundle = previous_bundles.get(doc.doc_id)
                 if (
@@ -1087,14 +1126,23 @@ class ReviewService:
         candidates = [record for record in previous if record.source_doc_id not in replaced_ids]
 
         hashes = {document.doc_id: document.content_sha256 for document in documents}
-        covered_hashes = {hashes[record.source_doc_id] for record in candidates}
+        retained_owners = {
+            hashes[record.source_doc_id]: previous_bundles[record.source_doc_id]
+            for record in candidates
+            if hashes[record.source_doc_id]
+        }
+        replaced_owners = {
+            hashes[record.source_doc_id]: previous_bundles[record.source_doc_id]
+            for record in old_lines
+            if hashes[record.source_doc_id]
+        }
+        covered_hashes = set(retained_owners)
         covered_hashes.update(
             document.content_sha256
             for document in parsed
             if document.status is DocumentStatus.PARSED
         )
-        prior_hashes = {hashes[record.source_doc_id] for record in old_lines}
-        lost_hashes = prior_hashes - covered_hashes - {None, ""}
+        lost_hashes = replaced_owners.keys() - covered_hashes
         restoring = {
             bundle.document.doc_id: bundle
             for bundle in retained
@@ -1133,6 +1181,20 @@ class ReviewService:
             return self._save_failed_repair(batch, documents, doc_id, failure)
 
         unchanged.update(restoring)
+        fresh_documents = {bundle.document.doc_id: bundle for bundle in result.documents}
+        duplicate_targets = set()
+        for fresh_id, bundle in fresh_documents.items():
+            content_hash = bundle.document.content_sha256
+            if retained_owner := retained_owners.get(content_hash):
+                # The retained rows may move to this document during final deduplication.
+                # Keep their extraction and document corrections with them.
+                duplicate_targets.add(fresh_id)
+                bundle.extraction = retained_owner.extraction
+                if totals := retained_owner.document.metadata.get(_TOTAL_REVIEW):
+                    bundle.document.metadata[_TOTAL_REVIEW] = totals
+            elif replaced_owner := replaced_owners.get(content_hash):
+                unchanged[fresh_id] = replaced_owner
+
         corrected_totals = {
             bundle.document.doc_id: _restore_reviewed_totals(
                 bundle, unchanged[bundle.document.doc_id]
@@ -1140,12 +1202,42 @@ class ReviewService:
             for bundle in result.documents
             if bundle.document.doc_id in unchanged
         }
-        carried, ids = _carry_line_edits(old_lines, replacement_lines, set(unchanged))
+        canonical, _ = deduplicate_same_source_documents(result.documents)
+        same_sources = {
+            fresh_id: unchanged[fresh_id].document.doc_id
+            for bundle in canonical
+            if (fresh_id := bundle.document.doc_id) in unchanged
+            and fresh_id not in duplicate_targets
+        }
+        fresh_lines = [
+            record
+            for record in [*replacement_lines, *restored_lines]
+            if record.source_doc_id not in duplicate_targets
+        ]
+        carried, ids = _carry_line_edits(old_lines, fresh_lines, same_sources, fresh_documents)
+        prior_source_ids = set(same_sources.values())
+        prior_lines = [record for record in old_lines if record.source_doc_id in prior_source_ids]
+        promoted_sources = {
+            origin for fresh_id, origin in same_sources.items() if fresh_id in restoring
+        }
+        carried_ids = {record.id for record in carried}
+        if any(
+            record.source_doc_id in promoted_sources
+            and record.id not in carried_ids
+            and (record.review_status in _DECISIONS or record.human_review_history)
+            for record in prior_lines
+        ):
+            failure = FailedDocumentAlert(
+                doc_id=doc_id,
+                filename=original.original_filename,
+                error_message="同源单据的已复核费用行未能对齐。",
+            )
+            return self._save_failed_repair(batch, documents, doc_id, failure)
         carried = [
             _without_total_issues(record, fields)
             if (fields := corrected_totals.get(record.source_doc_id))
             else record
-            for record in [*carried, *restored_lines]
+            for record in carried
         ]
         replacements = [bundle for bundle in result.documents if bundle.document.doc_id in targets]
         restored = {
@@ -1160,11 +1252,13 @@ class ReviewService:
                 merged.extend(replacements)
             elif current_id not in replaced_ids:
                 merged.append(restored.get(current_id, bundle))
-        previous_decisions = [
-            *candidates,
-            *(record for record in old_lines if record.source_doc_id in unchanged),
-        ]
-        checked = _recheck([*candidates, *carried], merged, scope, previous_decisions)
+        duplicate_hashes = {
+            fresh_documents[fresh_id].document.content_sha256 for fresh_id in duplicate_targets
+        }
+        same_source_ids = {record.id for record in prior_lines if hashes[record.source_doc_id]}
+        same_source_ids.update(
+            record.id for record in candidates if hashes[record.source_doc_id] in duplicate_hashes
+        )
         failures = [
             alert
             for alert in batch["failed_document_alerts"]
@@ -1174,19 +1268,30 @@ class ReviewService:
             alert.model_copy(
                 update={
                     "affected_record_ids": [
-                        ids.get(record_id, record_id) for record_id in alert.affected_record_ids
+                        ids[record_id]
+                        for record_id in alert.affected_record_ids
+                        if record_id in ids
                     ]
                 }
             )
             for alert in result.failed_document_alerts
         )
-        outcome = _batch_outcome([bundle.document for bundle in merged], checked, failures)
         reused = {doc_id: row["stored_path"]} if data is not None and file is None else {}
         with self.batch_service._staged_originals(batch_id) as new_paths:
             stored = self.batch_service._store_child_originals(batch_id, parsed, new_paths, reused)
             with self.repository.transaction() as transaction:
                 current = _require_batch(transaction, batch_id)
                 _require_editable(current, batch["version"])
+                scope = _load_batch_scope(transaction, current, current["accounting_entity"])
+                checked = _recheck(
+                    [*candidates, *carried],
+                    merged,
+                    scope,
+                    [*candidates, *prior_lines],
+                    same_source_ids=same_source_ids,
+                )
+                outcome = _batch_outcome([bundle.document for bundle in merged], checked, failures)
+                outcome.update(_shared_baseline_changes(transaction, current, scope))
                 transaction.upsert_source_documents(batch_id, result.documents, stored_paths=stored)
                 transaction.upsert_billing_records(batch_id, checked)
                 live_ids = {record.id for record in checked}

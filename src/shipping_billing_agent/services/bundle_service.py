@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, StringConstraints
 from ..domain.currency import is_valid_iso4217
 from ..domain.entity_resolver import entity_matches
 from ..domain.models import (
+    AccountingEntityProfile,
     BatchStatus,
     DocumentExtractionBundle,
     DocumentStatus,
@@ -40,6 +41,7 @@ from ..domain.serializer import _json_values
 from ..gateways.url_guard import HTTP_URL_PATTERN
 from ..storage import BillingRepository, ResourceNotFoundError
 from ..storage.db import utc_timestamp
+from ..storage.repositories import configured_entity_profile
 from .batch_service import (
     ServiceValidationError,
     SourceChannel,
@@ -104,6 +106,7 @@ class _PortableDocument(BaseModel):
 class _PortableBundle(BaseModel):
     bundle_version: Literal["1.0"]
     accounting_entity: _NonBlank = Field(max_length=120)
+    accounting_entity_profile: AccountingEntityProfile | None = None
     exported_at: str | None = None
     short_code: str | None = None
     ocr_mode: OcrMode = OcrMode.REMOTE_ONLY
@@ -171,13 +174,24 @@ def export_review_bundle(repository: BillingRepository, batch_id: str) -> dict[s
                 "BATCH_PROCESSING", "批次仍在处理，请完成后再导出复核包", status_code=409
             )
         bills = batch["batch_existing_bills"]
+        snapshot = batch["shared_baseline_snapshot"]
+        if bills is None and snapshot is None and transaction.has_baseline_sync_items(batch_id):
+            raise ServiceValidationError(
+                "MISSING_BASELINE_SNAPSHOT",
+                "该历史共享库批次缺少同步前基线快照，已同步基线后无法无损导出复核包",
+                status_code=409,
+            )
+        scope = _load_batch_scope(
+            transaction, batch, batch["accounting_entity"], shared_baseline=snapshot
+        )
         if bills is None:
-            bills = _load_batch_scope(
-                transaction,
-                batch,
-                batch["accounting_entity"],
-                shared_baseline=batch["shared_baseline_snapshot"],
-            ).existing_bills
+            bills = scope.existing_bills
+        profile = configured_entity_profile(batch["accounting_entity"], scope.profiles)
+        profile_snapshot = (
+            {"accounting_entity_profile": profile.model_dump(include={"canonical_name", "aliases"})}
+            if profile is not None
+            else {}
+        )
         audit_by_record = defaultdict(list)
         for entry in transaction.list_review_audit_logs(batch_id):
             audit_by_record[entry["record_id"]].append(entry)
@@ -205,6 +219,7 @@ def export_review_bundle(repository: BillingRepository, batch_id: str) -> dict[s
                 "exported_at": utc_timestamp(),
                 "short_code": batch["short_code"],
                 "accounting_entity": batch["accounting_entity"],
+                **profile_snapshot,
                 "ocr_mode": batch["ocr_mode"],
                 "existing_bills_snapshot": [bill.model_dump() for bill in bills],
                 "documents": documents,
@@ -429,7 +444,10 @@ def _import_bundle(
         )
         batch_id = batch["id"]
         scope = _load_batch_scope(
-            transaction, {"batch_existing_bills": bills}, bundle.accounting_entity
+            transaction,
+            {"batch_existing_bills": bills},
+            bundle.accounting_entity,
+            accounting_entity_profile=bundle.accounting_entity_profile,
         )
         if any(
             not entity_matches(record.accounting_entity, bundle.accounting_entity, scope.profiles)

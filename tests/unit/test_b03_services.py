@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from email.message import EmailMessage
@@ -676,6 +677,36 @@ def test_document_totals_patch_updates_snapshot_and_clears_reconciliation_error(
     assert retried["documents"][0]["total_amount"] == Decimal("100.00")
 
 
+def test_totals_rematch_saves_the_shared_baseline_with_the_records(make_service):
+    service = make_service()
+    repository = service.repository
+    batch = _create(service)
+    batch_id = batch["id"]
+    (row,) = batch["records"]
+    ledger = repository.create_existing_bill(_bill("recent-ledger", amount="80"))
+    before = repository.get_batch(batch_id)
+    assert before["shared_baseline_snapshot"] == []
+    review = ReviewService(service)
+    with repository.db.connect() as connection:
+        connection.execute(
+            """CREATE TRIGGER block_snapshot BEFORE UPDATE OF batch_existing_bills_json ON batches
+               BEGIN
+                   SELECT RAISE(ABORT, 'snapshot write failed');
+               END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="snapshot write failed"):
+        review.patch_document_totals(batch_id, row["source_doc_id"], {"total_amount": 100})
+
+    assert repository.get_batch(batch_id) == before
+    with repository.db.connect() as connection:
+        connection.execute("DROP TRIGGER block_snapshot")
+    after = review.patch_document_totals(batch_id, row["source_doc_id"], {"total_amount": 100})
+    (matched,) = after["records"]
+    assert (matched["operation"], matched["matched_existing_bill_id"]) == ("UPDATE", ledger.id)
+    assert repository.get_batch(batch_id)["shared_baseline_snapshot"] == [ledger]
+
+
 def test_totals_patch_corrects_only_the_selected_currency_map(make_service):
     service = make_service()
     batch = _create(service)
@@ -828,6 +859,43 @@ def test_replacement_does_not_guess_between_identical_charge_and_amount_pairs(ma
     assert record["id"] not in old_ids
     assert record["human_overrides"] == {}
     assert record["document_info"]["reference_no"] == "INV-123"
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_replacement_moves_the_reviewed_line_to_the_surviving_copy(make_service, action):
+    service = make_service(ocr=FixtureOcr(results={b"new": _invoice("INV-NEW")}))
+    batch = _create(service, ("first.png", b"same"), ("second.png", b"same"))
+    batch_id = batch["id"]
+    repository = service.repository
+    review = ReviewService(service)
+    (row,) = batch["records"]
+    record_id = row["id"]
+    owner = row["source_doc_id"]
+    survivor = next(doc["id"] for doc in batch["documents"] if doc["id"] != owner)
+    review.patch_record(batch_id, record_id, {"payment_term": "PP"})
+    if action == "approve":
+        review.approve_record(batch_id, record_id, "已核对")
+    else:
+        review.reject_record(batch_id, record_id, "不应入账")
+    before = repository.get_billing_record(batch_id, record_id)
+    logs = repository.list_review_audit_logs(batch_id, record_id)
+    assert [log["action"] for log in logs] == ["PATCH_RECORD", action.upper()]
+
+    after = review.retry_or_replace_document(batch_id, owner, file=("new.png", b"new"))
+
+    assert len(after["records"]) == 2
+    migrated = repository.get_billing_record(batch_id, record_id)
+    assert migrated is not None
+    assert (migrated.source_doc_id, migrated.source_evidence.source_doc_id) == (survivor, survivor)
+    assert migrated.reference_no == before.reference_no
+    assert migrated.created_at == before.created_at
+    assert migrated.human_overrides == before.human_overrides
+    assert migrated.human_review_history == before.human_review_history
+    assert migrated.review_status == before.review_status
+    assert migrated.reject_reason == before.reject_reason
+    assert repository.list_review_audit_logs(batch_id) == logs
+    new_line = next(row for row in after["records"] if row["source_doc_id"] == owner)
+    assert new_line["human_overrides"] == {}
 
 
 def test_replacement_cannot_overwrite_an_edit_that_commits_during_ocr(make_service):

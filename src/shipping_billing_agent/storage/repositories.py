@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from ..domain.entity_resolver import entity_matches
+from ..domain.entity_resolver import normalize_party_name
 from ..domain.models import (
     AccountingEntityProfile,
     BatchStage,
@@ -49,6 +49,13 @@ class OptimisticLockError(RuntimeError):
         super().__init__(f"{code} for {resource_id}: expected {expected!r}, found {actual!r}")
 
 
+class BaselineSyncConflictError(OptimisticLockError):
+    """A reviewed record now selects a different target from its sync receipt."""
+
+    def __init__(self, record_id: str, bill_id: str, selected: str) -> None:
+        super().__init__("BASELINE_SYNC_TARGET_CONFLICT", record_id, bill_id, selected)
+
+
 class ResourceNotFoundError(LookupError):
     """A required resource is absent within the requested scope."""
 
@@ -59,6 +66,7 @@ class _Unchanged(Enum):
 
 _UNCHANGED = _Unchanged.VALUE
 _SHARED_BASELINE_SNAPSHOT = "shared_baseline_snapshot"
+_BASELINE_SYNC_SELECTION = "baseline_sync_selection"
 _BATCH_UPDATE_FIELDS = {
     "accounting_entity",
     "status",
@@ -735,6 +743,13 @@ class BillingRepository:
             total = connection.execute("SELECT COUNT(*) FROM existing_bills").fetchone()[0]
             return {"imported_count": len(bills), "total_count": total}
 
+    def has_baseline_sync_items(self, batch_id: str) -> bool:
+        with self._transaction() as connection:
+            item = connection.execute(
+                "SELECT 1 FROM baseline_sync_items WHERE batch_id = ? LIMIT 1", (batch_id,)
+            ).fetchone()
+            return item is not None
+
     def sync_batch_to_baseline(
         self, batch_id: str, expected_version: int | None = None
     ) -> dict[str, int]:
@@ -767,8 +782,13 @@ class BillingRepository:
                 ):
                     raise ValueError(f"Record {row['id']!r} belongs to another accounting entity")
                 record = _billing_record(row)
+                state = loads_decimal_json(row["record_state_json"])
                 previous = _baseline_target(
-                    connection, record, profiles, uses_isolated_baseline=uses_isolated_baseline
+                    connection,
+                    record,
+                    profiles,
+                    state.get(_BASELINE_SYNC_SELECTION, {}),
+                    uses_isolated_baseline=uses_isolated_baseline,
                 )
                 bill = _store_existing_bill(
                     connection, _bill_from_record(record, previous), previous=previous
@@ -779,6 +799,19 @@ class BillingRepository:
                         accounting_entity, existing_bill_id, synced_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (uuid4().hex, *sync_key, bill.accounting_entity, bill.id, utc_timestamp()),
+                )
+                # The shared bill ID alone cannot describe a prior isolated or forced selection.
+                state[_BASELINE_SYNC_SELECTION] = {
+                    "existing_bill_id": bill.id,
+                    "matched_existing_bill_id": record.matched_existing_bill_id,
+                    "force_create_new": record.human_overrides.get("force_create_new") is True,
+                }
+                _update(
+                    connection,
+                    "billing_records",
+                    {"record_state_json": dumps_decimal_json(state)},
+                    "batch_id = ? AND id = ?",
+                    (batch_id, record.id),
                 )
                 counts["updated" if previous is not None else "created"] += 1
         return counts
@@ -1109,8 +1142,9 @@ def _store_billing_record(
             previous["updated_at"], record.updated_at, changed=changed
         )
         stored_state = loads_decimal_json(previous["record_state_json"])
-        if "review_audit_logs" in stored_state:
-            state["review_audit_logs"] = stored_state["review_audit_logs"]
+        for key in ("review_audit_logs", _BASELINE_SYNC_SELECTION):
+            if key in stored_state:
+                state[key] = stored_state[key]
 
     if sql_match_id is None and record.matched_existing_bill_id is not None:
         state["snapshot_matched_bill_id"] = record.matched_existing_bill_id
@@ -1185,19 +1219,29 @@ def _entity_profiles(connection: sqlite3.Connection) -> list[AccountingEntityPro
     ]
 
 
+def configured_entity_profile(
+    name: str, profiles: Sequence[AccountingEntityProfile]
+) -> AccountingEntityProfile | None:
+    """Resolve an explicit name or alias while retaining branch suffixes."""
+    normalized = normalize_party_name(name)
+    if not normalized:
+        return None
+    aliases = []
+    for profile in profiles:
+        if normalize_party_name(profile.canonical_name) == normalized:
+            return profile
+        if any(normalize_party_name(alias) == normalized for alias in profile.aliases):
+            aliases.append(profile)
+    return aliases[0] if len(aliases) == 1 else None
+
+
 def _bill_entity_matches(
     name: str, entity: str, profiles: Sequence[AccountingEntityProfile]
 ) -> bool:
-    if entity_matches(name, entity, profiles):
+    if name.strip() == entity.strip():
         return True
-    if not entity_matches(name, entity):
-        return False
-    # Unconfigured companies can use the domain fallback. Keep configured branch boundaries.
-    return not any(
-        entity_matches(name, configured) or entity_matches(entity, configured)
-        for profile in profiles
-        for configured in (profile.canonical_name, *profile.aliases)
-    )
+    profile = configured_entity_profile(entity, profiles)
+    return profile is not None and configured_entity_profile(name, profiles) is profile
 
 
 def _existing_bill_rows(
@@ -1273,9 +1317,11 @@ def _baseline_target(
     connection: sqlite3.Connection,
     record: ProcessedBillingRecord,
     profiles: Sequence[AccountingEntityProfile],
+    previous_selection: Mapping[str, Any],
     *,
     uses_isolated_baseline: bool,
 ) -> sqlite3.Row | None:
+    matched_id = record.matched_existing_bill_id
     receipts = connection.execute(
         """SELECT bill.*, sync.accounting_entity AS receipt_entity FROM baseline_sync_items AS sync
            JOIN existing_bills AS bill ON bill.id = sync.existing_bill_id
@@ -1284,12 +1330,30 @@ def _baseline_target(
         (record.batch_id, record.id),
     )
     for bill in receipts:
-        if all(
+        if not all(
             _bill_entity_matches(bill[column], record.accounting_entity, profiles)
             for column in ("accounting_entity", "receipt_entity")
         ):
-            return bill
-    matched_id = record.matched_existing_bill_id
+            continue
+        bill_id = bill["id"]
+        same_receipt = previous_selection.get("existing_bill_id") == bill_id
+        same_isolated_match = (
+            uses_isolated_baseline
+            and same_receipt
+            and previous_selection.get("matched_existing_bill_id") == matched_id
+        )
+        if (
+            record.operation is OperationType.UPDATE
+            and matched_id is not None
+            and matched_id != bill_id
+            and not same_isolated_match
+        ):
+            raise BaselineSyncConflictError(record.id, bill_id, matched_id)
+        if record.human_overrides.get("force_create_new") is True and not (
+            same_receipt and previous_selection.get("force_create_new") is True
+        ):
+            raise BaselineSyncConflictError(record.id, bill_id, "force_create_new")
+        return bill
     if (
         not uses_isolated_baseline
         and record.operation is OperationType.UPDATE

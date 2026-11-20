@@ -677,6 +677,8 @@ paths:
                 $ref: "#/components/schemas/BatchDetail"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
 
@@ -735,6 +737,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BatchDetail"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
         "422":
@@ -1606,6 +1610,20 @@ components:
         accounting_entity:
           type: string
           minLength: 1
+        accounting_entity_profile:
+          type: ["object", "null"]
+          description: 复核包在导入重验时使用的记账主体及其别名
+          required: [canonical_name]
+          properties:
+            canonical_name:
+              type: string
+              minLength: 1
+              maxLength: 120
+            aliases:
+              type: array
+              items:
+                type: string
+              default: []
         ocr_mode:
           type: string
           enum: [REMOTE_ONLY, REMOTE_WITH_LOCAL_FALLBACK]

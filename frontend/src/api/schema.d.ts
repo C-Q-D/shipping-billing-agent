@@ -689,6 +689,12 @@ export interface components {
             bundle_version: "1.0";
             short_code?: string | null;
             accounting_entity: string;
+            /** @description 复核包在导入重验时使用的记账主体及其别名 */
+            accounting_entity_profile?: {
+                canonical_name: string;
+                /** @default [] */
+                aliases: string[];
+            } | null;
             /**
              * @default REMOTE_ONLY
              * @enum {string}
@@ -1396,6 +1402,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
         };
     };
@@ -1456,6 +1463,7 @@ export interface operations {
                     "application/json": components["schemas"]["BatchDetail"];
                 };
             };
+            404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             422: components["responses"]["ValidationFailed"];
         };

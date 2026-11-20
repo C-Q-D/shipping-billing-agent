@@ -21,7 +21,7 @@ from ..agent.graph import BillingGraphInput, _BillingNodes, _BillingState, _pack
 from ..config.limits import ResourceLimits
 from ..config.settings import AppSettings, get_settings
 from ..domain.currency import is_valid_iso4217
-from ..domain.entity_resolver import entity_matches
+from ..domain.entity_resolver import normalize_party_name
 from ..domain.models import (
     AccountingEntityProfile,
     AlertSeverity,
@@ -61,6 +61,7 @@ from ..parsers.dispatcher import (
 from ..parsers.filename_sanitizer import detect_source_kind, sanitize_filename
 from ..storage import BillingRepository, DatabaseManager, ResourceNotFoundError
 from ..storage.db import BatchWorkerLease, document_root_ids
+from ..storage.repositories import _bill_entity_matches
 
 Upload = tuple[str, bytes | BinaryIO]
 SourceChannel = Literal["WEB", "CLI"]
@@ -178,11 +179,20 @@ def _load_batch_scope(
     entity: str,
     *,
     shared_baseline: list[ExistingBillRecord] | None = None,
+    accounting_entity_profile: AccountingEntityProfile | None = None,
 ) -> _BatchScope:
     profiles = [
         AccountingEntityProfile.model_validate(profile)
         for profile in repository.list_accounting_entities()
     ]
+    if accounting_entity_profile is not None:
+        canonical = normalize_party_name(accounting_entity_profile.canonical_name)
+        profiles = [
+            profile
+            for profile in profiles
+            if normalize_party_name(profile.canonical_name) != canonical
+        ]
+        profiles.append(accounting_entity_profile)
     bills = batch["batch_existing_bills"]
     if bills is None:
         bills = repository.list_existing_bills() if shared_baseline is None else shared_baseline
@@ -190,13 +200,24 @@ def _load_batch_scope(
         profiles=profiles,
         baseline=bills,
         existing_bills=[
-            bill for bill in bills if entity_matches(bill.accounting_entity, entity, profiles)
+            bill for bill in bills if _bill_entity_matches(bill.accounting_entity, entity, profiles)
         ],
         charge_dictionary=[
             ChargeDictionaryItem.model_validate(item)
             for item in repository.list_charge_dictionary()
         ],
     )
+
+
+def _shared_baseline_changes(
+    repository: BillingRepository, batch: Mapping[str, Any], scope: _BatchScope
+) -> dict[str, list[ExistingBillRecord]]:
+    # The shared ledger can contain this batch's own results after the first sync.
+    if batch["batch_existing_bills"] is None and not repository.has_baseline_sync_items(
+        batch["id"]
+    ):
+        return {"shared_baseline_snapshot": scope.baseline}
+    return {}
 
 
 def _document_bundle(row: Mapping[str, Any]) -> DocumentExtractionBundle:
@@ -902,9 +923,8 @@ class BatchService:
                     result.records,
                     result.failed_document_alerts,
                 )
-                if batch["batch_existing_bills"] is None:
-                    outcome["shared_baseline_snapshot"] = scope.baseline
                 with self._worker_transaction(lease, version) as transaction:
+                    outcome.update(_shared_baseline_changes(transaction, batch, scope))
                     transaction.upsert_source_documents(batch_id, result.documents)
                     transaction.upsert_billing_records(batch_id, result.records)
                     transaction.update_batch_with_version_check(batch_id, version, **outcome)

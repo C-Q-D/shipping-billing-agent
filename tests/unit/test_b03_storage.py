@@ -698,8 +698,9 @@ def test_optimistic_locks_and_batch_scope(repository: BillingRepository) -> None
     assert repository.get_batch(first_id)["stage_message"] == "已复核"
 
 
+@pytest.mark.parametrize("force_create", [False, True], ids=["automatic", "forced"])
 def test_baseline_sync_is_idempotent_across_in_place_rewrites(
-    repository: BillingRepository,
+    repository: BillingRepository, force_create: bool
 ) -> None:
     batch = _completed_batch(repository)
     batch_id = batch["id"]
@@ -708,7 +709,7 @@ def test_baseline_sync_is_idempotent_across_in_place_rewrites(
     record = repository.upsert_billing_records(
         batch_id,
         [
-            _record("ready"),
+            _record("ready", human_overrides={"force_create_new": True} if force_create else {}),
             _record("pending", operation=OperationType.PENDING_REVIEW),
             _record("no-change", operation=OperationType.NO_CHANGE),
             _record("rejected", review_status=ReviewStatus.REJECTED),
@@ -791,6 +792,14 @@ def test_baseline_sync_updates_shared_match_and_isolates_snapshot_ids(
         ),
     )
     assert repository.sync_baseline(scoped_id) == {"created": 1, "updated": 0, "skipped": 0}
+    assert repository.get_existing_bill(shared.id) == updated
+    (receipt,) = _sync_items(repository, scoped_id)
+    snapshot_record = repository.get_billing_record(scoped_id, "snapshot-update")
+    repository.upsert_billing_record(
+        scoped_id, snapshot_record.model_copy(update={"amount": Decimal("25")})
+    )
+    assert repository.sync_baseline(scoped_id) == {"created": 0, "updated": 1, "skipped": 0}
+    assert repository.get_existing_bill(receipt["existing_bill_id"]).amount == Decimal("25")
     assert repository.get_existing_bill(shared.id) == updated
 
     assert repository.clear_existing_bills(_ENTITY) == 2
@@ -948,7 +957,7 @@ def test_shared_bill_scopes_treat_aliases_as_equivalent(repository: BillingRepos
     assert repository.get_existing_bill("alias", accounting_entity=_ENTITY) is not None
     assert repository.get_existing_bill("canonical", accounting_entity=_ENTITY_ALIAS) is not None
     assert repository.get_existing_bill("other-branch", accounting_entity=_ENTITY) is None
-    assert repository.get_existing_bill("unconfigured", accounting_entity="example co") is not None
+    assert repository.get_existing_bill("unconfigured", accounting_entity="example co") is None
 
     assert repository.delete_existing_bill("canonical", accounting_entity=_ENTITY_ALIAS)
     assert not repository.delete_existing_bill("other-branch", accounting_entity=_ENTITY_ALIAS)
@@ -966,6 +975,32 @@ def test_shared_bill_scopes_treat_aliases_as_equivalent(repository: BillingRepos
     assert repository.clear_existing_bills(_ENTITY_ALIAS) == 1
     remaining = repository.list_existing_bills()
     assert {bill.id for bill in remaining} == {"other-branch", "unconfigured"}
+
+
+@pytest.mark.parametrize(
+    ("entity", "other_entity"),
+    [
+        ("Harbor Orchid Logistics", "Harbor Orchid Logistics (LAX)"),
+        ("Harbor Orchid Logistics (LAX)", "Harbor Orchid Logistics"),
+    ],
+)
+def test_unconfigured_entities_are_isolated_in_shared_bill_operations(
+    repository: BillingRepository, entity: str, other_entity: str
+) -> None:
+    bill = repository.create_existing_bill(_bill("scoped", accounting_entity=entity))
+    other = repository.create_existing_bill(_bill("other", accounting_entity=other_entity))
+
+    assert repository.list_existing_bills(f" {entity} ") == [bill]
+    assert repository.get_existing_bill(other.id, accounting_entity=entity) is None
+    assert not repository.delete_existing_bill(other.id, accounting_entity=entity)
+    with pytest.raises(ValueError, match="requested accounting entity"):
+        repository.import_existing_bills([other], replace_existing=True, accounting_entity=entity)
+    assert repository.import_existing_bills(
+        [bill], replace_existing=True, accounting_entity=entity
+    ) == {"imported_count": 1, "total_count": 2}
+    assert repository.clear_existing_bills(entity) == 1
+    assert repository.list_existing_bills() == [other]
+    assert repository.clear_existing_bills(other_entity) == 1
 
 
 def test_sync_accepts_alias_scope_for_legacy_matches_and_prior_receipts(
@@ -1008,6 +1043,53 @@ def test_sync_accepts_alias_scope_for_legacy_matches_and_prior_receipts(
     (bill,) = repository.list_existing_bills()
     assert (bill.id, bill.version, bill.amount) == ("ledger", 4, _SMALL_AMOUNT)
     assert {item["existing_bill_id"] for item in _sync_items(repository, batch_id)} == {"ledger"}
+
+
+@pytest.mark.parametrize("target", ["matched-bill", "force-create"])
+def test_baseline_sync_target_conflict_rolls_back_earlier_records(
+    repository: BillingRepository, target: str
+) -> None:
+    batch_id = _completed_batch(repository)["id"]
+    repository.upsert_source_documents(batch_id, [_document("doc")])
+    repository.import_existing_bills([_bill("first-ledger"), _bill("second-ledger")])
+    record = repository.upsert_billing_record(
+        batch_id,
+        _record(
+            "reviewed",
+            source_line_index=1,
+            operation=OperationType.UPDATE,
+            matched_existing_bill_id="first-ledger",
+        ),
+    )
+    assert repository.sync_baseline(batch_id) == {"created": 0, "updated": 1, "skipped": 0}
+    old_bills = repository.list_existing_bills()
+    old_receipts = _sync_items(repository, batch_id)
+    force_create = target == "force-create"
+    repository.upsert_billing_records(
+        batch_id,
+        [
+            _record("eligible-before-conflict"),
+            record.model_copy(
+                update={
+                    "operation": OperationType.CREATE if force_create else OperationType.UPDATE,
+                    "amount": Decimal("120"),
+                    "matched_existing_bill_id": None if force_create else "second-ledger",
+                    "human_overrides": {"force_create_new": True} if force_create else {},
+                    "review_status": ReviewStatus.APPROVED,
+                }
+            ),
+        ],
+    )
+
+    with pytest.raises(OptimisticLockError) as error:
+        repository.sync_baseline(batch_id)
+
+    assert error.value.code == "BASELINE_SYNC_TARGET_CONFLICT"
+    assert error.value.resource_id == record.id
+    assert error.value.expected == "first-ledger"
+    assert error.value.actual == ("force_create_new" if force_create else "second-ledger")
+    assert repository.list_existing_bills() == old_bills
+    assert _sync_items(repository, batch_id) == old_receipts
 
 
 def test_eval_runs_restore_null_metrics_and_full_reports(repository: BillingRepository) -> None:
