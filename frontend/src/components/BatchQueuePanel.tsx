@@ -5,6 +5,7 @@ import type {
   BillingRecordDetail,
 } from "../api/client.ts";
 import { formatLosslessAmount, readDecimalString } from "../api/decimalJson.ts";
+import type { PendingBatchDetailRecovery } from "../api/reviewState.ts";
 import { LumnoButton, LumnoSegmentedControl } from "./LumnoPrimitives.tsx";
 
 export type RecordFilterTab =
@@ -66,6 +67,7 @@ export interface BatchQueuePanelProps {
   dirtyRecordIds?: ReadonlySet<string>;
   retryingDocId: string | null;
   pollTransientError?: string | null;
+  pendingBatchRecovery?: PendingBatchDetailRecovery | null;
   entityNotice: { count: number; message: string } | null;
   onChangeFilterTab: (tab: RecordFilterTab) => void;
   onClearDocFilter: () => void;
@@ -73,6 +75,7 @@ export interface BatchQueuePanelProps {
   onInspectDoc: (docId: string) => void;
   onRetryOrReplaceDoc: (docId: string, file?: File) => void;
   onRefreshBatch?: () => void;
+  onRetryPendingBatch?: () => void;
   onDismissEntityNotice: () => void;
   onOpenManualRecord: () => void;
 }
@@ -85,6 +88,7 @@ export function BatchQueuePanel({
   dirtyRecordIds,
   retryingDocId,
   pollTransientError = null,
+  pendingBatchRecovery = null,
   entityNotice,
   onChangeFilterTab,
   onClearDocFilter,
@@ -92,6 +96,7 @@ export function BatchQueuePanel({
   onInspectDoc,
   onRetryOrReplaceDoc,
   onRefreshBatch,
+  onRetryPendingBatch,
   onDismissEntityNotice,
   onOpenManualRecord,
 }: BatchQueuePanelProps) {
@@ -161,20 +166,64 @@ export function BatchQueuePanel({
               手工补行
             </LumnoButton>
           </div>
+        ) : pendingBatchRecovery ? (
+          <span className="wb-badge wb-badge--muted wb-tabular">
+            {pendingBatchRecovery.shortCode}
+          </span>
         ) : null}
       </div>
 
       <div className="wb-pane-body">
         {!batch ? (
-          <div className="wb-empty-state lumno-paper-card">
-            <i
-              className="ri-icon ri-file-list-3-line"
-              style={{ "--ri-size": "28px" } as React.CSSProperties}
-              aria-hidden="true"
-            />
-            <strong>当前尚未选中解析批次</strong>
-            <span>请在左栏投递多格式单据或点击“一键载入 4 份真样本”</span>
-          </div>
+          pendingBatchRecovery ? (
+            pendingBatchRecovery.errorMessage ? (
+              <div
+                className="wb-alert-item lumno-paper-card"
+                data-severity="BLOCKER"
+                role="alert"
+              >
+                <strong>批次详情读取失败</strong>
+                <div>
+                  批次 {pendingBatchRecovery.shortCode}（ID：
+                  <span className="wb-mono">{pendingBatchRecovery.id}</span>
+                  ）已创建入队，但首次读取详情失败，请点击下方按钮重试读取（无需重复上传）。
+                </div>
+                <div className="wb-field-error">
+                  {pendingBatchRecovery.errorMessage}
+                </div>
+                <div className="wb-action-row" style={{ marginTop: "4px" }}>
+                  <LumnoButton
+                    variant="primary"
+                    compact
+                    icon="ri-refresh-line"
+                    busy={pendingBatchRecovery.loading}
+                    onClick={onRetryPendingBatch}
+                  >
+                    重试读取此批次
+                  </LumnoButton>
+                </div>
+              </div>
+            ) : (
+              <div className="wb-empty-state lumno-paper-card" role="status">
+                <strong>
+                  正在读取新建批次 {pendingBatchRecovery.shortCode} 详情…
+                </strong>
+                <span className="wb-mono wb-helper-note">
+                  批次 ID：{pendingBatchRecovery.id}
+                </span>
+              </div>
+            )
+          ) : (
+            <div className="wb-empty-state lumno-paper-card">
+              <i
+                className="ri-icon ri-file-list-3-line"
+                style={{ "--ri-size": "28px" } as React.CSSProperties}
+                aria-hidden="true"
+              />
+              <strong>当前尚未选中解析批次</strong>
+              <span>请在左栏投递多格式单据或点击“一键载入 4 份真样本”</span>
+            </div>
+          )
         ) : (
           <>
             <div className="wb-stage-bar" aria-label="实时解析阶段">

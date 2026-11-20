@@ -657,6 +657,12 @@ export function LumnoPopconfirm({
   }, [open, reposition]);
 
   useEffect(() => {
+    if (disabled && open) {
+      setOpen(false);
+    }
+  }, [disabled, open]);
+
+  useEffect(() => {
     if (!open) return;
     const onPointerDown = (e: PointerEvent) => {
       const target = e.target as Node | null;
@@ -685,6 +691,7 @@ export function LumnoPopconfirm({
   }, [open, reposition]);
 
   const handleConfirm = async () => {
+    if (disabled) return;
     const trimmed = reason.trim();
     if (requireReason) {
       const reasonErr = validateReviewReason(trimmed);

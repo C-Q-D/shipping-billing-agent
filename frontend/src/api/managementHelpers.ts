@@ -1,4 +1,5 @@
 import {
+  hasValidDecimalNumber,
   isValidIso4217Currency,
   normalizeBillingRecord,
   normalizeExistingBill,
@@ -18,6 +19,7 @@ import {
   copyDecimalMeta,
   parseLosslessJson,
   rawDecimal,
+  RawDecimalLiteral,
   readDecimalString,
   toSchemaDecimal,
 } from "./decimalJson.ts";
@@ -587,38 +589,41 @@ interface ParsedReportMetric {
 
 function readMetricFromReport(
   report: Record<string, unknown> | undefined,
-  metricKey: string
+  metricKey: string,
+  aliasKeys: ReadonlyArray<string> = []
 ): ParsedReportMetric {
   if (!report) return { rate: null, fraction: null };
 
-  // B05 runner.py real shape: report[metric] = { rate: float | None, numerator: int, denominator: int }
-  const direct = report[metricKey];
-  if (typeof direct === "number" && Number.isFinite(direct)) {
-    const legacy = readLegacyFractionFromReport(report, metricKey);
-    return { rate: direct, fraction: legacy };
-  }
-  if (isPlainObject(direct)) {
-    const rate =
-      typeof direct.rate === "number" && Number.isFinite(direct.rate)
-        ? direct.rate
-        : null;
-    const passed =
-      typeof direct.numerator === "number" && Number.isFinite(direct.numerator)
-        ? direct.numerator
-        : typeof direct.passed === "number" && Number.isFinite(direct.passed)
-          ? direct.passed
+  for (const key of [metricKey, ...aliasKeys]) {
+    // B05 runner.py real shape: report[metric] = { rate: float | None, numerator: int, denominator: int }
+    const direct = report[key];
+    if (typeof direct === "number" && Number.isFinite(direct)) {
+      const legacy = readLegacyFractionFromReport(report, key);
+      return { rate: direct, fraction: legacy };
+    }
+    if (isPlainObject(direct)) {
+      const rate =
+        typeof direct.rate === "number" && Number.isFinite(direct.rate)
+          ? direct.rate
           : null;
-    const total =
-      typeof direct.denominator === "number" &&
-      Number.isFinite(direct.denominator)
-        ? direct.denominator
-        : typeof direct.total === "number" && Number.isFinite(direct.total)
-          ? direct.total
-          : null;
-    return {
-      rate,
-      fraction: passed !== null && total !== null ? { passed, total } : null,
-    };
+      const passed =
+        typeof direct.numerator === "number" && Number.isFinite(direct.numerator)
+          ? direct.numerator
+          : typeof direct.passed === "number" && Number.isFinite(direct.passed)
+            ? direct.passed
+            : null;
+      const total =
+        typeof direct.denominator === "number" &&
+        Number.isFinite(direct.denominator)
+          ? direct.denominator
+          : typeof direct.total === "number" && Number.isFinite(direct.total)
+            ? direct.total
+            : null;
+      return {
+        rate,
+        fraction: passed !== null && total !== null ? { passed, total } : null,
+      };
+    }
   }
 
   return {
@@ -705,9 +710,10 @@ export function buildEvalRunViewModel(run: EvalRunSummary): EvalRunViewModel {
     key: string,
     label: string,
     description: string,
-    summaryVal?: number | null
+    summaryVal?: number | null,
+    aliasKeys: ReadonlyArray<string> = []
   ): EvalMetricRowView => {
-    const parsed = readMetricFromReport(report, key);
+    const parsed = readMetricFromReport(report, key, aliasKeys);
     const effectiveRate =
       summaryVal !== undefined && summaryVal !== null
         ? summaryVal
@@ -724,6 +730,13 @@ export function buildEvalRunViewModel(run: EvalRunSummary): EvalRunViewModel {
       ...formatted,
     };
   };
+
+  const rawAmountExactMatch = (run as unknown as Record<string, unknown>)
+    .amount_exact_match;
+  const summaryAmountExactMatch =
+    typeof rawAmountExactMatch === "number" && Number.isFinite(rawAmountExactMatch)
+      ? rawAmountExactMatch
+      : undefined;
 
   // A12: Always render all 9 truth metrics & 2 stability metrics even when COMPLETED has null rate ("无结果")
   const truthMetrics: EvalMetricRowView[] = [
@@ -760,7 +773,9 @@ export function buildEvalRunViewModel(run: EvalRunSummary): EvalRunViewModel {
     makeRow(
       "amount_accuracy",
       "金额无损一致率",
-      "高精十进制金额相对真值零舍入误差一致率"
+      "高精十进制金额相对真值零舍入误差一致率",
+      summaryAmountExactMatch,
+      ["amount_exact_match"]
     ),
     makeRow(
       "currency_accuracy",
@@ -884,6 +899,50 @@ const VALID_REVIEW_STATUSES = new Set([
   "REJECTED",
 ]);
 
+function isNullableString(val: unknown): val is string | null {
+  return val === null || typeof val === "string";
+}
+
+function isOptionalNullableString(
+  val: unknown
+): val is string | null | undefined {
+  return val === undefined || val === null || typeof val === "string";
+}
+
+function isStringArray(val: unknown): val is string[] {
+  return Array.isArray(val) && val.every((item) => typeof item === "string");
+}
+
+function validateShipmentRefsShape(val: unknown, label: string): string | null {
+  if (val === undefined || val === null) return null;
+  if (!isPlainObject(val)) {
+    return `${label} shipment_refs 须为 JSON 对象`;
+  }
+  if (val.mbl_nos !== undefined) {
+    if (
+      !Array.isArray(val.mbl_nos) ||
+      val.mbl_nos.some(
+        (item) =>
+          !isPlainObject(item) ||
+          typeof item.value !== "string" ||
+          typeof item.source !== "string"
+      )
+    ) {
+      return `${label} shipment_refs.mbl_nos 须为含 value 与 source 的对象数组`;
+    }
+  }
+  if (!isOptionalNullableString(val.hbl_no)) {
+    return `${label} shipment_refs.hbl_no 须为字符串或 null`;
+  }
+  if (!isOptionalNullableString(val.booking_no)) {
+    return `${label} shipment_refs.booking_no 须为字符串或 null`;
+  }
+  if (val.container_nos !== undefined && !isStringArray(val.container_nos)) {
+    return `${label} shipment_refs.container_nos 须为字符串数组`;
+  }
+  return null;
+}
+
 function validateDecimalOrNull(
   holder: Record<string, unknown>,
   key: string
@@ -891,7 +950,7 @@ function validateDecimalOrNull(
   const val = holder[key];
   if (val === undefined || val === null) return true;
   if (typeof val === "number") return Number.isFinite(val);
-  if (val instanceof Object && "toJsonLiteral" in val) return true;
+  if (val instanceof RawDecimalLiteral) return true;
   return false;
 }
 
@@ -916,6 +975,18 @@ export function validateReviewBundleInput(
     return {
       valid: false,
       error: '不符合 ReviewBundleV1 契约：bundle_version 必须严格为 "1.0"',
+    };
+  }
+  if (!isOptionalNullableString(parsed.short_code)) {
+    return {
+      valid: false,
+      error: "不符合 ReviewBundleV1 契约：short_code 须为字符串或 null",
+    };
+  }
+  if (!isOptionalNullableString(parsed.exported_at)) {
+    return {
+      valid: false,
+      error: "不符合 ReviewBundleV1 契约：exported_at 须为字符串或 null",
     };
   }
   if (
@@ -952,8 +1023,18 @@ export function validateReviewBundleInput(
       error: "ReviewBundleV1 中的 existing_bills_snapshot 必须为数组",
     };
   }
+  if (
+    parsed.failed_documents !== undefined &&
+    !Array.isArray(parsed.failed_documents)
+  ) {
+    return {
+      valid: false,
+      error: "ReviewBundleV1 中的 failed_documents 必须为数组",
+    };
+  }
 
   const docIds = new Set<string>();
+  const rawAffectedChecks: Array<{ docId: string; recordIds: string[] }> = [];
   const normalizedDocs: SourceDocumentSummary[] = [];
   for (let i = 0; i < parsed.documents.length; i++) {
     const rawDoc = parsed.documents[i];
@@ -998,11 +1079,7 @@ export function validateReviewBundleInput(
         error: `第 ${rowNo} 份来源单据 (${id}) status 无效，须为 PARSED / SKIPPED_NOISE / METADATA_ONLY / FAILED`,
       };
     }
-    if (
-      rawDoc.parent_doc_id !== undefined &&
-      rawDoc.parent_doc_id !== null &&
-      typeof rawDoc.parent_doc_id !== "string"
-    ) {
+    if (!isOptionalNullableString(rawDoc.parent_doc_id)) {
       return {
         valid: false,
         error: `第 ${rowNo} 份来源单据 (${id}) parent_doc_id 须为字符串或 null`,
@@ -1013,6 +1090,88 @@ export function validateReviewBundleInput(
         valid: false,
         error: `第 ${rowNo} 份来源单据 (${id}) parent_doc_id 不能指向自身`,
       };
+    }
+    for (const optStrKey of [
+      "error_message",
+      "total_currency",
+      "content_sha256",
+    ] as const) {
+      if (!isOptionalNullableString(rawDoc[optStrKey])) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 份来源单据 (${id}) ${optStrKey} 须为字符串或 null`,
+        };
+      }
+    }
+    if (
+      rawDoc.retry_count !== undefined &&
+      (typeof rawDoc.retry_count !== "number" ||
+        !Number.isInteger(rawDoc.retry_count) ||
+        (rawDoc.retry_count !== 0 && rawDoc.retry_count !== 1))
+    ) {
+      return {
+        valid: false,
+        error: `第 ${rowNo} 份来源单据 (${id}) retry_count 须为整数 0 或 1`,
+      };
+    }
+    if (
+      rawDoc.ocr_suspicious !== undefined &&
+      typeof rawDoc.ocr_suspicious !== "boolean"
+    ) {
+      return {
+        valid: false,
+        error: `第 ${rowNo} 份来源单据 (${id}) ocr_suspicious 须为布尔值`,
+      };
+    }
+    if (rawDoc.affected_record_ids !== undefined) {
+      if (!isStringArray(rawDoc.affected_record_ids)) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 份来源单据 (${id}) affected_record_ids 须为字符串数组`,
+        };
+      }
+      rawAffectedChecks.push({ docId: id, recordIds: rawDoc.affected_record_ids });
+    }
+    if (rawDoc.excluded_clauses !== undefined) {
+      if (
+        !Array.isArray(rawDoc.excluded_clauses) ||
+        rawDoc.excluded_clauses.some(
+          (clause) =>
+            !isPlainObject(clause) ||
+            typeof clause.text !== "string" ||
+            typeof clause.reason !== "string" ||
+            (clause.page !== undefined &&
+              clause.page !== null &&
+              (typeof clause.page !== "number" || !Number.isInteger(clause.page)))
+        )
+      ) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 份来源单据 (${id}) excluded_clauses 结构无效`,
+        };
+      }
+    }
+    const docShipErr = validateShipmentRefsShape(
+      rawDoc.shipment_refs,
+      `第 ${rowNo} 份来源单据 (${id})`
+    );
+    if (docShipErr) {
+      return { valid: false, error: docShipErr };
+    }
+    for (const optObjKey of [
+      "extraction_snapshot",
+      "document_totals_review",
+    ] as const) {
+      if (
+        rawDoc[optObjKey] !== undefined &&
+        rawDoc[optObjKey] !== null &&
+        !isPlainObject(rawDoc[optObjKey])
+      ) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 份来源单据 (${id}) ${optObjKey} 须为对象或 null`,
+        };
+      }
     }
     if (
       !validateDecimalOrNull(rawDoc, "subtotal_amount") ||
@@ -1108,10 +1267,7 @@ export function validateReviewBundleInput(
         error: `第 ${rowNo} 条账单记录 (${id}) 缺少必填 match_level`,
       };
     }
-    if (
-      !Array.isArray(rawRec.ai_reasoning) ||
-      rawRec.ai_reasoning.some((line) => typeof line !== "string")
-    ) {
+    if (!isStringArray(rawRec.ai_reasoning)) {
       return {
         valid: false,
         error: `第 ${rowNo} 条账单记录 (${id}) ai_reasoning 须为字符串数组`,
@@ -1123,19 +1279,28 @@ export function validateReviewBundleInput(
       !isPlainObject(docInfo) ||
       !("document_type" in docInfo) ||
       !("reference_no" in docInfo) ||
-      !("document_date" in docInfo)
+      !("document_date" in docInfo) ||
+      !isNullableString(docInfo.document_type) ||
+      !isNullableString(docInfo.reference_no) ||
+      !isNullableString(docInfo.document_date)
     ) {
       return {
         valid: false,
-        error: `第 ${rowNo} 条账单记录 (${id}) 缺少完整的 document_info`,
+        error: `第 ${rowNo} 条账单记录 (${id}) document_info 缺少必填键或字段类型须为字符串/null`,
       };
     }
 
     const party = rawRec.transaction_party;
-    if (!isPlainObject(party) || !("issuer" in party) || !("recipient" in party)) {
+    if (
+      !isPlainObject(party) ||
+      !("issuer" in party) ||
+      !("recipient" in party) ||
+      !isNullableString(party.issuer) ||
+      !isNullableString(party.recipient)
+    ) {
       return {
         valid: false,
-        error: `第 ${rowNo} 条账单记录 (${id}) 缺少完整的 transaction_party`,
+        error: `第 ${rowNo} 条账单记录 (${id}) transaction_party 缺少必填键或字段类型须为字符串/null`,
       };
     }
 
@@ -1146,13 +1311,16 @@ export function validateReviewBundleInput(
       !("amount" in charge) ||
       !("currency" in charge) ||
       !("payment_term" in charge) ||
+      !isNullableString(charge.charge_item) ||
+      !isNullableString(charge.currency) ||
+      !isOptionalNullableString(charge.raw_charge_name) ||
       !validateDecimalOrNull(charge, "quantity") ||
       !validateDecimalOrNull(charge, "unit_price") ||
       !validateDecimalOrNull(charge, "amount")
     ) {
       return {
         valid: false,
-        error: `第 ${rowNo} 条账单记录 (${id}) charge_details 结构或数值不合法`,
+        error: `第 ${rowNo} 条账单记录 (${id}) charge_details 结构、字符串或数值类型不合法`,
       };
     }
     if (
@@ -1182,9 +1350,223 @@ export function validateReviewBundleInput(
       };
     }
 
+    for (const optStrKey of [
+      "matched_existing_bill_id",
+      "matched_bill_ref",
+      "reject_reason",
+      "created_at",
+      "updated_at",
+    ] as const) {
+      if (!isOptionalNullableString(rawRec[optStrKey])) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 条账单记录 (${id}) ${optStrKey} 须为字符串或 null`,
+        };
+      }
+    }
+
+    if (
+      rawRec.inherited_fields !== undefined &&
+      !isStringArray(rawRec.inherited_fields)
+    ) {
+      return {
+        valid: false,
+        error: `第 ${rowNo} 条账单记录 (${id}) inherited_fields 须为字符串数组`,
+      };
+    }
+    if (
+      rawRec.record_state !== undefined &&
+      !isPlainObject(rawRec.record_state)
+    ) {
+      return {
+        valid: false,
+        error: `第 ${rowNo} 条账单记录 (${id}) record_state 须为 JSON 对象`,
+      };
+    }
+    if (
+      rawRec.human_overrides !== undefined &&
+      rawRec.human_overrides !== null &&
+      !isPlainObject(rawRec.human_overrides)
+    ) {
+      return {
+        valid: false,
+        error: `第 ${rowNo} 条账单记录 (${id}) human_overrides 须为对象或 null`,
+      };
+    }
+
+    const recShipErr = validateShipmentRefsShape(
+      rawRec.shipment_refs,
+      `第 ${rowNo} 条账单记录 (${id})`
+    );
+    if (recShipErr) {
+      return { valid: false, error: recShipErr };
+    }
+
+    if (rawRec.source_evidence !== undefined && rawRec.source_evidence !== null) {
+      if (!isPlainObject(rawRec.source_evidence)) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 条账单记录 (${id}) source_evidence 须为对象或 null`,
+        };
+      }
+      if (
+        rawRec.source_evidence.source_paths !== undefined &&
+        !isStringArray(rawRec.source_evidence.source_paths)
+      ) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 条账单记录 (${id}) source_evidence.source_paths 须为字符串数组`,
+        };
+      }
+      if (
+        !isOptionalNullableString(rawRec.source_evidence.source_file) ||
+        !isOptionalNullableString(rawRec.source_evidence.snippet)
+      ) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 条账单记录 (${id}) source_evidence 文本字段须为字符串或 null`,
+        };
+      }
+    }
+
+    if (rawRec.candidate_bills !== undefined && rawRec.candidate_bills !== null) {
+      if (
+        !Array.isArray(rawRec.candidate_bills) ||
+        rawRec.candidate_bills.some(
+          (cand) =>
+            !isPlainObject(cand) ||
+            typeof cand.id !== "string" ||
+            !cand.id.trim() ||
+            typeof cand.label !== "string" ||
+            typeof cand.charge_item !== "string" ||
+            !hasValidDecimalNumber(cand.amount) ||
+            typeof cand.currency !== "string"
+        )
+      ) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 条账单记录 (${id}) candidate_bills 结构无效`,
+        };
+      }
+    }
+
+    if (
+      rawRec.validation_alerts !== undefined &&
+      rawRec.validation_alerts !== null
+    ) {
+      if (
+        !Array.isArray(rawRec.validation_alerts) ||
+        rawRec.validation_alerts.some(
+          (alert) =>
+            !isPlainObject(alert) ||
+            typeof alert.code !== "string" ||
+            typeof alert.severity !== "string" ||
+            typeof alert.message !== "string"
+        )
+      ) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 条账单记录 (${id}) validation_alerts 结构无效`,
+        };
+      }
+    }
+
+    if (rawRec.field_diffs !== undefined && rawRec.field_diffs !== null) {
+      if (
+        !Array.isArray(rawRec.field_diffs) ||
+        rawRec.field_diffs.some(
+          (diff) =>
+            !isPlainObject(diff) ||
+            typeof diff.field !== "string" ||
+            typeof diff.changed !== "boolean"
+        )
+      ) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 条账单记录 (${id}) field_diffs 结构无效`,
+        };
+      }
+    }
+
+    if (
+      rawRec.review_audit_logs !== undefined &&
+      rawRec.review_audit_logs !== null
+    ) {
+      if (
+        !Array.isArray(rawRec.review_audit_logs) ||
+        rawRec.review_audit_logs.some(
+          (entry) =>
+            !isPlainObject(entry) ||
+            typeof entry.action !== "string" ||
+            typeof entry.operator !== "string" ||
+            typeof entry.timestamp !== "string" ||
+            !isOptionalNullableString(entry.reason)
+        )
+      ) {
+        return {
+          valid: false,
+          error: `第 ${rowNo} 条账单记录 (${id}) review_audit_logs 结构无效`,
+        };
+      }
+    }
+
     normalizedRecords.push(
       normalizeBillingRecord(rawRec as unknown as BillingRecordDetail)
     );
+  }
+
+  for (const check of rawAffectedChecks) {
+    for (const recId of check.recordIds) {
+      if (!recordIds.has(recId)) {
+        return {
+          valid: false,
+          error: `来源单据 "${check.docId}" 的 affected_record_ids 引用了不存在的记录 "${recId}"`,
+        };
+      }
+    }
+  }
+
+  if (parsed.failed_documents !== undefined) {
+    for (let i = 0; i < parsed.failed_documents.length; i++) {
+      const failItem = parsed.failed_documents[i];
+      if (!isPlainObject(failItem)) {
+        return {
+          valid: false,
+          error: `failed_documents[${i}] 必须为对象`,
+        };
+      }
+      const failDocId =
+        typeof failItem.doc_id === "string" ? failItem.doc_id.trim() : "";
+      if (!failDocId || !docIds.has(failDocId)) {
+        return {
+          valid: false,
+          error: `failed_documents[${i}] 缺少有效 doc_id 或未在 documents 中声明`,
+        };
+      }
+      if (typeof failItem.filename !== "string" || !failItem.filename.trim()) {
+        return {
+          valid: false,
+          error: `failed_documents[${i}] (${failDocId}) 缺少非空字符串 filename`,
+        };
+      }
+      if (typeof failItem.error_message !== "string") {
+        return {
+          valid: false,
+          error: `failed_documents[${i}] (${failDocId}) error_message 须为字符串`,
+        };
+      }
+      if (failItem.affected_record_ids !== undefined) {
+        if (
+          !isStringArray(failItem.affected_record_ids) ||
+          failItem.affected_record_ids.some((recId) => !recordIds.has(recId))
+        ) {
+          return {
+            valid: false,
+            error: `failed_documents[${i}] (${failDocId}) affected_record_ids 须为有效记录 ID 数组`,
+          };
+        }
+      }
+    }
   }
 
   const rawBills = Array.isArray(parsed.existing_bills_snapshot)
@@ -1211,29 +1593,105 @@ export function validateReviewBundleInput(
     billIds.add(id);
     if (
       typeof rawBill.accounting_entity !== "string" ||
-      !rawBill.accounting_entity.trim() ||
+      countCodePoints(rawBill.accounting_entity) < 1 ||
+      countCodePoints(rawBill.accounting_entity) > 120 ||
       typeof rawBill.charge_item !== "string" ||
       !rawBill.charge_item.trim() ||
-      typeof rawBill.amount !== "number" ||
-      !Number.isFinite(rawBill.amount) ||
+      !hasValidDecimalNumber(rawBill.amount) ||
+      typeof rawBill.currency !== "string" ||
       !isValidIso4217Currency(rawBill.currency) ||
       (rawBill.posting_type !== "AR" && rawBill.posting_type !== "AP")
     ) {
       return {
         valid: false,
-        error: `existing_bills_snapshot 第 ${rowNo} 条 (${id}) 缺少必填有效字段`,
+        error: `existing_bills_snapshot 第 ${rowNo} 条 (${id}) 缺少必填有效字段或币种/金额非法`,
       };
     }
+    for (const optNum of ["quantity", "unit_price"] as const) {
+      if (
+        rawBill[optNum] !== undefined &&
+        rawBill[optNum] !== null &&
+        !hasValidDecimalNumber(rawBill[optNum])
+      ) {
+        return {
+          valid: false,
+          error: `existing_bills_snapshot 第 ${rowNo} 条 (${id}) ${optNum} 不是合法数值`,
+        };
+      }
+    }
+    if (
+      rawBill.payment_term !== undefined &&
+      rawBill.payment_term !== null &&
+      rawBill.payment_term !== "PP" &&
+      rawBill.payment_term !== "CC"
+    ) {
+      return {
+        valid: false,
+        error: `existing_bills_snapshot 第 ${rowNo} 条 (${id}) payment_term 无效`,
+      };
+    }
+    if (
+      rawBill.container_nos !== undefined &&
+      !isStringArray(rawBill.container_nos)
+    ) {
+      return {
+        valid: false,
+        error: `existing_bills_snapshot 第 ${rowNo} 条 (${id}) container_nos 须为字符串数组`,
+      };
+    }
+    if (
+      rawBill.version !== undefined &&
+      (typeof rawBill.version !== "number" ||
+        !Number.isInteger(rawBill.version) ||
+        rawBill.version < 1)
+    ) {
+      return {
+        valid: false,
+        error: `existing_bills_snapshot 第 ${rowNo} 条 (${id}) version 须为正整数`,
+      };
+    }
+    for (const optStrKey of [
+      "external_bill_key",
+      "document_type",
+      "reference_no",
+      "document_date",
+      "issuer",
+      "recipient",
+      "mbl_no",
+      "hbl_no",
+      "booking_no",
+      "raw_charge_name",
+    ] as const) {
+      if (!isOptionalNullableString(rawBill[optStrKey])) {
+        return {
+          valid: false,
+          error: `existing_bills_snapshot 第 ${rowNo} 条 (${id}) ${optStrKey} 须为字符串或 null`,
+        };
+      }
+    }
+    const normalizedBillInput = copyDecimalMeta(rawBill, {
+      ...rawBill,
+      currency: rawBill.currency.trim().toUpperCase(),
+      amount:
+        typeof rawBill.amount === "string"
+          ? toSchemaDecimal(rawBill.amount)
+          : rawBill.amount,
+      ...(typeof rawBill.quantity === "string"
+        ? { quantity: toSchemaDecimal(rawBill.quantity) }
+        : {}),
+      ...(typeof rawBill.unit_price === "string"
+        ? { unit_price: toSchemaDecimal(rawBill.unit_price) }
+        : {}),
+    });
     normalizedBills.push(
-      normalizeExistingBill(rawBill as unknown as ExistingBill)
+      normalizeExistingBill(normalizedBillInput as unknown as ExistingBill)
     );
   }
 
   const bundle: ReviewBundleV1 = {
     ...(parsed as Record<string, unknown>),
     bundle_version: "1.0",
-    short_code:
-      typeof parsed.short_code === "string" ? parsed.short_code : null,
+    short_code: parsed.short_code ?? null,
     accounting_entity: parsed.accounting_entity.trim(),
     ocr_mode: ocrMode as ReviewBundleV1["ocr_mode"],
     documents: normalizedDocs,
@@ -1371,5 +1829,148 @@ export function getExportModalActionEligibility(
     activeExport,
     canCopy: ready,
     canDownload: ready,
+  };
+}
+
+// F5 + B2: Pure existing-bills filter race & 503 error state machine
+export interface ExistingBillsViewState {
+  activeFilter: string;
+  loadedForFilter: string | null;
+  bills: ExistingBill[];
+  totalCount: number;
+  loading: boolean;
+  loadError: string | null;
+  reqSeq: number;
+}
+
+export function createExistingBillsViewState(
+  initialFilter = ""
+): ExistingBillsViewState {
+  return {
+    activeFilter: initialFilter,
+    loadedForFilter: null,
+    bills: [],
+    totalCount: 0,
+    loading: false,
+    loadError: null,
+    reqSeq: 0,
+  };
+}
+
+export function setExistingBillsFilter(
+  state: ExistingBillsViewState,
+  nextFilter: string
+): ExistingBillsViewState {
+  if (state.activeFilter === nextFilter) {
+    return state;
+  }
+  return {
+    ...state,
+    activeFilter: nextFilter,
+    loadedForFilter: null,
+    bills: [],
+    totalCount: 0,
+    loading: true,
+    loadError: null,
+  };
+}
+
+export function beginExistingBillsLoad(
+  state: ExistingBillsViewState,
+  requestedFilter: string,
+  explicitSeq?: number
+): { seq: number; nextState: ExistingBillsViewState } {
+  const seq = explicitSeq ?? state.reqSeq + 1;
+  const filterChanged = state.loadedForFilter !== requestedFilter;
+  return {
+    seq,
+    nextState: {
+      ...state,
+      reqSeq: Math.max(state.reqSeq, seq),
+      loading: true,
+      loadError: null,
+      ...(filterChanged
+        ? {
+            loadedForFilter: null,
+            bills: [],
+            totalCount: 0,
+          }
+        : {}),
+    },
+  };
+}
+
+export function completeExistingBillsLoadSuccess(
+  state: ExistingBillsViewState,
+  seq: number,
+  requestedFilter: string,
+  currentFilter: string,
+  filteredBills: ExistingBill[],
+  totalCount: number
+): { applied: boolean; nextState: ExistingBillsViewState } {
+  if (seq !== state.reqSeq || requestedFilter !== currentFilter) {
+    return { applied: false, nextState: state };
+  }
+  return {
+    applied: true,
+    nextState: {
+      ...state,
+      activeFilter: currentFilter,
+      loadedForFilter: requestedFilter,
+      bills: filteredBills,
+      totalCount,
+      loading: false,
+      loadError: null,
+    },
+  };
+}
+
+export function completeExistingBillsLoadFailure(
+  state: ExistingBillsViewState,
+  seq: number,
+  requestedFilter: string,
+  currentFilter: string,
+  errorMessage: string
+): { applied: boolean; nextState: ExistingBillsViewState } {
+  if (seq !== state.reqSeq || requestedFilter !== currentFilter) {
+    return { applied: false, nextState: state };
+  }
+  return {
+    applied: true,
+    nextState: {
+      ...state,
+      activeFilter: currentFilter,
+      loadedForFilter: null,
+      bills: [],
+      totalCount: 0,
+      loading: false,
+      loadError: errorMessage,
+    },
+  };
+}
+
+export function getExistingBillsHeaderStatus(state: ExistingBillsViewState): {
+  statusText: string;
+  canClear: boolean;
+  tabCount: number | undefined;
+} {
+  if (state.loadError) {
+    return {
+      statusText: "查询失败，暂无当前主体统计",
+      canClear: false,
+      tabCount: undefined,
+    };
+  }
+  if (state.loading || state.loadedForFilter !== state.activeFilter) {
+    return {
+      statusText: "查询中…",
+      canClear: false,
+      tabCount: undefined,
+    };
+  }
+  return {
+    statusText: `当前视图 ${state.bills.length} 条 / 全局共 ${state.totalCount} 条`,
+    canClear: state.bills.length > 0,
+    tabCount: state.totalCount,
   };
 }

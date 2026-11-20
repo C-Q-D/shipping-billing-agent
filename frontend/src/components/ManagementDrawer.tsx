@@ -13,15 +13,21 @@ import type {
   BillingApiClient,
   ChargeDictionaryEntry,
   EvalRunSummary,
-  ExistingBill,
 } from "../api/client.ts";
 import { formatLosslessAmount } from "../api/decimalJson.ts";
 import {
+  beginExistingBillsLoad,
   buildEvalRunViewModel,
+  completeExistingBillsLoadFailure,
+  completeExistingBillsLoadSuccess,
+  createExistingBillsViewState,
+  getExistingBillsHeaderStatus,
   NO_EVAL_RESULT_LABEL,
   parseExistingBillsImportInput,
+  setExistingBillsFilter,
   validateAccountingEntityInput,
   validateChargeDictionaryInput,
+  type ExistingBillsViewState,
 } from "../api/managementHelpers.ts";
 import {
   LumnoButton,
@@ -133,13 +139,19 @@ export function ManagementDrawer({
   const [dictLoadError, setDictLoadError] = useState<string | null>(null);
   const dictReqSeqRef = useRef(0);
 
-  // Tab 3: Shared Existing Bills Baseline
+  // Tab 3: Shared Existing Bills Baseline (F5 + B2 race & error guard)
   const [billEntityFilter, setBillEntityFilter] = useState<string>("");
-  const [existingBills, setExistingBills] = useState<ExistingBill[]>([]);
-  const [totalBillsCount, setTotalBillsCount] = useState<number>(0);
-  const [loadingBills, setLoadingBills] = useState(false);
-  const [billsLoadError, setBillsLoadError] = useState<string | null>(null);
+  const billEntityFilterRef = useRef<string>(billEntityFilter);
+  billEntityFilterRef.current = billEntityFilter;
+  const [billsViewState, setBillsViewState] = useState<ExistingBillsViewState>(
+    () => createExistingBillsViewState("")
+  );
   const billsReqSeqRef = useRef(0);
+  const existingBills = billsViewState.bills;
+  const billsLoadedForFilter = billsViewState.loadedForFilter;
+  const loadingBills = billsViewState.loading;
+  const billsLoadError = billsViewState.loadError;
+  const billsHeaderStatus = getExistingBillsHeaderStatus(billsViewState);
   const [billsImportText, setBillsImportText] = useState("");
   const [billsImportFilename, setBillsImportFilename] = useState<string | null>(
     null
@@ -227,28 +239,50 @@ export function ManagementDrawer({
   const loadBillsData = useCallback(
     async (entityFilter: string) => {
       const seq = ++billsReqSeqRef.current;
-      setLoadingBills(true);
-      setBillsLoadError(null);
+      setBillsViewState((prev) =>
+        beginExistingBillsLoad(prev, entityFilter, seq).nextState
+      );
       try {
         const [filtered, all] = await Promise.all([
           api.listExistingBills(entityFilter || undefined),
           entityFilter ? api.listExistingBills() : Promise.resolve(null),
         ]);
-        if (seq !== billsReqSeqRef.current) return;
-        setExistingBills(filtered);
-        const nextTotal = all ? all.length : filtered.length;
-        setTotalBillsCount(nextTotal);
-        onExistingBillsCountChanged(nextTotal);
-        setBillsLoadError(null);
-      } catch (err) {
-        if (seq !== billsReqSeqRef.current) return;
-        setBillsLoadError(
-          err instanceof Error ? err.message : "查询历史账单基准失败"
-        );
-      } finally {
-        if (seq === billsReqSeqRef.current) {
-          setLoadingBills(false);
+        if (
+          seq !== billsReqSeqRef.current ||
+          entityFilter !== billEntityFilterRef.current
+        ) {
+          return;
         }
+        const nextTotal = all ? all.length : filtered.length;
+        onExistingBillsCountChanged(nextTotal);
+        setBillsViewState((prev) =>
+          completeExistingBillsLoadSuccess(
+            prev,
+            seq,
+            entityFilter,
+            billEntityFilterRef.current,
+            filtered,
+            nextTotal
+          ).nextState
+        );
+      } catch (err) {
+        if (
+          seq !== billsReqSeqRef.current ||
+          entityFilter !== billEntityFilterRef.current
+        ) {
+          return;
+        }
+        const msg =
+          err instanceof Error ? err.message : "查询历史账单基准失败";
+        setBillsViewState((prev) =>
+          completeExistingBillsLoadFailure(
+            prev,
+            seq,
+            entityFilter,
+            billEntityFilterRef.current,
+            msg
+          ).nextState
+        );
       }
     },
     [api, onExistingBillsCountChanged]
@@ -494,7 +528,7 @@ export function ManagementDrawer({
       setBillsImportText("");
       setBillsImportFilename(null);
       setBillsImportRowErrors([]);
-      await loadBillsData(billEntityFilter);
+      await loadBillsData(billEntityFilterRef.current);
       onNotify(`已成功导入 ${res.imported_count} 条历史账单基准`);
     } catch (err) {
       const msg =
@@ -507,13 +541,14 @@ export function ManagementDrawer({
   };
 
   const handleClearBills = async () => {
+    const targetFilter = billEntityFilterRef.current;
     try {
-      await api.clearExistingBills(billEntityFilter || undefined);
+      await api.clearExistingBills(targetFilter || undefined);
       setLastImportSummary(null);
-      await loadBillsData(billEntityFilter);
+      await loadBillsData(billEntityFilterRef.current);
       onNotify(
-        billEntityFilter
-          ? `已清理主体「${billEntityFilter}」的共享历史基准账单`
+        targetFilter
+          ? `已清理主体「${targetFilter}」的共享历史基准账单`
           : "已清空工作台共享历史基准库"
       );
     } catch (err) {
@@ -632,7 +667,7 @@ export function ManagementDrawer({
               {
                 value: "existing_bills",
                 label: "历史基准库",
-                count: totalBillsCount,
+                count: billsHeaderStatus.tabCount,
               },
               {
                 value: "eval_runs",
@@ -1054,7 +1089,7 @@ export function ManagementDrawer({
                 <div className="wb-field-label">
                   <span>按记账主体查看共享基准库</span>
                   <span className="wb-tabular wb-helper-note">
-                    当前视图 {existingBills.length} 条 / 全局共 {totalBillsCount} 条
+                    {billsHeaderStatus.statusText}
                   </span>
                 </div>
                 <div className="wb-action-row" style={{ justifyContent: "space-between" }}>
@@ -1063,7 +1098,13 @@ export function ManagementDrawer({
                       value={billEntityFilter}
                       ariaLabel="按记账主体筛选共享历史账单"
                       options={entityFilterOptions}
-                      onChange={setBillEntityFilter}
+                      onChange={(nextFilter) => {
+                        billEntityFilterRef.current = nextFilter;
+                        setBillEntityFilter(nextFilter);
+                        setBillsViewState((prev) =>
+                          setExistingBillsFilter(prev, nextFilter)
+                        );
+                      }}
                     />
                   </div>
                   <div className="wb-action-row">
@@ -1072,7 +1113,9 @@ export function ManagementDrawer({
                       compact
                       icon="ri-refresh-line"
                       busy={loadingBills}
-                      onClick={() => void loadBillsData(billEntityFilter)}
+                      onClick={() =>
+                        void loadBillsData(billEntityFilterRef.current)
+                      }
                     >
                       刷新
                     </LumnoButton>
@@ -1084,6 +1127,12 @@ export function ManagementDrawer({
                       }
                       description="仅清理工作台共享历史基准库，绝不会修改或污染各批次已保存的随批隔离快照（existing_bills_json / 复核包快照）。"
                       confirmLabel="确认清理"
+                      disabled={
+                        loadingBills ||
+                        Boolean(billsLoadError) ||
+                        existingBills.length === 0 ||
+                        billsLoadedForFilter !== billEntityFilter
+                      }
                       onConfirm={() => void handleClearBills()}
                     >
                       {(triggerProps) => (
@@ -1091,7 +1140,12 @@ export function ManagementDrawer({
                           variant="ghost"
                           compact
                           icon="ri-delete-bin-6-line"
-                          disabled={existingBills.length === 0}
+                          disabled={
+                            loadingBills ||
+                            Boolean(billsLoadError) ||
+                            existingBills.length === 0 ||
+                            billsLoadedForFilter !== billEntityFilter
+                          }
                           {...triggerProps}
                         >
                           {billEntityFilter ? "清理该主体基准" : "清空共享库"}
@@ -1212,19 +1266,21 @@ export function ManagementDrawer({
                         variant="secondary"
                         compact
                         icon="ri-refresh-line"
-                        onClick={() => void loadBillsData(billEntityFilter)}
+                        onClick={() =>
+                          void loadBillsData(billEntityFilterRef.current)
+                        }
                       >
                         重试加载
                       </LumnoButton>
                     </div>
                   </div>
+                ) : loadingBills || billsLoadedForFilter !== billEntityFilter ? (
+                  <div className="wb-empty-state">
+                    <span>正在读取共享历史账单基准...</span>
+                  </div>
                 ) : existingBills.length === 0 ? (
                   <div className="wb-empty-state">
-                    <span>
-                      {loadingBills
-                        ? "正在读取共享历史账单基准..."
-                        : "当前筛选下暂无共享历史账单基准"}
-                    </span>
+                    <span>当前筛选下暂无共享历史账单基准</span>
                   </div>
                 ) : (
                   <div className="wb-mgmt-list">

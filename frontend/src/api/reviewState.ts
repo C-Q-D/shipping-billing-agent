@@ -7,6 +7,7 @@ import {
 } from "./client.ts";
 
 type BatchDetail = components["schemas"]["BatchDetail"];
+type BatchSummary = components["schemas"]["BatchSummary"];
 type BillingRecordDetail = components["schemas"]["BillingRecordDetail"];
 type SourceDocumentSummary = components["schemas"]["SourceDocumentSummary"];
 type ValidationAlert = components["schemas"]["ValidationAlert"];
@@ -54,10 +55,24 @@ export interface DocTotalsDraftEntry {
   fields: Partial<DocTotalsFormValues>;
 }
 
+export interface InFlightRecordSaveEntry {
+  submittedVersion: number;
+  submittedFields: Partial<RecordFormValues>;
+  postSubmitTouched: Partial<Record<keyof RecordFormValues, true>>;
+}
+
+export interface InFlightDocSaveEntry {
+  submittedVersion: number;
+  submittedFields: Partial<DocTotalsFormValues>;
+  postSubmitTouched: Partial<Record<keyof DocTotalsFormValues, true>>;
+}
+
 export interface DraftStoreState {
   nextDraftVersion: number;
   recordDrafts: Record<string, RecordDraftEntry>;
   docDrafts: Record<string, DocTotalsDraftEntry>;
+  inFlightRecordSaves: Record<string, InFlightRecordSaveEntry>;
+  inFlightDocSaves: Record<string, InFlightDocSaveEntry>;
 }
 
 export interface RecordDiffPatchResult {
@@ -142,7 +157,46 @@ export const HARD_BLOCKER_CODES: ReadonlySet<string> = new Set([
 ]);
 
 export function createEmptyDraftStore(): DraftStoreState {
-  return { nextDraftVersion: 0, recordDrafts: {}, docDrafts: {} };
+  return {
+    nextDraftVersion: 0,
+    recordDrafts: {},
+    docDrafts: {},
+    inFlightRecordSaves: {},
+    inFlightDocSaves: {},
+  };
+}
+
+export function clearBatchScopedMap<T>(
+  entries: Record<string, T>,
+  batchId: string
+): Record<string, T> {
+  const prefix = `${batchId}::`;
+  let changed = false;
+  const next: Record<string, T> = {};
+  for (const [k, v] of Object.entries(entries)) {
+    if (k.startsWith(prefix)) {
+      changed = true;
+    } else {
+      next[k] = v;
+    }
+  }
+  return changed ? next : entries;
+}
+
+export function clearBatchDrafts(
+  store: DraftStoreState,
+  batchId: string
+): DraftStoreState {
+  return {
+    ...store,
+    recordDrafts: clearBatchScopedMap(store.recordDrafts, batchId),
+    docDrafts: clearBatchScopedMap(store.docDrafts, batchId),
+    inFlightRecordSaves: clearBatchScopedMap(
+      store.inFlightRecordSaves ?? {},
+      batchId
+    ),
+    inFlightDocSaves: clearBatchScopedMap(store.inFlightDocSaves ?? {}, batchId),
+  };
 }
 
 export function makeRecordDraftKey(batchId: string, recordId: string): string {
@@ -337,6 +391,162 @@ function pruneRecordFields(
   return Object.keys(nextFields).length > 0 ? nextFields : null;
 }
 
+function beginDraftSave<TFields extends object>(
+  drafts: Record<string, { draftVersion: number; fields: Partial<TFields> }>,
+  inFlightMap: Record<
+    string,
+    {
+      submittedVersion: number;
+      submittedFields: Partial<TFields>;
+      postSubmitTouched: Partial<Record<keyof TFields, true>>;
+    }
+  >,
+  key: string,
+  fallbackVersion: number,
+  version?: number | null,
+  submittedFields?: Partial<TFields>
+) {
+  const existingDraft = drafts[key];
+  const submittedVersion =
+    version ?? existingDraft?.draftVersion ?? fallbackVersion;
+  const snapshot: Partial<TFields> = {
+    ...(submittedFields ?? existingDraft?.fields ?? {}),
+  };
+  return {
+    ...inFlightMap,
+    [key]: {
+      submittedVersion,
+      submittedFields: snapshot,
+      postSubmitTouched: {} as Partial<Record<keyof TFields, true>>,
+    },
+  };
+}
+
+function finishDraftSaveSuccess<TFields extends object, TServer>(
+  drafts: Record<string, { draftVersion: number; fields: Partial<TFields> }>,
+  inFlightMap: Record<
+    string,
+    {
+      submittedVersion: number;
+      submittedFields: Partial<TFields>;
+      postSubmitTouched: Partial<Record<keyof TFields, true>>;
+    }
+  >,
+  key: string,
+  extractServer: (s: TServer) => TFields,
+  pruneFields: (s: TFields, f: Partial<TFields>) => Partial<TFields> | null,
+  updatedServer?: TServer,
+  expectedVersion?: number
+) {
+  const inFlight = inFlightMap[key];
+  if (!inFlight) {
+    const current = drafts[key];
+    if (!current) {
+      return { nextDrafts: drafts, nextInFlight: inFlightMap };
+    }
+    if (
+      expectedVersion === undefined ||
+      current.draftVersion === expectedVersion
+    ) {
+      const nextDrafts = { ...drafts };
+      delete nextDrafts[key];
+      return { nextDrafts, nextInFlight: inFlightMap };
+    }
+    if (!updatedServer) {
+      return { nextDrafts: drafts, nextInFlight: inFlightMap };
+    }
+    const nextServer = extractServer(updatedServer);
+    const remaining = pruneFields(nextServer, current.fields);
+    const nextDrafts = { ...drafts };
+    if (!remaining) {
+      delete nextDrafts[key];
+    } else {
+      nextDrafts[key] = {
+        draftVersion: current.draftVersion,
+        fields: remaining,
+      };
+    }
+    return { nextDrafts, nextInFlight: inFlightMap };
+  }
+
+  if (
+    expectedVersion !== undefined &&
+    inFlight.submittedVersion !== expectedVersion
+  ) {
+    return { nextDrafts: drafts, nextInFlight: inFlightMap };
+  }
+
+  const nextInFlight = { ...inFlightMap };
+  delete nextInFlight[key];
+
+  const current = drafts[key];
+  if (!current) {
+    return { nextDrafts: drafts, nextInFlight };
+  }
+
+  const postTouchedFields: Partial<TFields> = {};
+  (Object.keys(current.fields) as Array<keyof TFields>).forEach((k) => {
+    if (inFlight.postSubmitTouched[k] === true && current.fields[k] !== undefined) {
+      postTouchedFields[k] = current.fields[k];
+    }
+  });
+
+  const nextDrafts = { ...drafts };
+  if (Object.keys(postTouchedFields).length === 0) {
+    delete nextDrafts[key];
+    return { nextDrafts, nextInFlight };
+  }
+
+  const remaining = updatedServer
+    ? pruneFields(extractServer(updatedServer), postTouchedFields)
+    : postTouchedFields;
+
+  if (!remaining) {
+    delete nextDrafts[key];
+  } else {
+    nextDrafts[key] = {
+      draftVersion: current.draftVersion,
+      fields: remaining,
+    };
+  }
+  return { nextDrafts, nextInFlight };
+}
+
+function finishDraftSaveError<TFields extends object, TServer>(
+  drafts: Record<string, { draftVersion: number; fields: Partial<TFields> }>,
+  inFlightMap: Record<
+    string,
+    {
+      submittedVersion: number;
+      submittedFields: Partial<TFields>;
+      postSubmitTouched: Partial<Record<keyof TFields, true>>;
+    }
+  >,
+  key: string,
+  extractServer: (s: TServer) => TFields,
+  pruneFields: (s: TFields, f: Partial<TFields>) => Partial<TFields> | null,
+  serverEntity?: TServer
+) {
+  const nextInFlight = { ...inFlightMap };
+  delete nextInFlight[key];
+
+  const current = drafts[key];
+  if (!current || !serverEntity) {
+    return { nextDrafts: drafts, nextInFlight };
+  }
+  const remaining = pruneFields(extractServer(serverEntity), current.fields);
+  const nextDrafts = { ...drafts };
+  if (!remaining) {
+    delete nextDrafts[key];
+  } else {
+    nextDrafts[key] = {
+      draftVersion: current.draftVersion,
+      fields: remaining,
+    };
+  }
+  return { nextDrafts, nextInFlight };
+}
+
 export function setRecordDraftField<K extends keyof RecordFormValues>(
   store: DraftStoreState,
   batchId: string,
@@ -355,11 +565,13 @@ export function setRecordDraftField<K extends keyof RecordFormValues>(
     [field]: value,
   };
   const current = { ...server, ...nextFields };
+  const touchedFields: Array<keyof RecordFormValues> = [field];
 
   if (field === "debit_credit") {
     if (value === "CREDIT") {
       if (!isCreditDocumentType(current.document_type)) {
         nextFields.document_type = "Credit Note";
+        touchedFields.push("document_type");
       }
       const trimmedAmt = current.amount.trim();
       if (trimmedAmt && !trimmedAmt.startsWith("-")) {
@@ -367,6 +579,7 @@ export function setRecordDraftField<K extends keyof RecordFormValues>(
           const parsed = rawDecimal(trimmedAmt).raw;
           if (parsed !== "0" && !/^0+\.?0*$/.test(parsed)) {
             nextFields.amount = `-${parsed.replace(/^\+/, "")}`;
+            touchedFields.push("amount");
           }
         } catch {
           // Leave invalid amount text untouched for explicit user edit
@@ -377,25 +590,56 @@ export function setRecordDraftField<K extends keyof RecordFormValues>(
         nextFields.document_type = isCreditDocumentType(server.document_type)
           ? "Invoice"
           : server.document_type;
+        touchedFields.push("document_type");
       }
       const trimmedAmt = current.amount.trim();
       if (trimmedAmt.startsWith("-")) {
         nextFields.amount = trimmedAmt.slice(1);
+        touchedFields.push("amount");
       }
     }
   } else if (field === "force_create_new") {
     if (value === true) {
       nextFields.matched_existing_bill_id = null;
+      touchedFields.push("matched_existing_bill_id");
     }
   } else if (field === "matched_existing_bill_id") {
     if (value !== null) {
       nextFields.force_create_new = false;
+      touchedFields.push("force_create_new");
     }
   }
 
   const nextVersion = store.nextDraftVersion + 1;
-  const prunedFields = pruneRecordFields(server, nextFields);
   const nextRecordDrafts = { ...store.recordDrafts };
+  const inFlightMap = store.inFlightRecordSaves ?? {};
+  const inFlight = inFlightMap[key];
+
+  if (inFlight) {
+    // F1: Preserve edits made while a save is in-flight even if equal to old server value
+    nextRecordDrafts[key] = {
+      draftVersion: nextVersion,
+      fields: nextFields,
+    };
+    const nextTouched = { ...inFlight.postSubmitTouched };
+    for (const tf of touchedFields) {
+      nextTouched[tf] = true;
+    }
+    return {
+      ...store,
+      nextDraftVersion: nextVersion,
+      recordDrafts: nextRecordDrafts,
+      inFlightRecordSaves: {
+        ...inFlightMap,
+        [key]: {
+          ...inFlight,
+          postSubmitTouched: nextTouched,
+        },
+      },
+    };
+  }
+
+  const prunedFields = pruneRecordFields(server, nextFields);
   if (prunedFields) {
     nextRecordDrafts[key] = {
       draftVersion: nextVersion,
@@ -411,6 +655,73 @@ export function setRecordDraftField<K extends keyof RecordFormValues>(
   };
 }
 
+export function beginRecordSave(
+  store: DraftStoreState,
+  batchId: string,
+  recordId: string,
+  version?: number | null,
+  submittedFields?: Partial<RecordFormValues>
+): DraftStoreState {
+  const key = makeRecordDraftKey(batchId, recordId);
+  return {
+    ...store,
+    inFlightRecordSaves: beginDraftSave(
+      store.recordDrafts,
+      store.inFlightRecordSaves ?? {},
+      key,
+      store.nextDraftVersion,
+      version,
+      submittedFields
+    ),
+  };
+}
+
+export function finishRecordSaveSuccess(
+  store: DraftStoreState,
+  batchId: string,
+  recordId: string,
+  updatedRecord?: BillingRecordDetail,
+  expectedVersion?: number
+): DraftStoreState {
+  const key = makeRecordDraftKey(batchId, recordId);
+  const { nextDrafts, nextInFlight } = finishDraftSaveSuccess(
+    store.recordDrafts,
+    store.inFlightRecordSaves ?? {},
+    key,
+    extractServerRecordFormValues,
+    pruneRecordFields,
+    updatedRecord,
+    expectedVersion
+  );
+  return {
+    ...store,
+    recordDrafts: nextDrafts,
+    inFlightRecordSaves: nextInFlight,
+  };
+}
+
+export function finishRecordSaveError(
+  store: DraftStoreState,
+  batchId: string,
+  recordId: string,
+  serverRecord?: BillingRecordDetail
+): DraftStoreState {
+  const key = makeRecordDraftKey(batchId, recordId);
+  const { nextDrafts, nextInFlight } = finishDraftSaveError(
+    store.recordDrafts,
+    store.inFlightRecordSaves ?? {},
+    key,
+    extractServerRecordFormValues,
+    pruneRecordFields,
+    serverRecord
+  );
+  return {
+    ...store,
+    recordDrafts: nextDrafts,
+    inFlightRecordSaves: nextInFlight,
+  };
+}
+
 export function clearRecordDraft(
   store: DraftStoreState,
   batchId: string,
@@ -419,33 +730,25 @@ export function clearRecordDraft(
   updatedRecord?: BillingRecordDetail
 ): DraftStoreState {
   const key = makeRecordDraftKey(batchId, recordId);
-  const current = store.recordDrafts[key];
-  if (!current) {
-    return store;
-  }
-  if (
-    expectedVersion === undefined ||
-    current.draftVersion === expectedVersion
-  ) {
+  const inFlightMap = store.inFlightRecordSaves ?? {};
+  if (expectedVersion === undefined) {
     const nextRecordDrafts = { ...store.recordDrafts };
     delete nextRecordDrafts[key];
-    return { ...store, recordDrafts: nextRecordDrafts };
-  }
-  if (!updatedRecord) {
-    return store;
-  }
-  const nextServer = extractServerRecordFormValues(updatedRecord);
-  const remainingFields = pruneRecordFields(nextServer, current.fields);
-  const nextRecordDrafts = { ...store.recordDrafts };
-  if (!remainingFields) {
-    delete nextRecordDrafts[key];
-  } else {
-    nextRecordDrafts[key] = {
-      draftVersion: current.draftVersion,
-      fields: remainingFields,
+    const nextInFlight = { ...inFlightMap };
+    delete nextInFlight[key];
+    return {
+      ...store,
+      recordDrafts: nextRecordDrafts,
+      inFlightRecordSaves: nextInFlight,
     };
   }
-  return { ...store, recordDrafts: nextRecordDrafts };
+  return finishRecordSaveSuccess(
+    store,
+    batchId,
+    recordId,
+    updatedRecord,
+    expectedVersion
+  );
 }
 
 export function hasRecordDraft(
@@ -528,8 +831,34 @@ export function setDocTotalsDraftField<K extends keyof DocTotalsFormValues>(
     [field]: value,
   };
   const nextVersion = store.nextDraftVersion + 1;
-  const prunedFields = pruneDocFields(server, nextFields);
   const nextDocDrafts = { ...store.docDrafts };
+  const inFlightMap = store.inFlightDocSaves ?? {};
+  const inFlight = inFlightMap[key];
+
+  if (inFlight) {
+    // F1: Preserve edits made while a doc totals save is in-flight even if equal to old server value
+    nextDocDrafts[key] = {
+      draftVersion: nextVersion,
+      fields: nextFields,
+    };
+    return {
+      ...store,
+      nextDraftVersion: nextVersion,
+      docDrafts: nextDocDrafts,
+      inFlightDocSaves: {
+        ...inFlightMap,
+        [key]: {
+          ...inFlight,
+          postSubmitTouched: {
+            ...inFlight.postSubmitTouched,
+            [field]: true,
+          },
+        },
+      },
+    };
+  }
+
+  const prunedFields = pruneDocFields(server, nextFields);
   if (!prunedFields) {
     delete nextDocDrafts[key];
   } else {
@@ -545,6 +874,73 @@ export function setDocTotalsDraftField<K extends keyof DocTotalsFormValues>(
   };
 }
 
+export function beginDocTotalsSave(
+  store: DraftStoreState,
+  batchId: string,
+  docId: string,
+  version?: number | null,
+  submittedFields?: Partial<DocTotalsFormValues>
+): DraftStoreState {
+  const key = makeDocDraftKey(batchId, docId);
+  return {
+    ...store,
+    inFlightDocSaves: beginDraftSave(
+      store.docDrafts,
+      store.inFlightDocSaves ?? {},
+      key,
+      store.nextDraftVersion,
+      version,
+      submittedFields
+    ),
+  };
+}
+
+export function finishDocTotalsSaveSuccess(
+  store: DraftStoreState,
+  batchId: string,
+  docId: string,
+  updatedDoc?: SourceDocumentSummary,
+  expectedVersion?: number
+): DraftStoreState {
+  const key = makeDocDraftKey(batchId, docId);
+  const { nextDrafts, nextInFlight } = finishDraftSaveSuccess(
+    store.docDrafts,
+    store.inFlightDocSaves ?? {},
+    key,
+    extractServerDocTotalsValues,
+    pruneDocFields,
+    updatedDoc,
+    expectedVersion
+  );
+  return {
+    ...store,
+    docDrafts: nextDrafts,
+    inFlightDocSaves: nextInFlight,
+  };
+}
+
+export function finishDocTotalsSaveError(
+  store: DraftStoreState,
+  batchId: string,
+  docId: string,
+  serverDoc?: SourceDocumentSummary
+): DraftStoreState {
+  const key = makeDocDraftKey(batchId, docId);
+  const { nextDrafts, nextInFlight } = finishDraftSaveError(
+    store.docDrafts,
+    store.inFlightDocSaves ?? {},
+    key,
+    extractServerDocTotalsValues,
+    pruneDocFields,
+    serverDoc
+  );
+  return {
+    ...store,
+    docDrafts: nextDrafts,
+    inFlightDocSaves: nextInFlight,
+  };
+}
+
 export function clearDocTotalsDraft(
   store: DraftStoreState,
   batchId: string,
@@ -553,33 +949,25 @@ export function clearDocTotalsDraft(
   updatedDoc?: SourceDocumentSummary
 ): DraftStoreState {
   const key = makeDocDraftKey(batchId, docId);
-  const current = store.docDrafts[key];
-  if (!current) {
-    return store;
-  }
-  if (
-    expectedVersion === undefined ||
-    current.draftVersion === expectedVersion
-  ) {
+  const inFlightMap = store.inFlightDocSaves ?? {};
+  if (expectedVersion === undefined) {
     const nextDocDrafts = { ...store.docDrafts };
     delete nextDocDrafts[key];
-    return { ...store, docDrafts: nextDocDrafts };
-  }
-  if (!updatedDoc) {
-    return store;
-  }
-  const nextServer = extractServerDocTotalsValues(updatedDoc);
-  const remainingFields = pruneDocFields(nextServer, current.fields);
-  const nextDocDrafts = { ...store.docDrafts };
-  if (!remainingFields) {
-    delete nextDocDrafts[key];
-  } else {
-    nextDocDrafts[key] = {
-      draftVersion: current.draftVersion,
-      fields: remainingFields,
+    const nextInFlight = { ...inFlightMap };
+    delete nextInFlight[key];
+    return {
+      ...store,
+      docDrafts: nextDocDrafts,
+      inFlightDocSaves: nextInFlight,
     };
   }
-  return { ...store, docDrafts: nextDocDrafts };
+  return finishDocTotalsSaveSuccess(
+    store,
+    batchId,
+    docId,
+    updatedDoc,
+    expectedVersion
+  );
 }
 
 export function hasDocTotalsDraft(
@@ -921,4 +1309,37 @@ export function finishMutationError(
     inFlightMutations: Math.max(0, tracker.inFlightMutations - 1),
     mutationEpoch: tracker.mutationEpoch + 1,
   };
+}
+
+export const ACTIVE_BATCH_STAGES: ReadonlySet<BatchSummary["stage"]> = new Set([
+  "QUEUED",
+  "UNPACKING",
+  "EXTRACTING",
+  "MATCHING",
+  "VALIDATING",
+]);
+
+export function isActiveBatchStage(
+  stage: BatchSummary["stage"] | null | undefined
+): boolean {
+  return Boolean(stage && ACTIVE_BATCH_STAGES.has(stage));
+}
+
+export function shouldContinuePollingAfterDiscard(
+  tracker: PollRaceTracker,
+  targetBatchId: string,
+  currentStage: BatchSummary["stage"] | null | undefined
+): boolean {
+  return (
+    tracker.activeBatchId === targetBatchId && isActiveBatchStage(currentStage)
+  );
+}
+
+export interface PendingBatchDetailRecovery {
+  id: string;
+  shortCode: string;
+  accountingEntity: string;
+  isDemo: boolean;
+  loading: boolean;
+  errorMessage: string | null;
 }

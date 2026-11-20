@@ -14,6 +14,7 @@ import {
   type SourceDocumentSummary,
 } from "../api/client.ts";
 import { formatLosslessAmount } from "../api/decimalJson.ts";
+import type { PendingBatchDetailRecovery } from "../api/reviewState.ts";
 import {
   LumnoButton,
   LumnoInfoButton,
@@ -119,6 +120,8 @@ export interface UploadAndFileTreeProps {
   submittingDemo: boolean;
   retryingDocId: string | null;
   forcingDocId: string | null;
+  pendingBatchRecovery?: PendingBatchDetailRecovery | null;
+  onRetryPendingBatch?: () => void;
   onSubmitBatch: (args: {
     accountingEntity: string;
     ocrMode: OcrMode;
@@ -145,6 +148,8 @@ export function UploadAndFileTree({
   submittingDemo,
   retryingDocId,
   forcingDocId,
+  pendingBatchRecovery = null,
+  onRetryPendingBatch,
   onSubmitBatch,
   onSubmitDemo,
   onSelectDocFilter,
@@ -581,14 +586,38 @@ export function UploadAndFileTree({
           </div>
 
           {!activeBatch ? (
-            <div className="wb-empty-state lumno-paper-card">
-              <i
-                className="ri-icon ri-folder-info-line"
-                style={{ "--ri-size": "24px" } as React.CSSProperties}
-                aria-hidden="true"
-              />
-              <span>上传单据或点击“一键载入 4 份真样本”后查看文件树</span>
-            </div>
+            pendingBatchRecovery ? (
+              <div className="wb-empty-state lumno-paper-card" role="status">
+                <strong>
+                  {pendingBatchRecovery.errorMessage
+                    ? `批次 ${pendingBatchRecovery.shortCode} 详情待读取`
+                    : `正在加载批次 ${pendingBatchRecovery.shortCode}…`}
+                </strong>
+                <span className="wb-mono wb-helper-note">
+                  {pendingBatchRecovery.id}
+                </span>
+                {pendingBatchRecovery.errorMessage && onRetryPendingBatch ? (
+                  <LumnoButton
+                    variant="secondary"
+                    compact
+                    icon="ri-refresh-line"
+                    busy={pendingBatchRecovery.loading}
+                    onClick={onRetryPendingBatch}
+                  >
+                    重试读取此批次
+                  </LumnoButton>
+                ) : null}
+              </div>
+            ) : (
+              <div className="wb-empty-state lumno-paper-card">
+                <i
+                  className="ri-icon ri-folder-info-line"
+                  style={{ "--ri-size": "24px" } as React.CSSProperties}
+                  aria-hidden="true"
+                />
+                <span>上传单据或点击“一键载入 4 份真样本”后查看文件树</span>
+              </div>
+            )
           ) : orderedDocs.length === 0 ? (
             <div className="wb-empty-state lumno-paper-card">
               <span>批次拆包中，稍候将显示文档与 EML 附件节点...</span>

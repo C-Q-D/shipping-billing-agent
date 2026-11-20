@@ -7,6 +7,7 @@ import {
   toSchemaDecimal,
 } from "./decimalJson.ts";
 import { createDevStubTransport, type FetchLike } from "./devStubTransport.ts";
+import { ACTIVE_ISO4217_CURRENCY_SET } from "./iso4217.ts";
 import type { components, operations } from "./schema";
 
 export type ErrorResponse = components["schemas"]["ErrorResponse"];
@@ -160,48 +161,17 @@ export function isValidPublicHttpUrl(raw: string): boolean {
   }
 }
 
-const NON_ACTIVE_ISO_CURRENCIES = new Set(["XXX", "XTS"]);
-const ISO_4217_RUNTIME_SET: ReadonlySet<string> | null = (() => {
-  try {
-    const intlObj = Intl as unknown as {
-      supportedValuesOf?: (key: string) => string[];
-    };
-    if (typeof intlObj.supportedValuesOf === "function") {
-      const list = intlObj.supportedValuesOf("currency");
-      if (Array.isArray(list) && list.length > 50) {
-        return new Set(
-          list.filter(
-            (c) =>
-              typeof c === "string" &&
-              /^[A-Z]{3}$/.test(c) &&
-              !NON_ACTIVE_ISO_CURRENCIES.has(c)
-          )
-        );
-      }
-    }
-  } catch {
-    // Fallback below if Intl.supportedValuesOf is unavailable
-  }
-  return null;
-})();
-
 export function isValidIso4217Currency(code: unknown): boolean {
-  if (typeof code !== "string") return false;
-  const trimmed = code.trim();
-  if (!/^[A-Z]{3}$/.test(trimmed) || NON_ACTIVE_ISO_CURRENCIES.has(trimmed)) {
-    return false;
-  }
-  if (ISO_4217_RUNTIME_SET) {
-    return ISO_4217_RUNTIME_SET.has(trimmed);
-  }
-  return true;
+  return (
+    typeof code === "string" && ACTIVE_ISO4217_CURRENCY_SET.has(code.trim())
+  );
 }
 
 function isPlainObject(val: unknown): val is Record<string, unknown> {
   return Boolean(val) && typeof val === "object" && !Array.isArray(val);
 }
 
-function hasValidDecimalNumber(val: unknown): boolean {
+export function hasValidDecimalNumber(val: unknown): boolean {
   if (val instanceof RawDecimalLiteral) return true;
   if (typeof val === "number") return Number.isFinite(val);
   if (typeof val === "string") {

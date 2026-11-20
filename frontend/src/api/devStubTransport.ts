@@ -287,7 +287,7 @@ function reconcileDocRecords(
       }
     }
 
-    if (!curr || !/^[A-Z]{3}$/.test(curr) || curr === "XXX" || curr === "XTS") {
+    if (!curr || !isValidIso4217Currency(curr)) {
       alerts.push({
         code: "INVALID_OR_MISSING_CURRENCY",
         severity: "BLOCKER",
