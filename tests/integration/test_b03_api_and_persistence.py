@@ -1768,6 +1768,71 @@ def test_export_legacy_alias_scope_uses_the_batch_time_window(
         ) == ("UPDATE", "recent-ledger", "APPROVED")
 
 
+@pytest.mark.parametrize(
+    "remove_before_approval", [True, False], ids=["during-batch", "after-sync"]
+)
+def test_export_refuses_a_synced_legacy_batch_after_competing_alias_removal(
+    client: TestClient, settings: AppSettings, remove_before_approval: bool
+) -> None:
+    branch, reference = f"{NEPTUNE} (LAX)", "INV-962"
+    entity_path = f"{API}/entities"
+    competing = {"canonical_name": "Pacific Ledger", "aliases": [branch]}
+    competitor = _body(client.post(entity_path, json=competing), 201)
+    assert competitor["aliases"] == [branch]
+    competitor_path = f"{entity_path}/{competitor['id']}"
+    without_alias = competing | {"aliases": []}
+
+    bills = [
+        _ledger_bill("recent-ledger", reference),
+        _ledger_bill("other-ledger", "INV-OTHER", entity=branch) | {"amount": 45},
+    ]
+    _body(client.post(f"{BILLS}/import", json={"bills": bills}))
+    pre_sync = _body(client.get(BILLS))
+    batch = _body(_upload(client, _invoice(reference)), 201)
+    batch_id = batch["id"]
+    path = f"{BATCHES}/{batch_id}"
+    (row,) = batch["records"]
+    repository = _open_repository(settings.sqlite_db_path)
+    _write_legacy_shared_snapshot(repository, batch_id, pre_sync, keep_profile=True)
+    before = export_review_bundle(repository, batch_id)
+    assert [(bill["id"], bill["amount"]) for bill in before["existing_bills_snapshot"]] == [
+        ("recent-ledger", 80),
+    ]
+
+    if remove_before_approval:
+        edited = _body(client.put(competitor_path, json=without_alias))
+    approved = _body(client.post(f"{_record_url(path, row)}/approve", json={"reason": "已核对"}))
+    (row,) = approved["records"]
+    assert (row["operation"], row["matched_existing_bill_id"], row["review_status"]) == (
+        "UPDATE",
+        "recent-ledger",
+        "APPROVED",
+    )
+    assert _body(client.post(f"{path}/sync-baseline"))["updated_count"] == 1
+    if not remove_before_approval:
+        edited = _body(client.put(competitor_path, json=without_alias))
+
+    reopened = _open_repository(settings.sqlite_db_path)
+    stored = reopened.get_batch(batch_id)
+    assert reopened.has_baseline_sync_items(batch_id)
+    assert stored["shared_baseline_scoped"] is False
+    assert branch in stored["entity_profile_snapshot"].aliases
+    assert {
+        (bill.id, bill.accounting_entity, bill.amount)
+        for bill in stored["shared_baseline_snapshot"]
+    } == {("recent-ledger", NEPTUNE, 80), ("other-ledger", branch, 45)}
+    assert edited["aliases"] == []
+    assert competitor["created_at"] <= stored["created_at"] < edited["updated_at"]
+    if remove_before_approval:
+        assert edited["updated_at"] <= stored["updated_at"]
+    else:
+        assert stored["updated_at"] < edited["updated_at"]
+
+    with pytest.raises(ServiceValidationError) as error:
+        export_review_bundle(reopened, batch_id)
+    assert (error.value.status_code, error.value.code) == (409, "MISSING_BASELINE_SNAPSHOT")
+
+
 def test_export_refuses_a_synced_legacy_match_without_a_provable_entity_scope(
     client: TestClient, settings: AppSettings
 ) -> None:

@@ -198,9 +198,14 @@ def _scope_legacy_baseline(
     batch_start, batch_end = batch["created_at"], batch["updated_at"]
     previously_owned: set[str] = set()
     uncertain_ownership: set[str] = set()
+    has_edited_other_entity = False
     for row in db_entity_rows:
         if row["canonical_name"].strip() in target_canonicals:
             continue
+        could_have_competed = row["created_at"] <= batch_end or not has_frozen_profile
+        # Current profiles do not show which aliases were removed after the batch began.
+        if could_have_competed and row["updated_at"] > batch_start:
+            has_edited_other_entity = True
         canonical = _name_with_punctuation(row["canonical_name"])
         aliases = set(map(_name_with_punctuation, row["aliases"]))
         if row["created_at"] <= batch_start:
@@ -210,7 +215,7 @@ def _scope_legacy_baseline(
                 previously_owned.update(aliases)
             else:
                 uncertain_ownership.update(aliases)
-        elif row["created_at"] <= batch_end or not has_frozen_profile:
+        elif could_have_competed:
             # A current profile alone cannot prove that a later claimant was the only change.
             uncertain_ownership.update({canonical, *aliases})
         elif row["updated_at"] <= batch_end:
@@ -226,7 +231,9 @@ def _scope_legacy_baseline(
             return False
         if key in previously_owned:
             return False
-        return None if key in uncertain_ownership else True
+        if key in uncertain_ownership or has_edited_other_entity:
+            return None
+        return True
 
     bills = []
     uncertain_bill_ids = set()
