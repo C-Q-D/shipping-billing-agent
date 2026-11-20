@@ -25,6 +25,7 @@ from shipping_billing_agent.gateways.url_guard import (
 
 _EMPTY_RESULT = "OCR 网关返回空列表且无有效单据内容"
 _PAGE_FIELDS = ("page", "pageNo", "pageNumber", "pageNum")
+_EXTRA_TEXT_FIELDS = ("text", "content", "ocrText", "rawText", "markdown", "md")
 
 
 class PresignedRelayPublisher(Protocol):
@@ -124,10 +125,35 @@ def _parse_item(value: Any) -> OcrListItem:
     return OcrListItem.model_validate(value)
 
 
+def _has_extra_content(item: OcrListItem) -> bool:
+    extra = item.model_extra or {}
+    return any(key not in _PAGE_FIELDS and _has_content(value) for key, value in extra.items())
+
+
+def _extra_text_blocks(item: OcrListItem) -> list[str]:
+    extra = item.model_extra or {}
+    texts: list[str] = []
+    seen: set[str] = set()
+    for key in _EXTRA_TEXT_FIELDS:
+        value = extra.get(key)
+        if isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+            seen.add(key)
+    for key, value in extra.items():
+        if key in _PAGE_FIELDS or key in seen:
+            continue
+        if isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+    return texts
+
+
 def _format_item(item: OcrListItem) -> str:
     fields = item.model_dump(mode="python", by_alias=True, exclude_unset=True)
     page = next((fields[key] for key in _PAGE_FIELDS if _has_content(fields.get(key))), None)
-    body = dumps_decimal_json(fields)
+    parts = [dumps_decimal_json(fields)]
+    if not _has_content(item.charge_list):
+        parts.extend(_extra_text_blocks(item))
+    body = "\n".join(parts)
     return body if page is None else f"[Page {page}]\n{body}"
 
 
@@ -168,6 +194,7 @@ def _parse_response(response: httpx.Response) -> OcrRecognitionResult:
                 item.other,
             )
         )
+        or _has_extra_content(item)
         for item in items
     )
     if not has_charges and not has_metadata:

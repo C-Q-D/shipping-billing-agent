@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Sequence
 from decimal import Decimal
+from enum import Enum
 from fractions import Fraction
 from typing import Any
 from unicodedata import normalize
@@ -72,7 +73,30 @@ _AUTOMATIC_LEVELS = (
     MatchLevel.L4_CNTR_PARTY_DATE_AMT,
 )
 _AMOUNT_TOLERANCE = Fraction(DECIMAL_TOLERANCE)
+_MATCH_LEVEL_LABELS = {
+    MatchLevel.L1_DOC_CHARGE: "单据编号和费用名称",
+    MatchLevel.L2_BL_CHARGE_CURR: "提单号、费用名称和币种",
+    MatchLevel.L3_BOOKING_CHARGE_CURR: "订舱号、费用名称和币种",
+    MatchLevel.L4_CNTR_PARTY_DATE_AMT: "箱号、交易双方、日期和金额",
+}
+_MATCH_REASON_PREFIXES = (
+    *(f"按 {level.value}（" for level in _MATCH_LEVEL_LABELS),
+    "已人工关联历史账单 ",
+    "字段变更：",
+    "未明确修改字段继承历史账单原值",
+    "核心字段与历史账单一致，无变更",
+)
 _BillPool = tuple[ExistingBillRecord, ...]
+
+
+def _format_diff_value(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, Decimal):
+        return f"{value:f}"
+    if isinstance(value, Enum):
+        return str(value.value)
+    return str(value)
 
 
 def _reference_key(value: str | None) -> str:
@@ -155,6 +179,11 @@ def _prepare_record(
         field_diffs=[],
         inherited_fields={},
         source_values_before_overrides={},
+        ai_reasoning=[
+            reason
+            for reason in values.get("ai_reasoning", ())
+            if isinstance(reason, str) and not reason.startswith(_MATCH_REASON_PREFIXES)
+        ],
     )
     prepared = ProcessedBillingRecord.model_validate(values)
     prepared, corrected, override_issues = apply_human_overrides(prepared, charge_dictionary)
@@ -497,14 +526,42 @@ def _inherit_and_compare(
         new = getattr(merged, field)
         if not _same_bill_value(field, old, new, profiles):
             diffs.append(FieldDiff(field=field, old_value=old, new_value=new, changed=True))
+    bill_ref = bill.external_bill_key or bill.id
+    match_reasons: list[str] = []
+    if level in _MATCH_LEVEL_LABELS:
+        match_reasons.append(
+            f"按 {level.value}（{_MATCH_LEVEL_LABELS[level]}）匹配历史账单 {bill_ref}"
+        )
+    else:
+        match_reasons.append(f"已人工关联历史账单 {bill_ref}")
+    if diffs:
+        diff_summary = "；".join(
+            f"{diff.field} {_format_diff_value(diff.old_value)}"
+            f" -> {_format_diff_value(diff.new_value)}"
+            for diff in diffs
+        )
+        match_reasons.append(f"字段变更：{diff_summary}")
+        if originals:
+            match_reasons.append("未明确修改字段继承历史账单原值")
+    else:
+        match_reasons.append("核心字段与历史账单一致，无变更")
+    reasoning = [
+        reason
+        for reason in merged.ai_reasoning
+        if not reason.startswith(_MATCH_REASON_PREFIXES)
+    ]
+    for reason in match_reasons:
+        if reason not in reasoning:
+            reasoning.append(reason)
     return _with_decision(
         merged,
         OperationType.UPDATE if diffs else OperationType.NO_CHANGE,
         inherited_fields=originals,
         field_diffs=diffs,
+        ai_reasoning=reasoning,
         match_level=level,
         matched_existing_bill_id=bill.id,
-        matched_bill_ref=bill.external_bill_key or bill.id,
+        matched_bill_ref=bill_ref,
     )
 
 

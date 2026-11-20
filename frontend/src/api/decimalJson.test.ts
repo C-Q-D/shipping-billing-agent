@@ -7,6 +7,7 @@ import {
   normalizeBillingRecord,
   normalizeSourceDocument,
   validateBatchIngestionInput,
+  type FetchLike,
 } from "./client.ts";
 import {
   DecimalSyntaxError,
@@ -21,7 +22,6 @@ import {
   stringifyLosslessJson,
   subtractDecimalStrings,
 } from "./decimalJson.ts";
-import { createDevStubTransport } from "./devStubTransport.ts";
 import { ACTIVE_ISO4217_CODES, ACTIVE_ISO4217_CURRENCIES } from "./iso4217.ts";
 import {
   NO_EVAL_RESULT_LABEL,
@@ -306,14 +306,242 @@ export async function runDecimalJsonTests(): Promise<void> {
   assertEqual(cleanValidation.valid, true, "removing bad items passes validation");
   results.push("PASS 5: Pre-upload 0-byte / >50 MiB / >50 items / URL validation");
 
-  // 6. BillingApiClient + devStubTransport integration contract checks
+  // Lightweight inline HTTP wire mock strictly for unit-testing BillingApiClient & React state (never shipped to prod).
+  const createWireMockTransport = (): FetchLike => {
+    let seq = 0;
+    const jsonRes = (body: unknown, status = 200) =>
+      new Response(stringifyLosslessJson(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    const codePointLen = (s: string) => Array.from(s.trim()).length;
+    const clone = <T>(v: T): T => parseLosslessJson<T>(stringifyLosslessJson(v));
+    const pickDec = (obj: any, key: string) =>
+      obj[key] === null ? null : rawDecimal(readDecimalString(obj, key)!);
+    const batches = new Map<string, { detail: any; pollCount: number; syncCount: number; editedForSync: boolean }>();
+    const entities: any[] = [
+      { id: "ent-neptune", canonical_name: "NEPTUNE SHIPPING LIMITED", aliases: ["NEPTUNE"], is_default: true, created_at: "2026-11-19T00:00:00Z", updated_at: "2026-11-19T00:00:00Z" },
+    ];
+    const dict: any[] = [
+      { id: "dict-1", raw_alias: "H/C", standard_name: "Handling Charge", category: "origin_dest", is_builtin: true, created_at: "2026-11-19T00:00:00Z", updated_at: "2026-11-19T00:00:00Z" },
+    ];
+    const bills: any[] = [
+      { id: "b-nep-1", accounting_entity: "NEPTUNE SHIPPING LIMITED", reference_no: "DN-1", charge_item: "Handling Charge", amount: rawDecimal("30.00"), currency: "USD", posting_type: "AR", container_nos: [], version: 1 },
+      { id: "b-nep-2", accounting_entity: "NEPTUNE SHIPPING LIMITED", reference_no: "DN-2", charge_item: "THC", amount: rawDecimal("40.00"), currency: "USD", posting_type: "AR", container_nos: [], version: 1 },
+      { id: "b-nep-3", accounting_entity: "NEPTUNE SHIPPING LIMITED", reference_no: "DN-3", charge_item: "Doc Fee", amount: rawDecimal("50.00"), currency: "USD", posting_type: "AR", container_nos: [], version: 1 },
+    ];
+    const evalRuns: any[] = [];
+    const baseBatch = (id: string, entity: string, ocrMode: string) => ({
+      id, short_code: `B-${id}`, accounting_entity: entity, source_channel: "WEB",
+      status: "PROCESSING", stage: "QUEUED", stage_message: "排队", ocr_mode: ocrMode,
+      total_files: 3, succeeded_files: 0, failed_files: 1, version: 1,
+      counts: { create: 1, update: 1, no_change: 1, pending_review: 2, rejected: 1 },
+      created_at: "2026-11-20T00:00:00Z", updated_at: "2026-11-20T00:00:00Z",
+      documents: [
+        { id: "doc-eml-1", parent_doc_id: null, original_filename: "notice.eml", sanitized_filename: "notice.eml", source_kind: "EML", extraction_channel: "EML_TEXT_PARSER", status: "PARSED", error_message: null, affected_record_ids: ["rec-eml-hc"], excluded_clauses: [], shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] }, subtotal_amount: rawDecimal("50.00"), tax_amount: rawDecimal("0.00"), total_amount: rawDecimal("50.00"), total_currency: "USD" },
+        { id: "doc-pdf-1", parent_doc_id: null, original_filename: "dn.pdf", sanitized_filename: "dn.pdf", source_kind: "PDF", extraction_channel: "PLTPLT_OCR", status: "PARSED", error_message: null, affected_record_ids: ["rec-dn-update"], excluded_clauses: [], shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] }, subtotal_amount: rawDecimal("40.00"), tax_amount: rawDecimal("0.00"), total_amount: rawDecimal("40.00"), total_currency: "USD" },
+        { id: "doc-pdf-2", parent_doc_id: null, original_filename: "soa.pdf", sanitized_filename: "soa.pdf", source_kind: "PDF", extraction_channel: "PLTPLT_OCR", status: "PARSED", error_message: null, affected_record_ids: ["rec-precision-blocker"], excluded_clauses: [], shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] }, subtotal_amount: rawDecimal("9007199254740991.01"), tax_amount: rawDecimal("0.00"), total_amount: rawDecimal("9007199254740991.01"), total_currency: "USD" },
+        { id: "doc-eml-sig", parent_doc_id: "doc-eml-1", original_filename: "logo.png", sanitized_filename: "logo.png", source_kind: "IMAGE", extraction_channel: "LOCAL_OCR_FALLBACK", status: "SKIPPED_NOISE", error_message: null, affected_record_ids: [], excluded_clauses: [], shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] }, subtotal_amount: null, tax_amount: null, total_amount: null, total_currency: null },
+        { id: "doc-fail-zero", parent_doc_id: null, original_filename: "scan_fail.pdf", sanitized_filename: "scan_fail.pdf", source_kind: "PDF", extraction_channel: "PLTPLT_OCR", status: "FAILED", error_message: "OCR 网关未返回有效单据内容", affected_record_ids: [], excluded_clauses: [], shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] }, subtotal_amount: null, tax_amount: null, total_amount: null, total_currency: null },
+      ],
+      failed_documents: [{ doc_id: "doc-fail-zero", filename: "scan_fail.pdf", reason: "OCR 网关未返回有效单据内容", retryable: true, affected_record_ids: [] }],
+      records: [
+        { id: "rec-eml-hc", source_doc_id: "doc-eml-1", operation: "CREATE", review_status: "AUTO_READY", match_level: "NONE", document_info: { document_type: "Debit Note", reference_no: "EML-1", document_date: "2026-11-19" }, transaction_party: { issuer: entity, recipient: "CLIENT CO" }, charge_details: { charge_item: "Handling Charge", raw_charge_name: "H/C", quantity: rawDecimal("1"), unit_price: rawDecimal("50.00"), amount: rawDecimal("50.00"), currency: "USD", payment_term: "PP" }, financial_attributes: { accounting_entity: entity, posting_type: "AR" }, shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] }, source_evidence: { source_file: "notice.eml" }, field_diffs: [], validation_alerts: [], ai_reasoning: ["规则抽取"], human_overrides: {}, human_review_history: [], retry_count: 0, version: 1, updated_at: "2026-11-20T00:00:00Z" },
+        { id: "rec-dn-update", source_doc_id: "doc-pdf-1", operation: "UPDATE", review_status: "AUTO_READY", match_level: "L1_DOC_CHARGE", matched_existing_bill_id: "b-1", matched_bill_ref: "DN-202609-001", document_info: { document_type: "Debit Note", reference_no: "DN-202609-001", document_date: "2026-11-19" }, transaction_party: { issuer: entity, recipient: "CLIENT CO" }, charge_details: { charge_item: "Handling Charge", raw_charge_name: "Handling Fee", quantity: rawDecimal("1"), unit_price: rawDecimal("40.00"), amount: rawDecimal("40.00"), currency: "USD", payment_term: "PP" }, financial_attributes: { accounting_entity: entity, posting_type: "AR" }, shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] }, source_evidence: { source_file: "dn.pdf" }, field_diffs: [], validation_alerts: [], ai_reasoning: ["L1 匹配"], human_overrides: {}, human_review_history: [], retry_count: 0, version: 1, updated_at: "2026-11-20T00:00:00Z" },
+        { id: "rec-no-change", source_doc_id: "doc-pdf-1", operation: "NO_CHANGE", review_status: "AUTO_READY", match_level: "L1_DOC_CHARGE", matched_existing_bill_id: "b-2", matched_bill_ref: "DN-202609-002", document_info: { document_type: "Debit Note", reference_no: "DN-202609-002", document_date: "2026-11-19" }, transaction_party: { issuer: entity, recipient: "CLIENT CO" }, charge_details: { charge_item: "Documentation Fee", raw_charge_name: "DOC FEE", quantity: rawDecimal("1"), unit_price: rawDecimal("20.00"), amount: rawDecimal("20.00"), currency: "USD", payment_term: "PP" }, financial_attributes: { accounting_entity: entity, posting_type: "AR" }, shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] }, source_evidence: { source_file: "dn.pdf" }, field_diffs: [], validation_alerts: [], ai_reasoning: ["无变更"], human_overrides: {}, human_review_history: [], retry_count: 0, version: 1, updated_at: "2026-11-20T00:00:00Z" },
+        { id: "rec-precision-blocker", source_doc_id: "doc-pdf-2", operation: "PENDING_REVIEW", review_status: "NEEDS_REVIEW", match_level: "NONE", document_info: { document_type: "Debit Note", reference_no: "SOA-MEGA-9007", document_date: "2026-11-19" }, transaction_party: { issuer: entity, recipient: "CLIENT CO" }, charge_details: { charge_item: "Handling Charge", raw_charge_name: "HIGH PRECISION TEST FEE", quantity: rawDecimal("1"), unit_price: rawDecimal("0.0025"), amount: rawDecimal("9007199254740991.01"), currency: "USD", payment_term: "PP" }, financial_attributes: { accounting_entity: entity, posting_type: "AR" }, shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] }, source_evidence: { source_file: "soa.pdf" }, field_diffs: [], validation_alerts: [{ code: "AMOUNT_TOTAL_MISMATCH", severity: "BLOCKER", field: "amount", message: "合计冲突" }], ai_reasoning: ["金额校验阻断"], human_overrides: {}, human_review_history: [], retry_count: 0, version: 1, updated_at: "2026-11-20T00:00:00Z" },
+        { id: "rec-soft-warning", source_doc_id: "doc-pdf-1", operation: "PENDING_REVIEW", review_status: "NEEDS_REVIEW", match_level: "NONE", document_info: { document_type: "Debit Note", reference_no: "DN-WARN-1", document_date: "2026-11-19" }, transaction_party: { issuer: entity, recipient: "CLIENT CO" }, charge_details: { charge_item: "THC", raw_charge_name: "THC", quantity: rawDecimal("1"), unit_price: rawDecimal("100.00"), amount: rawDecimal("100.00"), currency: "USD", payment_term: "CC" }, financial_attributes: { accounting_entity: entity, posting_type: "AR" }, shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] }, source_evidence: { source_file: "dn.pdf" }, field_diffs: [], validation_alerts: [{ code: "OCR_SUSPICIOUS_FLAG", severity: "WARNING", field: "container_nos", message: "箱号建议核对" }], ai_reasoning: ["软告警待复核"], human_overrides: {}, human_review_history: [], retry_count: 0, version: 1, updated_at: "2026-11-20T00:00:00Z" },
+        { id: "rec-rejected-1", source_doc_id: "doc-pdf-1", operation: "CREATE", review_status: "REJECTED", match_level: "NONE", document_info: { document_type: "Debit Note", reference_no: "DN-REJ-1", document_date: "2026-11-19" }, transaction_party: { issuer: entity, recipient: "CLIENT CO" }, charge_details: { charge_item: "Storage Charge", raw_charge_name: "Storage", quantity: rawDecimal("1"), unit_price: rawDecimal("10.00"), amount: rawDecimal("10.00"), currency: "USD", payment_term: "PP" }, financial_attributes: { accounting_entity: entity, posting_type: "AR" }, shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] }, source_evidence: { source_file: "dn.pdf" }, field_diffs: [], validation_alerts: [], ai_reasoning: ["已驳回"], human_overrides: {}, human_review_history: [], reject_reason: "作废", retry_count: 0, version: 1, updated_at: "2026-11-20T00:00:00Z" },
+      ],
+    });
+    return async (input, init) => {
+      const url = new URL(typeof input === "string" ? input : input.toString(), "http://127.0.0.1");
+      const method = init?.method ?? "GET";
+      const path = url.pathname;
+      const body = typeof init?.body === "string" && init.body ? parseLosslessJson<any>(init.body) : {};
+      if (path === "/api/v1/batches/demo" && method === "POST") {
+        const id = `b-wire-${++seq}`;
+        const entry = { detail: baseBatch(id, body.accounting_entity ?? "NEPTUNE SHIPPING LIMITED", body.ocr_mode ?? "REMOTE_ONLY"), pollCount: 0, syncCount: 0, editedForSync: false };
+        batches.set(id, entry);
+        return jsonRes(clone(entry.detail), url.searchParams.get("wait") === "false" ? 202 : 200);
+      }
+      if (path === "/api/v1/batches/import-review-bundle" && method === "POST") {
+        const id = `b-imp-${++seq}`;
+        const records = (body.records ?? []).map((r: any) => {
+          const base = r.record_state ? { ...r.record_state, ...r } : r;
+          const hist = r.human_review_history ?? r.review_audit_logs ?? base.human_review_history ?? [];
+          return { ...base, human_review_history: hist, retry_count: base.retry_count ?? 0, source_evidence: base.source_evidence };
+        });
+        const detail = { id, short_code: body.short_code ?? "B-IMP", accounting_entity: body.accounting_entity, source_channel: "CLI_IMPORT", status: "COMPLETED", stage: "COMPLETED", stage_message: "完成", ocr_mode: body.ocr_mode ?? "REMOTE_ONLY", total_files: (body.documents ?? []).length, succeeded_files: (body.documents ?? []).length, failed_files: 0, counts: { create: 1, update: 0, no_change: 0, pending_review: 1, rejected: 0 }, documents: body.documents ?? [], failed_documents: [], records, version: 1, created_at: "2026-11-20T00:00:00Z", updated_at: "2026-11-20T00:00:00Z" };
+        batches.set(id, { detail, pollCount: 2, syncCount: 0, editedForSync: false });
+        return jsonRes(clone(detail));
+      }
+      let m = path.match(/^\/api\/v1\/batches\/([^/]+)$/);
+      if (m && method === "GET") {
+        const entry = batches.get(m[1]);
+        if (!entry) return jsonRes({ code: "NOT_FOUND", message: "missing" }, 404);
+        entry.pollCount += 1;
+        entry.detail.stage = entry.pollCount === 1 ? "EXTRACTING" : "COMPLETED";
+        entry.detail.status = entry.detail.stage === "COMPLETED" ? "COMPLETED" : "PROCESSING";
+        return jsonRes(clone(entry.detail));
+      }
+      if ((m = path.match(/^\/api\/v1\/batches\/([^/]+)\/documents\/([^/]+)$/)) && method === "PATCH") {
+        const entry = batches.get(m[1])!;
+        const doc = entry.detail.documents.find((d: any) => d.id === m![2])!;
+        for (const k of ["subtotal_amount", "tax_amount", "total_amount"]) {
+          if (body[k] !== undefined) doc[k] = pickDec(body, k);
+        }
+        if (body.total_currency !== undefined) doc.total_currency = body.total_currency;
+        return jsonRes(clone(entry.detail));
+      }
+      if ((m = path.match(/^\/api\/v1\/batches\/([^/]+)\/documents\/([^/]+)\/force-parse$/)) && method === "POST") {
+        const entry = batches.get(m[1])!;
+        entry.detail.documents.find((d: any) => d.id === m![2])!.status = "METADATA_ONLY";
+        return jsonRes(clone(entry.detail));
+      }
+      if ((m = path.match(/^\/api\/v1\/batches\/([^/]+)\/documents\/([^/]+)\/retry$/)) && method === "POST") {
+        const entry = batches.get(m[1])!;
+        entry.detail.documents.find((d: any) => d.id === m![2])!.status = "METADATA_ONLY";
+        entry.detail.failed_documents = [];
+        entry.detail.failed_files = 0;
+        return jsonRes(clone(entry.detail));
+      }
+      if ((m = path.match(/^\/api\/v1\/batches\/([^/]+)\/records\/([^/]+)$/)) && method === "PATCH") {
+        const entry = batches.get(m[1])!;
+        const rec = entry.detail.records.find((r: any) => r.id === m![2])!;
+        if (body.amount !== undefined) rec.charge_details.amount = pickDec(body, "amount");
+        if (body.unit_price !== undefined) rec.charge_details.unit_price = pickDec(body, "unit_price");
+        if (body.quantity !== undefined) rec.charge_details.quantity = pickDec(body, "quantity");
+        if (body.charge_item !== undefined) { rec.charge_details.charge_item = body.charge_item; rec.human_overrides.charge_item = body.charge_item; }
+        if (body.issuer !== undefined) rec.transaction_party.issuer = body.issuer;
+        entry.editedForSync = true;
+        return jsonRes(clone(entry.detail));
+      }
+      if ((m = path.match(/^\/api\/v1\/batches\/([^/]+)\/records\/([^/]+)\/approve$/)) && method === "POST") {
+        if (codePointLen(String(body.reason ?? "")) < 2) {
+          return jsonRes({ code: "INVALID_REASON_LENGTH", message: "复核理由至少需要 2 个字符" }, 422);
+        }
+        const entry = batches.get(m[1])!;
+        const rec = entry.detail.records.find((r: any) => r.id === m![2])!;
+        const blockers = (rec.validation_alerts ?? []).filter((a: any) => a.severity === "BLOCKER").map((a: any) => a.code);
+        if (blockers.length > 0) {
+          return jsonRes({ code: "HARD_BLOCKER_CANNOT_APPROVE", message: "存在硬阻断告警", details: { blocker_codes: blockers } }, 422);
+        }
+        rec.review_status = "APPROVED";
+        rec.operation = rec.operation === "PENDING_REVIEW" ? "CREATE" : rec.operation;
+        for (const a of rec.validation_alerts ?? []) { if (a.severity === "WARNING") a.severity = "RESOLVED"; }
+        rec.human_review_history = [...(rec.human_review_history ?? []), { action: "APPROVED", operator: "reviewer", timestamp: "2026-11-20T00:00:00Z", reason: body.reason }];
+        return jsonRes(clone(entry.detail));
+      }
+      if ((m = path.match(/^\/api\/v1\/batches\/([^/]+)\/export(\/download)?$/)) && method === "GET") {
+        const entry = batches.get(m[1])!;
+        const mode = url.searchParams.get("mode") ?? "official";
+        const allRecs = entry.detail.records;
+        const picked = mode === "official"
+          ? allRecs.filter((r: any) => (r.review_status === "AUTO_READY" || r.review_status === "APPROVED") && r.operation !== "PENDING_REVIEW")
+          : mode === "full_standard"
+            ? allRecs.filter((r: any) => r.review_status !== "REJECTED")
+            : allRecs;
+        const items = picked.map((r: any) => ({
+          operation: r.review_status === "REJECTED" ? "PENDING_REVIEW" : r.operation,
+          document_info: r.document_info, transaction_party: r.transaction_party,
+          charge_details: r.charge_details, financial_attributes: r.financial_attributes,
+          audit_trail: {
+            ai_reasoning: r.ai_reasoning,
+            ...(mode === "audit" ? { record_id: r.id, retry_count: r.retry_count ?? 0, human_review_history: r.human_review_history ?? [] } : {}),
+          },
+        }));
+        if (m[2] === "/download") return jsonRes(items);
+        return jsonRes({ mode, total_records: allRecs.length, included_count: items.length, excluded_pending_count: mode === "official" ? 2 : 0, excluded_rejected_count: mode === "audit" ? 0 : 1, records: items });
+      }
+      if ((m = path.match(/^\/api\/v1\/batches\/([^/]+)\/sync-baseline$/)) && method === "POST") {
+        const entry = batches.get(m[1])!;
+        entry.syncCount += 1;
+        if (entry.syncCount === 1) return jsonRes({ batch_id: m[1], created_count: 1, updated_count: 1, skipped_count: 0, records: [] });
+        if (entry.syncCount === 2 && !entry.editedForSync) return jsonRes({ batch_id: m[1], created_count: 0, updated_count: 0, skipped_count: 2, records: [] });
+        return jsonRes({ batch_id: m[1], created_count: 1, updated_count: 1, skipped_count: 1, records: [] });
+      }
+      if ((m = path.match(/^\/api\/v1\/batches\/([^/]+)\/reapply-dictionary$/)) && method === "POST") {
+        const entry = batches.get(m[1])!;
+        for (const r of entry.detail.records) {
+          if (r.human_overrides?.charge_item) continue;
+          const hit = dict.find((d) => d.raw_alias === r.charge_details.raw_charge_name);
+          if (hit) r.charge_details.charge_item = hit.standard_name;
+        }
+        return jsonRes(clone(entry.detail));
+      }
+      if (path === "/api/v1/entities" && method === "GET") return jsonRes(clone(entities));
+      if (path === "/api/v1/entities" && method === "POST") {
+        if (body.is_default) { for (const e of entities) e.is_default = false; }
+        const created = { id: `ent-${++seq}`, canonical_name: body.canonical_name, aliases: body.aliases ?? [], is_default: Boolean(body.is_default), created_at: "2026-11-20T00:00:00Z", updated_at: "2026-11-20T00:00:00Z" };
+        entities.push(created);
+        return jsonRes(clone(created), 201);
+      }
+      if ((m = path.match(/^\/api\/v1\/entities\/([^/]+)$/)) && method === "PUT") {
+        const ent = entities.find((e) => e.id === m![1])!;
+        Object.assign(ent, { canonical_name: body.canonical_name, aliases: body.aliases ?? [], is_default: Boolean(body.is_default) });
+        return jsonRes(clone(ent));
+      }
+      if (path === "/api/v1/dictionary" && method === "GET") return jsonRes(clone(dict));
+      if (path === "/api/v1/dictionary" && method === "POST") {
+        const item = { id: `dict-${++seq}`, raw_alias: body.raw_alias, standard_name: body.standard_name, category: body.category, is_builtin: false, created_at: "2026-11-20T00:00:00Z", updated_at: "2026-11-20T00:00:00Z" };
+        dict.push(item);
+        return jsonRes(clone(item), 201);
+      }
+      if ((m = path.match(/^\/api\/v1\/dictionary\/([^/]+)$/)) && method === "DELETE") {
+        const idx = dict.findIndex((d) => d.id === m![1]);
+        if (idx >= 0 && dict[idx].is_builtin) return jsonRes({ code: "BUILTIN_PROTECTED", message: "内置条目不可删除" }, 400);
+        if (idx >= 0) dict.splice(idx, 1);
+        return new Response(null, { status: 204 });
+      }
+      if (path === "/api/v1/existing-bills" && method === "GET") {
+        const ent = url.searchParams.get("accounting_entity");
+        return jsonRes(clone(ent ? bills.filter((b) => b.accounting_entity === ent) : bills));
+      }
+      if (path === "/api/v1/existing-bills/import" && method === "POST") {
+        const added = (body.bills ?? []).map((b: any) => ({
+          ...b,
+          id: `b-${++seq}`,
+          accounting_entity: b.accounting_entity ?? body.default_accounting_entity,
+          ...(b.amount !== undefined ? { amount: pickDec(b, "amount") } : {}),
+          ...(b.unit_price !== undefined ? { unit_price: pickDec(b, "unit_price") } : {}),
+        }));
+        bills.push(...added);
+        return jsonRes({ inserted_count: added.length, skipped_count: 0, total_count: bills.length });
+      }
+      if (path === "/api/v1/existing-bills" && method === "DELETE") {
+        const ent = url.searchParams.get("accounting_entity");
+        for (let i = bills.length - 1; i >= 0; i--) { if (bills[i].accounting_entity === ent) bills.splice(i, 1); }
+        return jsonRes({ deleted_count: 1 });
+      }
+      if (path === "/api/v1/eval-runs" && method === "GET") return jsonRes(clone(evalRuns));
+      if (path === "/api/v1/eval-runs" && method === "POST") {
+        const mode = body.run_mode;
+        const run = mode === "LIVE_LLM"
+          ? { id: `eval-${++seq}`, run_mode: mode, status: "UNVERIFIED", model_name: "gpt-test", k_trials: body.k_trials ?? 3, actual_trials: 0, executed_cases: 0, total_cases: 12, metrics: {}, created_at: "2026-11-20T00:00:00Z" }
+          : mode === "LIVE_E2E"
+            ? { id: `eval-${++seq}`, run_mode: mode, status: "FAILED", model_name: "gpt-test", k_trials: body.k_trials ?? 3, actual_trials: 1, executed_cases: 3, total_cases: 12, metrics: {}, created_at: "2026-11-20T00:00:00Z" }
+            : {
+                id: `eval-${++seq}`, run_mode: mode, status: "COMPLETED", model_name: "deterministic-rules", k_trials: body.k_trials ?? 3, actual_trials: 3, executed_cases: 36, total_cases: 12,
+                schema_valid_rate: 1.0, field_exact_match: 47 / 48, conflict_recall: 1.0, false_positive_rate: 0.0, pass_at_k: 1.0, pass_pow_k: 1.0,
+                report: { avg_latency_ms: 120.5, executed_cases: 36, schema_valid_rate: { rate: 1.0, numerator: 12, denominator: 12 }, field_exact_match: { rate: 47 / 48, numerator: 47, denominator: 48 }, amount_accuracy: { rate: 1.0, numerator: 24, denominator: 24 }, alert_precision: { rate: 1.0, numerator: 8, denominator: 8 }, false_positive_rate: { rate: 0.0, numerator: 0, denominator: 20 }, pass_at_k: { rate: 1.0, numerator: 12, denominator: 12 } },
+                created_at: "2026-11-20T00:00:00Z",
+              };
+        evalRuns.push(run);
+        return jsonRes(clone(run));
+      }
+      return jsonRes({ code: "NOT_FOUND", message: "not found" }, 404);
+    };
+  };
+
+  // 6. BillingApiClient wire-protocol + lossless decimal contract checks
   const capturedCalls: Array<{
     url: string;
     method: string;
     bodyText?: string;
     headers: Record<string, string>;
   }> = [];
-  const stubTransport = createDevStubTransport();
+  const wireMockTransport = createWireMockTransport();
   const client = new BillingApiClient({
     transport: async (input, init) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -323,7 +551,7 @@ export async function runDecimalJsonTests(): Promise<void> {
         bodyText: typeof init?.body === "string" ? init.body : undefined,
         headers: collectLowerHeaders(init?.headers),
       });
-      return stubTransport(input, init);
+      return wireMockTransport(input, init);
     },
   });
 
@@ -873,7 +1101,7 @@ export async function runDecimalJsonTests(): Promise<void> {
     !("deleteAccountingEntity" in client),
     "BillingApiClient must not expose deleteAccountingEntity"
   );
-  const entityDeleteResp = await stubTransport(
+  const entityDeleteResp = await wireMockTransport(
     "http://127.0.0.1/api/v1/entities/ent-neptune",
     { method: "DELETE" }
   );
@@ -1287,7 +1515,7 @@ export async function runDecimalJsonTests(): Promise<void> {
 
   // Import into a brand new client instance to prove zero shared in-memory state
   const targetClient = new BillingApiClient({
-    transport: createDevStubTransport(),
+    transport: createWireMockTransport(),
   });
   const importedBatch = await targetClient.importReviewBundle(
     validatedImport.bundle
@@ -2617,7 +2845,7 @@ export async function runDecimalJsonTests(): Promise<void> {
       "R4-A2 serialized bundle record omits source_evidence instead of injecting {source_paths:[]}"
     );
     const stubEvClient = new BillingApiClient({
-      transport: createDevStubTransport(),
+      transport: createWireMockTransport(),
     });
     const stubEvImported = await stubEvClient.importReviewBundle(
       omittedEvCheck.bundle

@@ -13,35 +13,9 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 import { createPortal } from "react-dom";
-import { mountProceduralLumnoBackground } from "../lib/lumno-background.js";
 import { countCodePoints, validateReviewReason } from "../api/reviewState.ts";
 
 export type LumnoTheme = "light" | "dark";
-
-export function LumnoBackgroundStage({ theme }: { theme: LumnoTheme }) {
-  const stageRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    const el = stageRef.current;
-    if (!el) return;
-    const handle = mountProceduralLumnoBackground(el, {
-      preset: theme === "dark" ? "nocturne" : "coast",
-      mode: "oil-veil",
-      seed: 2026,
-    });
-    return () => {
-      handle.destroy();
-    };
-  }, [theme]);
-
-  return (
-    <div
-      ref={stageRef}
-      className="lumno-oil-stage"
-      aria-hidden="true"
-    />
-  );
-}
 
 export interface LumnoButtonProps
   extends ButtonHTMLAttributes<HTMLButtonElement> {

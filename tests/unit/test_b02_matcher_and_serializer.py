@@ -948,3 +948,57 @@ def test_export_strips_signed_query_and_fragment_from_both_source_locations() ->
         path,
         "Mail.eml/bill#2.pdf",
     ]
+
+
+def test_official_export_ai_reasoning_records_match_level_diff_and_inheritance(
+    output_validator: Draft202012Validator,
+) -> None:
+    bill = _bill(
+        reference_no="DN-202609-001",
+        external_bill_key="example-dn-202609-001-handling",
+        amount="30.00",
+        payment_term="PP",
+    )
+    partial_update = _line(
+        "partial-update",
+        reference_no="DN-202609-001",
+        amount="40.00",
+        payment_term=None,
+        currency=None,
+        explicit_fields={"reference_no", "raw_charge_name", "charge_item", "amount"},
+    )
+    matched = match_record(partial_update, [bill])
+    # Re-matching the already-matched record stays idempotent without duplicating reasoning lines.
+    rematched = match_record(matched, [bill])
+    (update_item,) = serialize_records([rematched], "official")
+    output_validator.validate([update_item])
+    update_reasoning = update_item["audit_trail"]["ai_reasoning"]
+    assert any(
+        "L1_DOC_CHARGE" in line and "example-dn-202609-001-handling" in line
+        for line in update_reasoning
+    )
+    assert any("amount 30.00 -> 40.00" in line for line in update_reasoning)
+    assert "未明确修改字段继承历史账单原值" in update_reasoning
+    assert len(update_reasoning) == len(set(update_reasoning))
+
+    force_created = match_record(
+        rematched.model_copy(update={"human_overrides": {"force_create_new": True}}), [bill]
+    )
+    assert all(
+        "L1_DOC_CHARGE" not in line and "字段变更：" not in line
+        for line in force_created.ai_reasoning
+    )
+
+    unchanged = match_record(
+        _line(
+            "no-change",
+            reference_no="DN-202609-001",
+            amount="30.00",
+            payment_term="PP",
+            currency="USD",
+        ),
+        [bill],
+    )
+    (unchanged_item,) = serialize_records([unchanged], "official")
+    output_validator.validate([unchanged_item])
+    assert "核心字段与历史账单一致，无变更" in unchanged_item["audit_trail"]["ai_reasoning"]

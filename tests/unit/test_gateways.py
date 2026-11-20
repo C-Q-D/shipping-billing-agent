@@ -19,7 +19,7 @@ from langsmith.utils import get_env_var
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 
-from shipping_billing_agent.agent import arun_billing_pipeline
+from shipping_billing_agent.agent import arun_billing_pipeline, run_billing_pipeline
 from shipping_billing_agent.config.limits import ResourceLimits
 from shipping_billing_agent.config.settings import AppSettings
 from shipping_billing_agent.domain.models import ParsedDocument
@@ -382,6 +382,8 @@ def test_ocr_reports_non_json_and_nonfinite_json_as_gateway_errors(body: bytes) 
         (200, {"data": {"list": {}}}, "无有效单据内容"),
         (200, {"data": {"list": []}}, "无有效单据内容"),
         (200, {"data": {"list": [{"chargeList": [], "invoiceNumber": " "}]}}, "无有效单据内容"),
+        (200, {"data": {"list": [{"pageNo": 1}]}}, "无有效单据内容"),
+        (200, {"data": {"list": [{"pageNo": 1, "text": "   "}]}}, "无有效单据内容"),
     ],
 )
 def test_ocr_raises_on_failure_or_missing_content(status, response, expected_error) -> None:
@@ -390,6 +392,53 @@ def test_ocr_raises_on_failure_or_missing_content(status, response, expected_err
 
     with pytest.raises(ocr_client.OcrGatewayError, match=expected_error):
         client.recognize_url(PUBLIC_FILE)
+
+
+def test_ocr_accepts_extra_text_payload_and_extracts_charges() -> None:
+    body = {
+        "success": True,
+        "data": {
+            "list": [
+                {
+                    "pageNo": 1,
+                    "text": (
+                        "Debit Note DN-900\n"
+                        "Issuer: Example Carrier Ltd.\n"
+                        "Bill To: NEPTUNE SHIPPING LIMITED\n"
+                        "Handling Charge 40.00 USD\n"
+                        "Total: 40.00 USD"
+                    ),
+                }
+            ]
+        },
+    }
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=body))
+    client = ocr_client.PltPltOcrClient(_ocr_settings(), transport=transport)
+    ocr_result = client.recognize_url(PUBLIC_FILE)
+
+    assert ocr_result.payload.has_metadata is True
+    assert "Debit Note DN-900" in ocr_result.formatted_text
+    assert "Handling Charge 40.00 USD" in ocr_result.formatted_text
+
+    doc = ParsedDocument(
+        doc_id="ocr-extra-text",
+        original_filename="dn-900.png",
+        sanitized_filename="dn-900.png",
+        media_type="image/png",
+        source_kind="IMAGE",
+        content_sha256="a" * 64,
+        extraction_channel="PLTPLT_OCR",
+        status="PARSED",
+        raw_text=ocr_result.formatted_text,
+        ocr_payload=ocr_result.payload,
+    )
+    pipeline_result = run_billing_pipeline([doc], "NEPTUNE SHIPPING LIMITED")
+    (row,) = pipeline_result.records
+    assert row.reference_no == "DN-900"
+    assert row.charge_item == "Handling Charge"
+    assert row.amount == Decimal("40.00")
+    assert row.currency == "USD"
+    assert row.posting_type.value == "AP"
 
 
 def test_ocr_rejects_blocked_file_before_gateway_post() -> None:

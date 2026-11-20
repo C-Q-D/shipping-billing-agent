@@ -31,7 +31,7 @@
   --wb-info-border: rgba(59, 130, 246, 0.24);
   --wb-muted-badge-bg: rgba(15, 23, 42, 0.055);
   --wb-muted-badge-text: #475569;
-  --wb-stage-bg: #eae8e1;
+  --wb-stage-bg: linear-gradient(180deg, #f3f5f8 0%, #eaedf2 100%);
 }
 
 body[data-theme="dark"] {
@@ -63,7 +63,7 @@ body[data-theme="dark"] {
   --wb-info-border: rgba(96, 165, 250, 0.28);
   --wb-muted-badge-bg: rgba(255, 255, 255, 0.08);
   --wb-muted-badge-text: #cbd5e1;
-  --wb-stage-bg: #151b22;
+  --wb-stage-bg: linear-gradient(180deg, #131820 0%, #171d26 100%);
 }
 
 *,
@@ -130,39 +130,6 @@ select {
 
 button .ri-icon {
   pointer-events: none;
-}
-
-/* Paradigm B: Procedural Impressionist Oil Stage + 3-Stop Concave Atmospheric Veil */
-.lumno-oil-stage {
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  overflow: hidden;
-  background: var(--wb-stage-bg);
-}
-
-.lumno-oil-stage::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  z-index: 1;
-  background: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.54) 0%,
-    rgba(255, 255, 255, 0.20) 42%,
-    rgba(255, 255, 255, 0.38) 100%
-  );
-}
-
-body[data-theme="dark"] .lumno-oil-stage::after {
-  background: linear-gradient(
-    180deg,
-    rgba(15, 20, 26, 0.56) 0%,
-    rgba(15, 20, 26, 0.24) 42%,
-    rgba(15, 20, 26, 0.56) 100%
-  );
 }
 
 /* Glass Panels (NEVER apply opacity < 1 transitions to ancestors of backdrop-filter) */

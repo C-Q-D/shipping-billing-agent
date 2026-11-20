@@ -52,7 +52,7 @@ FIXED_FILES = {
 SOURCE_SUFFIXES = {
     "src": {".py"},
     "tests": {".py"},
-    "frontend/src": {".ts", ".tsx", ".css", ".js"},
+    "frontend/src": {".ts", ".tsx", ".css"},
 }
 REQUIRED_FILES = FIXED_FILES | {
     "frontend/src/main.tsx",

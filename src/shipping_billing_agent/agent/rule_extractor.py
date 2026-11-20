@@ -1687,9 +1687,17 @@ def _split_ocr_rows(lines: Sequence[_Line], evidence: _Evidence, skipped: set[in
 
 def _rate_row(text: str) -> re.Match[str] | None:
     row = _RATE_ROW.fullmatch(text)
-    if row and (
-        (row["marker"] and _FEE.search(row["name"]))
-        or row["name"].casefold() in {"wharfage", "wharfage administration fee"}
+    if (
+        row
+        and _FEE.search(row["name"])
+        and not _TRANSPORT_LABEL.search(row["name"])
+        and not _UNPARSED_RATE.search(row["name"])
+        and (
+            row["marker"]
+            or row["rate_prefix"]
+            or row["rate_suffix"]
+            or (row["quantity"] is None and not re.search(r"\d", row["name"]))
+        )
     ):
         return row
     return None
@@ -2125,6 +2133,24 @@ class SiblingFieldUse:
         return sanitize_source_path(self.source.original_filename) or self.source.sanitized_filename
 
 
+_PORT_CITY_ABBREVIATIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bSHANGHAI\b", re.I), "sha"),
+    (re.compile(r"\bSHENZHEN\b", re.I), "szx"),
+    (re.compile(r"\bNINGBO\b", re.I), "nbo"),
+    (re.compile(r"\bQINGDAO\b", re.I), "tao"),
+    (re.compile(r"\bTIANJIN\b", re.I), "tsn"),
+    (re.compile(r"\bXIAMEN\b", re.I), "xmn"),
+    (re.compile(r"\bGUANGZHOU\b", re.I), "can"),
+    (re.compile(r"\bHONG\s*KONG\b", re.I), "hkg"),
+    (re.compile(r"\bLOS\s+ANGELES\b", re.I), "lax"),
+    (re.compile(r"\bLONG\s+BEACH\b", re.I), "lgb"),
+    (re.compile(r"\bNEW\s+YORK\b", re.I), "nyc"),
+    (re.compile(r"\bROTTERDAM\b", re.I), "rtm"),
+    (re.compile(r"\bSINGAPORE\b", re.I), "sin"),
+    (re.compile(r"\bBUSAN\b", re.I), "pus"),
+)
+
+
 def _package_parties(
     siblings: Sequence[tuple[ParsedDocument, RawExtractionEnvelope]],
 ) -> list[tuple[str, ParsedDocument, str | None]]:
@@ -2140,12 +2166,17 @@ def _package_parties(
             re.I | re.M,
         )
         for role, name in _transport_parties(doc, lines):
-            shanghai_shipper = (
-                role == "shipper"
-                and shipper_address
-                and re.search(r"\bSHANGHAI\b", shipper_address[0], re.I)
-            )
-            parties.append((name, doc, "sha" if shanghai_shipper else None))
+            location_alias = None
+            if role == "shipper" and shipper_address:
+                location_alias = next(
+                    (
+                        abbr
+                        for pattern, abbr in _PORT_CITY_ABBREVIATIONS
+                        if pattern.search(shipper_address[0])
+                    ),
+                    None,
+                )
+            parties.append((name, doc, location_alias))
         if not envelope.metadata_only:
             continue
         for current, following in zip(lines, lines[1:], strict=False):

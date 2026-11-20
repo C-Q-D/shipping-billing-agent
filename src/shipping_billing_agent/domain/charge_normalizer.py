@@ -10,6 +10,8 @@ from unicodedata import normalize
 from .models import ChargeDictionaryItem, PaymentTerm
 
 _EDGE_PUNCTUATION = re.compile(r"^[\W_]+|[\W_]+$")
+_LEADING_COUNT_PREFIX = re.compile(r"^\d+\s+(?=\S)")
+_TRAILING_LANE_SUFFIX = re.compile(r"\s+-\s+[a-z]{2}(?:\s+[a-z]{2,4})?$")
 _CHARGE_PUNCTUATION = str.maketrans({"’": "'", "‘": "'", "–": "-", "—": "-"})
 _CHARGE_NAMES = {
     "handling": "Handling Charge",
@@ -38,11 +40,9 @@ _CHARGE_NAMES = {
     "wharfage": "Wharfage",
     "wharfage administration fee": "Wharfage Administration Fee",
     "wharfage admin fee": "Wharfage Administration Fee",
-    "4 add'l detention free time charge": "Detention Free Time Charge",
     "add'l detention free time charge": "Detention Free Time Charge",
     "detention free time charge": "Detention Free Time Charge",
     "detention charge": "Detention Free Time Charge",
-    "on carriage additional - us em": "On Carriage Additional",
     "on carriage additional": "On Carriage Additional",
 }
 _PAYMENT_TERMS = {
@@ -64,17 +64,31 @@ def _charge_key(name: str) -> str:
     return " ".join(_EDGE_PUNCTUATION.sub("", text).split())
 
 
+def _lookup_charge_alias(
+    key: str, custom_dictionary: Sequence[ChargeDictionaryItem]
+) -> str | None:
+    for item in custom_dictionary:
+        if _charge_key(item.raw_alias) == key:
+            return item.standard_name
+    return _CHARGE_NAMES.get(key)
+
+
 def normalize_charge_item(
     raw_name: str | None, custom_dictionary: Sequence[ChargeDictionaryItem] = ()
 ) -> tuple[str | None, bool]:
     key = _charge_key(raw_name or "")
     if not key:
         return None, False
-    for item in custom_dictionary:
-        if _charge_key(item.raw_alias) == key:
-            return item.standard_name, True
-    if key in _CHARGE_NAMES:
-        return _CHARGE_NAMES[key], True
+    candidates = [key]
+    no_prefix = _LEADING_COUNT_PREFIX.sub("", key).strip()
+    no_lane = _TRAILING_LANE_SUFFIX.sub("", key).strip()
+    no_both = _TRAILING_LANE_SUFFIX.sub("", no_prefix).strip()
+    for candidate in (no_prefix, no_lane, no_both):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
+        if matched := _lookup_charge_alias(candidate, custom_dictionary):
+            return matched, True
     return key.title(), False
 
 

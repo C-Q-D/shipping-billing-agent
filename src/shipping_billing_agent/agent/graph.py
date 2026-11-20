@@ -1319,6 +1319,13 @@ class _BillingNodes:
         return _ModelAttempt(envelope, invoked=True)
 
     async def extract_documents(self, state: _BillingState) -> dict:
+        """Run online LangChain extraction across all parsed bundles and verify via grounding.
+
+        Offline runs (`self.client is None`) keep the deterministic rule bundles built by
+        `build_context_packages`. Online runs send every `PARSED` bundle to `self.client`,
+        ground proposals against rule evidence, and fail closed per document if the initial
+        LLM call or batch budget fails so unverified documents do not bypass model checks.
+        """
         bundles = state["bundles"]
         if self.client is None:
             return {}

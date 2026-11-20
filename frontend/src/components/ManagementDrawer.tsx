@@ -79,7 +79,7 @@ const EVAL_MODE_OPTIONS: ReadonlyArray<{
   {
     value: "OFFLINE_DETERMINISTIC",
     label: "离线确定性基准 (OFFLINE_DETERMINISTIC)",
-    sublabel: "执行 12 组内置真值与对抗用例，验证确定性提取、匹配与门禁",
+    sublabel: "执行 13 组（16 项）内置真值与对抗用例，验证确定性提取、匹配与门禁",
   },
   {
     value: "LIVE_LLM",

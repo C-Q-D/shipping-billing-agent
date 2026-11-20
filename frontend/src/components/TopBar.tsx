@@ -17,7 +17,6 @@ import {
 export interface TopBarProps {
   health: HealthStatus | null;
   healthError: string | null;
-  isStubMode: boolean;
   batches: ReadonlyArray<BatchSummary>;
   activeBatchId: string | null;
   activeBatch: BatchDetail | null;
@@ -42,7 +41,6 @@ export interface TopBarProps {
 export function TopBar({
   health,
   healthError,
-  isStubMode,
   batches,
   activeBatchId,
   activeBatch,
@@ -119,11 +117,9 @@ export function TopBar({
 
   const healthShortLabel = healthError
     ? "服务离线"
-    : isStubMode
-      ? "演示桩"
-      : health?.llm_configured
-        ? "能力就绪"
-        : "规则兜底";
+    : health?.llm_configured
+      ? "能力就绪"
+      : "规则兜底";
 
   const healthTooltipContent = (
     <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
@@ -149,9 +145,6 @@ export function TopBar({
             {health.public_relay_configured ? "已配置" : "未配置"}
           </div>
         </>
-      ) : null}
-      {isStubMode ? (
-        <div>当前运行于前端独立演示桩（?mode=stub），用于界面与契约联调</div>
       ) : null}
     </div>
   );

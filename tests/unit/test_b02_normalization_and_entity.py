@@ -92,6 +92,25 @@ def test_charge_dictionary_maps_the_exam_and_sample_aliases(
         assert normalize_charge_item(alias) == (standard_name, True), alias
 
 
+def test_charge_normalizer_strips_generic_count_prefixes_and_lane_suffixes() -> None:
+    assert normalize_charge_item("7 Add'l Detention Free Time Charge") == (
+        "Detention Free Time Charge",
+        True,
+    )
+    assert normalize_charge_item("On Carriage Additional - EU WB") == (
+        "On Carriage Additional",
+        True,
+    )
+    assert normalize_charge_item("7 Add'l Detention Free Time Charge - EU WB") == (
+        "Detention Free Time Charge",
+        True,
+    )
+    assert normalize_charge_item("7 Fuel Adjustment - EU WB") == (
+        "7 Fuel Adjustment - Eu Wb",
+        False,
+    )
+
+
 def test_custom_charge_alias_takes_precedence_and_unknown_name_is_kept() -> None:
     custom = ChargeDictionaryItem(raw_alias=" … HANDLING\tFee ! ", standard_name="Agent Fee")
     assert normalize_charge_item(" (Handling   fee), ", [custom]) == ("Agent Fee", True)

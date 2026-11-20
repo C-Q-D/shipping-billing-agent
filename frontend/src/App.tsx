@@ -9,7 +9,6 @@ import {
 import {
   ApiClientError,
   BillingApiClient,
-  isStubModeActive,
   isValidIso4217Currency,
   type AccountingEntity,
   type BatchDetail,
@@ -79,7 +78,6 @@ import {
   type SyncResultRecord,
 } from "./components/ExportAndSyncModal.tsx";
 import {
-  LumnoBackgroundStage,
   LumnoButton,
   LumnoInput,
   LumnoModal,
@@ -173,7 +171,6 @@ export default function App({
   apiClient,
 }: AppProps = {}) {
   const api = useMemo(() => apiClient ?? new BillingApiClient(), [apiClient]);
-  const stubMode = useMemo(() => isStubModeActive(), []);
 
   const [theme, setTheme] = useState<LumnoTheme>("light");
   const [mobileTab, setMobileTab] = useState<MobileViewTab>(() =>
@@ -1578,14 +1575,12 @@ export default function App({
 
   return (
     <>
-      <LumnoBackgroundStage theme={theme} />
       <LumnoToastHost toasts={toasts} />
 
       <div className="wb-shell">
         <TopBar
           health={health}
           healthError={healthError}
-          isStubMode={stubMode}
           batches={batches}
           activeBatchId={activeBatchId}
           activeBatch={activeBatch}

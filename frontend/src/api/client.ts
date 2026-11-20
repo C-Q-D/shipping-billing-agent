@@ -6,9 +6,13 @@ import {
   stringifyLosslessJson,
   toSchemaDecimal,
 } from "./decimalJson.ts";
-import { createDevStubTransport, type FetchLike } from "./devStubTransport.ts";
 import { ACTIVE_ISO4217_CURRENCY_SET } from "./iso4217.ts";
 import type { components, operations } from "./schema";
+
+export type FetchLike = (
+  input: RequestInfo | URL,
+  init?: RequestInit
+) => Promise<Response>;
 
 export type ErrorResponse = components["schemas"]["ErrorResponse"];
 export type HealthStatus = components["schemas"]["HealthStatus"];
@@ -323,19 +327,6 @@ export function validateBatchIngestionInput(args: {
     existingBillsError,
     summaryErrors,
   };
-}
-
-export function isStubModeActive(): boolean {
-  if (typeof window !== "undefined") {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get("mode") === "stub") {
-      return true;
-    }
-  }
-  const envVal = (
-    import.meta as unknown as { env?: Record<string, string | undefined> }
-  ).env?.VITE_API_STUB;
-  return envVal === "1";
 }
 
 function normalizeDecimalField(
@@ -672,20 +663,11 @@ export interface BillingApiClientOptions {
 export class BillingApiClient {
   private readonly baseUrl: string;
   private readonly transport: FetchLike;
-  readonly isStubMode: boolean;
 
   constructor(options: BillingApiClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "").replace(/\/$/, "");
-    if (options.transport) {
-      this.transport = options.transport;
-      this.isStubMode = false;
-    } else if (isStubModeActive()) {
-      this.transport = createDevStubTransport();
-      this.isStubMode = true;
-    } else {
-      this.transport = (input, init) => fetch(input, init);
-      this.isStubMode = false;
-    }
+    this.transport =
+      options.transport ?? ((input, init) => fetch(input, init));
   }
 
   private async requestRaw(
