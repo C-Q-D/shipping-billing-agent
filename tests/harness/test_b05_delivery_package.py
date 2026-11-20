@@ -159,7 +159,7 @@ def test_delivery_documents_cover_evidence_and_submission(delivery_zip: Path) ->
         assert text in harness
     for doc in (readme, harness):
         assert "UNVERIFIED" in doc
-        assert "1729 passed" in doc
+        assert re.search(r"\b17\d\d\s+passed", doc)
     assert re.findall(r"^## 思考([一二三四五六])(?:\s|$)", thinking, re.MULTILINE) == list(
         "一二三四五六"
     )

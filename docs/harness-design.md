@@ -92,7 +92,7 @@ EML 解析 `multipart`、邮件头、正文和附件，按实际文件格式递�
 
 一次全对要求行数、核心字段、操作与复核状态、必需告警、误拦检查及该用例的额外断言均通过。单用例三轮为 `[False, True, False]` 时，单独计算得到 `pass@3=1.0`、`pass^3=0.0`。财务自动处理不能依靠偶尔答对。回归以 `pass^k=1.0` 要求这 k 次中通过与否零波动，同时保留每轮差异定位原因。
 
-该次报告的 `avg_latency_ms` 为 `320.41`，取 48 次完成执行的平均用时。`llm_calls=15` 指离线队列替身调用，`ocr_calls=3` 指本地 RapidOCR 对 `图片示例.png` 的识别，`failing_cases=[]`。同一主流程在 `master` 运行 `uv run pytest -p no:cacheprovider -q`，结果为 **1729 passed, 0 failed, 0 skipped (548.95s)**。
+该次报告的 `avg_latency_ms` 为 `320.41`，取 48 次完成执行的平均用时。`llm_calls=15` 指离线队列替身调用，`ocr_calls=3` 指本地 RapidOCR 对 `图片示例.png` 的识别，`failing_cases=[]`。同一主流程在 `master`（`0771c17` 独立终验）运行 `uv run pytest -p no:cacheprovider -q`，结果为 **1789 passed, 0 failed, 0 skipped (668.59s)**。
 
 ### 自修复证据
 

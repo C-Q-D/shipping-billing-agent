@@ -982,9 +982,13 @@ def _ground_parties(
         needs_source_party = (
             has_payment_direction or alternative or transport_only or matches_transport
         )
+        alternative_agency = bool(alternative and _matches_agency_declaration(model, alternative))
         contradicts_source = printed or (
             needs_source_party
-            and not (alternative and entity_matches(model, alternative, profiles))
+            and not (
+                alternative
+                and (entity_matches(model, alternative, profiles) or alternative_agency)
+            )
         )
         if contradicts_source:
             updates[field] = printed
@@ -997,6 +1001,8 @@ def _ground_parties(
                     actual=model,
                 )
             )
+        elif not printed and alternative_agency:
+            updates[field] = alternative
         elif has_payment_direction and field in ("payer_hint", "payee_hint"):
             # A labeled issuer or recipient does not supply the missing leg of the instruction.
             updates[field] = printed

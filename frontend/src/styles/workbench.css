@@ -1164,6 +1164,7 @@ body[data-theme="dark"] .lumno-modal-panel {
   overflow-y: auto;
   overflow-x: hidden;
   padding: 12px;
+  scroll-padding-bottom: 140px;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -1635,6 +1636,7 @@ body[data-theme="dark"] .wb-doc-node[data-active="true"] {
   border-radius: var(--lumno-radius-md);
   border: 1px solid transparent;
   font-size: var(--lumno-font-size-sm);
+  scroll-margin-bottom: 140px;
   display: flex;
   flex-direction: column;
   gap: 3px;

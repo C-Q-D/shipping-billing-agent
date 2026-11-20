@@ -295,6 +295,55 @@ def test_party_agency_declaration_requires_the_whole_printed_entity(
     assert record.review_status is expected_status
 
 
+@pytest.mark.parametrize(
+    ("printed", "model", "blocked"),
+    [
+        (
+            _ZIM,
+            "Zim American Integrated Shipping Services Co., LLC As Agents for Zim Integrated "
+            "Shipping Services Ltd.",
+            False,
+        ),
+        (
+            f"{_ZIM} (HK)",
+            "Zim American Integrated Shipping Services Co., LLC (UK) As Agents for Zim Integrated "
+            "Shipping Services Ltd.",
+            True,
+        ),
+    ],
+    ids=["zim-counterpart-space-variant", "zim-counterpart-branch-mismatch"],
+)
+def test_party_agency_declaration_counterpart_fallback_without_printed_hint(
+    printed: str, model: str, blocked: bool
+) -> None:
+    doc = _document(
+        f"Invoice No. INV-13B\nIssuer: {printed}\nHandling Charge 100 USD\nTotal USD 100"
+    )
+    assert extract_document_by_rules(doc).extraction.payee_hint is None
+    client = _model(
+        issuer=printed,
+        payee_hint=model,
+        charges=[{"raw_charge_name": "Handling Charge", "amount": "100", "currency": "USD"}],
+    )
+
+    result = run_billing_pipeline([doc], printed, llm_client=client)
+
+    (record,) = result.records
+    alerts = {
+        alert.field
+        for alert in record.validation_alerts
+        if alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT
+        and alert.severity is AlertSeverity.BLOCKER
+    }
+    if blocked:
+        assert "payee_hint" in alerts
+        assert record.review_status is ReviewStatus.NEEDS_REVIEW
+    else:
+        assert alerts == set()
+        assert record.payee_hint == printed
+        assert record.review_status is ReviewStatus.AUTO_READY
+
+
 def test_c08_cannot_approve_a_zeroed_charge_with_a_name_variant() -> None:
     doc = _document(
         f"{_INVOICE}Handling Charge 100.00 USD\nTotal USD 100.00\n"
