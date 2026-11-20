@@ -67,6 +67,7 @@ class _Unchanged(Enum):
 _UNCHANGED = _Unchanged.VALUE
 _ISOLATED_BILLS = "isolated_bills"
 _SHARED_BASELINE_SNAPSHOT = "shared_baseline_snapshot"
+_SHARED_BASELINE_SCOPED = "shared_baseline_scoped"
 _ENTITY_PROFILE_SNAPSHOT = "entity_profile_snapshot"
 _SYNCED_WITHOUT_SNAPSHOT = "synced_without_snapshot"
 _BASELINE_SYNC_SELECTION = "baseline_sync_selection"
@@ -292,6 +293,7 @@ class BillingRepository:
                 _SHARED_BASELINE_SNAPSHOT: _load_bill_snapshot(
                     metadata.get(_SHARED_BASELINE_SNAPSHOT)
                 ),
+                _SHARED_BASELINE_SCOPED: metadata.get(_SHARED_BASELINE_SCOPED) is True,
                 _ENTITY_PROFILE_SNAPSHOT: (
                     AccountingEntityProfile.model_validate(profile) if profile is not None else None
                 ),
@@ -361,11 +363,13 @@ class BillingRepository:
                     metadata[_SHARED_BASELINE_SNAPSHOT] = _bill_snapshot_values(
                         changes.pop(_SHARED_BASELINE_SNAPSHOT)
                     )
+                    metadata[_SHARED_BASELINE_SCOPED] = True
                 if "batch_existing_bills" in changes:
                     metadata[_ISOLATED_BILLS] = _bill_snapshot_values(
                         changes.pop("batch_existing_bills")
                     )
                     metadata.pop(_SHARED_BASELINE_SNAPSHOT, None)
+                    metadata.pop(_SHARED_BASELINE_SCOPED, None)
                 if _ENTITY_PROFILE_SNAPSHOT in changes:
                     profile = changes.pop(_ENTITY_PROFILE_SNAPSHOT)
                     metadata[_ENTITY_PROFILE_SNAPSHOT] = (
@@ -860,7 +864,14 @@ class BillingRepository:
                     (batch_id, record.id),
                 )
                 counts["updated" if previous is not None else "created"] += 1
-            _mark_batch_synced_without_snapshot(connection, batch_id, metadata)
+            if (
+                counts["created"] > 0
+                or counts["updated"] > 0
+                or connection.execute(
+                    "SELECT 1 FROM baseline_sync_items WHERE batch_id = ? LIMIT 1", (batch_id,)
+                ).fetchone() is not None
+            ):
+                _mark_batch_synced_without_snapshot(connection, batch_id, metadata)
         return counts
 
     sync_baseline = sync_batch_to_baseline
@@ -1325,13 +1336,15 @@ def configured_entity_profile(
     name: str, profiles: Sequence[AccountingEntityProfile]
 ) -> AccountingEntityProfile | None:
     """Resolve an exact name or alias before considering unique normalized matches."""
-    return resolve_party_profile(name, profiles)
+    return resolve_party_profile(name, profiles, allow_branch_fallback=False)
 
 
 def _bill_entity_matches(
     name: str, entity: str, profiles: Sequence[AccountingEntityProfile]
 ) -> bool:
-    return entity_matches(name, entity, profiles, allow_unconfigured_fallback=False)
+    return entity_matches(
+        name, entity, profiles, allow_unconfigured_fallback=False, allow_branch_fallback=False
+    )
 
 
 def _existing_bill_rows(

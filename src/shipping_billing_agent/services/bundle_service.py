@@ -15,7 +15,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, StringConstraints
 
 from ..domain.currency import is_valid_iso4217
-from ..domain.entity_resolver import entity_matches
+from ..domain.entity_resolver import _name_with_punctuation, entity_matches
 from ..domain.models import (
     AccountingEntityProfile,
     BatchStatus,
@@ -41,6 +41,7 @@ from ..domain.serializer import _json_values
 from ..gateways.url_guard import HTTP_URL_PATTERN
 from ..storage import BillingRepository, ResourceNotFoundError
 from ..storage.db import utc_timestamp
+from ..storage.repositories import _bill_entity_matches
 from .batch_service import (
     ServiceValidationError,
     SourceChannel,
@@ -164,6 +165,58 @@ def _has_ocr_flag(document: ParsedDocument) -> bool:
     )
 
 
+def _require_snapshot_if_synced(repository: BillingRepository, batch: Mapping[str, Any]) -> None:
+    if batch["synced_without_snapshot"] or repository.has_baseline_sync_items(batch["id"]):
+        raise ServiceValidationError(
+            "MISSING_BASELINE_SNAPSHOT",
+            "该历史共享库批次缺少同步前基线快照，已同步基线后无法无损导出复核包",
+            status_code=409,
+        )
+
+
+def _scope_legacy_baseline(
+    repository: BillingRepository,
+    batch: Mapping[str, Any],
+    snapshot: Sequence[ExistingBillRecord],
+    profile: AccountingEntityProfile | None,
+    current_profiles: Sequence[AccountingEntityProfile] | None,
+) -> list[ExistingBillRecord]:
+    entity = batch["accounting_entity"].strip()
+    profiles = [profile] if profile is not None else []
+    profile_names = (
+        set(map(_name_with_punctuation, (profile.canonical_name, *profile.aliases)))
+        if profile is not None
+        else set()
+    )
+    if current_profiles is not None and _name_with_punctuation(entity) not in profile_names:
+        profile_names.clear()
+
+    def belongs_to_batch(name: str) -> bool:
+        if name.strip() == entity:
+            return True
+        # A legacy snapshot held the full table. A punctuation-insensitive match alone
+        # cannot prove which ledger owned one of its rows.
+        return (
+            _name_with_punctuation(name) in profile_names
+            and _bill_entity_matches(name, entity, profiles)
+            and (current_profiles is None or _bill_entity_matches(name, entity, current_profiles))
+        )
+
+    bills = [bill for bill in snapshot if belongs_to_batch(bill.accounting_entity)]
+    bill_ids = {bill.id for bill in bills}
+    unproven_scope = current_profiles is not None and snapshot and not (profile_names or bills)
+    if unproven_scope or any(
+        not belongs_to_batch(record.accounting_entity)
+        or (
+            record.matched_existing_bill_id is not None
+            and record.matched_existing_bill_id not in bill_ids
+        )
+        for record in batch["records"]
+    ):
+        _require_snapshot_if_synced(repository, batch)
+    return bills
+
+
 def export_review_bundle(repository: BillingRepository, batch_id: str) -> dict[str, Any]:
     """Capture a consistent snapshot of a completed batch and its audit history."""
     with repository.transaction(write=False) as transaction:
@@ -174,23 +227,24 @@ def export_review_bundle(repository: BillingRepository, batch_id: str) -> dict[s
             )
         bills = batch["batch_existing_bills"]
         snapshot = batch["shared_baseline_snapshot"]
-        if bills is None and snapshot is None and (
-            batch["synced_without_snapshot"] or transaction.has_baseline_sync_items(batch_id)
-        ):
-            raise ServiceValidationError(
-                "MISSING_BASELINE_SNAPSHOT",
-                "该历史共享库批次缺少同步前基线快照，已同步基线后无法无损导出复核包",
-                status_code=409,
-            )
-        if bills is None:
-            bills = snapshot
+        missing_baseline = bills is None and snapshot is None
+        if missing_baseline:
+            _require_snapshot_if_synced(transaction, batch)
         profile = batch["entity_profile_snapshot"]
-        if bills is None or not batch["has_entity_profile_snapshot"]:
+        current_profiles = None
+        if missing_baseline or not batch["has_entity_profile_snapshot"]:
             scope = _load_batch_scope(transaction, batch, batch["accounting_entity"])
-            if bills is None:
+            if missing_baseline:
                 bills = scope.existing_bills
             if not batch["has_entity_profile_snapshot"]:
                 profile = scope.entity_profile
+                current_profiles = scope.profiles
+        if bills is None:
+            bills = (
+                snapshot
+                if batch["shared_baseline_scoped"]
+                else _scope_legacy_baseline(transaction, batch, snapshot, profile, current_profiles)
+            )
         audit_by_record = defaultdict(list)
         for entry in transaction.list_review_audit_logs(batch_id):
             audit_by_record[entry["record_id"]].append(entry)

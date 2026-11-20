@@ -312,7 +312,7 @@ def _restore_decisions(
         if record.id in ambiguous_source_ids:
             restored.append(
                 _require_reextraction_review(
-                    record, "同源单据重新提取后无法唯一对应已复核费用行，请重新核对原件"
+                    record, "同源单据重新提取后无法唯一对应原费用行，请重新核对原件"
                 )
             )
             continue
@@ -741,23 +741,19 @@ def _same_source_line_matches(
             alignment.matches[remaining_new[0].id] = remaining_old[0]
             continue
 
-        if any(
-            line.review_status in _DECISIONS
-            or line.human_review_history
-            or line.human_overrides
-            or any(map(_is_reextraction_warning, line.raw_parse_issues))
-            for line in remaining_old
-        ):
-            alignment.ambiguous_ids.update(line.id for line in remaining_new)
-
+        alignment.ambiguous_ids.update(line.id for line in remaining_new)
         old_by_index = defaultdict(list)
         for line in remaining_old:
             old_by_index[line.source_line_index].append(line)
         new_index_counts = Counter(line.source_line_index for line in remaining_new)
+        # Keep a decided fee's audit history at a unique position and require a new review.
+        # An automatic line has no audit to retain and its ID may carry a sync receipt.
         for line in remaining_new:
             index = line.source_line_index
             if len(old_by_index[index]) == new_index_counts[index] == 1:
-                alignment.matches[line.id] = old_by_index[index][0]
+                old = old_by_index[index][0]
+                if old.review_status in _DECISIONS:
+                    alignment.matches[line.id] = old
     return alignment
 
 

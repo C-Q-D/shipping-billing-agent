@@ -117,7 +117,9 @@ def _name_with_punctuation(name: str) -> str:
     return " ".join(normalize("NFKC", name).casefold().split())
 
 
-def _resolve_party_key(name: str, profiles: Sequence[AccountingEntityProfile]) -> _PartyMatch:
+def _resolve_party_key(
+    name: str, profiles: Sequence[AccountingEntityProfile], allow_branch_fallback: bool = True
+) -> _PartyMatch:
     name = name.strip()
     if not name or not profiles:
         return _PartyMatch()
@@ -154,7 +156,7 @@ def _resolve_party_key(name: str, profiles: Sequence[AccountingEntityProfile]) -
         if len(matches) == 1:
             return _PartyMatch(matches[0], matched_name=True)
         return _PartyMatch(ambiguous=True)
-    if len(by_stem) == 1:
+    if allow_branch_fallback and len(by_stem) == 1:
         index, suffixes = next(iter(by_stem.items()))
         if not branches or suffixes == {()}:
             return _PartyMatch(index)
@@ -162,9 +164,9 @@ def _resolve_party_key(name: str, profiles: Sequence[AccountingEntityProfile]) -
 
 
 def resolve_party_profile(
-    name: str, profiles: Sequence[AccountingEntityProfile]
+    name: str, profiles: Sequence[AccountingEntityProfile], *, allow_branch_fallback: bool = True
 ) -> AccountingEntityProfile | None:
-    index = _resolve_party_key(name, profiles).profile_index
+    index = _resolve_party_key(name, profiles, allow_branch_fallback).profile_index
     return profiles[index] if index is not None else None
 
 
@@ -174,11 +176,12 @@ def entity_matches(
     profiles: Sequence[AccountingEntityProfile] = (),
     *,
     allow_unconfigured_fallback: bool = True,
+    allow_branch_fallback: bool = True,
 ) -> bool:
     if not party_name or not party_name.strip() or not target_entity.strip():
         return False
-    party_match = _resolve_party_key(party_name, profiles)
-    target_match = _resolve_party_key(target_entity, profiles)
+    party_match = _resolve_party_key(party_name, profiles, allow_branch_fallback)
+    target_match = _resolve_party_key(target_entity, profiles, allow_branch_fallback)
     if party_match.ambiguous or target_match.ambiguous:
         return False
     if party_match.profile_index != target_match.profile_index:
@@ -192,7 +195,8 @@ def entity_matches(
     target_stem, target_branch = _party_key(target_entity)
     if party_match.profile_index is None:
         return bool(party_stem and party_stem == target_stem) and (
-            party_branch == target_branch or not (party_branch and target_branch)
+            party_branch == target_branch
+            or (allow_branch_fallback and not (party_branch and target_branch))
         )
     return not (
         party_stem == target_stem

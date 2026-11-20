@@ -1062,8 +1062,9 @@ def test_same_source_retry_holds_all_ambiguous_fees_for_review(make_service, old
     assert retried["failed_documents"] == []
     rows = repository.list_billing_records(batch_id)
     assert [row.amount for row in rows] == list(new_fees)
-    assert [row.id for row in rows[:2]] == [reviewed["id"], other["id"]]
-    assert rows[2].id not in {reviewed["id"], other["id"]}
+    assert rows[0].id == reviewed["id"]
+    assert len({row.id for row in rows}) == 3
+    assert other["id"] not in {row.id for row in rows}
     assert [action.action for action in rows[0].human_review_history] == ["PATCH_RECORD", "REJECT"]
     assert rows[0].human_overrides == {}
     assert repository.list_review_audit_logs(batch_id) == logs
@@ -1080,6 +1081,48 @@ def test_same_source_retry_holds_all_ambiguous_fees_for_review(make_service, old
         "NEEDS_REVIEW"
     }
     assert serialize_records(repository.list_billing_records(batch_id), "official") == []
+
+
+def test_same_source_retry_does_not_assign_old_automatic_ids_to_ambiguous_fees(make_service):
+    ocr = FixtureOcr(results={b"same": _invoice_with_fees(5, 7)})
+    service = make_service(ocr=ocr)
+    batch = _create(service, ("invoice.png", b"same"))
+    old_ids = {row["id"] for row in batch["records"]}
+    assert {row["review_status"] for row in batch["records"]} == {"AUTO_READY"}
+
+    ocr.results[b"same"] = _invoice_with_fees(6, 8)
+    retried = ReviewService(service).retry_or_replace_document(
+        batch["id"], batch["documents"][0]["id"]
+    )
+
+    assert retried["failed_documents"] == []
+    assert [row["charge_details"]["amount"] for row in retried["records"]] == [6, 8]
+    for row in retried["records"]:
+        assert row["id"] not in old_ids
+        assert (row["operation"], row["review_status"]) == ("PENDING_REVIEW", "NEEDS_REVIEW")
+        assert any(alert["code"] == "OCR_SUSPICIOUS_FLAG" for alert in row["validation_alerts"])
+
+
+def test_same_source_retry_preserves_an_unaligned_edit_without_reassigning_its_id(make_service):
+    ocr = FixtureOcr(results={b"same": _invoice_with_fees(5, 7)})
+    service = make_service(ocr=ocr)
+    review = ReviewService(service)
+    batch = _create(service, ("invoice.png", b"same"))
+    batch_id = batch["id"]
+    first = batch["records"][0]
+    edited = review.patch_record(batch_id, first["id"], {"payment_term": "PP"})
+    assert edited["records"][0]["review_status"] == "AUTO_READY"
+    repository = service.repository
+    before = repository.list_billing_records(batch_id)
+    logs = repository.list_review_audit_logs(batch_id)
+
+    ocr.results[b"same"] = _invoice_with_fees(6, 8)
+    retried = review.retry_or_replace_document(batch_id, first["source_doc_id"])
+
+    (failure,) = retried["failed_documents"]
+    assert "未能对齐" in failure["error_message"]
+    assert repository.list_billing_records(batch_id) == before
+    assert repository.list_review_audit_logs(batch_id) == logs
 
 
 def test_same_source_retry_preserves_audit_when_neither_reviewed_fee_can_be_aligned(make_service):

@@ -21,6 +21,7 @@ from ..agent.graph import BillingGraphInput, _BillingNodes, _BillingState, _pack
 from ..config.limits import ResourceLimits
 from ..config.settings import AppSettings, get_settings
 from ..domain.currency import is_valid_iso4217
+from ..domain.entity_resolver import _name_with_punctuation, normalize_party_name
 from ..domain.models import (
     AccountingEntityProfile,
     AlertSeverity,
@@ -179,27 +180,60 @@ def _load_batch_scope(
 ) -> _BatchScope:
     bills = batch["batch_existing_bills"]
     same_entity = entity.strip() == batch["accounting_entity"].strip()
-    profile_snapshot = batch.get("entity_profile_snapshot") if same_entity else None
-    if bills is not None and same_entity and batch.get("has_entity_profile_snapshot"):
-        profiles = [profile_snapshot] if profile_snapshot is not None else []
-    else:
-        profiles = [
-            AccountingEntityProfile.model_validate(profile)
-            for profile in repository.list_accounting_entities()
+    db_profiles = [
+        AccountingEntityProfile.model_validate(profile)
+        for profile in repository.list_accounting_entities()
+    ]
+    has_profile_snapshot = same_entity and batch.get("has_entity_profile_snapshot")
+    profile_snapshot = batch["entity_profile_snapshot"] if has_profile_snapshot else None
+    explicit_null = has_profile_snapshot and profile_snapshot is None
+    if has_profile_snapshot:
+        # An explicit null freezes the target name without inheriting current database aliases.
+        target = profile_snapshot or AccountingEntityProfile(canonical_name=entity)
+        canonical = target.canonical_name.strip()
+        canonical_key = _name_with_punctuation(canonical)
+        equivalent_canonicals = [
+            profile.canonical_name.strip()
+            for profile in db_profiles
+            if _name_with_punctuation(profile.canonical_name) == canonical_key
         ]
-        if profile_snapshot is not None:
-            canonical = profile_snapshot.canonical_name.strip()
-            profiles = [
-                profile for profile in profiles if profile.canonical_name.strip() != canonical
+        if canonical not in equivalent_canonicals and len(equivalent_canonicals) == 1:
+            canonical = equivalent_canonicals[0]
+        normalized_target = normalize_party_name(target.canonical_name)
+        saved_names = {canonical_key, *map(_name_with_punctuation, target.aliases)}
+        shadowed_aliases = saved_names if bills is not None or explicit_null else set()
+        profiles = [target]
+        for profile in db_profiles:
+            name = _name_with_punctuation(profile.canonical_name)
+            # A portable baseline keeps its old aliases while registered punctuation siblings
+            # still disambiguate printed names. Live bills use current canonical ownership.
+            reclaimed_alias = (
+                bills is not None
+                and name in saved_names
+                and normalize_party_name(profile.canonical_name) != normalized_target
+            )
+            if profile.canonical_name.strip() == canonical or reclaimed_alias:
+                continue
+            aliases = [
+                alias
+                for alias in profile.aliases
+                if _name_with_punctuation(alias) not in shadowed_aliases
             ]
-            profiles.append(profile_snapshot)
+            if aliases != profile.aliases:
+                profile = profile.model_copy(update={"aliases": aliases})
+            profiles.append(profile)
+    else:
+        profiles = db_profiles
+    entity_profile = None if explicit_null else configured_entity_profile(entity, profiles)
+    bill_profiles = () if explicit_null else profiles
     if bills is None:
         bills = repository.list_existing_bills()
     return _BatchScope(
         profiles=profiles,
-        entity_profile=configured_entity_profile(entity, profiles),
+        entity_profile=entity_profile,
         existing_bills=[
-            bill for bill in bills if _bill_entity_matches(bill.accounting_entity, entity, profiles)
+            bill for bill in bills
+            if _bill_entity_matches(bill.accounting_entity, entity, bill_profiles)
         ],
         charge_dictionary=[
             ChargeDictionaryItem.model_validate(item)
@@ -308,6 +342,7 @@ def _batch_detail(batch: Mapping[str, Any]) -> dict[str, Any]:
                 "failed_document_alerts",
                 "batch_existing_bills",
                 "shared_baseline_snapshot",
+                "shared_baseline_scoped",
                 "entity_profile_snapshot",
                 "has_entity_profile_snapshot",
                 "synced_without_snapshot",

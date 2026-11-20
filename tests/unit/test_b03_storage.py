@@ -952,6 +952,7 @@ def test_batch_metadata_preserves_legacy_baseline_mode_and_exact_values(
     batch = repository.create_batch(_ENTITY, batch_existing_bills=isolated)
     batch_id = batch["id"]
     assert repository.get_batch(batch_id)["batch_existing_bills"] == isolated
+    assert repository.get_batch(batch_id)["shared_baseline_scoped"] is False
     with repository.db.connect() as connection:
         row = connection.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
         assert _uses_isolated_baseline(row) is (isolated is not None)
@@ -970,12 +971,14 @@ def test_batch_metadata_preserves_legacy_baseline_mode_and_exact_values(
     saved = reopened.get_batch(batch_id)
     assert saved["batch_existing_bills"] == isolated
     assert saved["shared_baseline_snapshot"] == changes.get("shared_baseline_snapshot")
+    assert saved["shared_baseline_scoped"] is (mode == "shared")
     assert saved["entity_profile_snapshot"] == new_profile
     assert saved["synced_without_snapshot"] is False
     with reopened.db.connect() as connection:
         row = connection.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
         envelope = loads_decimal_json(row["batch_existing_bills_json"])
         assert envelope["entity_profile_snapshot"] == new_profile.model_dump()
+        assert ("shared_baseline_scoped" in envelope) is (mode == "shared")
         assert _uses_isolated_baseline(row) is (isolated is not None)
 
 
@@ -1008,6 +1011,30 @@ def _batch_with_sync_receipt(
                 (dumps_decimal_json({"entity_profile_snapshot": profile.model_dump()}), batch_id),
             )
     return batch_id, receipt["existing_bill_id"]
+
+
+@pytest.mark.parametrize("prior_sync", [False, True])
+def test_zero_row_sync_marks_only_batches_with_prior_receipts(
+    repository: BillingRepository, prior_sync: bool
+) -> None:
+    if prior_sync:
+        batch_id, _ = _batch_with_sync_receipt(repository, _ENTITY)
+        (record,) = repository.list_billing_records(batch_id)
+    else:
+        batch_id = _completed_batch(repository)["id"]
+        repository.upsert_source_documents(batch_id, [_document("doc")])
+        record = _record()
+    repository.upsert_billing_record(
+        batch_id, record.model_copy(update={"review_status": ReviewStatus.REJECTED})
+    )
+    assert repository.get_batch(batch_id)["synced_without_snapshot"] is False
+    receipts = _sync_items(repository, batch_id)
+    assert len(receipts) == int(prior_sync)
+
+    assert repository.sync_batch_to_baseline(batch_id) == {"created": 0, "updated": 0, "skipped": 0}
+    reopened = BillingRepository(DatabaseManager(repository.db.path))
+    assert reopened.get_batch(batch_id)["synced_without_snapshot"] is prior_sync
+    assert _sync_items(reopened, batch_id) == receipts
 
 
 @pytest.mark.parametrize("operation", ["single", "scoped-clear", "global-clear", "replace"])
@@ -1156,9 +1183,19 @@ def test_configured_same_stem_names_require_a_unique_profile(repository: Billing
         ("Harbor Orchid Logistics (LAX)", "Harbor Orchid Logistics"),
     ],
 )
-def test_unconfigured_entities_are_isolated_in_shared_bill_operations(
-    repository: BillingRepository, entity: str, other_entity: str
+@pytest.mark.parametrize("configured_headquarters", [False, True])
+def test_unlisted_branches_are_isolated_in_shared_bill_operations(
+    repository: BillingRepository, entity: str, other_entity: str, configured_headquarters: bool
 ) -> None:
+    headquarters = "Harbor Orchid Logistics"
+    if configured_headquarters:
+        profile = AccountingEntityProfile(canonical_name=headquarters)
+        repository.create_accounting_entity(profile)
+        assert entity_matches(entity, other_entity, [profile])
+        assert not entity_matches(entity, other_entity, [profile], allow_branch_fallback=False)
+        assert configured_entity_profile(f"{headquarters} (LAX)", [profile]) is None
+    else:
+        assert not entity_matches(entity, other_entity, allow_branch_fallback=False)
     bill = repository.create_existing_bill(_bill("scoped", accounting_entity=entity))
     other = repository.create_existing_bill(_bill("other", accounting_entity=other_entity))
 
