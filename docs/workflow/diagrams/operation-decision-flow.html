@@ -17,7 +17,7 @@
 - 颜色变量都以 --dg- 开头。文字色、次要文字色、卡片底色、分隔线对到宿主的主题变量（--foreground、--muted-foreground、--card、--border），宿主没有这些变量时用逗号后面的固定值；分类色（青、绿、品红、琥珀，回流用橙）是模板自己的两套取值。深浅两套按 prefers-color-scheme 切换：浅色是默认，深色写在 <style> 末尾的 @media 里。
 - 动画：一轮 12 秒（时序图 14 秒），每档 5%。第 k 档的元素用类 igK 闪亮，导线用 dwK 画出（长度类 lNNN 等于路径长度），彗星用 tK 出发；88% 起全部熄灭再循环。系统设了"减少动态"时整张静止全亮。增删步骤时同步改这三种类。
 - 一个页面只放一张图：各模板的类名、动画名相同但取值不同，两张不同模板的图放进同一页会互相覆盖。
-- 要换的内容在 <!-- 内容 --> 和 <!-- 内容结束 --> 之间，其余是固定部分。放不下就删字或换行，不缩字号。
+- 要换的内容在“内容”与“内容结束”标记之间，其余是固定部分。放不下就删字或换行，不缩字号。
 -->
 <meta charset="utf-8">
 <style>
@@ -174,6 +174,10 @@
 .l501{--dg-len:501}
 .l881{--dg-len:881}
 .l891{--dg-len:891}
+body{margin:24px auto;max-width:760px;padding:0 16px;background:#ffffff}
+@media (prefers-color-scheme: dark){body{background:#07090c}}
+</style>
+<div class="dg">
 <!-- 内容 -->
 <svg width="712" height="922" viewBox="0 0 712 922" role="img" aria-label="费用操作类型判定与校验门禁流程图，9 步 2 处分支">
 <defs>
