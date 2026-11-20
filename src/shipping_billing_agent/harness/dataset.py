@@ -418,8 +418,9 @@ def _prealert(ctx: EvalContext) -> None:
         )
 
 
-def _partial_update(ctx: EvalContext, *, amount_change: bool) -> None:
+def _partial_update_branch(ctx: EvalContext, *, amount_change: bool) -> None:
     reference = "DN-202609-001"
+    field = "amount" if amount_change else "payment_term"
     notice_lines = (
         ("Handling Charge 40.00",)
         if amount_change
@@ -444,7 +445,7 @@ def _partial_update(ctx: EvalContext, *, amount_change: bool) -> None:
             version=2 if updated else 1,
         )
         result = ctx.run(documents, _VENDOR, existing_bills=[baseline])
-        label = "V2" if updated else "V1"
+        label = f"{field} {'V2' if updated else 'V1'}"
         amount = "40.00" if amount_change else "30.00"
         ctx.score(
             label,
@@ -477,6 +478,11 @@ def _partial_update(ctx: EvalContext, *, amount_change: bool) -> None:
             [(Decimal("40.00") if amount_change else None, f"{reference}/HC")],
             [(r.raw_explicit_amount, r.matched_bill_ref) for r in result.records],
         )
+
+
+def _partial_update(ctx: EvalContext) -> None:
+    _partial_update_branch(ctx, amount_change=False)
+    _partial_update_branch(ctx, amount_change=True)
 
 
 def _credit(ctx: EvalContext) -> None:
@@ -841,6 +847,7 @@ def _zero_and_missing(ctx: EvalContext) -> None:
     (missing,) = ctx.parse([("missing-detail.pdf", _invoice("ZERO-2", "Total USD 100.00"))])
     result = ctx.run([missing], _VENDOR, rule_only=True)
     ctx.score("仅总额无明细触发失败卡", result, [], failure_doc_id=missing.doc_id)
+    _mixed_exports(ctx)
 
 
 def _office(ctx: EvalContext, *, filename: str, amounts: tuple[str, ...]) -> None:
@@ -944,8 +951,7 @@ def build_eval_cases() -> tuple[EvalCase, ...]:
         EvalCase("C02_REAL_PDF1_GENERAL_NOTICE", _general_notice, "PDF示例账单1.pdf"),
         EvalCase("C03_REAL_PDF2_DC108478_MULTI_LINE", _multi_line_notice, "PDF 示例账单2.pdf"),
         EvalCase("C04_REAL_EML_PREALERT_NO_GUESS", _prealert, "深圳容宇 PRE-ALERT*.eml"),
-        EvalCase(f"{_UPDATE}/payment_term", partial(_partial_update, amount_change=False)),
-        EvalCase(f"{_UPDATE}/amount", partial(_partial_update, amount_change=True)),
+        EvalCase(_UPDATE, _partial_update),
         EvalCase("C06_SUPPLIER_CREDIT_NOTE_AP", _credit),
         EvalCase("C07_MULTI_CURRENCY_TAX_INVOICE", _tax),
         EvalCase(ATTACK_CASE_ID, _injection),
@@ -962,5 +968,4 @@ def build_eval_cases() -> tuple[EvalCase, ...]:
                 ("docx", "b01_interleaved.docx", ("65.25",)),
             )
         ),
-        EvalCase("MIXED_EXPORT_MODES", _mixed_exports),
     )

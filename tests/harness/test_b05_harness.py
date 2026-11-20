@@ -171,16 +171,18 @@ def _assert_unscored(result: EvalRunResult) -> None:
 def test_two_complete_offline_trials(offline: EvalRunResult) -> None:
     assert offline.status == "COMPLETED", offline.report_json["failing_cases"]
     assert offline.actual_trials == offline.k_trials == 2
-    assert offline.total_cases == 18
+    assert offline.total_cases == 16
     report = offline.report_json
-    assert report["executed_cases"] == 36
+    assert report["executed_cases"] == 32
     assert report["ocr_calls"] == 2
     assert report["llm_calls"] == 10
     assert report["failing_cases"] == []
     assert {row["status"] for row in report["case_results"]} == {"PASSED"}
-    assert {
-        row["group_id"][:3] for row in report["case_results"] if row["group_id"].startswith("C")
-    } == {f"C{number:02}" for number in range(1, 14)}
+    groups = {row["group_id"] for row in report["case_results"]}
+    assert len(groups) == 13
+    assert {group.partition("_")[0] for group in groups} == {
+        f"C{number:02}" for number in range(1, 14)
+    }
     for metric in METRICS:
         counts = report[metric]
         assert counts["denominator"] > 0
@@ -436,9 +438,9 @@ def test_c13_office_subcases_are_reported_separately(offline, suffix, filename, 
 
 @pytest.mark.parametrize(("branch", "amount"), [("payment_term", "30.00"), ("amount", "40.00")])
 def test_c05_partial_update_inherits_fields_against_both_baselines(offline, branch, amount) -> None:
-    checks = _checks(offline, f"C05_PARTIAL_UPDATE_DN202609001/{branch}")
+    checks = _checks(offline, "C05_PARTIAL_UPDATE_DN202609001")
     for baseline, operation in (("V1", "UPDATE"), ("V2", "NO_CHANGE")):
-        row = checks[f"{baseline} 第 1 行"]["actual"]
+        row = checks[f"{branch} {baseline} 第 1 行"]["actual"]
         assert (row["operation"], row["amount"], row["currency"], row["payment_term"]) == (
             operation,
             amount,
@@ -451,8 +453,8 @@ def test_c05_partial_update_inherits_fields_against_both_baselines(offline, bran
             "AR",
         )
     diff = ["amount", "30.00", "40.00"] if branch == "amount" else ["payment_term", "PP", "CC"]
-    assert checks["V1 字段变动"]["actual"] == [diff]
-    assert checks["V2 字段变动"]["actual"] == []
+    assert checks[f"{branch} V1 字段变动"]["actual"] == [diff]
+    assert checks[f"{branch} V2 字段变动"]["actual"] == []
 
 
 def test_c08_offline_fake_is_blocked_without_self_repair_evidence(offline: EvalRunResult) -> None:
@@ -674,7 +676,7 @@ def test_missing_real_samples_are_an_explicit_failure(tmp_path, missing_director
 
 
 def test_mixed_export_uses_three_nonempty_schema_valid_payloads(offline: EvalRunResult) -> None:
-    checks = _checks(offline, "MIXED_EXPORT_MODES")
+    checks = _checks(offline, ZERO)
     for mode, count in (("official", 3), ("full_standard", 5), ("audit", 6)):
         assert checks[f"六条混合记录 {mode} 导出数"]["actual"] == count
         assert checks[f"六条混合记录 {mode} Schema"]["actual"] == "通过"

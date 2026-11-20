@@ -6,7 +6,7 @@ import asyncio
 import os
 import sys
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, redirect_stdout
 from enum import StrEnum
 from importlib import import_module
@@ -42,9 +42,7 @@ _IGNORED_FILE_ATTRIBUTES = (
     FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT
 )
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
-_HARNESS_RUNNER_MODULE = "shipping_billing_agent.harness.runner"
-_EvalReport = Mapping[str, Any] | None
-EvalRunner = Callable[..., _EvalReport | Awaitable[_EvalReport]]
+EvalRunner = Callable[..., object]
 
 app = typer.Typer(help="多格式文档解析的航运智能账单助手 CLI", no_args_is_help=True)
 
@@ -286,42 +284,28 @@ def serve(
         uvicorn.run(application, host=bind_host, port=bind_port, workers=1)
 
 
-def _discover_eval_runner() -> EvalRunner | None:
-    try:
-        module = import_module(_HARNESS_RUNNER_MODULE)
-    except ModuleNotFoundError as exc:
-        if exc.name != _HARNESS_RUNNER_MODULE:
-            raise
-        return None
-    return getattr(module, "run_eval_suite", None)
-
-
 def _resolve_eval_runner(
     context: typer.Context, mode: _EvalMode, settings: AppSettings
 ) -> EvalRunner | None:
-    if mode is not _EvalMode.OFFLINE_DETERMINISTIC and not settings.is_llm_configured():
-
-        def missing_credentials(**_options: Any) -> _EvalReport:
-            return {
-                "status": "UNVERIFIED",
-                "model_name": settings.llm_model,
-                "error_message": "LIVE 评测需要有效的 LLM 配置和凭据，未运行评测。",
-            }
-
-        return missing_credentials
-
     # An embedded caller can pass its eval_runner as the Typer context object.
-    if context.obj is not None:
-        if not callable(context.obj):
-            raise ValueError("注入的 eval_runner 须可调用")
-        return context.obj
-    return _discover_eval_runner()
+    if context.obj is None:
+        return None
+    if mode is not _EvalMode.OFFLINE_DETERMINISTIC and (
+        settings.llm_base_url is None
+        or settings.llm_api_key is None
+        or not settings.is_llm_configured()
+    ):
+        return None
+    if not callable(context.obj):
+        raise ValueError("注入的 eval_runner 须可调用")
+    return context.obj
 
 
 async def _post_eval_run(
     service: BatchService, runner: EvalRunner | None, mode: _EvalMode, k_trials: int
 ) -> str:
-    application = _create_api_app(batch_service=service, eval_runner=runner)
+    options = {} if runner is None else {"eval_runner": runner}
+    application = _create_api_app(batch_service=service, **options)
     # In-process transport shares the API's result validation and persistence.
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=application), base_url="http://localhost"
@@ -332,6 +316,23 @@ async def _post_eval_run(
     if response.status_code != 201:
         raise ValueError(response.json()["message"])
     return response.text
+
+
+def _print_eval_differences(failures: object) -> None:
+    for failure in failures if isinstance(failures, list) else [failures]:
+        if not isinstance(failure, dict):
+            typer.echo(f"失败用例 {dumps_decimal_json(failure)}", err=True)
+            continue
+        line = f"失败用例 {failure.get('case_id', '未知')}"
+        if (trial := failure.get("trial")) is not None:
+            line += f"（第 {trial} 轮）"
+        if reason := failure.get("reason"):
+            line += f" · {reason}"
+        if "expected" in failure and "actual" in failure:
+            expected = dumps_decimal_json(failure["expected"])
+            actual = dumps_decimal_json(failure["actual"])
+            line += f" · expected {expected} | actual {actual}"
+        typer.echo(line, err=True)
 
 
 @app.command("eval")
@@ -357,13 +358,22 @@ def evaluate(
         typer.echo(f"评测失败。{exc}", err=True)
         raise typer.Exit(code=1) from exc
 
-    if report["status"] != "COMPLETED":
-        typer.echo(f"{report['status']}。{report['error_message'] or '评测未完成。'}", err=True)
-        raise typer.Exit(code=1)
+    status = report["status"]
     pass_pow_k = report["pass_pow_k"]
-    if report["report"].get("failing_cases") or (pass_pow_k is not None and pass_pow_k < 1):
-        typer.echo("评测未达标。请查看报告中的失败用例和 pass^k。", err=True)
-        raise typer.Exit(code=1)
+    failures = report["report"].get("failing_cases")
+    below_threshold = pass_pow_k is not None and pass_pow_k < 1
+    if status == "COMPLETED":
+        if not failures and not below_threshold:
+            return
+        typer.echo("评测未达标。", err=True)
+    else:
+        typer.echo(f"{status}。{report['error_message'] or '评测未完成。'}", err=True)
+    if status in {"COMPLETED", "FAILED"}:
+        if below_threshold:
+            typer.echo(f"pass^k expected 1 | actual {pass_pow_k}", err=True)
+        if failures:
+            _print_eval_differences(failures)
+    raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

@@ -2,20 +2,27 @@
 
 from collections.abc import Awaitable, Callable, Mapping
 from decimal import Decimal
-from inspect import isawaitable
-from typing import Annotated, Any, Literal
+from inspect import Parameter, isawaitable, signature
+from typing import Annotated, Any, Literal, Protocol
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
+from ...config.settings import AppSettings
 from ...domain import decimal_to_db_text
 from ...services import ServiceValidationError
 from .http import BatchDependency, DecimalJsonResponse, read_decimal_json_body, validate_body
 
 router = APIRouter(prefix="/api/v1/eval-runs", tags=["Evaluation"])
 
-EvalRunner = Callable[..., Mapping[str, Any] | Awaitable[Mapping[str, Any] | None] | None]
+
+class _EvalSummaryProvider(Protocol):
+    def to_eval_run_summary(self) -> Mapping[str, Any]: ...
+
+
+_EvalOutput = Mapping[str, Any] | _EvalSummaryProvider | None
+EvalRunner = Callable[..., _EvalOutput | Awaitable[_EvalOutput]]
 _RunMode = Literal["OFFLINE_DETERMINISTIC", "LIVE_LLM", "LIVE_E2E"]
 _Rate = Annotated[Decimal, Field(ge=0, le=1)]
 _METRICS = (
@@ -79,6 +86,29 @@ def _save_eval_run(service: BatchDependency, result: _EvalResult) -> dict[str, A
     return _eval_summary(row)
 
 
+def _call_eval_runner(
+    resolve_runner: Callable[[], EvalRunner | None], options: dict[str, Any], settings: AppSettings
+) -> _EvalOutput | Awaitable[_EvalOutput]:
+    runner = resolve_runner()
+    if runner is None:
+        return None
+    try:
+        parameters = signature(runner).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    accepts_settings = any(
+        param.kind is Parameter.VAR_KEYWORD
+        or (
+            param.name == "settings"
+            and param.kind in (Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY)
+        )
+        for param in parameters
+    )
+    if accepts_settings:
+        return runner(**options, settings=settings)
+    return runner(**options)
+
+
 @router.get("", operation_id="listEvalRuns")
 def list_eval_runs(service: BatchDependency) -> DecimalJsonResponse:
     return DecimalJsonResponse([_eval_summary(row) for row in service.repository.list_eval_runs()])
@@ -93,18 +123,20 @@ async def trigger_eval_run(request: Request, service: BatchDependency) -> Decima
         )
     fields = validate_body(_EvalRequest, payload, status_code=422)
     options = fields.model_dump()
-    runner: EvalRunner | None = request.app.state.eval_runner
-    output = None
-    if runner is not None:
-        output = await run_in_threadpool(runner, **options)
-        if isawaitable(output):
-            output = await output
+    output = await run_in_threadpool(
+        _call_eval_runner, request.app.state.resolve_eval_runner, options, service.settings
+    )
+    if isawaitable(output):
+        output = await output
     if output is None:
         output = {
             "status": "UNVERIFIED",
             "model_name": service.settings.llm_model,
             "error_message": "当前未接入或尚未就绪的评测执行器，未运行评测。",
         }
+    to_summary = getattr(output, "to_eval_run_summary", None)
+    if callable(to_summary):
+        output = to_summary()
     if not isinstance(output, Mapping) or any(
         key in output and output[key] != value for key, value in options.items()
     ):

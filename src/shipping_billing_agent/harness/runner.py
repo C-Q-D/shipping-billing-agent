@@ -905,7 +905,11 @@ def run_eval_suite(
         except ValueError:
             return run.finish("UNVERIFIED", "LLM 或 OCR 配置格式无效，请检查运行配置")
         run.model_name = settings.llm_model
-        if not settings.is_llm_configured():
+        if (
+            settings.llm_base_url is None
+            or settings.llm_api_key is None
+            or not settings.is_llm_configured()
+        ):
             return run.finish("UNVERIFIED", "请配置可用的 LLM_BASE_URL 和 LLM_API_KEY")
         if run_mode == "LIVE_E2E":
             first_remote = next((case for case in suite if case.remote_ocr), None)

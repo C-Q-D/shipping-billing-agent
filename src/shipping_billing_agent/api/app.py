@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
-from functools import cache
+from functools import cache, partial
+from importlib import import_module
 from pathlib import Path
 from sqlite3 import IntegrityError
 from threading import Lock
@@ -37,6 +38,9 @@ _ROOT = Path(__file__).resolve().parents[3]
 _CONTRACT = _ROOT / "docs/workflow/contracts/openapi.yaml"
 _FRONTEND_DIST = _ROOT / "frontend/dist"
 _RESERVED_PATH_SEGMENTS = {"api", "docs", "redoc", "openapi.json"}
+_DEFAULT_EVAL_RUNNER = object()
+_HARNESS_PACKAGE = "shipping_billing_agent.harness"
+_HARNESS_RUNNER_MODULE = f"{_HARNESS_PACKAGE}.runner"
 
 
 class _FrontendMount(Mount):
@@ -122,12 +126,23 @@ def _register_error_handlers(app: FastAPI) -> None:
         return error_response(exc.status_code, code, message, headers=exc.headers)
 
 
+def _discover_eval_runner() -> EvalRunner | None:
+    try:
+        module = import_module(_HARNESS_RUNNER_MODULE)
+    except ModuleNotFoundError as exc:
+        if exc.name not in {_HARNESS_PACKAGE, _HARNESS_RUNNER_MODULE}:
+            raise
+        return None
+    runner = getattr(module, "run_eval_suite", None)
+    return runner if callable(runner) else None
+
+
 def create_app(
     relay_publisher: object | None = None,
     *,
     settings: AppSettings | None = None,
     batch_service: BatchService | None = None,
-    eval_runner: EvalRunner | None = None,
+    eval_runner: EvalRunner | None | object = _DEFAULT_EVAL_RUNNER,
     allowed_origins: Iterable[str] = (),
     frontend_dir: Path | None = None,
 ) -> FastAPI:
@@ -140,7 +155,9 @@ def create_app(
     origin_settings = (
         configured_settings
         if isinstance(configured_settings, ApiSettings)
-        else ApiSettings(**(configured_settings.model_dump() if configured_settings else {}))
+        else ApiSettings(
+            **(configured_settings.model_dump(exclude_none=True) if configured_settings else {})
+        )
     )
     origins = allowed_origin_tuples((*origin_settings.allowed_origins, *allowed_origins))
     service = batch_service
@@ -154,6 +171,16 @@ def create_app(
                     configured_settings or load_settings(), relay_publisher=relay_publisher
                 )
             return service
+
+    def resolve_eval_runner() -> EvalRunner | None:
+        if eval_runner is _DEFAULT_EVAL_RUNNER:
+            runner = _discover_eval_runner()
+            if runner is not None and relay_publisher is not None:
+                return partial(runner, relay_publisher=relay_publisher)
+            return runner
+        if eval_runner is None or callable(eval_runner):
+            return eval_runner
+        raise TypeError("eval_runner 须可调用或为 None")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -173,7 +200,7 @@ def create_app(
         lifespan=lifespan,
     )
     fastapi_app.state.resolve_batch_service = resolve_batch_service
-    fastapi_app.state.eval_runner = eval_runner
+    fastapi_app.state.resolve_eval_runner = resolve_eval_runner
     fastapi_app.add_middleware(OriginMiddleware, allowed_origins=origins)
     _register_error_handlers(fastapi_app)
 
