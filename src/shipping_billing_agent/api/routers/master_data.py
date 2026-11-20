@@ -90,23 +90,6 @@ async def update_entity(
     return DecimalJsonResponse(entity)
 
 
-@router.patch("/entities/{entity_id}", operation_id="patchAccountingEntity")
-async def patch_entity(
-    entity_id: str, request: Request, service: BatchDependency
-) -> DecimalJsonResponse:
-    patch = await read_decimal_json_body(request)
-
-    def update() -> dict[str, Any]:
-        with service.repository.transaction() as transaction:
-            for entity in transaction.list_accounting_entities():
-                if entity["id"] == entity_id:
-                    profile = validate_body(_EntityFields, entity | patch)
-                    return transaction.update_accounting_entity(entity_id, profile)
-            raise ResourceNotFoundError("未找到该记账主体")
-
-    return DecimalJsonResponse(await run_in_threadpool(update))
-
-
 @router.get("/dictionary", operation_id="listChargeDictionary")
 def list_dictionary(service: BatchDependency) -> DecimalJsonResponse:
     return DecimalJsonResponse(service.repository.list_charge_dictionary())
@@ -118,24 +101,6 @@ async def upsert_dictionary(request: Request, service: BatchDependency) -> Decim
     item = ChargeDictionaryItem(**fields.model_dump())
     entry = await run_in_threadpool(service.repository.upsert_charge_dictionary_entry, item)
     return DecimalJsonResponse(entry, status_code=201)
-
-
-@router.patch("/dictionary/{entry_id}", operation_id="patchChargeDictionaryEntry")
-async def patch_dictionary(
-    entry_id: str, request: Request, service: BatchDependency
-) -> DecimalJsonResponse:
-    patch = await read_decimal_json_body(request)
-
-    def update() -> dict[str, Any]:
-        with service.repository.transaction() as transaction:
-            for entry in transaction.list_charge_dictionary():
-                if entry["id"] == entry_id:
-                    fields = validate_body(_DictionaryFields, entry | patch)
-                    item = ChargeDictionaryItem(**fields.model_dump())
-                    return transaction.upsert_charge_dictionary_entry(item, entry_id=entry_id)
-            raise ResourceNotFoundError("未找到该词典条目")
-
-    return DecimalJsonResponse(await run_in_threadpool(update))
 
 
 @router.delete(

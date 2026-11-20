@@ -9,6 +9,7 @@ from collections import Counter
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+from email.message import EmailMessage
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
@@ -31,9 +32,9 @@ from typer.testing import CliRunner
 from shipping_billing_agent.api.app import create_app
 from shipping_billing_agent.cli.app import app as cli_app
 from shipping_billing_agent.config.settings import AppSettings
-from shipping_billing_agent.domain.models import BatchStage, ParsedDocument
+from shipping_billing_agent.domain.models import BatchStage, ParsedDocument, dumps_decimal_json
 from shipping_billing_agent.gateways.local_ocr import RapidOcrFallback
-from shipping_billing_agent.services import BatchService
+from shipping_billing_agent.services import BatchService, export_review_bundle
 from shipping_billing_agent.storage import BillingRepository, DatabaseManager
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -199,7 +200,7 @@ def test_all_contract_operations_are_mounted_and_browser_writes_are_guarded(
         if route.path.startswith(f"{API}/")
     }
     assert len(contract["paths"]) == 24 and len(expected) == 29
-    assert {key: registered[key] for key in expected} == expected
+    assert registered == expected
     assert _body(client.get("/openapi.json")) == contract
 
     origin = {"Origin": "http://127.0.0.1:9999"}
@@ -338,6 +339,15 @@ def test_four_real_samples_resume_from_extraction_and_survive_review_and_reopen(
             extracting = _body(client.get(batch_path))
             assert (extracting["status"], extracting["stage"]) == ("PROCESSING", "EXTRACTING")
             assert extracting["records"] == []
+            with TestClient(create_app(settings=settings)) as second:
+                assert _body(second.get(batch_path)) == extracting
+                switch = second.post(
+                    f"{batch_path}/switch-entity", json={"accounting_entity": TARGETING}
+                )
+                assert _body(switch, 409)["code"] == "BATCH_PROCESSING"
+                assert _body(second.post(f"{batch_path}/sync-baseline"), 409)["code"] == (
+                    "BATCH_PROCESSING"
+                )
         finally:
             ocr.release.set()
         uploaded = _wait_for_terminal_batch(client, batch_path)
@@ -507,6 +517,70 @@ def test_restart_recovers_an_extraction_orphan_without_changing_completed_batch(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+@pytest.mark.parametrize("packaged", [False, True], ids=["loose-copies", "mail-attachments"])
+def test_replacing_deduplicated_invoice_keeps_surviving_copy_in_official_download(
+    client: TestClient, packaged: bool
+) -> None:
+    invoice = _invoice("INV-101")
+    if packaged:
+        copies = []
+        for name in ("first.eml", "second.eml", "third.eml"):
+            mail = EmailMessage()
+            mail.set_content(f"Original invoice enclosed in {name}.")
+            mail.add_attachment(
+                invoice[1], maintype="application", subtype="octet-stream", filename=invoice[0]
+            )
+            copies.append((name, mail.as_bytes()))
+    else:
+        copies = [("first.xlsx", invoice[1]), ("second.xlsx", invoice[1])]
+
+    batch = _body(_upload(client, *copies, _invoice("INV-303", "42.00")), 201)
+    path = f"{BATCHES}/{batch['id']}"
+    rows = _records_by_reference(batch)
+    assert len(batch["records"]) == 2 and rows.keys() == {"INV-101", "INV-303"}
+    row_path = _record_url(path, rows["INV-303"])
+    reviewed = _body(client.post(f"{row_path}/approve", json={"reason": "已核对"}))
+    documents = {doc["id"]: doc for doc in batch["documents"]}
+    owner = documents[rows["INV-101"]["source_doc_id"]]
+    target = documents[owner["parent_doc_id"]] if packaged else owner
+    copy_names = {invoice[0]} if packaged else {"first.xlsx", "second.xlsx"}
+    survivors = [
+        doc
+        for doc in documents.values()
+        if doc["id"] != owner["id"] and doc["original_filename"] in copy_names
+    ]
+    replacement = _body(
+        client.post(
+            f"{path}/documents/{target['id']}/retry",
+            files={"file": _invoice("INV-202", "180.00")},
+        )
+    )
+    assert replacement["status"] == "COMPLETED" and replacement["failed_documents"] == []
+    rows = _records_by_reference(replacement)
+    assert len(replacement["records"]) == 3
+    assert rows["INV-101"]["source_doc_id"] in {doc["id"] for doc in survivors}
+    if packaged:
+        mail_names = {documents[doc["parent_doc_id"]]["original_filename"] for doc in survivors}
+        assert len(mail_names) == 2
+        assert set(rows["INV-101"]["source_evidence"]["source_paths"]) == {
+            f"{email}/{invoice[0]}" for email in mail_names
+        }
+    assert rows["INV-202"]["source_doc_id"] == target["id"]
+    assert rows["INV-303"] == _records_by_reference(reviewed)["INV-303"]
+
+    reapplied = _body(client.post(f"{path}/reapply-dictionary"))
+    assert len(reapplied["records"]) == 3
+    downloaded = _body(client.get(f"{path}/export/download"))
+    assert len(downloaded) == 3
+    assert {
+        row["document_info"]["reference_no"]: row["charge_details"]["amount"] for row in downloaded
+    } == {
+        "INV-101": Decimal("100.00"),
+        "INV-202": Decimal("180.00"),
+        "INV-303": Decimal("42.00"),
+    }
+
+
 def test_six_mixed_records_export_exactly_three_five_and_six_with_decimal_bytes(
     settings: AppSettings, client: TestClient, billing_schema: Draft202012Validator
 ) -> None:
@@ -650,6 +724,85 @@ def test_third_baseline_sync_updates_the_original_bill_and_preserves_both_receip
     original_receipt, updated_receipt = _sync_receipts(repository, batch["id"])
     assert original_receipt == first_receipt
     assert updated_receipt[1:] == (row["id"], edited["updated_at"], first_bill["id"])
+
+
+@pytest.mark.parametrize("shared_match", [False, True], ids=["empty-baseline", "alias-match"])
+def test_shared_review_bundle_after_sync_keeps_the_evaluated_baseline(
+    client: TestClient, settings: AppSettings, tmp_path: Path, shared_match: bool
+) -> None:
+    reference = "INV-501"
+    alias = "NEPTUNE SHIPPING LIMITED (LAX)"
+    if shared_match:
+        bill = {
+            "id": "old-bill",
+            "reference_no": reference,
+            "accounting_entity": alias,
+            "charge_item": "Handling Charge",
+            "amount": 80,
+            "currency": "USD",
+            "posting_type": "AR",
+        }
+        unrelated = bill | {
+            "id": "other-bill",
+            "accounting_entity": TARGETING,
+            "posting_type": "AP",
+        }
+        _body(client.post(f"{BILLS}/import", json={"bills": [bill, unrelated]}))
+
+    original_bills = _body(client.get(BILLS))
+    batch = _body(_upload(client, _invoice(reference)), 201)
+    path = f"{BATCHES}/{batch['id']}"
+    (row,) = batch["records"]
+    operation = "UPDATE" if shared_match else "CREATE"
+    assert (row["operation"], row["review_status"]) == (operation, "AUTO_READY")
+    assert row["matched_existing_bill_id"] == ("old-bill" if shared_match else None)
+    assert "shared_baseline_snapshot" not in batch
+    assert "shared_baseline_snapshot" not in _body(client.get(BATCHES))[0]
+    repository = _open_repository(settings.sqlite_db_path)
+    with repository.db.connect() as connection:
+        (match_id,) = connection.execute(
+            "SELECT matched_existing_bill_id FROM billing_records WHERE id = ?", (row["id"],)
+        ).fetchone()
+        assert match_id == row["matched_existing_bill_id"]
+    approved = _body(client.post(f"{_record_url(path, row)}/approve", json={"reason": "核对通过"}))
+    assert _body(client.post(f"{path}/sync-baseline")) == {
+        "created_count": 0 if shared_match else 1,
+        "updated_count": 1 if shared_match else 0,
+        "skipped_count": 0,
+    }
+    (synced,) = _body(client.get(BILLS, params={"accounting_entity": NEPTUNE}))
+    assert (synced["amount"], synced["version"]) == (100, 2 if shared_match else 1)
+    if shared_match:
+        assert synced["id"] == "old-bill"
+        assert _body(client.get(BILLS, params={"accounting_entity": alias})) == [synced]
+    assert _body(client.get(path)) == approved
+
+    reopened = _open_repository(settings.sqlite_db_path)
+    stored = reopened.get_batch(batch["id"])
+    assert stored["batch_existing_bills"] is None
+    assert [bill.model_dump() for bill in stored["shared_baseline_snapshot"]] == original_bills
+    bundle = export_review_bundle(reopened, batch["id"])
+    assert bundle["existing_bills_snapshot"] == [
+        bill for bill in original_bills if bill["accounting_entity"] == alias
+    ]
+
+    target = tmp_path / "bundle-import"
+    target_settings = AppSettings(app_data_dir=target, sqlite_db_path=target / "billing.sqlite")
+    with TestClient(create_app(settings=target_settings)) as importer:
+        response = importer.post(
+            f"{BATCHES}/import-review-bundle", content=dumps_decimal_json(bundle)
+        )
+        imported = _body(response, 201)
+        (restored,) = imported["records"]
+        assert (restored["operation"], restored["review_status"]) == (operation, "APPROVED")
+        assert _body(importer.get(BILLS)) == []
+        assert _body(importer.post(f"{BATCHES}/{imported['id']}/sync-baseline")) == {
+            "created_count": 1,
+            "updated_count": 0,
+            "skipped_count": 0,
+        }
+        (new_bill,) = _body(importer.get(BILLS))
+        assert (new_bill["reference_no"], new_bill["amount"]) == (reference, 100)
 
 
 def test_overlapping_switch_with_stale_version_cannot_overwrite_a_committed_patch(

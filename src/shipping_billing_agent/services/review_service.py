@@ -207,7 +207,9 @@ def _reason(value: str | None, *, required: bool = True) -> str | None:
     if value is None and not required:
         return None
     if not isinstance(value, str) or not 2 <= len(value.strip()) <= 500:
-        raise ServiceValidationError("INVALID_REVIEW_REASON", "复核理由须为 2–500 字符")
+        raise ServiceValidationError(
+            "INVALID_REVIEW_REASON", "复核理由须为 2–500 字符", status_code=422
+        )
     return value.strip()
 
 
@@ -1080,20 +1082,57 @@ class ReviewService:
         targets = {document.doc_id for document in parsed}
         roots = _root_documents(documents)
         retained = [bundle for bundle in bundles if bundle.document.doc_id not in replaced_ids]
+        previous = batch["records"]
+        old_lines = [record for record in previous if record.source_doc_id in replaced_ids]
+        candidates = [record for record in previous if record.source_doc_id not in replaced_ids]
+
+        hashes = {document.doc_id: document.content_sha256 for document in documents}
+        covered_hashes = {hashes[record.source_doc_id] for record in candidates}
+        covered_hashes.update(
+            document.content_sha256
+            for document in parsed
+            if document.status is DocumentStatus.PARSED
+        )
+        prior_hashes = {hashes[record.source_doc_id] for record in old_lines}
+        lost_hashes = prior_hashes - covered_hashes - {None, ""}
+        restoring = {
+            bundle.document.doc_id: bundle
+            for bundle in retained
+            if bundle.document.content_sha256 in lost_hashes
+        }
+        # Rebuild duplicate rows using the surviving copies' own email context.
+        affected_roots = {roots[doc_id], *(roots[copy_id] for copy_id in restoring)}
         package = [
-            bundle.document for bundle in retained if roots[bundle.document.doc_id] == roots[doc_id]
+            bundle.document
+            for bundle in retained
+            if roots[bundle.document.doc_id] in affected_roots
         ]
         scope = _load_batch_scope(self.repository, batch, batch["accounting_entity"])
         result = self.batch_service._run_pipeline(
-            [*package, *parsed], batch["accounting_entity"], scope, batch_id, targets=targets
+            [*package, *parsed],
+            batch["accounting_entity"],
+            scope,
+            batch_id,
+            targets=targets | restoring.keys(),
         )
-        previous = batch["records"]
-        old_lines = [record for record in previous if record.source_doc_id in replaced_ids]
-        if old_lines and not result.records and result.failed_document_alerts:
-            return self._save_failed_repair(
-                batch, documents, doc_id, result.failed_document_alerts[0]
-            )
+        replacement_lines = [record for record in result.records if record.source_doc_id in targets]
+        replacement_failures = [
+            alert for alert in result.failed_document_alerts if alert.doc_id in targets
+        ]
+        if old_lines and not replacement_lines and replacement_failures:
+            return self._save_failed_repair(batch, documents, doc_id, replacement_failures[0])
 
+        restored_lines = [record for record in result.records if record.source_doc_id in restoring]
+        restored_hashes = {hashes[record.source_doc_id] for record in restored_lines}
+        if any(hashes[copy_id] not in restored_hashes for copy_id in restoring):
+            failure = FailedDocumentAlert(
+                doc_id=doc_id,
+                filename=original.original_filename,
+                error_message="保留的同源副本未能重新生成费用明细。",
+            )
+            return self._save_failed_repair(batch, documents, doc_id, failure)
+
+        unchanged.update(restoring)
         corrected_totals = {
             bundle.document.doc_id: _restore_reviewed_totals(
                 bundle, unchanged[bundle.document.doc_id]
@@ -1101,27 +1140,35 @@ class ReviewService:
             for bundle in result.documents
             if bundle.document.doc_id in unchanged
         }
-        carried, ids = _carry_line_edits(old_lines, result.records, set(unchanged))
+        carried, ids = _carry_line_edits(old_lines, replacement_lines, set(unchanged))
         carried = [
             _without_total_issues(record, fields)
             if (fields := corrected_totals.get(record.source_doc_id))
             else record
-            for record in carried
+            for record in [*carried, *restored_lines]
         ]
+        replacements = [bundle for bundle in result.documents if bundle.document.doc_id in targets]
+        restored = {
+            bundle.document.doc_id: bundle
+            for bundle in result.documents
+            if bundle.document.doc_id in restoring
+        }
         merged = []
         for bundle in bundles:
-            if bundle.document.doc_id == doc_id:
-                merged.extend(result.documents)
-            elif bundle.document.doc_id not in replaced_ids:
-                merged.append(bundle)
-        candidates = [record for record in previous if record.source_doc_id not in replaced_ids]
+            current_id = bundle.document.doc_id
+            if current_id == doc_id:
+                merged.extend(replacements)
+            elif current_id not in replaced_ids:
+                merged.append(restored.get(current_id, bundle))
         previous_decisions = [
             *candidates,
             *(record for record in old_lines if record.source_doc_id in unchanged),
         ]
         checked = _recheck([*candidates, *carried], merged, scope, previous_decisions)
         failures = [
-            alert for alert in batch["failed_document_alerts"] if alert.doc_id not in replaced_ids
+            alert
+            for alert in batch["failed_document_alerts"]
+            if alert.doc_id not in replaced_ids and alert.doc_id not in restoring
         ]
         failures.extend(
             alert.model_copy(
@@ -1144,7 +1191,7 @@ class ReviewService:
                 transaction.upsert_billing_records(batch_id, checked)
                 live_ids = {record.id for record in checked}
                 transaction.delete_billing_records(
-                    batch_id, [record.id for record in old_lines if record.id not in live_ids]
+                    batch_id, [record.id for record in previous if record.id not in live_ids]
                 )
                 if obsolete := replaced_ids - targets:
                     # Keep removal of obsolete descendants in the same transaction as the repair.

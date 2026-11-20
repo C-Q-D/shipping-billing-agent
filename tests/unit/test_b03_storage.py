@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from decimal import Decimal
 from pathlib import Path
 from threading import Barrier
+from time import monotonic, sleep
 from typing import Any
 
 import pytest
@@ -47,6 +50,8 @@ from shipping_billing_agent.domain.models import (
     SourceKind,
     SourceRefValue,
     ValidationAlert,
+    dumps_decimal_json,
+    loads_decimal_json,
 )
 from shipping_billing_agent.storage import (
     BillingRepository,
@@ -56,6 +61,7 @@ from shipping_billing_agent.storage import (
 )
 
 _ENTITY = "NEPTUNE SHIPPING LIMITED"
+_ENTITY_ALIAS = "NEPTUNE SHIPPING LIMITED (LAX)"
 _OTHER_ENTITY = "TARGETING A INC"
 _LARGE_AMOUNT = Decimal("9007199254740991.01")
 _SMALL_AMOUNT = Decimal("0.0025")
@@ -329,6 +335,68 @@ def test_startup_recovers_interrupted_batches_and_documents(
     assert reopened.get_document(batch_id, "no-rows")["status"] == "PARSED"
     assert reopened.get_batch(completed["id"])["stage"] == "COMPLETED"
     assert BillingRepository(DatabaseManager(repository.db.path)).get_batch(batch_id) == failed
+
+
+def test_worker_process_exit_allows_recovery_and_counts_one_failed_mail(
+    repository: BillingRepository, tmp_path: Path
+) -> None:
+    prior = FailedDocumentAlert(
+        doc_id="body", filename="body.pdf", reason="正文已有告警", affected_record_ids=["line"]
+    )
+    batch_id = repository.create_batch(
+        _ENTITY, stage=BatchStage.EXTRACTING, total_files=1, failed_document_alerts=[prior]
+    )["id"]
+    repository.upsert_source_documents(
+        batch_id,
+        [
+            _document("mail", source_kind=SourceKind.EML),
+            _document("body", source_kind=SourceKind.EML_BODY, parent_doc_id="mail"),
+            _document("nested", source_kind=SourceKind.EML, parent_doc_id="mail"),
+            _document("attachment", status=DocumentStatus.FAILED, parent_doc_id="nested"),
+        ],
+    )
+    repository.upsert_billing_record(batch_id, _record("line", source_doc_id="attachment"))
+    before = repository.get_batch(batch_id)
+    ready = tmp_path / "worker-holds-lease"
+    script = """
+import sys
+from pathlib import Path
+from shipping_billing_agent.storage import DatabaseManager
+
+db = DatabaseManager(sys.argv[1], recover_orphans=False)
+lease = db.try_acquire_worker_lease(sys.argv[2])
+assert lease is not None and lease.active
+with lease:
+    Path(sys.argv[3]).touch()
+    sys.stdin.buffer.read(1)
+"""
+    command = [sys.executable, "-c", script, str(repository.db.path), batch_id, str(ready)]
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE) as worker:
+        try:
+            deadline = monotonic() + 15
+            while not ready.is_file():
+                if worker.poll() is not None or monotonic() >= deadline:
+                    pytest.fail("Worker process did not acquire the file lease")
+                sleep(0.02)
+            reopened = BillingRepository(DatabaseManager(repository.db.path))
+            assert reopened.get_batch(batch_id) == before
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+            worker.communicate(timeout=10)
+
+    recovered = BillingRepository(DatabaseManager(repository.db.path)).get_batch(batch_id)
+    assert (recovered["status"], recovered["stage"], recovered["failed_files"]) == (
+        "PARTIAL_ERROR",
+        "FAILED",
+        1,
+    )
+    assert recovered["total_files"] == 1 and recovered["version"] == before["version"] + 1
+    alerts = {alert.doc_id: alert for alert in recovered["failed_document_alerts"]}
+    assert alerts.keys() == {"mail", "body", "nested", "attachment"}
+    assert alerts["body"] == prior
+    assert alerts["attachment"].affected_record_ids == ["line"]
+    assert recovered["records"] == before["records"]
 
 
 def test_document_and_record_snapshots_reopen_with_exact_values(
@@ -860,6 +928,86 @@ def test_shared_bill_import_and_clear_do_not_touch_batch_snapshot(
     assert repository.delete_existing_bill("other", accounting_entity=_OTHER_ENTITY)
     assert repository.clear_existing_bills() == 1
     assert repository.get_batch(batch_id)["batch_existing_bills"] == [isolated]
+
+
+def test_shared_bill_scopes_treat_aliases_as_equivalent(repository: BillingRepository) -> None:
+    opposite_branch = _bill("other-branch", accounting_entity=f"{_ENTITY} (SFO)")
+    unconfigured = _bill("unconfigured", accounting_entity="Example Co. (HQ)")
+    repository.import_existing_bills(
+        [
+            _bill("canonical"),
+            _bill("alias", accounting_entity=_ENTITY_ALIAS),
+            _bill("obsolete"),
+            opposite_branch,
+            unconfigured,
+        ]
+    )
+    expected = {"canonical", "alias", "obsolete"}
+    for name in (_ENTITY, _ENTITY_ALIAS, "NEPTUNE"):
+        assert {bill.id for bill in repository.list_existing_bills(name)} == expected
+    assert repository.get_existing_bill("alias", accounting_entity=_ENTITY) is not None
+    assert repository.get_existing_bill("canonical", accounting_entity=_ENTITY_ALIAS) is not None
+    assert repository.get_existing_bill("other-branch", accounting_entity=_ENTITY) is None
+    assert repository.get_existing_bill("unconfigured", accounting_entity="example co") is not None
+
+    assert repository.delete_existing_bill("canonical", accounting_entity=_ENTITY_ALIAS)
+    assert not repository.delete_existing_bill("other-branch", accounting_entity=_ENTITY_ALIAS)
+    assert repository.import_existing_bills(
+        [_bill("alias", amount=_SMALL_AMOUNT)],
+        replace_existing=True,
+        accounting_entity=_ENTITY_ALIAS,
+    ) == {"imported_count": 1, "total_count": 3}
+    (updated,) = repository.list_existing_bills(_ENTITY_ALIAS)
+    assert (updated.id, updated.version, updated.amount) == ("alias", 2, _SMALL_AMOUNT)
+    with pytest.raises(ValueError, match="requested accounting entity"):
+        repository.import_existing_bills(
+            [opposite_branch], replace_existing=True, accounting_entity=_ENTITY
+        )
+    assert repository.clear_existing_bills(_ENTITY_ALIAS) == 1
+    remaining = repository.list_existing_bills()
+    assert {bill.id for bill in remaining} == {"other-branch", "unconfigured"}
+
+
+def test_sync_accepts_alias_scope_for_legacy_matches_and_prior_receipts(
+    repository: BillingRepository,
+) -> None:
+    repository.create_existing_bill(_bill("ledger", accounting_entity=_ENTITY_ALIAS))
+    batch_id = _completed_batch(repository)["id"]
+    repository.upsert_source_documents(batch_id, [_document("doc")])
+    (record,) = repository.upsert_billing_records(
+        batch_id,
+        [
+            _record(
+                operation=OperationType.UPDATE,
+                accounting_entity="NEPTUNE",
+                matched_existing_bill_id="ledger",
+            )
+        ],
+    )
+    with repository.db.connect() as connection:
+        match_id, payload = connection.execute(
+            "SELECT matched_existing_bill_id, record_state_json FROM billing_records WHERE id = ?",
+            (record.id,),
+        ).fetchone()
+        assert match_id == "ledger"
+        # Simulate the preceding version's representation of a shared alias match.
+        state = loads_decimal_json(payload) | {"snapshot_matched_bill_id": match_id}
+        connection.execute(
+            "UPDATE billing_records SET matched_existing_bill_id = NULL, record_state_json = ? "
+            "WHERE id = ?",
+            (dumps_decimal_json(state), record.id),
+        )
+
+    assert repository.sync_baseline(batch_id) == {"created": 0, "updated": 1, "skipped": 0}
+    updated = repository.get_existing_bill("ledger")
+    assert (updated.version, updated.amount) == (2, _LARGE_AMOUNT)
+    aliased = updated.model_copy(update={"accounting_entity": _ENTITY_ALIAS})
+    repository.import_existing_bills([aliased])
+    repository.upsert_billing_record(batch_id, _record(amount=_SMALL_AMOUNT))
+    assert repository.sync_baseline(batch_id) == {"created": 0, "updated": 1, "skipped": 0}
+    (bill,) = repository.list_existing_bills()
+    assert (bill.id, bill.version, bill.amount) == ("ledger", 4, _SMALL_AMOUNT)
+    assert {item["existing_bill_id"] for item in _sync_items(repository, batch_id)} == {"ledger"}
 
 
 def test_eval_runs_restore_null_metrics_and_full_reports(repository: BillingRepository) -> None:

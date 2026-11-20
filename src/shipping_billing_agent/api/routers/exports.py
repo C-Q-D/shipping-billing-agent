@@ -1,4 +1,4 @@
-"""Produce standard JSON downloads and portable review snapshots."""
+"""Produce standard JSON downloads and synchronize the shared baseline."""
 
 from urllib.parse import quote
 
@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from ...domain import ExportMode, serialize_export_bundle
-from ...services import ResourceNotFoundError, ServiceValidationError, export_review_bundle
+from ...services import ResourceNotFoundError, ServiceValidationError
 from .http import (
     BatchDependency,
     DecimalJsonResponse,
@@ -58,12 +58,6 @@ def download_json_array(
 ) -> DecimalJsonResponse:
     output = _export(batch_id, service, mode)
     return DecimalJsonResponse(output["items"], headers=_attachment(batch_id, mode))
-
-
-@router.get("/export/review-bundle", operation_id="downloadReviewBundle")
-def download_review_bundle(batch_id: str, service: BatchDependency) -> DecimalJsonResponse:
-    bundle = export_review_bundle(service.repository, batch_id)
-    return DecimalJsonResponse(bundle, headers=_attachment(batch_id, "review-bundle"))
 
 
 @router.post("/sync-baseline", operation_id="syncBatchToBaseline")

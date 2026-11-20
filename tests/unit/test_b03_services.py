@@ -19,6 +19,7 @@ from shipping_billing_agent.config.settings import AppSettings
 from shipping_billing_agent.domain.models import (
     AlertCode,
     BatchStage,
+    BatchStatus,
     ChargeDictionaryItem,
     ExistingBillRecord,
     OcrStructuredPayload,
@@ -210,9 +211,10 @@ def test_wait_false_commits_intermediate_stages_while_ocr_is_blocked(make_servic
     stages = []
     advance = service._advance
 
-    def track_stage(batch_id, stage):
-        advance(batch_id, stage)
-        stages.append(service.get_batch(batch_id)["stage"])
+    def track_stage(lease, stage, version):
+        new_version = advance(lease, stage, version)
+        stages.append(service.get_batch(lease.batch_id)["stage"])
+        return new_version
 
     monkeypatch.setattr(service, "_advance", track_stage)
     email = _email(b"invoice")
@@ -249,6 +251,65 @@ def test_wait_false_commits_intermediate_stages_while_ocr_is_blocked(make_servic
     )
     service.close()
     assert service.wait_for_batch(queued["id"]) == complete
+
+
+@pytest.mark.parametrize("boundary", ["stage", "commit", "failure", "lost-lease", "new-version"])
+def test_superseded_worker_cannot_write_batch_documents_or_records(
+    make_service, monkeypatch, boundary
+):
+    service = make_service()
+    entered, release = Event(), Event()
+    process_batch = service._process_batch
+    run_pipeline = service._run_pipeline
+    leases = []
+
+    def capture_lease(lease, version):
+        leases.append(lease)
+        return process_batch(lease, version)
+
+    def suspend_pipeline(*args, **kwargs):
+        if boundary == "stage":
+            entered.set()
+            assert release.wait(10)
+        result = run_pipeline(*args, **kwargs)
+        if boundary != "stage":
+            entered.set()
+            assert release.wait(10)
+        if boundary == "failure":
+            raise RuntimeError("Worker failed after recovery had committed")
+        return result
+
+    monkeypatch.setattr(service, "_process_batch", capture_lease)
+    monkeypatch.setattr(service, "_run_pipeline", suspend_pipeline)
+    batch_id = _create(service, wait=False)["id"]
+    task = service._tasks[batch_id]
+    try:
+        assert entered.wait(10)
+        repository = BillingRepository(DatabaseManager(service.repository.db.path))
+        active = repository.get_batch(batch_id)
+        assert active["status"] == BatchStatus.PROCESSING and leases[0].active
+        if boundary == "lost-lease":
+            leases[0].close()
+        elif boundary == "new-version":
+            repository.update_batch_with_version_check(
+                batch_id, active["version"], stage_message="外部操作已修改批次"
+            )
+        else:
+            repository.update_batch_with_version_check(
+                batch_id,
+                active["version"],
+                stage=BatchStage.FAILED,
+                status=BatchStatus.PARTIAL_ERROR,
+                stage_message="已标记为恢复终态",
+                accounting_entity=CUSTOMER,
+            )
+        expected = repository.get_batch(batch_id)
+    finally:
+        release.set()
+
+    assert task.result(timeout=10) == service.get_batch(batch_id)
+    assert repository.get_batch(batch_id) == expected
+    assert not leases[0].active
 
 
 def test_existing_bill_snapshot_never_reads_from_or_writes_shared_baseline(make_service):
@@ -518,6 +579,23 @@ def test_hard_blocker_always_denies_approval_and_reject_requires_reason(make_ser
             review.reject_record(batch_id, record_id, reason)
     rejected = review.reject_record(batch_id, record_id, "  需要重新确认  ")["records"][0]
     assert (rejected["review_status"], rejected["reject_reason"]) == ("REJECTED", "需要重新确认")
+
+
+def test_approve_and_reject_service_validate_trimmed_unicode_reason(make_service):
+    service = make_service()
+    batch = _create(service)
+    batch_id = batch["id"]
+    (record,) = batch["records"]
+    review = ReviewService(service)
+    for decide in (review.approve_record, review.reject_record):
+        for reason in ("😀", " A", "核" * 501):
+            with pytest.raises(ServiceValidationError) as error:
+                decide(batch_id, record["id"], reason)
+            assert (error.value.status_code, error.value.code) == (422, "INVALID_REVIEW_REASON")
+    assert service.get_batch(batch_id) == batch
+    approved = review.approve_record(batch_id, record["id"], " 😀😀 ")
+    assert approved["records"][0]["review_status"] == "APPROVED"
+    assert service.repository.list_review_audit_logs(batch_id)[0]["reason"] == "😀😀"
 
 
 def test_acknowledged_warning_is_tied_to_its_code_field_and_current_actual(make_service):

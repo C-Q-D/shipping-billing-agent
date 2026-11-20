@@ -60,6 +60,7 @@ from ..parsers.dispatcher import (
 )
 from ..parsers.filename_sanitizer import detect_source_kind, sanitize_filename
 from ..storage import BillingRepository, DatabaseManager, ResourceNotFoundError
+from ..storage.db import BatchWorkerLease, document_root_ids
 
 Upload = tuple[str, bytes | BinaryIO]
 SourceChannel = Literal["WEB", "CLI"]
@@ -113,9 +114,14 @@ class ServiceValidationError(ValueError):
         self.details = dict(details or {})
 
 
+class _StaleBatchWorker(RuntimeError):
+    """The worker no longer owns the processing version it is about to write."""
+
+
 @dataclass(frozen=True, slots=True)
 class _BatchScope:
     profiles: list[AccountingEntityProfile]
+    baseline: list[ExistingBillRecord]
     existing_bills: list[ExistingBillRecord]
     charge_dictionary: list[ChargeDictionaryItem]
 
@@ -167,16 +173,22 @@ def _existing_bills_snapshot(payload: str | None) -> list[ExistingBillRecord] | 
 
 
 def _load_batch_scope(
-    repository: BillingRepository, batch: Mapping[str, Any], entity: str
+    repository: BillingRepository,
+    batch: Mapping[str, Any],
+    entity: str,
+    *,
+    shared_baseline: list[ExistingBillRecord] | None = None,
 ) -> _BatchScope:
     profiles = [
         AccountingEntityProfile.model_validate(profile)
         for profile in repository.list_accounting_entities()
     ]
-    snapshot = batch["batch_existing_bills"]
-    bills = repository.list_existing_bills() if snapshot is None else snapshot
+    bills = batch["batch_existing_bills"]
+    if bills is None:
+        bills = repository.list_existing_bills() if shared_baseline is None else shared_baseline
     return _BatchScope(
         profiles=profiles,
+        baseline=bills,
         existing_bills=[
             bill for bill in bills if entity_matches(bill.accounting_entity, entity, profiles)
         ],
@@ -274,7 +286,13 @@ def _batch_detail(batch: Mapping[str, Any]) -> dict[str, Any]:
         **{
             key: value
             for key, value in batch.items()
-            if key not in {"documents", "records", "failed_document_alerts", "batch_existing_bills"}
+            if key not in {
+                "documents",
+                "records",
+                "failed_document_alerts",
+                "batch_existing_bills",
+                "shared_baseline_snapshot",
+            }
         },
         "documents": documents,
         "failed_documents": [alert.model_dump() for alert in failures.values()],
@@ -283,18 +301,7 @@ def _batch_detail(batch: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _root_documents(documents: Sequence[ParsedDocument]) -> dict[str, str]:
-    parents = {document.doc_id: document.parent_doc_id for document in documents}
-    roots = {}
-    for doc_id in parents:
-        root = doc_id
-        seen = {root}
-        while (parent := parents[root]) is not None:
-            if parent in seen or parent not in parents:
-                raise ValueError("Invalid source document tree")
-            root = parent
-            seen.add(root)
-        roots[doc_id] = root
-    return roots
+    return document_root_ids({document.doc_id: document.parent_doc_id for document in documents})
 
 
 def _batch_outcome(
@@ -598,34 +605,42 @@ class BatchService:
         self._validate_inputs(files, public_urls)
         batch_id = uuid4().hex
         submission_error = None
-        with self._staged_originals(batch_id) as paths:
-            documents, stored_paths = self._retain_inputs(batch_id, files, public_urls, paths)
-            with self._lock:
-                if self._closed:
-                    raise RuntimeError("Batch service is closed")
-                with self.repository.transaction() as transaction:
-                    summary = transaction.create_batch(
-                        entity,
-                        batch_id=batch_id,
-                        stage_message=_STAGE_MESSAGES[BatchStage.QUEUED],
-                        source_channel=source_channel,
-                        ocr_mode=mode,
-                        total_files=len(documents),
-                        batch_existing_bills=snapshot,
-                    )
-                    transaction.upsert_source_documents(
-                        batch_id, documents, stored_paths=stored_paths
-                    )
-                try:
-                    task = self._executor.submit(self._process_batch, batch_id)
-                except RuntimeError as exc:
-                    submission_error = exc
-                else:
-                    self._tasks[batch_id] = task
-        if submission_error is not None:
-            _LOGGER.error("Could not queue billing batch %s", batch_id, exc_info=submission_error)
-            self._mark_processing_failure(batch_id)
-            return self.get_batch(batch_id) if wait else summary
+        with ExitStack() as pending_lease:
+            with self._staged_originals(batch_id) as paths:
+                documents, stored_paths = self._retain_inputs(batch_id, files, public_urls, paths)
+                with self._lock:
+                    if self._closed:
+                        raise RuntimeError("Batch service is closed")
+                    lease = self.repository.db.try_acquire_worker_lease(batch_id)
+                    if lease is None:
+                        raise RuntimeError(f"Billing batch {batch_id} already has a worker")
+                    pending_lease.enter_context(lease)
+                    with self.repository.transaction() as transaction:
+                        summary = transaction.create_batch(
+                            entity,
+                            batch_id=batch_id,
+                            stage_message=_STAGE_MESSAGES[BatchStage.QUEUED],
+                            source_channel=source_channel,
+                            ocr_mode=mode,
+                            total_files=len(documents),
+                            batch_existing_bills=snapshot,
+                        )
+                        transaction.upsert_source_documents(
+                            batch_id, documents, stored_paths=stored_paths
+                        )
+                    try:
+                        task = self._executor.submit(self._process_batch, lease, summary["version"])
+                    except RuntimeError as exc:
+                        submission_error = exc
+                    else:
+                        self._tasks[batch_id] = task
+                        pending_lease.pop_all()  # The queued worker now owns the lease.
+            if submission_error is not None:
+                _LOGGER.error(
+                    "Could not queue billing batch %s", batch_id, exc_info=submission_error
+                )
+                self._mark_processing_failure(lease, summary["version"])
+                return self.get_batch(batch_id) if wait else summary
         task.add_done_callback(lambda completed: self._forget_task(batch_id, completed))
         return task.result() if wait else summary
 
@@ -781,8 +796,21 @@ class BatchService:
                 stored[document.doc_id] = None
         return stored
 
-    def _advance(self, batch_id: str, stage: BatchStage) -> None:
-        self.repository.update_batch_stage(batch_id, stage, stage_message=_STAGE_MESSAGES[stage])
+    @contextmanager
+    def _worker_transaction(
+        self, lease: BatchWorkerLease, version: int
+    ) -> Iterator[BillingRepository]:
+        with self.repository.transaction() as transaction:
+            if not lease.active or not transaction.is_processing_version(lease.batch_id, version):
+                raise _StaleBatchWorker(lease.batch_id)
+            yield transaction
+
+    def _advance(self, lease: BatchWorkerLease, stage: BatchStage, version: int) -> int:
+        with self._worker_transaction(lease, version) as transaction:
+            batch = transaction.update_batch_stage(
+                lease.batch_id, stage, stage_message=_STAGE_MESSAGES[stage]
+            )
+        return batch["version"]
 
     def _parse_retained(
         self,
@@ -810,8 +838,10 @@ class BatchService:
             remaining_expanded_slots=remaining_slots,
         )
 
-    def _unpack_batch(self, batch: Mapping[str, Any]) -> set[str]:
-        batch_id = batch["id"]
+    def _unpack_batch(
+        self, batch: Mapping[str, Any], lease: BatchWorkerLease, version: int
+    ) -> set[str]:
+        batch_id = lease.batch_id
         unpacker = _UnpackingDispatcher(self.limits, self._url_validator)
         remaining_slots = self.limits.max_expanded_documents - batch["total_files"]
         for row in batch["documents"]:
@@ -821,12 +851,18 @@ class BatchService:
                 paths_by_id = self._store_child_originals(
                     batch_id, parsed, paths, {row["id"]: row["stored_path"]}
                 )
-                self.repository.upsert_source_documents(batch_id, parsed, stored_paths=paths_by_id)
+                with self._worker_transaction(lease, version) as transaction:
+                    transaction.upsert_source_documents(batch_id, parsed, stored_paths=paths_by_id)
         return unpacker.pending
 
     def _extract_documents(
-        self, batch_id: str, dispatcher: DocumentParserDispatcher, pending: set[str]
+        self,
+        lease: BatchWorkerLease,
+        version: int,
+        dispatcher: DocumentParserDispatcher,
+        pending: set[str],
     ) -> list[ParsedDocument]:
+        batch_id = lease.batch_id
         rows = _require_batch(self.repository, batch_id)["documents"]
         unpacked = [_document_bundle(row).document for row in rows]
         documents = []
@@ -834,65 +870,78 @@ class BatchService:
             if document.doc_id in pending:
                 depth, slots = compute_retry_context(unpacked, document.doc_id, self.limits)
                 (document,) = self._parse_retained(batch_id, row, dispatcher, depth, slots)
-                self.repository.upsert_source_documents(batch_id, [document])
+                with self._worker_transaction(lease, version) as transaction:
+                    transaction.upsert_source_documents(batch_id, [document])
                 document.raw_bytes = None
             documents.append(document)
         return documents
 
-    def _process_batch(self, batch_id: str) -> dict[str, Any]:
-        try:
-            self._advance(batch_id, BatchStage.UNPACKING)
-            batch = _require_batch(self.repository, batch_id)
-            entity = batch["accounting_entity"]
-            scope = _load_batch_scope(self.repository, batch, entity)
-            pending = self._unpack_batch(batch)
-            dispatcher = self._dispatcher(OcrMode(batch["ocr_mode"]))
-            self._advance(batch_id, BatchStage.EXTRACTING)
-            documents = self._extract_documents(batch_id, dispatcher, pending)
+    def _process_batch(self, lease: BatchWorkerLease, version: int) -> dict[str, Any]:
+        batch_id = lease.batch_id
 
-            result = self._run_pipeline(
-                documents,
-                entity,
-                scope,
-                batch_id,
-                stage_changed=lambda stage: self._advance(batch_id, stage),
-            )
-            outcome = _batch_outcome(
-                [bundle.document for bundle in result.documents],
-                result.records,
-                result.failed_document_alerts,
-            )
-            with self.repository.transaction() as transaction:
-                current = _require_batch(transaction, batch_id)
-                transaction.upsert_source_documents(batch_id, result.documents)
-                transaction.upsert_billing_records(batch_id, result.records)
-                transaction.update_batch_with_version_check(batch_id, current["version"], **outcome)
-        except Exception:
-            _LOGGER.exception("Billing batch %s failed during processing", batch_id)
-            self._mark_processing_failure(batch_id)
-        return self.get_batch(batch_id)
+        def advance(stage: BatchStage) -> None:
+            nonlocal version
+            version = self._advance(lease, stage, version)
 
-    def _mark_processing_failure(self, batch_id: str) -> None:
-        with self.repository.transaction() as transaction:
-            batch = _require_batch(transaction, batch_id)
-            documents = [_document_bundle(row).document for row in batch["documents"]]
-            for document in documents:
-                if document.status is DocumentStatus.SKIPPED_NOISE:
-                    continue
-                document.status = DocumentStatus.FAILED
-                document.extraction_channel = ExtractionChannel.FAILED
-                document.error_message = document.error_message or _PROCESSING_FAILURE
-                transaction.update_document_status_and_snapshot(
-                    batch_id,
-                    document.doc_id,
-                    status=document.status,
-                    extraction_channel=document.extraction_channel,
-                    error_message=document.error_message,
+        with lease:
+            try:
+                advance(BatchStage.UNPACKING)
+                batch = _require_batch(self.repository, batch_id)
+                entity = batch["accounting_entity"]
+                scope = _load_batch_scope(self.repository, batch, entity)
+                pending = self._unpack_batch(batch, lease, version)
+                dispatcher = self._dispatcher(OcrMode(batch["ocr_mode"]))
+                advance(BatchStage.EXTRACTING)
+                documents = self._extract_documents(lease, version, dispatcher, pending)
+
+                result = self._run_pipeline(
+                    documents, entity, scope, batch_id, stage_changed=advance
                 )
-            outcome = _batch_outcome(documents, batch["records"], batch["failed_document_alerts"])
-            outcome.update(
-                status=BatchStatus.PARTIAL_ERROR,
-                stage=BatchStage.FAILED,
-                stage_message=_PROCESSING_FAILURE,
-            )
-            transaction.update_batch_with_version_check(batch_id, batch["version"], **outcome)
+                outcome = _batch_outcome(
+                    [bundle.document for bundle in result.documents],
+                    result.records,
+                    result.failed_document_alerts,
+                )
+                if batch["batch_existing_bills"] is None:
+                    outcome["shared_baseline_snapshot"] = scope.baseline
+                with self._worker_transaction(lease, version) as transaction:
+                    transaction.upsert_source_documents(batch_id, result.documents)
+                    transaction.upsert_billing_records(batch_id, result.records)
+                    transaction.update_batch_with_version_check(batch_id, version, **outcome)
+            except _StaleBatchWorker:
+                _LOGGER.debug("Stopped superseded billing worker for batch %s", batch_id)
+            except Exception:
+                _LOGGER.exception("Billing batch %s failed during processing", batch_id)
+                self._mark_processing_failure(lease, version)
+            return self.get_batch(batch_id)
+
+    def _mark_processing_failure(self, lease: BatchWorkerLease, version: int) -> None:
+        batch_id = lease.batch_id
+        try:
+            with self._worker_transaction(lease, version) as transaction:
+                batch = _require_batch(transaction, batch_id)
+                documents = [_document_bundle(row).document for row in batch["documents"]]
+                for document in documents:
+                    if document.status is DocumentStatus.SKIPPED_NOISE:
+                        continue
+                    document.status = DocumentStatus.FAILED
+                    document.extraction_channel = ExtractionChannel.FAILED
+                    document.error_message = document.error_message or _PROCESSING_FAILURE
+                    transaction.update_document_status_and_snapshot(
+                        batch_id,
+                        document.doc_id,
+                        status=document.status,
+                        extraction_channel=document.extraction_channel,
+                        error_message=document.error_message,
+                    )
+                outcome = _batch_outcome(
+                    documents, batch["records"], batch["failed_document_alerts"]
+                )
+                outcome.update(
+                    status=BatchStatus.PARTIAL_ERROR,
+                    stage=BatchStage.FAILED,
+                    stage_message=_PROCESSING_FAILURE,
+                )
+                transaction.update_batch_with_version_check(batch_id, version, **outcome)
+        except _StaleBatchWorker:
+            _LOGGER.debug("Kept current state after failure of superseded worker for %s", batch_id)

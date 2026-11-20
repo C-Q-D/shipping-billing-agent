@@ -512,6 +512,7 @@ export interface components {
         };
         BatchSummary: {
             id: string;
+            version?: number;
             short_code: string;
             accounting_entity: string;
             /** @enum {string} */
@@ -699,6 +700,10 @@ export interface components {
             existing_bills_snapshot: components["schemas"]["ExistingBill"][];
         };
         RecordPatchRequest: {
+            /** @description 读取待修订记录时的批次版本 */
+            expected_version?: number | null;
+            /** @description 读取待修订记录时的 updated_at */
+            expected_updated_at?: string | null;
             charge_item?: string | null;
             quantity?: number | null;
             unit_price?: number | null;
@@ -794,6 +799,15 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
+        /** @description 资源版本或当前状态发生冲突，或相同名称的资源已存在 */
+        Conflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
         /** @description 业务校验未通过或存在未解除的硬性阻断 */
         ValidationFailed: {
             headers: {
@@ -881,6 +895,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
         };
     };
     updateAccountingEntity: {
@@ -908,6 +923,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
     listChargeDictionary: {
@@ -1237,6 +1253,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
     reapplyBatchChargeDictionary: {
@@ -1260,6 +1277,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
     retryOrReplaceDocument: {
@@ -1295,6 +1313,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
     patchDocumentTotals: {
@@ -1324,6 +1343,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
     forceParseSkippedDocument: {
@@ -1348,6 +1368,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
     addManualBillingRecord: {
@@ -1375,6 +1396,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
         };
     };
     patchBillingRecord: {
@@ -1404,6 +1426,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
     approveBillingRecord: {
@@ -1433,6 +1456,7 @@ export interface operations {
                     "application/json": components["schemas"]["BatchDetail"];
                 };
             };
+            409: components["responses"]["Conflict"];
             422: components["responses"]["ValidationFailed"];
         };
     };
@@ -1464,6 +1488,8 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["ValidationFailed"];
         };
     };
     exportBatchJson: {
@@ -1543,6 +1569,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
     listEvalRuns: {

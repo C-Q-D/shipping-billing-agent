@@ -19,9 +19,9 @@ from jsonschema import Draft202012Validator
 
 from shipping_billing_agent.api.app import create_app
 from shipping_billing_agent.config.settings import AppSettings
-from shipping_billing_agent.domain import ExistingBillRecord, loads_decimal_json
+from shipping_billing_agent.domain import ExistingBillRecord, dumps_decimal_json, loads_decimal_json
 from shipping_billing_agent.domain.models import OcrStructuredPayload
-from shipping_billing_agent.services import BatchService
+from shipping_billing_agent.services import BatchService, export_review_bundle
 from shipping_billing_agent.storage import BillingRepository
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -139,12 +139,7 @@ def test_registered_operations_and_served_openapi_match_contract(api, contract) 
         for method in route.methods
         if route.path.startswith(API)
     }
-    assert {key: actual[key] for key in expected} == expected
-    assert actual.keys() - expected.keys() == {
-        ("GET", f"{API}/batches/{{batch_id}}/export/review-bundle"),
-        ("PATCH", f"{API}/entities/{{entity_id}}"),
-        ("PATCH", f"{API}/dictionary/{{entry_id}}"),
-    }
+    assert actual == expected
     assert client.get("/openapi.json").json() == contract
 
 
@@ -264,13 +259,12 @@ def test_decimal_patch_persistence_preview_and_file_download(api, contract, make
     Draft202012Validator(schema).validate(downloaded)
     assert len(downloaded[0]) == 6
 
-    bundle = client.get(f"{batch_path}/export/review-bundle")
-    assert bundle.status_code == 200
-    assert b'"amount":9007199254740991.01' in bundle.content
-    assert b'"quantity":0.0025' in bundle.content
+    bundle = dumps_decimal_json(export_review_bundle(service.repository, batch["id"])).encode()
+    assert b'"amount":9007199254740991.01' in bundle
+    assert b'"quantity":0.0025' in bundle
     target = make_service()
     with TestClient(create_app(batch_service=target)) as importer:
-        imported = importer.post(f"{API}/batches/import-review-bundle", content=bundle.content)
+        imported = importer.post(f"{API}/batches/import-review-bundle", content=bundle)
         assert imported.status_code == 201, imported.text
         reloaded = importer.get(f"{API}/batches/{imported.json()['id']}/export/download")
         imported_charges = loads_decimal_json(reloaded.text)[0]["charge_details"]
@@ -338,13 +332,35 @@ def test_review_blockers_reason_lengths_and_optimistic_locks(api, contract) -> N
     client, _ = api
     batch = _create(client)
     path = _record_url(batch)
-    patch = client.patch(path, json={"amount": 5, "expected_version": batch["version"]})
+    schemas = contract["components"]["schemas"]
+    summary = schemas["BatchSummary"]
+    assert "version" not in summary["required"]
+    assert summary["properties"]["version"] == {"type": "integer", "minimum": 1}
+    template = f"{API}/batches/{{batch_id}}/records/{{record_id}}"
+    operations = contract["paths"]
+    patch_contract = operations[template]["patch"]
+    assert patch_contract["responses"]["409"]["$ref"] == "#/components/responses/Conflict"
+    assert {"expected_version", "expected_updated_at"} <= schemas["RecordPatchRequest"][
+        "properties"
+    ].keys()
+    body = {
+        "amount": 5,
+        "expected_version": batch["version"],
+        "expected_updated_at": batch["records"][0]["updated_at"],
+    }
+    _assert_schema(contract, "RecordPatchRequest", body)
+    patch = client.patch(path, json=body)
     assert patch.status_code == 200
+    assert patch.json()["version"] == batch["version"] + 1
     for action in ("approve", "reject"):
-        for reason in ("x", "x" * 501):
+        assert operations[f"{template}/{action}"]["post"]["responses"]["422"]["$ref"] == (
+            "#/components/responses/ValidationFailed"
+        )
+        for reason in ("😀", " A", "核" * 501):
             invalid = client.post(f"{path}/{action}", json={"reason": reason})
             assert invalid.status_code == 422
             assert invalid.json()["code"] == "INVALID_REVIEW_REASON"
+            _assert_schema(contract, "ErrorResponse", invalid.json())
     blocked = client.post(f"{path}/approve", json={"reason": "核对"})
     assert blocked.status_code == 422
     assert blocked.json()["code"] == "HARD_BLOCKER_CANNOT_APPROVE"
@@ -360,32 +376,41 @@ def test_review_blockers_reason_lengths_and_optimistic_locks(api, contract) -> N
     )
     assert (stale_batch.status_code, stale_batch.json()["code"]) == (409, "BATCH_CONFLICT")
     assert (stale_record.status_code, stale_record.json()["code"]) == (409, "RECORD_CONFLICT")
-    assert client.post(f"{path}/reject", json={"reason": "x" * 500}).status_code == 200
+    for conflict in (stale_batch, stale_record):
+        _assert_schema(contract, "ErrorResponse", conflict.json())
+    max_reason = "核" * 500
+    rejected = client.post(f"{path}/reject", json={"reason": f" {max_reason} "})
+    assert rejected.status_code == 200
+    assert rejected.json()["records"][0]["reject_reason"] == max_reason
 
 
 def test_master_data_status_codes_and_existing_bill_precision(api, contract) -> None:
     client, service = api
     created = client.post(f"{API}/entities", json={"canonical_name": "New Entity"})
     assert created.status_code == 201
+    conflict = client.post(f"{API}/entities", json={"canonical_name": "New Entity"})
+    assert (conflict.status_code, conflict.json()["code"]) == (409, "DATA_CONFLICT")
     entity_path = f"{API}/entities/{created.json()['id']}"
-    assert (
-        client.put(
-            entity_path, json={"canonical_name": "Renamed", "aliases": ["Alias"]}
-        ).status_code
-        == 200
+    profile = {"canonical_name": "Renamed", "aliases": ["Alias"], "is_default": True}
+    updated = client.put(entity_path, json=profile)
+    assert updated.status_code == 200
+    assert {field: updated.json()[field] for field in profile} == profile
+    name_conflict = client.put(entity_path, json={"canonical_name": ENTITY})
+    assert (name_conflict.status_code, name_conflict.json()["code"]) == (409, "DATA_CONFLICT")
+    assert all(
+        "409" in contract["paths"][path][method]["responses"]
+        for path, method in ((f"{API}/entities", "post"), (f"{API}/entities/{{entity_id}}", "put"))
     )
-    patched = client.patch(entity_path, json={"is_default": True})
-    assert (patched.json()["canonical_name"], patched.json()["aliases"]) == ("Renamed", ["Alias"])
     assert client.delete(entity_path).status_code == 405
     _assert_schema(contract, "AccountingEntity", client.get(f"{API}/entities").json()[0])
 
-    entry = client.post(
-        f"{API}/dictionary", json={"raw_alias": "T03", "standard_name": "Handling Charge"}
-    )
+    item = {"raw_alias": "T03", "standard_name": "Handling Charge"}
+    entry = client.post(f"{API}/dictionary", json=item)
     assert entry.status_code == 201
     entry_path = f"{API}/dictionary/{entry.json()['id']}"
-    patched = client.patch(entry_path, json={"category": "local"})
-    assert patched.status_code == 200 and patched.json()["category"] == "local"
+    updated = client.post(f"{API}/dictionary", json=item | {"category": "local"})
+    assert updated.status_code == 201
+    assert updated.json()["id"] == entry.json()["id"] and updated.json()["category"] == "local"
     _assert_schema(contract, "ChargeDictionaryEntry", client.get(f"{API}/dictionary").json()[0])
     removed = client.delete(entry_path)
     assert removed.status_code == 204 and removed.content == b""
@@ -525,19 +550,16 @@ def test_bundle_round_trip_preserves_decisions_history_and_isolated_baseline(
                 f"{path}/records/{record['id']}/{action}", json={"reason": "核对"}
             )
             assert decision.status_code == 200, decision.text
-        exported = client.get(f"{path}/export/review-bundle")
-        assert exported.status_code == 200
-        assert exported.headers["content-disposition"].startswith("attachment;")
-        _assert_schema(contract, "ReviewBundleV1", exported.json())
-        assert "bundle-private" not in exported.text
-        assert "stored_path" not in exported.text and "raw_bytes" not in exported.text
-        assert exported.json()["bundle_version"] == "1.0" and exported.json()[
-            "exported_at"
-        ].endswith("Z")
+    exported = export_review_bundle(source.repository, batch["id"])
+    _assert_schema(contract, "ReviewBundleV1", exported)
+    content = dumps_decimal_json(exported).encode()
+    assert b"bundle-private" not in content
+    assert b"stored_path" not in content and b"raw_bytes" not in content
+    assert exported["bundle_version"] == "1.0" and exported["exported_at"].endswith("Z")
 
     with TestClient(create_app(batch_service=target)) as client:
         import_path = f"{API}/batches/import-review-bundle"
-        response = client.post(import_path, content=exported.content)
+        response = client.post(import_path, content=content)
         assert response.status_code == 201, response.text
         imported = response.json()
         new_id = imported["id"]
@@ -568,7 +590,7 @@ def test_bundle_round_trip_preserves_decisions_history_and_isolated_baseline(
         original = client.post(f"{API}/batches/{new_id}/documents/{approved.source_doc_id}/retry")
         assert (original.status_code, original.json()["code"]) == (400, "ORIGINAL_FILE_UNAVAILABLE")
 
-        repeated = client.post(import_path, content=exported.content)
+        repeated = client.post(import_path, content=content)
         assert repeated.status_code == 201 and repeated.json()["id"] != new_id
         before = _row_counts(target.repository)
         insert_audit = BillingRepository.insert_review_audit_log
@@ -581,7 +603,7 @@ def test_bundle_round_trip_preserves_decisions_history_and_isolated_baseline(
             return insert_audit(repository, *args, **kwargs)
 
         monkeypatch.setattr(BillingRepository, "insert_review_audit_log", fail_second_audit)
-        failed = client.post(import_path, content=exported.content)
+        failed = client.post(import_path, content=content)
         assert len(attempts) == 2
         assert (failed.status_code, failed.json()["code"]) == (400, "INVALID_REVIEW_BUNDLE")
         assert _row_counts(target.repository) == before
@@ -599,7 +621,7 @@ def _row_counts(repository: BillingRepository) -> tuple[int, int, int, int]:
 def test_bundle_rechecks_blockers_and_rejects_broken_references(api) -> None:
     client, service = api
     batch = _create(client)
-    exported = client.get(f"{API}/batches/{batch['id']}/export/review-bundle").json()
+    exported = json.loads(dumps_decimal_json(export_review_bundle(service.repository, batch["id"])))
     path = f"{API}/batches/import-review-bundle"
     before = _row_counts(service.repository)
     wrong_version = client.post(path, json=exported | {"bundle_version": 1.0})

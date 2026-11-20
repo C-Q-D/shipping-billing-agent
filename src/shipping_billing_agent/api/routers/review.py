@@ -1,7 +1,9 @@
 """Adapt record and document review requests to the existing review service."""
 
+from typing import Any
+
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
@@ -25,6 +27,11 @@ class _SwitchEntity(BaseModel):
 class _Decision(BaseModel):
     reason: str = Field(min_length=2, max_length=500)
     expected_updated_at: str | None = None
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
 
 
 class _DocumentRetry(BaseModel):

@@ -24,6 +24,7 @@ from shipping_billing_agent.domain import ExistingBillRecord, dumps_decimal_json
 from shipping_billing_agent.domain.models import OcrStructuredPayload
 from shipping_billing_agent.gateways.local_ocr import LocalOcrError, RapidOcrFallback
 from shipping_billing_agent.gateways.ocr_client import OcrRecognitionResult, PltPltOcrClient
+from shipping_billing_agent.services import export_review_bundle
 from shipping_billing_agent.storage import BillingRepository, DatabaseManager
 
 CONTRACTS = Path(__file__).resolve().parents[2] / "docs/workflow/contracts"
@@ -331,9 +332,7 @@ def test_parse_review_bundle_transfers_isolated_baseline_and_exact_review_histor
         assert approved_line["charge_details"]["payment_term"] == "CC"
         history = approved_line["audit_trail"]["human_review_history"]
         assert [action["action"] for action in history] == ["PATCH_RECORD", "APPROVE"]
-        reviewed_bundle = client.get(f"{path}/export/review-bundle")
-        assert reviewed_bundle.status_code == 200, reviewed_bundle.text
-
+    reviewed_bundle = export_review_bundle(web_repository, imported["id"])
     stored = web_repository.get_batch(imported["id"])
     assert stored["batch_existing_bills"] == [baseline]
     assert web_repository.list_existing_bills() == [web_bill]
@@ -344,7 +343,7 @@ def test_parse_review_bundle_transfers_isolated_baseline_and_exact_review_histor
     ]
 
     with TestClient(create_app(settings=AppSettings(sqlite_db_path=cli_db))) as client:
-        restored = client.post(import_path, content=reviewed_bundle.content)
+        restored = client.post(import_path, content=dumps_decimal_json(reviewed_bundle))
         assert restored.status_code == 201, restored.text
         (restored_record,) = loads_decimal_json(restored.text)["records"]
         assert restored_record["review_status"] == "APPROVED"

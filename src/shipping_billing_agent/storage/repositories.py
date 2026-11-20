@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+from ..domain.entity_resolver import entity_matches
 from ..domain.models import (
     AccountingEntityProfile,
     BatchStage,
@@ -24,6 +25,7 @@ from ..domain.models import (
     FailedDocumentAlert,
     FieldDiff,
     OcrMode,
+    OperationType,
     ParsedDocument,
     ProcessedBillingRecord,
     RawExtractionEnvelope,
@@ -56,6 +58,7 @@ class _Unchanged(Enum):
 
 
 _UNCHANGED = _Unchanged.VALUE
+_SHARED_BASELINE_SNAPSHOT = "shared_baseline_snapshot"
 _BATCH_UPDATE_FIELDS = {
     "accounting_entity",
     "status",
@@ -66,6 +69,7 @@ _BATCH_UPDATE_FIELDS = {
     "succeeded_files",
     "failed_files",
     "batch_existing_bills",
+    _SHARED_BASELINE_SNAPSHOT,
     "failed_document_alerts",
 }
 _BATCH_COUNTS = ("create", "update", "no_change", "pending_review", "rejected")
@@ -252,18 +256,24 @@ class BillingRepository:
                     (batch_id,),
                 )
             ]
-            batch_bills = row["batch_existing_bills_json"]
+            payload = row["batch_existing_bills_json"]
+            batch_bills = loads_decimal_json(payload) if payload is not None else None
             return {
                 **_batch_summary(row),
                 "documents": documents,
                 "records": records,
                 "failed_document_alerts": alerts,
                 "batch_existing_bills": (
+                    [ExistingBillRecord.model_validate(bill) for bill in batch_bills]
+                    if isinstance(batch_bills, list)
+                    else None
+                ),
+                _SHARED_BASELINE_SNAPSHOT: (
                     [
                         ExistingBillRecord.model_validate(bill)
-                        for bill in loads_decimal_json(batch_bills)
+                        for bill in batch_bills[_SHARED_BASELINE_SNAPSHOT]
                     ]
-                    if batch_bills is not None
+                    if isinstance(batch_bills, dict)
                     else None
                 ),
             }
@@ -277,6 +287,14 @@ class BillingRepository:
                 (limit,),
             )
             return [_batch_summary(row) for row in rows]
+
+    def is_processing_version(self, batch_id: str, version: int) -> bool:
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM batches WHERE id = ? AND status = ? AND version = ?",
+                (batch_id, BatchStatus.PROCESSING, version),
+            ).fetchone()
+            return row is not None
 
     def update_batch_stage(
         self,
@@ -311,6 +329,12 @@ class BillingRepository:
             _check_batch_version(row, expected_version)
             if not changes:
                 return _batch_summary(row)
+            if _SHARED_BASELINE_SNAPSHOT in changes:
+                if "batch_existing_bills" in changes or _uses_isolated_baseline(row):
+                    raise ValueError("A shared snapshot requires a shared-baseline batch")
+                changes["batch_existing_bills_json"] = _dump_batch_bills(
+                    changes.pop(_SHARED_BASELINE_SNAPSHOT), shared=True
+                )
             if "batch_existing_bills" in changes:
                 changes["batch_existing_bills_json"] = _dump_batch_bills(
                     changes.pop("batch_existing_bills")
@@ -441,7 +465,10 @@ class BillingRepository:
     ) -> list[ProcessedBillingRecord]:
         with self._transaction(write=True) as connection:
             batch = _require_batch(connection, batch_id)
-            return [_store_billing_record(connection, batch, record) for record in records]
+            profiles = _entity_profiles(connection)
+            return [
+                _store_billing_record(connection, batch, record, profiles) for record in records
+            ]
 
     def upsert_billing_record(
         self,
@@ -452,7 +479,9 @@ class BillingRepository:
     ) -> ProcessedBillingRecord:
         with self._transaction(write=True) as connection:
             batch = _require_batch(connection, batch_id)
-            return _store_billing_record(connection, batch, record, expected_updated_at)
+            return _store_billing_record(
+                connection, batch, record, _entity_profiles(connection), expected_updated_at
+            )
 
     def get_billing_record(self, batch_id: str, record_id: str) -> ProcessedBillingRecord | None:
         with self._transaction() as connection:
@@ -632,11 +661,8 @@ class BillingRepository:
     # Shared existing bills
 
     def list_existing_bills(self, accounting_entity: str | None = None) -> list[ExistingBillRecord]:
-        where, params = _entity_filter(accounting_entity)
         with self._transaction() as connection:
-            rows = connection.execute(
-                f"SELECT * FROM existing_bills {where} ORDER BY created_at, id", params
-            )
+            rows = _existing_bill_rows(connection, accounting_entity)
             return [_existing_bill(row) for row in rows]
 
     def get_existing_bill(
@@ -659,17 +685,19 @@ class BillingRepository:
 
     def delete_existing_bill(self, bill_id: str, *, accounting_entity: str | None = None) -> bool:
         with self._transaction(write=True) as connection:
-            sql = "DELETE FROM existing_bills WHERE id = ?"
-            params = (bill_id,)
-            if accounting_entity is not None:
-                sql += " AND accounting_entity = ?"
-                params += (accounting_entity,)
-            return bool(connection.execute(sql, params).rowcount)
+            if _select_existing_bill(connection, bill_id, accounting_entity) is None:
+                return False
+            deleted = connection.execute("DELETE FROM existing_bills WHERE id = ?", (bill_id,))
+            return bool(deleted.rowcount)
 
     def clear_existing_bills(self, accounting_entity: str | None = None) -> int:
-        where, params = _entity_filter(accounting_entity)
         with self._transaction(write=True) as connection:
-            return connection.execute(f"DELETE FROM existing_bills {where}", params).rowcount
+            if accounting_entity is None:
+                return connection.execute("DELETE FROM existing_bills").rowcount
+            bills = list(_existing_bill_rows(connection, accounting_entity))
+            return connection.executemany(
+                "DELETE FROM existing_bills WHERE id = ?", [(row["id"],) for row in bills]
+            ).rowcount
 
     def import_existing_bills(
         self,
@@ -683,22 +711,23 @@ class BillingRepository:
         new_ids = {bill.id for bill in bills}
         if len(new_ids) != len(bills):
             raise ValueError("Existing bill import contains duplicate IDs")
-        if accounting_entity is not None and any(
-            bill.accounting_entity != accounting_entity for bill in bills
-        ):
-            raise ValueError("Every imported bill must belong to the requested accounting entity")
 
         with self._transaction(write=True) as connection:
+            profiles = _entity_profiles(connection)
+            if accounting_entity is not None and any(
+                not _bill_entity_matches(bill.accounting_entity, accounting_entity, profiles)
+                for bill in bills
+            ):
+                raise ValueError("Imported bills must belong to the requested accounting entity")
             for bill in bills:
                 previous = _select_existing_bill(connection, bill.id)
-                if previous is not None and previous["accounting_entity"] != bill.accounting_entity:
+                if previous is not None and not _bill_entity_matches(
+                    previous["accounting_entity"], bill.accounting_entity, profiles
+                ):
                     raise ValueError(f"Existing bill {bill.id!r} belongs to another entity")
                 _store_existing_bill(connection, bill, previous=previous)
             if replace_existing:
-                where, params = _entity_filter(accounting_entity)
-                old_bills = connection.execute(
-                    f"SELECT id FROM existing_bills {where}", params
-                ).fetchall()
+                old_bills = list(_existing_bill_rows(connection, accounting_entity))
                 connection.executemany(
                     "DELETE FROM existing_bills WHERE id = ?",
                     ((row["id"],) for row in old_bills if row["id"] not in new_ids),
@@ -714,6 +743,8 @@ class BillingRepository:
         with self._transaction(write=True) as connection:
             batch = _require_batch(connection, batch_id)
             _check_batch_version(batch, expected_version)
+            profiles = _entity_profiles(connection)
+            uses_isolated_baseline = _uses_isolated_baseline(batch)
             records = connection.execute(
                 """SELECT * FROM billing_records
                    WHERE batch_id = ? AND operation IN ('CREATE', 'UPDATE')
@@ -731,11 +762,16 @@ class BillingRepository:
                     counts["skipped"] += 1
                     continue
 
-                if row["accounting_entity"] != batch["accounting_entity"]:
+                if not _bill_entity_matches(
+                    row["accounting_entity"], batch["accounting_entity"], profiles
+                ):
                     raise ValueError(f"Record {row['id']!r} belongs to another accounting entity")
-                previous = _baseline_target(connection, row)
+                record = _billing_record(row)
+                previous = _baseline_target(
+                    connection, record, profiles, uses_isolated_baseline=uses_isolated_baseline
+                )
                 bill = _store_existing_bill(
-                    connection, _bill_from_record(_billing_record(row), previous), previous=previous
+                    connection, _bill_from_record(record, previous), previous=previous
                 )
                 connection.execute(
                     """INSERT INTO baseline_sync_items
@@ -877,10 +913,20 @@ def _check_batch_version(batch: sqlite3.Row, expected: int | None) -> None:
         raise OptimisticLockError("BATCH_CONFLICT", batch["id"], expected, batch["version"])
 
 
-def _dump_batch_bills(bills: Sequence[ExistingBillRecord] | None) -> str | None:
+def _uses_isolated_baseline(batch: sqlite3.Row) -> bool:
+    payload = batch["batch_existing_bills_json"]
+    # Isolated baselines use the original JSON array format. Shared snapshots use an object.
+    return payload is not None and payload.lstrip().startswith("[")
+
+
+def _dump_batch_bills(
+    bills: Sequence[ExistingBillRecord] | None, *, shared: bool = False
+) -> str | None:
     if bills is None:
         return None
-    return dumps_decimal_json(_json_values([bill.model_dump(mode="python") for bill in bills]))
+    values = [bill.model_dump(mode="python") for bill in bills]
+    payload = {_SHARED_BASELINE_SNAPSHOT: values} if shared else values
+    return dumps_decimal_json(_json_values(payload))
 
 
 def _dump_alerts(alerts: Sequence[FailedDocumentAlert]) -> str:
@@ -1016,6 +1062,7 @@ def _store_billing_record(
     connection: sqlite3.Connection,
     batch: sqlite3.Row,
     record: ProcessedBillingRecord,
+    profiles: Sequence[AccountingEntityProfile],
     expected_updated_at: str | None = None,
 ) -> ProcessedBillingRecord:
     batch_id = batch["id"]
@@ -1039,8 +1086,10 @@ def _store_billing_record(
 
     sql_match_id = record.matched_existing_bill_id
     if sql_match_id is not None and (
-        batch["batch_existing_bills_json"] is not None
-        or _select_existing_bill(connection, sql_match_id, record.accounting_entity) is None
+        _uses_isolated_baseline(batch)
+        or _select_existing_bill(
+            connection, sql_match_id, record.accounting_entity, profiles=profiles
+        ) is None
     ):
         sql_match_id = None
 
@@ -1129,23 +1178,57 @@ def _dictionary_detail(row: sqlite3.Row) -> dict[str, Any]:
     return entry
 
 
-def _entity_filter(accounting_entity: str | None) -> tuple[str, tuple[str, ...]]:
-    return (
-        ("", ())
-        if accounting_entity is None
-        else ("WHERE accounting_entity = ?", (accounting_entity,))
+def _entity_profiles(connection: sqlite3.Connection) -> list[AccountingEntityProfile]:
+    return [
+        AccountingEntityProfile.model_validate(_entity_detail(row))
+        for row in connection.execute("SELECT * FROM accounting_entities")
+    ]
+
+
+def _bill_entity_matches(
+    name: str, entity: str, profiles: Sequence[AccountingEntityProfile]
+) -> bool:
+    if entity_matches(name, entity, profiles):
+        return True
+    if not entity_matches(name, entity):
+        return False
+    # Unconfigured companies can use the domain fallback. Keep configured branch boundaries.
+    return not any(
+        entity_matches(name, configured) or entity_matches(entity, configured)
+        for profile in profiles
+        for configured in (profile.canonical_name, *profile.aliases)
+    )
+
+
+def _existing_bill_rows(
+    connection: sqlite3.Connection, accounting_entity: str | None
+) -> Iterator[sqlite3.Row]:
+    rows = connection.execute("SELECT * FROM existing_bills ORDER BY created_at, id")
+    if accounting_entity is None:
+        yield from rows
+        return
+    profiles = _entity_profiles(connection)
+    yield from (
+        row
+        for row in rows
+        if _bill_entity_matches(row["accounting_entity"], accounting_entity, profiles)
     )
 
 
 def _select_existing_bill(
-    connection: sqlite3.Connection, bill_id: str, accounting_entity: str | None = None
+    connection: sqlite3.Connection,
+    bill_id: str,
+    accounting_entity: str | None = None,
+    *,
+    profiles: Sequence[AccountingEntityProfile] | None = None,
 ) -> sqlite3.Row | None:
-    sql = "SELECT * FROM existing_bills WHERE id = ?"
-    params = (bill_id,)
-    if accounting_entity is not None:
-        sql += " AND accounting_entity = ?"
-        params += (accounting_entity,)
-    return connection.execute(sql, params).fetchone()
+    row = connection.execute("SELECT * FROM existing_bills WHERE id = ?", (bill_id,)).fetchone()
+    if row is None or accounting_entity is None:
+        return row
+    profiles = _entity_profiles(connection) if profiles is None else profiles
+    if _bill_entity_matches(row["accounting_entity"], accounting_entity, profiles):
+        return row
+    return None
 
 
 def _existing_bill(row: sqlite3.Row) -> ExistingBillRecord:
@@ -1186,20 +1269,35 @@ def _store_existing_bill(
     return bill
 
 
-def _baseline_target(connection: sqlite3.Connection, record: sqlite3.Row) -> sqlite3.Row | None:
-    previous = connection.execute(
-        """SELECT bill.* FROM baseline_sync_items AS sync
+def _baseline_target(
+    connection: sqlite3.Connection,
+    record: ProcessedBillingRecord,
+    profiles: Sequence[AccountingEntityProfile],
+    *,
+    uses_isolated_baseline: bool,
+) -> sqlite3.Row | None:
+    receipts = connection.execute(
+        """SELECT bill.*, sync.accounting_entity AS receipt_entity FROM baseline_sync_items AS sync
            JOIN existing_bills AS bill ON bill.id = sync.existing_bill_id
            WHERE sync.batch_id = ? AND sync.billing_record_id = ?
-               AND sync.accounting_entity = ? AND bill.accounting_entity = sync.accounting_entity
-           ORDER BY sync.synced_at DESC, sync.rowid DESC LIMIT 1""",
-        (record["batch_id"], record["id"], record["accounting_entity"]),
-    ).fetchone()
-    if previous is not None:
-        return previous
-    matched_id = record["matched_existing_bill_id"]
-    if record["operation"] == "UPDATE" and matched_id is not None:
-        return _select_existing_bill(connection, matched_id, record["accounting_entity"])
+           ORDER BY sync.synced_at DESC, sync.rowid DESC""",
+        (record.batch_id, record.id),
+    )
+    for bill in receipts:
+        if all(
+            _bill_entity_matches(bill[column], record.accounting_entity, profiles)
+            for column in ("accounting_entity", "receipt_entity")
+        ):
+            return bill
+    matched_id = record.matched_existing_bill_id
+    if (
+        not uses_isolated_baseline
+        and record.operation is OperationType.UPDATE
+        and matched_id is not None
+    ):
+        return _select_existing_bill(
+            connection, matched_id, record.accounting_entity, profiles=profiles
+        )
     return None
 
 

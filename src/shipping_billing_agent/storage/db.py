@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+import sys
+from collections.abc import Iterator, Mapping
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime
+from errno import EACCES, EAGAIN
+from hashlib import sha256
 from pathlib import Path
+from threading import Lock
+from typing import BinaryIO, Self
 from uuid import uuid4
 
 from ..domain.charge_normalizer import _CHARGE_NAMES
 from ..domain.models import AccountingEntityProfile, dumps_decimal_json, loads_decimal_json
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 _BUSY_TIMEOUT_MS = 5000
 _SCHEMA_VERSION = 1
@@ -24,10 +34,73 @@ _SNAPSHOT_COLUMNS = {
     "source_documents": {"extraction_snapshot_json": "TEXT"},
     "billing_records": {"record_state_json": "TEXT NOT NULL DEFAULT '{}'"},
 }
+_WORKER_LEASE_LOCK = Lock()
+_ACTIVE_WORKERS: dict[Path, BatchWorkerLease] = {}
 
 
 def utc_timestamp() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def document_root_ids(parents: Mapping[str, str | None]) -> dict[str, str]:
+    """Map each source document to the submitted file at the root of its tree."""
+    roots = {}
+    for doc_id in parents:
+        root = doc_id
+        seen = {root}
+        while (parent := parents[root]) is not None:
+            if parent in seen or parent not in parents:
+                raise ValueError("Invalid source document tree")
+            if parent in roots:
+                root = roots[parent]
+                break
+            root = parent
+            seen.add(root)
+        roots[doc_id] = root
+    return roots
+
+
+def _lock_worker_file(stream: BinaryIO) -> None:
+    if sys.platform == "win32":
+        stream.seek(0)
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+class BatchWorkerLease:
+    """Hold a worker's file lock across queueing, execution, and the final commit."""
+
+    def __init__(self, batch_id: str, path: Path, stream: BinaryIO) -> None:
+        self.batch_id = batch_id
+        self._path = path
+        self._stream = stream
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    @property
+    def active(self) -> bool:
+        with _WORKER_LEASE_LOCK:
+            return _ACTIVE_WORKERS.get(self._path) is self and not self._stream.closed
+
+    def close(self) -> None:
+        # Keep the lock file in place so concurrent processes always lock the same file.
+        with _WORKER_LEASE_LOCK:
+            if _ACTIVE_WORKERS.get(self._path) is not self:
+                return
+            try:
+                if sys.platform == "win32":
+                    self._stream.seek(0)
+                    msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
+            finally:
+                _ACTIVE_WORKERS.pop(self._path)
+                self._stream.close()
 
 
 class DatabaseManager:
@@ -54,6 +127,27 @@ class DatabaseManager:
             connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield connection
 
+    def try_acquire_worker_lease(self, batch_id: str) -> BatchWorkerLease | None:
+        digest = sha256(batch_id.encode("utf-8")).hexdigest()
+        path = self.path.with_name(f".{self.path.name}.{digest}.worker.lock")
+        with _WORKER_LEASE_LOCK:
+            if path in _ACTIVE_WORKERS:
+                return None
+            stream = path.open("a+b")
+            try:
+                _lock_worker_file(stream)
+            except OSError as exc:
+                stream.close()
+                if exc.errno in {EACCES, EAGAIN}:
+                    return None
+                raise
+            except BaseException:
+                stream.close()
+                raise
+            lease = BatchWorkerLease(batch_id, path, stream)
+            _ACTIVE_WORKERS[path] = lease
+            return lease
+
     def _initialize(self, *, recover_orphans: bool) -> None:
         with self.connect() as connection, connection:
             mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
@@ -70,7 +164,7 @@ class DatabaseManager:
                 _seed_master_data(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             if recover_orphans:
-                _recover_interrupted_batches(connection)
+                _recover_interrupted_batches(connection, self)
 
 
 def _add_snapshot_columns(connection: sqlite3.Connection) -> None:
@@ -126,7 +220,7 @@ def _seed_master_data(connection: sqlite3.Connection) -> None:
         )
 
 
-def _recover_interrupted_batches(connection: sqlite3.Connection) -> None:
+def _recover_interrupted_batches(connection: sqlite3.Connection, db: DatabaseManager) -> None:
     batches = connection.execute(
         """SELECT id, failed_documents_json, failed_files FROM batches
            WHERE status = 'PROCESSING' OR stage IN (
@@ -135,72 +229,82 @@ def _recover_interrupted_batches(connection: sqlite3.Connection) -> None:
            )"""
     ).fetchall()
     for batch in batches:
-        batch_id = batch["id"]
-        alerts = loads_decimal_json(batch["failed_documents_json"])
-        alerted_documents = {alert["doc_id"] for alert in alerts}
-        records_by_document: dict[str, list[str]] = {}
-        for record in connection.execute(
-            """SELECT id, source_doc_id FROM billing_records WHERE batch_id = ?
-               ORDER BY source_line_index, id""",
-            (batch_id,),
-        ):
-            records_by_document.setdefault(record["source_doc_id"], []).append(record["id"])
+        if lease := db.try_acquire_worker_lease(batch["id"]):
+            with lease:
+                _recover_interrupted_batch(connection, batch)
 
-        for document in connection.execute(
-            """SELECT id, original_filename, status, error_message, extraction_snapshot_json
-               FROM source_documents WHERE batch_id = ?""",
-            (batch_id,),
-        ).fetchall():
-            doc_id = document["id"]
-            record_ids = records_by_document.get(doc_id, [])
-            awaiting_extraction = (
-                document["status"] == "PARSED"
-                and document["extraction_snapshot_json"] is None
-                and not record_ids
-                and doc_id not in alerted_documents
-            )
-            interrupted = awaiting_extraction or document["status"] not in (
-                "PARSED",
-                "SKIPPED_NOISE",
-                "METADATA_ONLY",
-                "FAILED",
-            )
-            if not interrupted and document["status"] != "FAILED":
-                continue
 
-            message = document["error_message"] if not interrupted else None
-            if not message:
-                message = _RESTART_MESSAGE
-                connection.execute(
-                    """UPDATE source_documents SET status = 'FAILED', extraction_channel = 'FAILED',
-                       error_message = ? WHERE batch_id = ? AND id = ?""",
-                    (message, batch_id, doc_id),
-                )
-            if doc_id not in alerted_documents:
-                alerts.append(
-                    {
-                        "doc_id": doc_id,
-                        "filename": document["original_filename"],
-                        "error_message": message,
-                        "affected_record_ids": record_ids,
-                    }
-                )
-                alerted_documents.add(doc_id)
+def _recover_interrupted_batch(connection: sqlite3.Connection, batch: sqlite3.Row) -> None:
+    batch_id = batch["id"]
+    alerts = loads_decimal_json(batch["failed_documents_json"])
+    alerted_documents = {alert["doc_id"] for alert in alerts}
+    records_by_document: dict[str, list[str]] = {}
+    for record in connection.execute(
+        """SELECT id, source_doc_id FROM billing_records WHERE batch_id = ?
+           ORDER BY source_line_index, id""",
+        (batch_id,),
+    ):
+        records_by_document.setdefault(record["source_doc_id"], []).append(record["id"])
 
-        connection.execute(
-            """UPDATE batches
-               SET status = 'PARTIAL_ERROR', stage = 'FAILED', stage_message = ?,
-                   failed_documents_json = ?, failed_files = ?,
-                   version = version + 1, updated_at = ?
-               WHERE id = ?""",
-            (
-                _RESTART_MESSAGE,
-                dumps_decimal_json(alerts),
-                max(batch["failed_files"], len(alerted_documents)),
-                utc_timestamp(),
-                batch_id,
-            ),
+    documents = connection.execute(
+        """SELECT id, parent_doc_id, original_filename, status, error_message,
+                  extraction_snapshot_json
+           FROM source_documents WHERE batch_id = ?""",
+        (batch_id,),
+    ).fetchall()
+    roots = document_root_ids({doc["id"]: doc["parent_doc_id"] for doc in documents})
+    for document in documents:
+        doc_id = document["id"]
+        record_ids = records_by_document.get(doc_id, [])
+        awaiting_extraction = (
+            document["status"] == "PARSED"
+            and document["extraction_snapshot_json"] is None
+            and not record_ids
+            and doc_id not in alerted_documents
         )
+        interrupted = awaiting_extraction or document["status"] not in (
+            "PARSED",
+            "SKIPPED_NOISE",
+            "METADATA_ONLY",
+            "FAILED",
+        )
+        if not interrupted and document["status"] != "FAILED":
+            continue
+
+        message = document["error_message"] if not interrupted else None
+        if not message:
+            message = _RESTART_MESSAGE
+            connection.execute(
+                """UPDATE source_documents SET status = 'FAILED', extraction_channel = 'FAILED',
+                   error_message = ? WHERE batch_id = ? AND id = ?""",
+                (message, batch_id, doc_id),
+            )
+        if doc_id not in alerted_documents:
+            alerts.append(
+                {
+                    "doc_id": doc_id,
+                    "filename": document["original_filename"],
+                    "error_message": message,
+                    "affected_record_ids": record_ids,
+                }
+            )
+            alerted_documents.add(doc_id)
+
+    failed_root_ids = {roots[doc_id] for doc_id in alerted_documents if doc_id in roots}
+    connection.execute(
+        """UPDATE batches
+           SET status = 'PARTIAL_ERROR', stage = 'FAILED', stage_message = ?,
+               failed_documents_json = ?, failed_files = ?,
+               version = version + 1, updated_at = ?
+           WHERE id = ?""",
+        (
+            _RESTART_MESSAGE,
+            dumps_decimal_json(alerts),
+            max(batch["failed_files"], len(failed_root_ids)),
+            utc_timestamp(),
+            batch_id,
+        ),
+    )
 
 
 # Packaged with the application so initialization also works from an installed wheel.

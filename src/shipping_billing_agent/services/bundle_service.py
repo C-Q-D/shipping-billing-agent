@@ -172,7 +172,12 @@ def export_review_bundle(repository: BillingRepository, batch_id: str) -> dict[s
             )
         bills = batch["batch_existing_bills"]
         if bills is None:
-            bills = _load_batch_scope(transaction, batch, batch["accounting_entity"]).existing_bills
+            bills = _load_batch_scope(
+                transaction,
+                batch,
+                batch["accounting_entity"],
+                shared_baseline=batch["shared_baseline_snapshot"],
+            ).existing_bills
         audit_by_record = defaultdict(list)
         for entry in transaction.list_review_audit_logs(batch_id):
             audit_by_record[entry["record_id"]].append(entry)
