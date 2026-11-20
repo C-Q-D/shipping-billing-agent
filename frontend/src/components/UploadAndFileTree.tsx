@@ -9,12 +9,16 @@ import {
 import {
   getStagedFileKey,
   validateBatchIngestionInput,
+  type AccountingEntity,
   type BatchDetail,
   type OcrMode,
   type SourceDocumentSummary,
 } from "../api/client.ts";
 import { formatLosslessAmount } from "../api/decimalJson.ts";
-import type { PendingBatchDetailRecovery } from "../api/reviewState.ts";
+import {
+  formatOcrChannelLabel,
+  type PendingBatchDetailRecovery,
+} from "../api/reviewState.ts";
 import {
   LumnoButton,
   LumnoInfoButton,
@@ -101,18 +105,45 @@ function getDocStatusMeta(status: SourceDocumentSummary["status"]): {
 } {
   switch (status) {
     case "PARSED":
-      return { label: "PARSED", tone: "ok" };
+      return { label: "已解析", tone: "ok" };
     case "METADATA_ONLY":
-      return { label: "METADATA_ONLY", tone: "info" };
+      return { label: "辅助凭据", tone: "info" };
     case "SKIPPED_NOISE":
-      return { label: "SKIPPED_NOISE", tone: "muted" };
+      return { label: "已忽略", tone: "muted" };
     case "FAILED":
-      return { label: "FAILED", tone: "error" };
+      return { label: "解析失败", tone: "error" };
   }
 }
 
+function getDocSemanticTitle(
+  doc: SourceDocumentSummary,
+  isChild: boolean
+): string {
+  const count = doc.affected_record_ids?.length ?? 0;
+  const kind = doc.source_kind.toUpperCase();
+  const isEmail = kind.includes("EML") || kind.includes("EMAIL");
+
+  if (doc.status === "FAILED") {
+    return isChild ? "附件解析失败" : "单据解析失败";
+  }
+  if (doc.status === "SKIPPED_NOISE") {
+    return "非计费图片（已自动忽略）";
+  }
+  if (isChild) {
+    if (isEmail) {
+      return count > 0 ? `邮件正文 · ${count} 条费用` : "邮件正文 · 无费用";
+    }
+    return count > 0 ? `邮件附件 · ${count} 条费用` : "邮件附件 · 无费用";
+  }
+  if (isEmail) {
+    return count > 0 ? `邮件主件 · ${count} 条费用` : "邮件容器 · 见下方正文与附件";
+  }
+  return count > 0 ? `单据 · ${count} 条费用` : "单据 · 仅辅助凭据";
+}
+
 export interface UploadAndFileTreeProps {
-  selectedEntity: string;
+  defaultEntity: string;
+  entities: ReadonlyArray<AccountingEntity>;
   activeBatch: BatchDetail | null;
   activeDocFilterId: string | null;
   dirtyDocIds?: ReadonlySet<string>;
@@ -133,7 +164,8 @@ export interface UploadAndFileTreeProps {
   onSubmitDemo: (args: {
     accountingEntity: string;
     ocrMode: OcrMode;
-  }) => Promise<void>;
+    onAccepted?: () => void;
+  }) => Promise<boolean>;
   onSelectDocFilter: (docId: string | null) => void;
   onInspectDoc: (docId: string) => void;
   onForceParseDoc: (docId: string) => void;
@@ -141,7 +173,8 @@ export interface UploadAndFileTreeProps {
 }
 
 export function UploadAndFileTree({
-  selectedEntity,
+  defaultEntity,
+  entities,
   activeBatch,
   activeDocFilterId,
   dirtyDocIds,
@@ -160,10 +193,12 @@ export function UploadAndFileTree({
 }: UploadAndFileTreeProps) {
   const [stagedFiles, setStagedFiles] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [showUrlsPanel, setShowUrlsPanel] = useState(false);
-  const [publicUrlLinesText, setPublicUrlLinesText] = useState("");
+  const [entityOverrideOpen, setEntityOverrideOpen] = useState(false);
   const [customEntityInput, setCustomEntityInput] = useState("");
-  const [ocrMode, setOcrMode] = useState<OcrMode>("REMOTE_ONLY");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [demoOpen, setDemoOpen] = useState(false);
+  const [publicUrlLinesText, setPublicUrlLinesText] = useState("");
+  const [ocrMode, setOcrMode] = useState<OcrMode>("REMOTE_WITH_LOCAL_FALLBACK");
   const [batchBills, setBatchBills] = useState<{
     name: string | null;
     text: string;
@@ -183,9 +218,10 @@ export function UploadAndFileTree({
     }
   }, []);
 
-  const effectiveEntity = (
-    customEntityInput.trim() || selectedEntity
-  ).trim();
+  const trimmedOverride = customEntityInput.trim();
+  const isEntityOverridden =
+    trimmedOverride.length > 0 && trimmedOverride !== defaultEntity;
+  const effectiveEntity = (trimmedOverride || defaultEntity).trim();
 
   const validation = useMemo(
     () =>
@@ -197,6 +233,13 @@ export function UploadAndFileTree({
       }),
     [effectiveEntity, stagedFiles, publicUrlLinesText, batchBills.text]
   );
+
+  const totalStagedCount = stagedFiles.length + validation.parsedUrls.length;
+  const hasActiveAdvancedOptions =
+    validation.parsedUrls.length > 0 ||
+    publicUrlLinesText.trim().length > 0 ||
+    Boolean(batchBills.name) ||
+    ocrMode !== "REMOTE_WITH_LOCAL_FALLBACK";
 
   const appendFiles = (incoming: File[]) => {
     if (incoming.length === 0) return;
@@ -243,6 +286,11 @@ export function UploadAndFileTree({
     setBatchBills({ name: file.name, text });
   };
 
+  const resetEntityOverride = () => {
+    setCustomEntityInput("");
+    setEntityOverrideOpen(false);
+  };
+
   const handleSubmit = async () => {
     if (submittingBatch || submittingDemo) {
       return;
@@ -268,6 +316,8 @@ export function UploadAndFileTree({
           ? { name: null, text: "" }
           : prev
       );
+      setCustomEntityInput("");
+      setEntityOverrideOpen(false);
       setHasAttemptedSubmit(false);
     };
 
@@ -324,12 +374,17 @@ export function UploadAndFileTree({
     return result;
   }, [activeBatch]);
 
+  const primarySubmitLabel =
+    totalStagedCount > 0
+      ? `解析 ${totalStagedCount} 份单据`
+      : "选择单据后开始解析";
+
   return (
     <>
       <div className="wb-pane-header">
         <h2 className="wb-pane-title">
           <i className="ri-icon ri-inbox-archive-line" aria-hidden="true" />
-          <span>单据投递与文件树</span>
+          <span>单据上传与文件列表</span>
         </h2>
         {activeBatch ? (
           <span className="wb-badge wb-badge--muted wb-tabular">
@@ -340,17 +395,88 @@ export function UploadAndFileTree({
 
       <div className="wb-pane-body">
         <section className="wb-section-box" aria-label="单据投递配置">
-          <div className="wb-field-label">
-            <span>投递记账主体（可选覆盖）</span>
-            <span className="wb-helper-note">当前：{selectedEntity}</span>
+          {/* P0-3: Distinct Next-Batch Entity Indicator & Clear Override */}
+          <div className="wb-next-entity-bar">
+            <div style={{ minWidth: 0 }}>
+              <div className="wb-kv-label">下一批新建将使用公司</div>
+              <div
+                style={{
+                  fontSize: "12px",
+                  fontWeight: 600,
+                  overflowWrap: "anywhere",
+                }}
+              >
+                {effectiveEntity}
+              </div>
+            </div>
+            <div style={{ display: "inline-flex", gap: "4px", flexShrink: 0 }}>
+              {isEntityOverridden ? (
+                <LumnoButton
+                  variant="ghost"
+                  compact
+                  icon="ri-arrow-go-back-line"
+                  onClick={resetEntityOverride}
+                >
+                  恢复默认
+                </LumnoButton>
+              ) : null}
+              <LumnoButton
+                variant="ghost"
+                compact
+                icon="ri-edit-line"
+                aria-expanded={entityOverrideOpen}
+                onClick={() => setEntityOverrideOpen((v) => !v)}
+              >
+                {entityOverrideOpen ? "收起" : "临时更换"}
+              </LumnoButton>
+            </div>
           </div>
-          <LumnoInput
-            value={customEntityInput}
-            placeholder={`留空沿用顶栏主体：${selectedEntity}`}
-            aria-label="自定义投递记账主体"
-            onChange={(e) => setCustomEntityInput(e.target.value)}
-          />
 
+          {isEntityOverridden ? (
+            <div className="wb-alert-item" data-severity="WARNING" role="status">
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "6px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <span>
+                  已临时覆盖：下一批将按 <strong>{effectiveEntity}</strong>{" "}
+                  记账（不影响上方当前正在复核的批次），提交后自动恢复默认。
+                </span>
+              </div>
+            </div>
+          ) : null}
+
+          {entityOverrideOpen ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+              <label
+                htmlFor="wb-upload-entity-override"
+                className="wb-form-label"
+              >
+                临时指定下一批记账公司（默认：{defaultEntity}）
+              </label>
+              <LumnoInput
+                id="wb-upload-entity-override"
+                name="upload_accounting_entity"
+                list="wb-upload-entity-options"
+                value={customEntityInput}
+                placeholder={`留空沿用默认：${defaultEntity}`}
+                aria-label="临时指定下一批记账公司"
+                onChange={(e) => setCustomEntityInput(e.target.value)}
+              />
+              <datalist id="wb-upload-entity-options">
+                {entities.map((ent) => (
+                  <option key={ent.id} value={ent.canonical_name} />
+                ))}
+              </datalist>
+            </div>
+          ) : null}
+
+          {/* Primary Dropzone */}
           <div
             className="wb-dropzone"
             data-dragging={dragging ? "true" : "false"}
@@ -367,10 +493,10 @@ export function UploadAndFileTree({
               aria-hidden="true"
             />
             <div style={{ fontWeight: 600, fontSize: "12px" }}>
-              拖拽多格式单据或文件夹至此
+              拖拽多格式账单或文件夹至此
             </div>
             <div className="wb-helper-note">
-              支持 .eml / .pdf / 图片 / Excel / Word，单文件 ≤ 50 MiB，单批 ≤ 50 项
+              支持邮件 .eml / PDF / 图片 / Excel / Word（单文件 ≤ 50 MiB）
             </div>
             <div className="wb-dropzone-actions">
               <LumnoButton
@@ -389,16 +515,10 @@ export function UploadAndFileTree({
               >
                 选择目录
               </LumnoButton>
-              <LumnoButton
-                variant="ghost"
-                compact
-                icon="ri-links-line"
-                onClick={() => setShowUrlsPanel((v) => !v)}
-              >
-                {showUrlsPanel ? "收起 URL" : "公网 URL"}
-              </LumnoButton>
             </div>
             <input
+              id="wb-upload-files"
+              name="upload_files"
               ref={fileInputRef}
               type="file"
               multiple
@@ -407,6 +527,8 @@ export function UploadAndFileTree({
               onChange={handleFileInputChange}
             />
             <input
+              id="wb-upload-dir"
+              name="upload_directory"
               ref={dirInputRef}
               type="file"
               multiple
@@ -430,7 +552,14 @@ export function UploadAndFileTree({
                       <span className="wb-staged-name" title={file.name}>
                         {file.name}
                       </span>
-                      <div style={{ display: "inline-flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
+                      <div
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "4px",
+                          flexShrink: 0,
+                        }}
+                      >
                         <span className="wb-helper-note wb-tabular">
                           {formatFileSize(file.size)}
                         </span>
@@ -456,97 +585,6 @@ export function UploadAndFileTree({
             </div>
           ) : null}
 
-          {showUrlsPanel ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-              <div className="wb-field-label">
-                <span>公网 URL 列表（每行一个 http/https 链接）</span>
-                <span className="wb-tabular">
-                  {validation.parsedUrls.length} 条有效
-                </span>
-              </div>
-              <LumnoTextarea
-                value={publicUrlLinesText}
-                placeholder="https://example.com/invoice_1.pdf"
-                aria-label="公网文件 URL 列表"
-                onChange={(e) => setPublicUrlLinesText(e.target.value)}
-              />
-              {validation.urlErrors.map((err) => (
-                <div key={err.index} className="wb-field-error">
-                  {err.message}
-                </div>
-              ))}
-            </div>
-          ) : null}
-
-          <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-            <div className="wb-field-label">
-              <span>随批已有账单基准（existing_bills_json）</span>
-              <LumnoInfoButton
-                ariaLabel="随批基准与全局库区别说明"
-                tooltip="随批导入的 existing_bills_json 仅用于当前批次四级匹配，不会覆盖或污染全局历史账单基准库。"
-              />
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
-              <LumnoButton
-                variant="secondary"
-                compact
-                icon="ri-file-code-line"
-                onClick={() => billsFileInputRef.current?.click()}
-              >
-                {batchBills.name ? `已选：${batchBills.name}` : "挂载随批 JSON"}
-              </LumnoButton>
-              {batchBills.name ? (
-                <LumnoButton
-                  variant="ghost"
-                  compact
-                  icon="ri-close-line"
-                  onClick={() => setBatchBills({ name: null, text: "" })}
-                >
-                  移除
-                </LumnoButton>
-              ) : null}
-              <input
-                ref={billsFileInputRef}
-                type="file"
-                accept=".json,application/json"
-                style={{ display: "none" }}
-                onChange={(e) => void handleBillsFilePick(e)}
-              />
-            </div>
-            <div className="wb-helper-note">
-              仅作用于本批匹配，须为标准 JSON 数组 [{`{...}`}]（拒绝对象包裹），不改写全局库
-            </div>
-            {validation.existingBillsError ? (
-              <div className="wb-field-error">
-                {validation.existingBillsError}
-              </div>
-            ) : null}
-          </div>
-
-          <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
-            <div className="wb-field-label">
-              <span>OCR 提取通道（OcrMode）</span>
-              <LumnoInfoButton
-                ariaLabel="OCR 模式前提说明"
-                tooltip="默认优先 REMOTE_ONLY（远端 OCR 网关）；若本地二进制 PDF/图片未配置公网中转，系统会诚实阻断并提示，可按需显式切换本地离线兜底。"
-              />
-            </div>
-            <LumnoSegmentedControl
-              value={ocrMode}
-              ariaLabel="选择 OCR 解析通道"
-              options={[
-                { value: "REMOTE_ONLY", label: "远端 OCR 优先" },
-                { value: "REMOTE_WITH_LOCAL_FALLBACK", label: "本地回退兜底" },
-              ]}
-              onChange={setOcrMode}
-            />
-            <div className="wb-helper-note">
-              {ocrMode === "REMOTE_ONLY"
-                ? "REMOTE_ONLY：优先调用远端 OCR 网关；本地无公网中转的扫描件将阻断待重试。"
-                : "REMOTE_WITH_LOCAL_FALLBACK：远端不可达时启用本地离线兜底并打标来源。"}
-            </div>
-          </div>
-
           {(hasAttemptedSubmit ||
             stagedFiles.length > 0 ||
             publicUrlLinesText.trim().length > 0) &&
@@ -560,46 +598,195 @@ export function UploadAndFileTree({
             </div>
           ) : null}
 
-          <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginTop: "2px" }}>
-            <LumnoButton
-              variant="primary"
-              icon="ri-sparkling-line"
-              busy={submittingBatch}
-              disabled={!validation.valid || submittingDemo}
-              onClick={() => void handleSubmit()}
+          <LumnoButton
+            variant="primary"
+            icon="ri-sparkling-line"
+            busy={submittingBatch}
+            disabled={!validation.valid || submittingDemo}
+            onClick={() => void handleSubmit()}
+          >
+            {primarySubmitLabel}
+          </LumnoButton>
+
+          {/* Collapsible Advanced Upload Options */}
+          <div className="wb-collapse-block">
+            <button
+              type="button"
+              className="wb-collapse-trigger"
+              aria-expanded={advancedOpen}
+              onClick={() => setAdvancedOpen((v) => !v)}
             >
-              开始智能解析
-            </LumnoButton>
-            <LumnoButton
-              variant="secondary"
-              icon="ri-play-circle-line"
-              busy={submittingDemo}
-              disabled={submittingBatch}
-              onClick={() =>
-                void onSubmitDemo({
-                  accountingEntity: effectiveEntity,
-                  ocrMode,
-                })
-              }
+              <span>
+                高级投递选项
+                {hasActiveAdvancedOptions ? "（已设置）" : ""}
+              </span>
+              <i
+                className={`ri-icon ri-icon--compact ${
+                  advancedOpen ? "ri-arrow-up-s-line" : "ri-arrow-down-s-line"
+                }`}
+                aria-hidden="true"
+              />
+            </button>
+
+            {advancedOpen ? (
+              <div className="wb-collapse-body">
+                <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                  <label htmlFor="wb-upload-public-urls" className="wb-field-label">
+                    <span>从链接添加（每行一个 http/https 链接）</span>
+                    <span className="wb-tabular">
+                      {validation.parsedUrls.length} 条有效
+                    </span>
+                  </label>
+                  <LumnoTextarea
+                    id="wb-upload-public-urls"
+                    name="public_urls"
+                    value={publicUrlLinesText}
+                    placeholder="https://example.com/invoice_1.pdf"
+                    aria-label="公网文件 URL 列表"
+                    onChange={(e) => setPublicUrlLinesText(e.target.value)}
+                  />
+                  {validation.urlErrors.map((err) => (
+                    <div key={err.index} className="wb-field-error">
+                      {err.message}
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                  <div className="wb-field-label">
+                    <span>仅本批使用的历史账单（JSON）</span>
+                    <LumnoInfoButton
+                      ariaLabel="本批临时历史账单说明"
+                      tooltip="仅用于本批核对是否重复入账或更新，不会改写全局历史账单库。"
+                    />
+                  </div>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <LumnoButton
+                      variant="secondary"
+                      compact
+                      icon="ri-file-code-line"
+                      onClick={() => billsFileInputRef.current?.click()}
+                    >
+                      {batchBills.name
+                        ? `已选：${batchBills.name}`
+                        : "选择本批历史账单 JSON"}
+                    </LumnoButton>
+                    {batchBills.name ? (
+                      <LumnoButton
+                        variant="ghost"
+                        compact
+                        icon="ri-close-line"
+                        onClick={() => setBatchBills({ name: null, text: "" })}
+                      >
+                        移除
+                      </LumnoButton>
+                    ) : null}
+                    <input
+                      id="wb-upload-batch-bills"
+                      name="existing_bills_file"
+                      ref={billsFileInputRef}
+                      type="file"
+                      accept=".json,application/json"
+                      style={{ display: "none" }}
+                      onChange={(e) => void handleBillsFilePick(e)}
+                    />
+                  </div>
+                  {validation.existingBillsError ? (
+                    <div className="wb-field-error">
+                      {validation.existingBillsError}
+                    </div>
+                  ) : null}
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
+                  <div className="wb-field-label">
+                    <span>单据识别方式</span>
+                    <LumnoInfoButton
+                      ariaLabel="识别方式说明"
+                      tooltip="默认优先远端识别并在不可用时自动切换本地识别；如仅允许远端网关，可切换为「仅使用远端服务」。"
+                    />
+                  </div>
+                  <LumnoSegmentedControl
+                    value={ocrMode}
+                    ariaLabel="选择单据识别方式"
+                    options={[
+                      {
+                        value: "REMOTE_WITH_LOCAL_FALLBACK",
+                        label: "自动识别（含本地回退）",
+                      },
+                      { value: "REMOTE_ONLY", label: "仅远端识别" },
+                    ]}
+                    onChange={setOcrMode}
+                  />
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          {/* Collapsible Sample Demo Drawer */}
+          <div className="wb-collapse-block">
+            <button
+              type="button"
+              className="wb-collapse-trigger"
+              aria-expanded={demoOpen}
+              onClick={() => setDemoOpen((v) => !v)}
             >
-              一键载入 4 份真样本
-            </LumnoButton>
+              <span>示例演练（内置 4 份真实样本）</span>
+              <i
+                className={`ri-icon ri-icon--compact ${
+                  demoOpen ? "ri-arrow-up-s-line" : "ri-arrow-down-s-line"
+                }`}
+                aria-hidden="true"
+              />
+            </button>
+
+            {demoOpen ? (
+              <div className="wb-collapse-body">
+                <div className="wb-helper-note">
+                  会按当前「下一批公司：{effectiveEntity}」新建一个独立演示批次，不影响已选文件。
+                </div>
+                <LumnoButton
+                  variant="secondary"
+                  compact
+                  icon="ri-play-circle-line"
+                  busy={submittingDemo}
+                  disabled={submittingBatch}
+                  onClick={() =>
+                    void onSubmitDemo({
+                      accountingEntity: effectiveEntity,
+                      ocrMode,
+                      onAccepted: resetEntityOverride,
+                    })
+                  }
+                >
+                  一键载入 4 份真样本
+                </LumnoButton>
+              </div>
+            ) : null}
           </div>
         </section>
 
+        {/* Document Tree */}
         <section
           aria-label="当前批次文档与附件树"
           style={{ display: "flex", flexDirection: "column", gap: "6px" }}
         >
           <div className="wb-field-label">
-            <span>批次文档 / EML 附件树</span>
+            <span>本批文件列表</span>
             {activeDocFilterId ? (
               <LumnoButton
                 variant="ghost"
                 compact
                 onClick={() => onSelectDocFilter(null)}
               >
-                清除筛选
+                显示全部文件
               </LumnoButton>
             ) : null}
           </div>
@@ -634,12 +821,12 @@ export function UploadAndFileTree({
                   style={{ "--ri-size": "24px" } as React.CSSProperties}
                   aria-hidden="true"
                 />
-                <span>上传单据或点击“一键载入 4 份真样本”后查看文件树</span>
+                <span>上传单据后，这里会列出邮件正文、附件及识别结果</span>
               </div>
             )
           ) : orderedDocs.length === 0 ? (
             <div className="wb-empty-state lumno-paper-card">
-              <span>批次拆包中，稍候将显示文档与 EML 附件节点...</span>
+              <span>正在拆包整理文件列表，请稍候...</span>
             </div>
           ) : (
             <div className="wb-doc-tree">
@@ -648,6 +835,7 @@ export function UploadAndFileTree({
                 const isSelected = activeDocFilterId === doc.id;
                 const isDocDirty = dirtyDocIds?.has(doc.id) ?? false;
                 const totalStr = formatLosslessAmount(doc, "total_amount", "");
+                const semanticTitle = getDocSemanticTitle(doc, isChild);
                 return (
                   <div
                     key={doc.id}
@@ -680,17 +868,21 @@ export function UploadAndFileTree({
                     }}
                   >
                     <div className="wb-doc-title-row">
-                      <span
-                        className="wb-doc-filename"
-                        title={doc.sanitized_filename}
-                      >
+                      <span className="wb-doc-semantic">
                         <i
                           className={`ri-icon ri-icon--compact ${getDocIcon(doc.source_kind)}`}
                           aria-hidden="true"
                         />
-                        <span>{doc.sanitized_filename}</span>
+                        <span>{semanticTitle}</span>
                       </span>
-                      <div style={{ display: "inline-flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
+                      <div
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "4px",
+                          flexShrink: 0,
+                        }}
+                      >
                         {isDocDirty ? (
                           <span className="wb-badge wb-badge--warn">未保存</span>
                         ) : null}
@@ -700,16 +892,27 @@ export function UploadAndFileTree({
                       </div>
                     </div>
 
+                    <div
+                      className="wb-doc-subfilename"
+                      title={doc.sanitized_filename}
+                    >
+                      {doc.sanitized_filename}
+                    </div>
+
                     <div className="wb-doc-meta-row">
                       <span className="wb-helper-note">
-                        通道：{doc.extraction_channel}
+                        {formatOcrChannelLabel(doc.extraction_channel)}
                         {totalStr
-                          ? ` · 总额 ${totalStr} ${doc.total_currency ?? ""}`
+                          ? ` · 合计 ${totalStr} ${doc.total_currency ?? ""}`
                           : ""}
                       </span>
 
                       <div
-                        style={{ display: "inline-flex", gap: "4px", flexWrap: "wrap" }}
+                        style={{
+                          display: "inline-flex",
+                          gap: "4px",
+                          flexWrap: "wrap",
+                        }}
                         onClick={(e) => e.stopPropagation()}
                       >
                         {doc.status === "SKIPPED_NOISE" ? (
@@ -720,7 +923,7 @@ export function UploadAndFileTree({
                             busy={forcingDocId === doc.id}
                             onClick={() => onForceParseDoc(doc.id)}
                           >
-                            强制 OCR 提取
+                            强制识别
                           </LumnoButton>
                         ) : null}
 
@@ -752,10 +955,10 @@ export function UploadAndFileTree({
                         <LumnoButton
                           variant="ghost"
                           compact
-                          icon="ri-tools-line"
+                          icon="ri-file-edit-line"
                           onClick={() => onInspectDoc(doc.id)}
                         >
-                          {doc.status === "PARSED" ? "总额与修理" : "详情修理"}
+                          {doc.status === "PARSED" ? "核对合计" : "查看"}
                         </LumnoButton>
                       </div>
                     </div>
@@ -778,6 +981,8 @@ export function UploadAndFileTree({
           )}
 
           <input
+            id="wb-upload-replace-doc"
+            name="upload_replace_doc_file"
             ref={replaceDocInputRef}
             type="file"
             style={{ display: "none" }}

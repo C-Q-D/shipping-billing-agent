@@ -25,8 +25,8 @@ Extract the billing evidence into one JSON object for RawDocumentExtraction.
 Use only the keys and nesting in this JSON example:
 {
   "document_type": "Invoice", "reference_no": "INV-123",
-  "document_date": "2026-10-01", "issuer": "Example Carrier",
-  "recipient": "Example Customer", "payer_hint": null, "payee_hint": null,
+  "document_date": "2026-10-01", "issuer": "Acme Shipping",
+  "recipient": "Beta Trading", "payer_hint": null, "payee_hint": null,
   "shipment_refs": {
     "mbl_nos": [{"value": "MBL123", "source": "page 1"}],
     "hbl_no": null, "booking_no": null, "container_nos": []
@@ -44,15 +44,38 @@ Use only the keys and nesting in this JSON example:
 Names, identifiers, dates, currency, evidence and reasons are strings or null when absent.
 raw_charge_name and each reference value/source and clause text/reason must be strings.
 shipment_refs is an object. mbl_nos, container_nos, excluded_clauses and charges are arrays.
+container_nos must be an array of plain container-number strings (e.g. ["MSCU1234567"]),
+never {"value", "source"} objects.
 Use [] for empty arrays. Page and line_number are integers or null.
 Return amounts, prices and quantity as decimal strings or JSON numbers, preserving precision.
 If a printed value is unclear, preserve its original token for validation.
 Copy the printed document title, reference number and date. Preserve company branch suffixes.
+In a Waybill table row like "CMDU CHN4053601 Waybill OCA17 On Carriage Additional", "Waybill"
+is only the bill type and "OCA17" is the charge code (never reference_no). Without a separate
+invoice or reference header, use the full master B/L ("CMDUCHN4053601") as reference_no and
+put the master B/L ("CMDUCHN4053601" or "CHN4053601") in shipment_refs.mbl_nos.
+In an email settlement instruction without a separate invoice or debit reference number,
+set reference_no to null and place MBL/HBL numbers only in shipment_refs.
 Use PP, CC or null for payment_term and DEBIT, CREDIT or UNKNOWN for debit_credit.
 Use the payment term and debit or credit direction printed for each charge row.
 Return null for absent scalar fields. Never derive quantity from amount / unit_price.
 Use printed billing labels for issuer and recipient and explicit settlement instructions for
-payer_hint and payee_hint. A shipper or consignee label supplies only a transport role.
+payer_hint and payee_hint. A shipper, consignee, or notify label supplies only a transport role;
+never duplicate the same company on both issuer and recipient unless explicitly printed as both.
+If a company name does not actually appear inside <UNTRUSTED_DOCUMENT_CONTENT>, never copy
+the Accounting entity line or the JSON example into issuer, recipient, payer_hint, or
+payee_hint.
+On a GENERAL NOTICE or ARRIVAL NOTICE, if a top company matches CONSIGNEE or NOTIFY, it is the
+recipient addressee rather than the issuer; extract the carrier from notice clauses, customer
+service, or PAYABLE TO (for example "IF <COMPANY> ARRANGES") as issuer.
+On a DEBIT NOTE with a top preparer or software header company (e.g. "Powered by ...") and
+"GRAND TOTAL BALANCE DUE TO <Company>", put the top company in issuer and the payee company
+in payee_hint.
+In email settlement instructions, never treat greetings (such as "Dear LI" or "LI") or
+personal salutations as issuer, recipient, payer_hint, or payee_hint companies.
+If a line prints a short account code like "Payer: USIAHALLAM" near a full company header
+(such as "ALL AMERICA FORWARDING, INC."), use the full legal company name rather than the
+bare code for payer_hint and recipient.
 If an instruction names only the payee, leave payer_hint null unless the source names a payer.
 Leave out values found only in sibling documents so the pipeline can attribute their source.
 FREIGHT PREPAID on a transport document does not set payment_term for a separate charge.

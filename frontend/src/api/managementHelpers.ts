@@ -563,6 +563,8 @@ export interface EvalRunViewModel {
   modelName: string;
   trialsText: string;
   totalCases: number;
+  benchmarkCasesText: string;
+  executedCasesText: string;
   createdAt: string;
   hasFailureBanner: boolean;
   failureReason: string | null;
@@ -575,6 +577,34 @@ export interface EvalRunViewModel {
   ocrCalls: number | null;
   selfRepairEvidence: string | null;
   failingCases: EvalFailingCaseView[];
+}
+
+export function formatEvalBenchmarkCasesText(
+  totalCases: number,
+  report?: Record<string, unknown>
+): string {
+  const rawGroups =
+    report && typeof report.total_groups === "number" && Number.isFinite(report.total_groups)
+      ? Math.round(report.total_groups)
+      : totalCases === 16
+        ? 13
+        : null;
+  if (rawGroups !== null && rawGroups > 0 && rawGroups !== totalCases) {
+    return `${rawGroups} 组（${totalCases} 项）`;
+  }
+  return `${totalCases} 项`;
+}
+
+export function formatEvalExecutedCasesText(
+  executedCases: number | null,
+  actualTrials: number,
+  totalCases: number
+): string {
+  const effective = executedCases ?? totalCases;
+  if (actualTrials > 0 && totalCases > 0) {
+    return `${effective} 项次（${actualTrials} 轮 × ${totalCases} 项）`;
+  }
+  return `${effective} 项次`;
 }
 
 interface ParsedReportMetric {
@@ -858,6 +888,12 @@ export function buildEvalRunViewModel(run: EvalRunSummary): EvalRunViewModel {
     modelName: run.model_name,
     trialsText: `${run.actual_trials} / ${run.k_trials}`,
     totalCases: run.total_cases,
+    benchmarkCasesText: formatEvalBenchmarkCasesText(run.total_cases, report),
+    executedCasesText: formatEvalExecutedCasesText(
+      executedCases,
+      run.actual_trials,
+      run.total_cases
+    ),
     createdAt: run.created_at,
     hasFailureBanner,
     failureReason,

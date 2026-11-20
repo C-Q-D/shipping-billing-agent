@@ -708,6 +708,10 @@ def test_static_workbench_keeps_api_docs_and_errors_reachable(tmp_path: Path) ->
             assert "Billing workspace" in page.text
         assert "console.log" in client.get("/assets/app.js").text
         assert client.get("/assets/missing.js").status_code == 404
+        favicon = client.get("/favicon.ico")
+        assert favicon.status_code == 200
+        assert "image/svg+xml" in favicon.headers["content-type"]
+        assert client.post("/favicon.ico").status_code == 405
         assert client.get(f"{API}/health").json()["status"] == "ok"
 
         created = client.post(f"{API}/entities", json={"canonical_name": "Workbench Entity"})

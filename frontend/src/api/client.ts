@@ -86,6 +86,7 @@ export const MAX_SINGLE_FILE_BYTES = 50 * 1024 * 1024;
 export const MAX_BATCH_ITEMS_COUNT = 50;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const UPLOAD_REQUEST_TIMEOUT_MS = 90_000;
+export const EVAL_REQUEST_TIMEOUT_MS = 180_000;
 
 export const ALLOWED_UPLOAD_EXTENSIONS = [
   ".eml",
@@ -1208,6 +1209,7 @@ export class BillingApiClient {
     return this.requestJson<EvalRunSummary>("/api/v1/eval-runs", {
       method: "POST",
       jsonBody: args,
+      timeoutMs: EVAL_REQUEST_TIMEOUT_MS,
     });
   }
 }

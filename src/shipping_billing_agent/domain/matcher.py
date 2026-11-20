@@ -34,6 +34,7 @@ from .models import (
     FieldDiff,
     MatchLevel,
     OperationType,
+    PostingType,
     ProcessedBillingRecord,
     ReviewStatus,
     ShipmentRefs,
@@ -85,6 +86,15 @@ _MATCH_REASON_PREFIXES = (
     "字段变更：",
     "未明确修改字段继承历史账单原值",
     "核心字段与历史账单一致，无变更",
+)
+_ENTITY_REASONING_MESSAGES = frozenset(
+    {
+        "记账主体匹配收款方，归入应收台账",
+        "记账主体匹配付款方，归入应付台账",
+        "当前记账主体无法唯一匹配单据的收款方或付款方",
+        "人工确认记账方向，归入应收台账",
+        "人工确认记账方向，归入应付台账",
+    }
 )
 _BillPool = tuple[ExistingBillRecord, ...]
 
@@ -189,11 +199,12 @@ def _prepare_record(
     prepared, corrected, override_issues = apply_human_overrides(prepared, charge_dictionary)
     alerts = _source_alerts(prepared, corrected, override_issues)
     party_edits = PARTY_FIELDS & (prepared.human_overrides.keys() | invalid.keys())
+    manual_posting = "posting_type" in prepared.human_overrides
     unresolved_entity = any(alert.code is AlertCode.ENTITY_NOT_MATCHED for alert in alerts)
     needs_initial_resolution = (
         values["posting_type"] is None and not unresolved_entity and has_explicit_parties(prepared)
     )
-    if recompute_entity or party_edits or needs_initial_resolution:
+    if recompute_entity or party_edits or needs_initial_resolution or manual_posting:
         perspective = resolve_entity_perspective(
             prepared.accounting_entity,
             issuer=prepared.issuer,
@@ -202,7 +213,6 @@ def _prepare_record(
             payee_hint=prepared.payee_hint,
             profiles=profiles,
         )
-        manual_posting = "posting_type" in prepared.human_overrides
         if not manual_posting:
             prepared = prepared.model_copy(update={"posting_type": perspective.posting_type})
         alerts = [alert for alert in alerts if alert.code is not AlertCode.ENTITY_NOT_MATCHED]
@@ -212,6 +222,26 @@ def _prepare_record(
             alerts.extend(perspective.validation_alerts)
         if recompute_entity:
             prepared = prepared.model_copy(update={"ai_reasoning": perspective.ai_reasoning})
+        else:
+            existing = [
+                reason
+                for reason in prepared.ai_reasoning
+                if reason not in _ENTITY_REASONING_MESSAGES
+            ]
+            entity_unresolved = any(
+                alert.code is AlertCode.ENTITY_NOT_MATCHED for alert in alerts
+            )
+            if prepared.posting_type is not None and not entity_unresolved:
+                if perspective.posting_type is not None:
+                    entity_reasons = perspective.ai_reasoning
+                else:
+                    direction_label = "应收" if prepared.posting_type is PostingType.AR else "应付"
+                    entity_reasons = [f"人工确认记账方向，归入{direction_label}台账"]
+            else:
+                entity_reasons = perspective.ai_reasoning
+            prepared = prepared.model_copy(
+                update={"ai_reasoning": [*entity_reasons, *existing]}
+            )
     return _with_credit(prepared.model_copy(update={"validation_alerts": alerts}))
 
 
@@ -514,7 +544,7 @@ def _inherit_and_compare(
                 "ai_reasoning": [
                     reason
                     for reason in merged.ai_reasoning
-                    if reason != "当前记账主体无法唯一匹配单据的收款方或付款方"
+                    if reason not in _ENTITY_REASONING_MESSAGES
                 ]
                 + ["沿用当前记账主体历史账单的交易双方和应收或应付台账"],
             }

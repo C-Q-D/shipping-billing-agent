@@ -407,7 +407,12 @@ def test_original_pdf_one_excludes_conditional_fees_and_remittance_by_page(
     result = run_billing_pipeline([document], NEPTUNE)
     assert not result.failed_document_alerts
     (row,) = result.records
-    assert (row.reference_no, row.document_date) == ("OCA17", "2026-10-19")
+    assert (row.reference_no, row.document_date) == ("CMDUCHN4053601", "2026-10-19")
+    assert (row.issuer, row.recipient, row.posting_type) == (
+        "CMA CGM (AMERICA) LLC",
+        NEPTUNE,
+        PostingType.AP,
+    )
     assert {ref.value for ref in row.shipment_refs.mbl_nos} == {"CHN4053601"}
     assert row.shipment_refs.container_nos == ["SAPU2040689"]
     assert row.charge_item == "On Carriage Additional"
@@ -442,7 +447,15 @@ def test_original_pdf_one_excludes_conditional_fees_and_remittance_by_page(
         charge["payment_term"],
         official["financial_attributes"]["posting_type"],
         official["operation"],
-    ) == ("OCA17", "On Carriage Additional", Decimal("245.00"), "USD", "CC", "AR", "CREATE")
+    ) == (
+        "CMDUCHN4053601",
+        "On Carriage Additional",
+        Decimal("245.00"),
+        "USD",
+        "CC",
+        "AP",
+        "CREATE",
+    )
 
 
 @pytest.mark.parametrize(
@@ -3919,3 +3932,468 @@ async def test_final_batch_document_failure_does_not_block_a_healthy_peer(
     assert row.source_doc_id == healthy.doc_id and row.review_status is ReviewStatus.AUTO_READY
     _, (official,) = _export(billing_schema, result.records)
     assert official["charge_details"]["amount"] == 20
+
+
+@pytest.mark.parametrize(
+    ("model_ref", "model_issuer", "model_recipient", "raw_charge", "blocked_field"),
+    [
+        (
+            "CMDUCHN4053601",
+            "CMA CGM (AMERICA) LLC",
+            NEPTUNE,
+            "On Carriage Additional - US Em",
+            None,
+        ),
+        (
+            "CMDU CHN4053601",
+            "CMA CGM (AMERICA) LLC",
+            NEPTUNE,
+            "OCA17 On Carriage Additional - US Em",
+            None,
+        ),
+        ("CHN4053601", "CMA CGM (AMERICA) LLC", NEPTUNE, "On Carriage Additional - US Em", None),
+        ("CMDUCHN4053601", "CMA CGM", NEPTUNE, "On Carriage Additional - US Em", None),
+        (
+            "CMDUCHN4053601",
+            "CMA CGM & ANL Securities BV",
+            None,
+            "On Carriage Additional - US Em",
+            None,
+        ),
+        ("CMDUCHN4053601", NEPTUNE, NEPTUNE, "On Carriage Additional - US Em", "issuer"),
+        (
+            "OCA17",
+            "CMA CGM (AMERICA) LLC",
+            NEPTUNE,
+            "On Carriage Additional - US Em",
+            "reference_no",
+        ),
+        (
+            "INV-SPOOF-99",
+            "CMA CGM (AMERICA) LLC",
+            NEPTUNE,
+            "On Carriage Additional - US Em",
+            "reference_no",
+        ),
+    ],
+    ids=[
+        "printed-mbl-with-carrier-issuer",
+        "spaced-scac-mbl-and-charge-code-prefix",
+        "bare-mbl-with-carrier-issuer",
+        "printed-mbl-with-short-brand-issuer",
+        "printed-mbl-with-beneficiary-issuer",
+        "neptune-as-issuer-still-blocked",
+        "charge-code-oca17-as-reference-blocked",
+        "spoofed-reference-still-blocked",
+    ],
+)
+def test_real_pdf_one_handles_live_llm_mbl_reference_and_container_objects(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    model_ref: str,
+    model_issuer: str,
+    model_recipient: str | None,
+    raw_charge: str,
+    blocked_field: str | None,
+) -> None:
+    document = _parse_file(dispatcher, _sample_path("PDF示例账单1.pdf"))
+    client = _model_reply(
+        document_type="GENERAL NOTICE",
+        reference_no=model_ref,
+        document_date="2026-10-19",
+        issuer=model_issuer,
+        recipient=model_recipient,
+        payer_hint=None,
+        payee_hint=None,
+        shipment_refs={
+            "mbl_nos": [{"value": "CMDUCHN4053601", "source": "page 1"}],
+            "hbl_no": None,
+            "booking_no": None,
+            "container_nos": [{"value": "SAPU2040689", "source": "page 1"}],
+        },
+        total_amount="245.0000",
+        total_currency="USD",
+        charges=[
+            {
+                "raw_charge_name": raw_charge,
+                "amount": "245.0000",
+                "currency": "USD",
+                "payment_term": "CC",
+                "page": 1,
+                "line_number": 48,
+                "debit_credit": "UNKNOWN",
+            }
+        ],
+    )
+
+    result = run_billing_pipeline([document], NEPTUNE, llm_client=client)
+
+    assert result.llm_calls_used == 1 and not result.failed_doc_ids
+    (row,) = result.records
+    assert row.retry_count == 0
+    assert row.reference_no == "CMDUCHN4053601"
+    assert (row.issuer, row.recipient, row.posting_type) == (
+        "CMA CGM (AMERICA) LLC",
+        NEPTUNE,
+        PostingType.AP,
+    )
+    assert row.shipment_refs.container_nos == ["SAPU2040689"]
+    if blocked_field is not None:
+        _assert_review_blocker(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
+        assert any(
+            alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT and alert.field == blocked_field
+            for alert in row.validation_alerts
+        )
+        assert _export(billing_schema, result.records)[1] == []
+    else:
+        assert row.validation_alerts == []
+        assert (row.operation, row.review_status) == (OperationType.CREATE, ReviewStatus.AUTO_READY)
+        _, (official,) = _export(billing_schema, result.records)
+        assert (
+            official["document_info"]["reference_no"],
+            official["charge_details"]["charge_item"],
+            official["charge_details"]["amount"],
+            official["financial_attributes"]["posting_type"],
+        ) == ("CMDUCHN4053601", "On Carriage Additional", Decimal("245.00"), "AP")
+
+
+def test_real_image_and_eml_tolerate_live_llm_payer_code_and_email_invoice_type(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+) -> None:
+    image = _parse_file(dispatcher, _sample_path("图片示例.png"))
+    aaf = f"{FORWARDER}, INC."
+    profiles = (
+        AccountingEntityProfile(canonical_name=ZIM, aliases=[ZIM_PRINTED]),
+        AccountingEntityProfile(canonical_name=FORWARDER, aliases=[aaf]),
+    )
+    for entity, expected_posting in ((ZIM, PostingType.AR), (aaf, PostingType.AP)):
+        image_client = _model_reply(
+            document_type="INVOICE",
+            reference_no="ORFR1618731",
+            document_date="2025-10-03",
+            issuer=ZIM_PRINTED,
+            recipient=aaf,
+            payer_hint="USIAHALLAM",
+            payee_hint=(
+                "Zim American Integrated Shipping Services Co., LLC "
+                "As Agents for Zim Integrated Shipping Services Ltd."
+            ),
+            total_amount="26.90",
+            total_currency="USD",
+            charges=[
+                {
+                    "raw_charge_name": "WHARFAGE ADMINISTRATION FEE",
+                    "amount": "5.00",
+                    "currency": "USD",
+                    "payment_term": "CC",
+                },
+                {
+                    "raw_charge_name": "WHARFAGE",
+                    "unit_price": "2.85",
+                    "amount": "21.90",
+                    "currency": "USD",
+                },
+            ],
+        )
+        image_result = run_billing_pipeline(
+            [image], entity, profiles=profiles, llm_client=image_client
+        )
+        assert not image_result.failed_doc_ids and image_result.llm_calls_used == 1
+        assert len(image_result.records) == 2
+        assert all(
+            row.posting_type is expected_posting
+            and row.validation_alerts == []
+            and row.review_status is ReviewStatus.AUTO_READY
+            for row in image_result.records
+        )
+        assert len(_export(billing_schema, image_result.records)[1]) == 2
+
+    eml_path = next(SAMPLES.glob("*.eml"))
+    eml_docs = _parse_files(dispatcher, [(eml_path.name, eml_path.read_bytes())])
+    eml_client = _model_reply(
+        document_type="Invoice",
+        reference_no=None,
+        document_date="2026-10-01",
+        payer_hint="SHA",
+        payee_hint="TAR",
+        charges=[{"raw_charge_name": "H/C", "amount": "50", "currency": "USD"}],
+    )
+    eml_result = run_billing_pipeline(
+        eml_docs, TARGETING, profiles=EMAIL_PROFILES, llm_client=eml_client
+    )
+    (eml_row,) = eml_result.records
+    assert eml_row.document_type == "EMAIL SETTLEMENT INSTRUCTION"
+    assert eml_row.posting_type is PostingType.AR
+    assert not any(
+        alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT for alert in eml_row.validation_alerts
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_issuer", "blocked"),
+    [
+        (f"{NEPTUNE} (LAX)", False),
+        ("AEBO TCO IMPORT LLC", True),
+        ("Fake Logistics Ltd.", True),
+    ],
+    ids=["payee-echoed-as-issuer", "consignee-debtor-blocked", "unrelated-issuer-blocked"],
+)
+def test_real_pdf_two_allows_printed_payee_as_issuer_and_blocks_debtor(
+    pdf_two: ParsedDocument,
+    billing_schema: Draft202012Validator,
+    model_issuer: str,
+    blocked: bool,
+) -> None:
+    client = _model_reply(
+        document_type="DEBIT NOTE",
+        reference_no="DC-108478",
+        document_date="2026-10-24",
+        issuer=model_issuer,
+        recipient=None,
+        payer_hint=None,
+        payee_hint=f"{NEPTUNE} (LAX)",
+        total_amount="1410.40",
+        total_currency="USD",
+        charges=[
+            {"raw_charge_name": name, "amount": amount, "currency": "USD"}
+            for name, amount in (
+                ("Handling Charge", "65.00"),
+                ("Detention Free Time Charge", "1310.40"),
+                ("Handling Charge", "35.00"),
+            )
+        ],
+    )
+
+    result = run_billing_pipeline([pdf_two], NEPTUNE, llm_client=client)
+
+    assert len(result.records) == 3 and not result.failed_doc_ids
+    for row in result.records:
+        assert row.issuer == PDF_TWO_ISSUER
+        assert row.payee_hint == f"{NEPTUNE} (LAX)"
+        assert row.posting_type is PostingType.AR
+        if blocked:
+            _assert_review_blocker(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
+            assert any(
+                alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT and alert.field == "issuer"
+                for alert in row.validation_alerts
+            )
+        else:
+            assert row.validation_alerts == []
+            assert row.review_status is ReviewStatus.AUTO_READY
+    if blocked:
+        assert _export(billing_schema, result.records)[1] == []
+    else:
+        assert len(_export(billing_schema, result.records)[1]) == 3
+
+
+@pytest.mark.parametrize(
+    ("doc_type", "model_issuer", "model_recipient", "blocked_field"),
+    [
+        ("Billing Notice", None, "LI", None),
+        ("Billing Notice", "LI", None, None),
+        ("Credit Note", None, None, "document_type"),
+        ("Bill of Lading", None, None, "document_type"),
+        ("Billing Notice", "Fake Logistics Ltd.", None, "issuer"),
+    ],
+    ids=[
+        "billing-notice-and-dear-li-recipient",
+        "billing-notice-and-dear-li-issuer",
+        "credit-note-still-blocked",
+        "bill-of-lading-still-blocked",
+        "fake-company-still-blocked",
+    ],
+)
+def test_real_eml_tolerates_billing_notice_and_dear_li_while_blocking_spoofs(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    doc_type: str,
+    model_issuer: str | None,
+    model_recipient: str | None,
+    blocked_field: str | None,
+) -> None:
+    eml_path = next(SAMPLES.glob("*.eml"))
+    eml_docs = _parse_files(dispatcher, [(eml_path.name, eml_path.read_bytes())])
+    eml_client = _model_reply(
+        document_type=doc_type,
+        reference_no=None,
+        document_date="2026-10-01",
+        issuer=model_issuer,
+        recipient=model_recipient,
+        payer_hint="SHA",
+        payee_hint="TAR",
+        charges=[{"raw_charge_name": "H/C", "amount": "50", "currency": "USD"}],
+    )
+
+    result = run_billing_pipeline(
+        eml_docs, TARGETING, profiles=EMAIL_PROFILES, llm_client=eml_client
+    )
+
+    (row,) = result.records
+    assert row.document_type == "EMAIL SETTLEMENT INSTRUCTION"
+    assert (row.issuer, row.recipient, row.posting_type) == (None, None, PostingType.AR)
+    if blocked_field is not None:
+        _assert_review_blocker(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
+        assert any(
+            alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT and alert.field == blocked_field
+            for alert in row.validation_alerts
+        )
+        assert _export(billing_schema, result.records)[1] == []
+    else:
+        assert not any(
+            alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT for alert in row.validation_alerts
+        )
+
+
+@pytest.mark.parametrize(
+    ("model_issuer", "blocked"),
+    [
+        ("湃乐多（上海）航运科技有限公司 Pilot Aiship Tech co., Ltd.", False),
+        ("Fake Bilingual Pilot Aiship Tech co., Ltd.", True),
+    ],
+    ids=["verbatim-bilingual-header", "fabricated-bilingual-blocked"],
+)
+def test_real_pdf_two_normalizes_bilingual_concatenated_issuer_and_blocks_fabricated(
+    pdf_two: ParsedDocument,
+    billing_schema: Draft202012Validator,
+    model_issuer: str,
+    blocked: bool,
+) -> None:
+    client = _model_reply(
+        document_type="DEBIT NOTE",
+        reference_no="DC-108478",
+        document_date="2026-10-24",
+        issuer=model_issuer,
+        payee_hint=f"{NEPTUNE} (LAX)",
+        total_amount="1410.40",
+        total_currency="USD",
+        charges=[
+            {"raw_charge_name": name, "amount": amount, "currency": "USD"}
+            for name, amount in (
+                ("Handling Charge", "65.00"),
+                ("Detention Free Time Charge", "1310.40"),
+                ("Handling Charge", "35.00"),
+            )
+        ],
+    )
+
+    result = run_billing_pipeline([pdf_two], NEPTUNE, llm_client=client)
+
+    assert len(result.records) == 3 and not result.failed_doc_ids
+    for row in result.records:
+        assert row.issuer == PDF_TWO_ISSUER
+        assert row.posting_type is PostingType.AR
+        if blocked:
+            _assert_review_blocker(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
+        else:
+            assert row.validation_alerts == []
+            assert row.review_status is ReviewStatus.AUTO_READY
+    if blocked:
+        assert _export(billing_schema, result.records)[1] == []
+    else:
+        assert len(_export(billing_schema, result.records)[1]) == 3
+
+
+def test_real_eml_clears_mbl_reference_and_image_tolerates_debit_direction(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+) -> None:
+    image = _parse_file(dispatcher, _sample_path("图片示例.png"))
+    image_client = _model_reply(
+        document_type="INVOICE",
+        reference_no="ORFR1618731",
+        document_date="2025-10-03",
+        issuer=ZIM_PRINTED,
+        recipient=f"{FORWARDER}, INC.",
+        payer_hint="USIAHALLAM",
+        payee_hint=ZIM_PRINTED,
+        total_amount="26.90",
+        total_currency="USD",
+        charges=[
+            {
+                "raw_charge_name": "WHARFAGE ADMINISTRATION FEE",
+                "amount": "5.00",
+                "currency": "USD",
+                "payment_term": "CC",
+                "debit_credit": "DEBIT",
+            },
+            {
+                "raw_charge_name": "WHARFAGE",
+                "unit_price": "2.85",
+                "amount": "21.90",
+                "currency": "USD",
+                "debit_credit": "DEBIT",
+            },
+        ],
+    )
+    image_result = run_billing_pipeline(
+        [image],
+        ZIM,
+        profiles=(
+            AccountingEntityProfile(canonical_name=ZIM, aliases=[ZIM_PRINTED]),
+            AccountingEntityProfile(canonical_name=FORWARDER, aliases=[f"{FORWARDER}, INC."]),
+        ),
+        llm_client=image_client,
+    )
+    assert len(image_result.records) == 2
+    assert all(
+        row.debit_credit == "UNKNOWN"
+        and row.validation_alerts == []
+        and row.review_status is ReviewStatus.AUTO_READY
+        for row in image_result.records
+    )
+    assert len(_export(billing_schema, image_result.records)[1]) == 2
+
+    eml_path = next(SAMPLES.glob("*.eml"))
+    eml_docs = _parse_files(dispatcher, [(eml_path.name, eml_path.read_bytes())])
+    eml_client = _model_reply(
+        document_type="Billing Notice",
+        reference_no="OOLU4055331281",
+        document_date="2026-10-01",
+        recipient="LI",
+        payer_hint="SHA",
+        payee_hint="TAR",
+        shipment_refs={
+            "mbl_nos": [{"value": "OOLU4055331281", "source": "body"}],
+            "hbl_no": None,
+            "booking_no": None,
+            "container_nos": [],
+        },
+        charges=[{"raw_charge_name": "H/C", "amount": "50", "currency": "USD"}],
+    )
+    eml_result = run_billing_pipeline(
+        eml_docs, TARGETING, profiles=EMAIL_PROFILES, llm_client=eml_client
+    )
+    (eml_row,) = eml_result.records
+    assert eml_row.reference_no is None
+    assert eml_row.posting_type is PostingType.AR
+    assert not any(
+        alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT for alert in eml_row.validation_alerts
+    )
+
+
+def test_real_office_fixture_clears_hallucinated_entity_to_entity_not_matched(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+) -> None:
+    xls_docs = _parse_files(
+        dispatcher, [("b01_merged.xls", (FIXTURES / "b01_merged.xls").read_bytes())]
+    )
+    client = _model_reply(
+        document_type="INVOICE",
+        issuer=VENDOR,
+        recipient="Beta Trading",
+        charges=[
+            {"raw_charge_name": "THC", "amount": amount, "currency": None}
+            for amount in ("65.25", "310.42")
+        ],
+    )
+
+    result = run_billing_pipeline(xls_docs, VENDOR, llm_client=client)
+
+    assert len(result.records) == 2 and not result.failed_doc_ids
+    for row in result.records:
+        assert (row.issuer, row.recipient) == (None, None)
+        assert row.posting_type is None
+        _assert_review_blocker(row, AlertCode.ENTITY_NOT_MATCHED)
+    assert _export(billing_schema, result.records)[1] == []

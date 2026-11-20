@@ -2,8 +2,8 @@
 schema_version: 1
 mode: tracked
 docs_root: docs/workflow
-current_node: "wave13c-all-modules-verified"
-next_action: "进入 Wave 14：执行两轮独立 gemini-4-neon-high 面试官评审与打磨（全项目严审与精简 -> 仓库外空白目录盲盒验 ZIP）并完成最终交卷汇总"
+current_node: "wave15-completed"
+next_action: "已完成全量自测、真实大模型 LIVE_LLM k=3、真实 Chrome R5 PASS 与交付打包，待完成 gemini-4-neon-high 独立终审"
 check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contracts.py && uv run pytest tests/unit -q && npm --prefix frontend run typecheck"
 ---
 
@@ -47,4 +47,6 @@ check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contract
 
 ## 4. 发版与交付归档（releases/）
 | 版本/批次 | 路径（相对项目根） | 交付范围与回滚基线摘要 |
+| :--- | :--- | :--- |
+| Wave 15（当前终版） | `docs/workflow/releases/wave15-real-data-and-ux-release.md` | 真实 `deepseek-flash` 多文档接地（`PDF示例账单1 AP + CMDUCHN4053601`、双语抬头、`USIAHALLAM`/问候语/提示词防幻觉）、用户视角 UX P0/P1/P2 重构、真实 Chrome R5 `PASS`、1897 pytest 与 4 份真实样本 `LIVE_LLM k=3` 3/3 全通过。 |
 | :--- | :--- | :--- |

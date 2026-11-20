@@ -37,7 +37,13 @@ from .security import ApiSettings, OriginMiddleware, allowed_origin_tuples
 _ROOT = Path(__file__).resolve().parents[3]
 _CONTRACT = _ROOT / "docs/workflow/contracts/openapi.yaml"
 _FRONTEND_DIST = _ROOT / "frontend/dist"
-_RESERVED_PATH_SEGMENTS = {"api", "docs", "redoc", "openapi.json"}
+_RESERVED_PATH_SEGMENTS = {"api", "docs", "redoc", "openapi.json", "favicon.ico"}
+_FAVICON_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
+    "<rect width='32' height='32' rx='8' fill='#273042'/>"
+    "<path d='M8 18h16l-2.2 5.5a2 2 0 0 1-1.85 1.25h-7.9a2 2 0 0 1-1.85-1.25L8 18z"
+    "m3-8h10v6H11v-6zm3-3h4v3h-4V7z' fill='#f8fafc'/></svg>"
+)
 _DEFAULT_EVAL_RUNNER = object()
 _HARNESS_PACKAGE = "shipping_billing_agent.harness"
 _HARNESS_RUNNER_MODULE = f"{_HARNESS_PACKAGE}.runner"
@@ -203,6 +209,11 @@ def create_app(
     fastapi_app.state.resolve_eval_runner = resolve_eval_runner
     fastapi_app.add_middleware(OriginMiddleware, allowed_origins=origins)
     _register_error_handlers(fastapi_app)
+
+    @fastapi_app.get("/favicon.ico", include_in_schema=False)
+    def get_favicon() -> Response:
+        """Serve the workbench icon directly for browsers probing /favicon.ico."""
+        return Response(content=_FAVICON_SVG, media_type="image/svg+xml")
 
     @fastapi_app.get("/api/v1/health", operation_id="getHealth", tags=["System"])
     def get_health() -> DecimalJsonResponse:

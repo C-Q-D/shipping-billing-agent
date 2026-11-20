@@ -21,6 +21,7 @@ import {
   completeExistingBillsLoadFailure,
   completeExistingBillsLoadSuccess,
   createExistingBillsViewState,
+  formatEvalBenchmarkCasesText,
   getExistingBillsHeaderStatus,
   NO_EVAL_RESULT_LABEL,
   parseExistingBillsImportInput,
@@ -65,10 +66,10 @@ export interface ManagementDrawerProps {
 }
 
 const DICT_CATEGORY_OPTIONS = [
-  { value: "origin_dest", label: "起运/目的港操作费 (origin_dest)" },
-  { value: "freight", label: "海运与附加费 (freight)" },
-  { value: "customs", label: "报关与查验费 (customs)" },
-  { value: "general", label: "通用港杂费用 (general)" },
+  { value: "origin_dest", label: "起运/目的港操作费" },
+  { value: "freight", label: "海运与附加费" },
+  { value: "customs", label: "报关与查验费" },
+  { value: "general", label: "通用港杂费用" },
 ] as const;
 
 const EVAL_MODE_OPTIONS: ReadonlyArray<{
@@ -115,6 +116,7 @@ export function ManagementDrawer({
 
   // Tab 1: Accounting Entities
   const [entitySearch, setEntitySearch] = useState("");
+  const [entityFormOpen, setEntityFormOpen] = useState(false);
   const [editingEntityId, setEditingEntityId] = useState<string | null>(null);
   const [entityNameInput, setEntityNameInput] = useState("");
   const [entityAliasesInput, setEntityAliasesInput] = useState("");
@@ -129,6 +131,7 @@ export function ManagementDrawer({
 
   // Tab 2: Charge Dictionary & Reapply
   const [dictSearch, setDictSearch] = useState("");
+  const [dictFormOpen, setDictFormOpen] = useState(false);
   const [dictAliasInput, setDictAliasInput] = useState("");
   const [dictStandardInput, setDictStandardInput] = useState("");
   const [dictCategoryInput, setDictCategoryInput] = useState("origin_dest");
@@ -139,8 +142,10 @@ export function ManagementDrawer({
   const [dictLoadError, setDictLoadError] = useState<string | null>(null);
   const dictReqSeqRef = useRef(0);
 
-  // Tab 3: Shared Existing Bills Baseline (F5 + B2 race & error guard)
+  // Tab 3: Shared Existing Bills Baseline
   const [billEntityFilter, setBillEntityFilter] = useState<string>("");
+  const [billsSearch, setBillsSearch] = useState<string>("");
+  const [billsImportOpen, setBillsImportOpen] = useState(false);
   const billEntityFilterRef = useRef<string>(billEntityFilter);
   billEntityFilterRef.current = billEntityFilter;
   const [billsViewState, setBillsViewState] = useState<ExistingBillsViewState>(
@@ -273,7 +278,7 @@ export function ManagementDrawer({
           return;
         }
         const msg =
-          err instanceof Error ? err.message : "查询历史账单基准失败";
+          err instanceof Error ? err.message : "查询历史账单库失败";
         setBillsViewState((prev) =>
           completeExistingBillsLoadFailure(
             prev,
@@ -303,7 +308,7 @@ export function ManagementDrawer({
     } catch (err) {
       if (seq !== evalReqSeqRef.current) return;
       setEvalLoadError(
-        err instanceof Error ? err.message : "查询 Harness 评测记录失败"
+        err instanceof Error ? err.message : "查询系统自检评测记录失败"
       );
     } finally {
       if (seq === evalReqSeqRef.current) {
@@ -355,6 +360,18 @@ export function ManagementDrawer({
         d.category.toLowerCase().includes(q)
     );
   }, [dictionaryList, dictSearch]);
+
+  const filteredExistingBills = useMemo(() => {
+    const q = billsSearch.trim().toLowerCase();
+    if (!q) return existingBills;
+    return existingBills.filter(
+      (bill) =>
+        bill.charge_item.toLowerCase().includes(q) ||
+        (bill.reference_no ?? "").toLowerCase().includes(q) ||
+        (bill.mbl_no ?? "").toLowerCase().includes(q) ||
+        bill.accounting_entity.toLowerCase().includes(q)
+    );
+  }, [existingBills, billsSearch]);
 
   const standardChargeSuggestions = useMemo(() => {
     const set = new Set<string>();
@@ -421,6 +438,7 @@ export function ManagementDrawer({
       const nextList = await api.listAccountingEntities();
       onEntitiesChanged(nextList);
       resetEntityForm();
+      setEntityFormOpen(false);
     } catch (err) {
       setEntityError(
         err instanceof Error ? err.message : "保存记账主体档案失败"
@@ -461,10 +479,11 @@ export function ManagementDrawer({
       setDictLoadError(null);
       onNotify(
         editingDictId
-          ? `已更新词典映射：${check.payload.raw_alias} → ${check.payload.standard_name}`
-          : `已新增词典映射：${check.payload.raw_alias} → ${check.payload.standard_name}`
+          ? `已更新费用映射：${check.payload.raw_alias} → ${check.payload.standard_name}`
+          : `已新增费用映射：${check.payload.raw_alias} → ${check.payload.standard_name}`
       );
       resetDictForm();
+      setDictFormOpen(false);
     } catch (err) {
       setDictError(
         err instanceof Error ? err.message : "保存费用标准映射失败"
@@ -523,16 +542,16 @@ export function ManagementDrawer({
         bills: parsed.bills,
       });
       setLastImportSummary(
-        `本次导入 ${res.imported_count} 条，共享基准库当前共 ${res.total_count} 条`
+        `本次导入 ${res.imported_count} 条，共享历史账单库当前共 ${res.total_count} 条`
       );
       setBillsImportText("");
       setBillsImportFilename(null);
       setBillsImportRowErrors([]);
       await loadBillsData(billEntityFilterRef.current);
-      onNotify(`已成功导入 ${res.imported_count} 条历史账单基准`);
+      onNotify(`已成功导入 ${res.imported_count} 条历史账单`);
     } catch (err) {
       const msg =
-        err instanceof Error ? err.message : "导入历史账单基准失败";
+        err instanceof Error ? err.message : "导入历史账单失败";
       setBillsImportError(msg);
       setBillsImportRowErrors([]);
     } finally {
@@ -548,12 +567,12 @@ export function ManagementDrawer({
       await loadBillsData(billEntityFilterRef.current);
       onNotify(
         targetFilter
-          ? `已清理主体「${targetFilter}」的共享历史基准账单`
-          : "已清空工作台共享历史基准库"
+          ? `已清理主体「${targetFilter}」的共享历史账单`
+          : "已清空工作台共享历史账单库"
       );
     } catch (err) {
       onNotify(
-        err instanceof Error ? err.message : "清理历史基准账单失败",
+        err instanceof Error ? err.message : "清理历史账单失败",
         "error"
       );
     }
@@ -571,8 +590,14 @@ export function ManagementDrawer({
       const latest = await api.listEvalRuns();
       onEvalRunsChanged(latest);
       setSelectedEvalRunId(created.id);
+      const casesLabel = formatEvalBenchmarkCasesText(
+        created.total_cases,
+        created.report
+      );
       if (created.status === "COMPLETED") {
-        onNotify(`评测完成：${created.run_mode}（共 ${created.total_cases} 组）`);
+        onNotify(
+          `系统自检完成：${casesLabel}，实际 ${created.actual_trials} 轮`
+        );
       } else {
         onNotify(
           `${created.run_mode} 状态为 ${created.status}，指标置为「${NO_EVAL_RESULT_LABEL}」`,
@@ -581,7 +606,7 @@ export function ManagementDrawer({
       }
     } catch (err) {
       onNotify(
-        err instanceof Error ? err.message : "触发 Harness 评测失败",
+        err instanceof Error ? err.message : "触发系统自检评测失败",
         "error"
       );
     } finally {
@@ -594,7 +619,7 @@ export function ManagementDrawer({
   }
 
   const entityFilterOptions = [
-    { value: "", label: "全部记账主体" },
+    { value: "", label: "全部记账公司" },
     ...entities.map((e) => ({
       value: e.canonical_name,
       label: e.canonical_name,
@@ -627,13 +652,13 @@ export function ManagementDrawer({
         className="wb-drawer-panel"
         role="dialog"
         aria-modal="true"
-        aria-label="主数据管理与 Harness 评测看板"
+        aria-label="主数据管理与系统自检"
       >
         <div className="wb-drawer-header">
           <div style={{ minWidth: 0 }}>
-            <h2 className="lumno-modal-title">主数据管理与 Harness 评测看板</h2>
+            <h2 className="lumno-modal-title">主数据管理与系统工具</h2>
             <div className="wb-helper-note">
-              维护记账主体、费用词典重算、共享基准库与双轨稳定性评测
+              查询维护记账公司、费用词典映射、历史账单库与系统自检
             </div>
           </div>
           <div style={{ display: "inline-flex", alignItems: "center", gap: "8px", flexShrink: 0 }}>
@@ -666,12 +691,12 @@ export function ManagementDrawer({
               },
               {
                 value: "existing_bills",
-                label: "历史基准库",
+                label: "历史账单库",
                 count: billsHeaderStatus.tabCount,
               },
               {
                 value: "eval_runs",
-                label: "Harness 评测",
+                label: "系统自检 (Harness)",
                 count: evalRuns.length,
               },
             ]}
@@ -680,103 +705,44 @@ export function ManagementDrawer({
         </div>
 
         <div className="wb-drawer-body">
-          {/* Tab 1: Accounting Entities (Query / Add / Edit only - NO delete) */}
+          {/* Tab 1: Accounting Entities — Lookup First, Add/Edit Below */}
           {activeTab === "entities" ? (
             <div className="wb-drawer-stack">
-              <div className="wb-notice-banner">
-                <span>
-                  记账主体档案仅支持查询、新增与修订别名（为保障历史批次 AR/AP 与审计可追溯，系统不提供删除主体操作）。
-                </span>
-              </div>
-
-              <div className="wb-section-box" aria-label="新增或编辑记账主体">
-                <div className="wb-field-label">
-                  <span>
-                    {editingEntityId ? "编辑记账主体档案" : "新增记账主体档案"}
-                  </span>
-                  {editingEntityId ? (
-                    <LumnoButton
-                      variant="ghost"
-                      compact
-                      onClick={resetEntityForm}
-                    >
-                      取消编辑
-                    </LumnoButton>
-                  ) : null}
-                </div>
-
-                <label className="wb-form-field">
-                  <span className="wb-form-label">主体规范名称 (canonical_name) *</span>
-                  <LumnoInput
-                    value={entityNameInput}
-                    placeholder="如 NEPTUNE SHIPPING LIMITED"
-                    aria-label="记账主体规范名称"
-                    onChange={(e) => {
-                      setEntityNameInput(e.target.value);
-                      setEntityError(null);
-                    }}
-                  />
-                </label>
-
-                <label className="wb-form-field">
-                  <span className="wb-form-label">别名列表 (aliases，逗号或换行分隔)</span>
-                  <LumnoInput
-                    value={entityAliasesInput}
-                    placeholder="如 Neptune Shipping, NEPTUNE (LAX), 海王星航运"
-                    aria-label="记账主体别名列表"
-                    onChange={(e) => setEntityAliasesInput(e.target.value)}
-                  />
-                </label>
-
-                <div className="wb-switch-row">
-                  <div>
-                    <div style={{ fontSize: "12px", fontWeight: 600 }}>
-                      设为默认记账主体
-                    </div>
-                    <div className="wb-helper-note">
-                      工作台启动或新投递未指定主体时默认采用该航运主体
-                    </div>
-                  </div>
-                  <LumnoSwitch
-                    ariaLabel="设为默认记账主体"
-                    compact
-                    checked={entityIsDefault}
-                    onChange={setEntityIsDefault}
-                  />
-                </div>
-
-                {entityError ? (
-                  <div className="wb-field-error">{entityError}</div>
-                ) : null}
-
-                <div className="wb-action-row" style={{ justifyContent: "flex-end" }}>
-                  <LumnoButton
-                    variant="primary"
-                    icon={editingEntityId ? "ri-save-line" : "ri-add-line"}
-                    busy={savingEntity}
-                    onClick={() => void handleSaveEntity()}
-                  >
-                    {editingEntityId ? "保存主体修改" : "新增记账主体"}
-                  </LumnoButton>
-                </div>
-              </div>
-
               <div className="wb-section-box" aria-label="记账主体列表">
                 <div className="wb-field-label">
                   <span>已登记记账主体 ({filteredEntities.length})</span>
-                  <LumnoButton
-                    variant="ghost"
-                    compact
-                    icon="ri-refresh-line"
-                    busy={loadingEntities}
-                    onClick={() => void loadEntitiesData()}
-                  >
-                    刷新
-                  </LumnoButton>
+                  <div style={{ display: "inline-flex", gap: "4px" }}>
+                    <LumnoButton
+                      variant="ghost"
+                      compact
+                      icon="ri-refresh-line"
+                      busy={loadingEntities}
+                      onClick={() => void loadEntitiesData()}
+                    >
+                      刷新
+                    </LumnoButton>
+                    <LumnoButton
+                      variant="secondary"
+                      compact
+                      icon={entityFormOpen ? "ri-arrow-up-s-line" : "ri-add-line"}
+                      onClick={() => {
+                        if (entityFormOpen && !editingEntityId) {
+                          setEntityFormOpen(false);
+                        } else {
+                          resetEntityForm();
+                          setEntityFormOpen(true);
+                        }
+                      }}
+                    >
+                      {entityFormOpen && !editingEntityId ? "收起表单" : "新增主体"}
+                    </LumnoButton>
+                  </div>
                 </div>
                 <LumnoInput
+                  id="wb-mgmt-entity-search"
+                  name="entity_search"
                   value={entitySearch}
-                  placeholder="搜索记账主体名称或别名..."
+                  placeholder="搜索公司名称或常用别名..."
                   aria-label="搜索记账主体"
                   onChange={(e) => setEntitySearch(e.target.value)}
                 />
@@ -815,7 +781,7 @@ export function ManagementDrawer({
                             </strong>
                             {ent.is_default ? (
                               <span className="wb-badge wb-badge--ok">
-                                默认航运主体
+                                默认记账公司
                               </span>
                             ) : null}
                           </div>
@@ -829,6 +795,7 @@ export function ManagementDrawer({
                               setEntityAliasesInput(ent.aliases.join(", "));
                               setEntityIsDefault(ent.is_default);
                               setEntityError(null);
+                              setEntityFormOpen(true);
                             }}
                           >
                             编辑
@@ -852,130 +819,132 @@ export function ManagementDrawer({
                   </div>
                 )}
               </div>
+
+              {(entityFormOpen || editingEntityId) ? (
+                <div className="wb-section-box" aria-label="新增或编辑记账主体">
+                  <div className="wb-field-label">
+                    <span>
+                      {editingEntityId ? "编辑记账主体档案" : "新增记账主体档案"}
+                    </span>
+                    <LumnoButton
+                      variant="ghost"
+                      compact
+                      onClick={() => {
+                        resetEntityForm();
+                        setEntityFormOpen(false);
+                      }}
+                    >
+                      取消
+                    </LumnoButton>
+                  </div>
+
+                  <label htmlFor="wb-mgmt-entity-name" className="wb-form-field">
+                    <span className="wb-form-label">公司规范全称 *</span>
+                    <LumnoInput
+                      id="wb-mgmt-entity-name"
+                      name="canonical_name"
+                      value={entityNameInput}
+                      placeholder="如 NEPTUNE SHIPPING LIMITED"
+                      aria-label="记账主体规范名称"
+                      onChange={(e) => {
+                        setEntityNameInput(e.target.value);
+                        setEntityError(null);
+                      }}
+                    />
+                  </label>
+
+                  <label htmlFor="wb-mgmt-entity-aliases" className="wb-form-field">
+                    <span className="wb-form-label">常用别名与分支简称（逗号或换行分隔）</span>
+                    <LumnoInput
+                      id="wb-mgmt-entity-aliases"
+                      name="aliases"
+                      value={entityAliasesInput}
+                      placeholder="如 Neptune Shipping, NEPTUNE (LAX), 海王星航运"
+                      aria-label="记账主体别名列表"
+                      onChange={(e) => setEntityAliasesInput(e.target.value)}
+                    />
+                  </label>
+
+                  <div className="wb-switch-row">
+                    <div>
+                      <div style={{ fontSize: "12px", fontWeight: 600 }}>
+                        设为默认记账公司
+                      </div>
+                      <div className="wb-helper-note">
+                        新上传单据未指定临时公司时默认按此公司记账
+                      </div>
+                    </div>
+                    <LumnoSwitch
+                      id="wb-mgmt-entity-default"
+                      name="is_default"
+                      ariaLabel="设为默认记账主体"
+                      compact
+                      checked={entityIsDefault}
+                      onChange={setEntityIsDefault}
+                    />
+                  </div>
+
+                  {entityError ? (
+                    <div className="wb-field-error">{entityError}</div>
+                  ) : null}
+
+                  <div className="wb-action-row" style={{ justifyContent: "flex-end" }}>
+                    <LumnoButton
+                      variant="primary"
+                      icon={editingEntityId ? "ri-save-line" : "ri-add-line"}
+                      busy={savingEntity}
+                      onClick={() => void handleSaveEntity()}
+                    >
+                      {editingEntityId ? "保存主体修改" : "保存新增主体"}
+                    </LumnoButton>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="wb-helper-note">
+                为保证历史批次审计可追溯，已登记记账主体仅支持新增与修订别名，不提供删除操作。
+              </div>
             </div>
           ) : null}
 
-          {/* Tab 2: Charge Dictionary & Current Batch Reapply */}
+          {/* Tab 2: Charge Dictionary — Lookup First, Add/Edit & Reapply Below */}
           {activeTab === "dictionary" ? (
             <div className="wb-drawer-stack">
-              <div className="wb-section-box" aria-label="当前批次词典重标准化">
-                <div className="wb-field-label">
-                  <span>按最新词典重新标准化当前批次</span>
-                  {activeBatch ? (
-                    <span className="wb-badge wb-badge--info wb-tabular">
-                      目标批次：{activeBatch.short_code}
-                    </span>
-                  ) : (
-                    <span className="wb-badge wb-badge--muted">未选中批次</span>
-                  )}
-                </div>
-                <div className="wb-helper-note">
-                  只重算当前批次 charge_item，不干扰其他批次且保留已有人工修订（human_overrides 锁定字段不会被覆写）。
-                </div>
-                <div className="wb-action-row" style={{ justifyContent: "flex-end" }}>
-                  <LumnoButton
-                    variant="primary"
-                    icon="ri-sparkling-line"
-                    busy={reapplyingDictionary}
-                    disabled={!activeBatch}
-                    onClick={() => void onReapplyDictionary()}
-                  >
-                    仅重新标准化当前批次
-                  </LumnoButton>
-                </div>
-              </div>
-
-              <div className="wb-section-box" aria-label="新增或编辑费用映射词典">
-                <div className="wb-field-label">
-                  <span>
-                    {editingDictId ? "编辑自定义费用映射" : "新增自定义费用映射"}
-                  </span>
-                  {editingDictId ? (
-                    <LumnoButton variant="ghost" compact onClick={resetDictForm}>
-                      取消编辑
-                    </LumnoButton>
-                  ) : null}
-                </div>
-
-                <div className="wb-form-grid-2">
-                  <label className="wb-form-field">
-                    <span className="wb-form-label">原始费用别名 (raw_alias) *</span>
-                    <LumnoInput
-                      value={
-                        editingDictEntry
-                          ? editingDictEntry.raw_alias
-                          : dictAliasInput
-                      }
-                      placeholder="如 HIGH PRECISION TEST FEE"
-                      aria-label="原始费用别名"
-                      readOnly={Boolean(editingDictId)}
-                      disabled={Boolean(editingDictId)}
-                      onChange={(e) => {
-                        setDictAliasInput(e.target.value);
-                        setDictError(null);
-                      }}
-                    />
-                    {editingDictId ? (
-                      <span className="wb-helper-note">
-                        编辑模式已锁定原始别名（如需更名请删除后新增）
-                      </span>
-                    ) : null}
-                  </label>
-                  <label className="wb-form-field">
-                    <span className="wb-form-label">标准费用名称 (standard_name) *</span>
-                    <LumnoInput
-                      list="wb-mgmt-std-charges"
-                      value={dictStandardInput}
-                      placeholder="如 Handling Charge"
-                      aria-label="标准费用名称"
-                      onChange={(e) => {
-                        setDictStandardInput(e.target.value);
-                        setDictError(null);
-                      }}
-                    />
-                  </label>
-                </div>
-
-                <div className="wb-form-field">
-                  <span className="wb-form-label">费用分类 (category)</span>
-                  <LumnoSelect
-                    value={dictCategoryInput}
-                    ariaLabel="费用分类"
-                    options={DICT_CATEGORY_OPTIONS}
-                    onChange={setDictCategoryInput}
-                  />
-                </div>
-
-                {dictError ? <div className="wb-field-error">{dictError}</div> : null}
-
-                <div className="wb-action-row" style={{ justifyContent: "flex-end" }}>
-                  <LumnoButton
-                    variant="primary"
-                    icon={editingDictId ? "ri-save-line" : "ri-add-line"}
-                    busy={savingDict}
-                    onClick={() => void handleSaveDictionaryEntry()}
-                  >
-                    {editingDictId ? "保存词典映射" : "保存并添加到词典"}
-                  </LumnoButton>
-                </div>
-              </div>
-
               <div className="wb-section-box" aria-label="费用标准映射列表">
                 <div className="wb-field-label">
-                  <span>词典映射条目 ({filteredDictionary.length})</span>
-                  <LumnoButton
-                    variant="ghost"
-                    compact
-                    icon="ri-refresh-line"
-                    busy={loadingDict}
-                    onClick={() => void loadDictionaryData()}
-                  >
-                    刷新
-                  </LumnoButton>
+                  <span>原收费名 → 账务标准名 ({filteredDictionary.length})</span>
+                  <div style={{ display: "inline-flex", gap: "4px" }}>
+                    <LumnoButton
+                      variant="ghost"
+                      compact
+                      icon="ri-refresh-line"
+                      busy={loadingDict}
+                      onClick={() => void loadDictionaryData()}
+                    >
+                      刷新
+                    </LumnoButton>
+                    <LumnoButton
+                      variant="secondary"
+                      compact
+                      icon={dictFormOpen ? "ri-arrow-up-s-line" : "ri-add-line"}
+                      onClick={() => {
+                        if (dictFormOpen && !editingDictId) {
+                          setDictFormOpen(false);
+                        } else {
+                          resetDictForm();
+                          setDictFormOpen(true);
+                        }
+                      }}
+                    >
+                      {dictFormOpen && !editingDictId ? "收起表单" : "新增映射"}
+                    </LumnoButton>
+                  </div>
                 </div>
                 <LumnoInput
+                  id="wb-mgmt-dict-search"
+                  name="dictionary_search"
                   value={dictSearch}
-                  placeholder="筛选原始别名、标准费用名或分类..."
+                  placeholder="搜索原收费名、标准费用名或分类..."
                   aria-label="筛选费用词典"
                   onChange={(e) => setDictSearch(e.target.value)}
                 />
@@ -1022,10 +991,12 @@ export function ManagementDrawer({
                                   entry.is_builtin ? "wb-badge--muted" : "wb-badge--info"
                                 }`}
                               >
-                                {entry.is_builtin ? "系统内置（不可删）" : "自定义映射"}
+                                {entry.is_builtin ? "系统内置" : "自定义映射"}
                               </span>
-                              <span className="wb-badge wb-badge--muted wb-mono">
-                                {entry.category}
+                              <span className="wb-badge wb-badge--muted">
+                                {DICT_CATEGORY_OPTIONS.find(
+                                  (o) => o.value === entry.category
+                                )?.label ?? entry.category}
                               </span>
                             </div>
                           </div>
@@ -1042,6 +1013,7 @@ export function ManagementDrawer({
                                   setDictStandardInput(entry.standard_name);
                                   setDictCategoryInput(entry.category);
                                   setDictError(null);
+                                  setDictFormOpen(true);
                                 }}
                               >
                                 编辑
@@ -1074,6 +1046,112 @@ export function ManagementDrawer({
                 )}
               </div>
 
+              {(dictFormOpen || editingDictId) ? (
+                <div className="wb-section-box" aria-label="新增或编辑费用映射词典">
+                  <div className="wb-field-label">
+                    <span>
+                      {editingDictId ? "编辑自定义费用映射" : "新增自定义费用映射"}
+                    </span>
+                    <LumnoButton
+                      variant="ghost"
+                      compact
+                      onClick={() => {
+                        resetDictForm();
+                        setDictFormOpen(false);
+                      }}
+                    >
+                      取消
+                    </LumnoButton>
+                  </div>
+
+                  <div className="wb-form-grid-2">
+                    <label htmlFor="wb-mgmt-dict-alias" className="wb-form-field">
+                      <span className="wb-form-label">原件收费名 *</span>
+                      <LumnoInput
+                        id="wb-mgmt-dict-alias"
+                        name="raw_alias"
+                        value={
+                          editingDictEntry
+                            ? editingDictEntry.raw_alias
+                            : dictAliasInput
+                        }
+                        placeholder="如 HIGH PRECISION TEST FEE"
+                        aria-label="原始费用别名"
+                        readOnly={Boolean(editingDictId)}
+                        disabled={Boolean(editingDictId)}
+                        onChange={(e) => {
+                          setDictAliasInput(e.target.value);
+                          setDictError(null);
+                        }}
+                      />
+                    </label>
+                    <label htmlFor="wb-mgmt-dict-standard" className="wb-form-field">
+                      <span className="wb-form-label">账务标准名 *</span>
+                      <LumnoInput
+                        id="wb-mgmt-dict-standard"
+                        name="standard_name"
+                        list="wb-mgmt-std-charges"
+                        value={dictStandardInput}
+                        placeholder="如 Handling Charge"
+                        aria-label="标准费用名称"
+                        onChange={(e) => {
+                          setDictStandardInput(e.target.value);
+                          setDictError(null);
+                        }}
+                      />
+                    </label>
+                  </div>
+
+                  <div className="wb-form-field">
+                    <span className="wb-form-label">费用分类</span>
+                    <LumnoSelect
+                      value={dictCategoryInput}
+                      ariaLabel="费用分类"
+                      options={DICT_CATEGORY_OPTIONS}
+                      onChange={setDictCategoryInput}
+                    />
+                  </div>
+
+                  {dictError ? <div className="wb-field-error">{dictError}</div> : null}
+
+                  <div className="wb-action-row" style={{ justifyContent: "flex-end" }}>
+                    <LumnoButton
+                      variant="primary"
+                      icon={editingDictId ? "ri-save-line" : "ri-add-line"}
+                      busy={savingDict}
+                      onClick={() => void handleSaveDictionaryEntry()}
+                    >
+                      {editingDictId ? "保存词典映射" : "保存并添加到词典"}
+                    </LumnoButton>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="wb-section-box" aria-label="当前批次词典重标准化">
+                <div className="wb-field-label">
+                  <span>按最新词典重算当前批次费用名</span>
+                  {activeBatch ? (
+                    <span className="wb-badge wb-badge--info wb-tabular">
+                      当前批 {activeBatch.short_code}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="wb-helper-note">
+                  只更新当前批次未手工改过的费用名称，保留已做过的人工修订。
+                </div>
+                <div className="wb-action-row" style={{ justifyContent: "flex-end" }}>
+                  <LumnoButton
+                    variant="secondary"
+                    icon="ri-sparkling-line"
+                    busy={reapplyingDictionary}
+                    disabled={!activeBatch}
+                    onClick={() => void onReapplyDictionary()}
+                  >
+                    仅重算当前批次费用名
+                  </LumnoButton>
+                </div>
+              </div>
+
               <datalist id="wb-mgmt-std-charges">
                 {standardChargeSuggestions.map((name) => (
                   <option key={name} value={name} />
@@ -1082,181 +1160,62 @@ export function ManagementDrawer({
             </div>
           ) : null}
 
-          {/* Tab 3: Shared Existing Bills Baseline */}
+          {/* Tab 3: Shared Existing Bills Baseline — Search & List First, Import/Clear Below */}
           {activeTab === "existing_bills" ? (
             <div className="wb-drawer-stack">
-              <div className="wb-section-box" aria-label="共享历史基准库筛选与清理">
+              <div className="wb-section-box" aria-label="共享历史账单列表">
                 <div className="wb-field-label">
-                  <span>按记账主体查看共享基准库</span>
+                  <span>历史账单查重与核对</span>
                   <span className="wb-tabular wb-helper-note">
                     {billsHeaderStatus.statusText}
                   </span>
                 </div>
-                <div className="wb-action-row" style={{ justifyContent: "space-between" }}>
-                  <div style={{ flex: "1 1 220px", minWidth: 0 }}>
-                    <LumnoSelect
-                      value={billEntityFilter}
-                      ariaLabel="按记账主体筛选共享历史账单"
-                      options={entityFilterOptions}
-                      onChange={(nextFilter) => {
-                        billEntityFilterRef.current = nextFilter;
-                        setBillEntityFilter(nextFilter);
-                        setBillsViewState((prev) =>
-                          setExistingBillsFilter(prev, nextFilter)
-                        );
-                      }}
-                    />
-                  </div>
-                  <div className="wb-action-row">
-                    <LumnoButton
-                      variant="secondary"
-                      compact
-                      icon="ri-refresh-line"
-                      busy={loadingBills}
-                      onClick={() =>
-                        void loadBillsData(billEntityFilterRef.current)
-                      }
-                    >
-                      刷新
-                    </LumnoButton>
-                    <LumnoPopconfirm
-                      title={
-                        billEntityFilter
-                          ? `确认清理「${billEntityFilter}」历史账单？`
-                          : "确认清空全部共享历史账单基准？"
-                      }
-                      description="仅清理工作台共享历史基准库，绝不会修改或污染各批次已保存的随批隔离快照（existing_bills_json / 复核包快照）。"
-                      confirmLabel="确认清理"
-                      disabled={
-                        loadingBills ||
-                        Boolean(billsLoadError) ||
-                        existingBills.length === 0 ||
-                        billsLoadedForFilter !== billEntityFilter
-                      }
-                      onConfirm={() => void handleClearBills()}
-                    >
-                      {(triggerProps) => (
-                        <LumnoButton
-                          variant="ghost"
-                          compact
-                          icon="ri-delete-bin-6-line"
-                          disabled={
-                            loadingBills ||
-                            Boolean(billsLoadError) ||
-                            existingBills.length === 0 ||
-                            billsLoadedForFilter !== billEntityFilter
-                          }
-                          {...triggerProps}
-                        >
-                          {billEntityFilter ? "清理该主体基准" : "清空共享库"}
-                        </LumnoButton>
-                      )}
-                    </LumnoPopconfirm>
-                  </div>
-                </div>
-              </div>
 
-              <div className="wb-section-box" aria-label="无损导入历史账单基准">
-                <div className="wb-field-label">
-                  <span>无损导入历史账单基准（JSON / CSV）</span>
+                <div className="wb-form-grid-2">
+                  <LumnoSelect
+                    value={billEntityFilter}
+                    ariaLabel="按记账公司筛选共享历史账单"
+                    options={entityFilterOptions}
+                    onChange={(nextFilter) => {
+                      billEntityFilterRef.current = nextFilter;
+                      setBillEntityFilter(nextFilter);
+                      setBillsViewState((prev) =>
+                        setExistingBillsFilter(prev, nextFilter)
+                      );
+                    }}
+                  />
+                  <LumnoInput
+                    id="wb-mgmt-bills-search"
+                    name="existing_bills_search"
+                    value={billsSearch}
+                    placeholder="按单据号、提单号或费用名称筛选..."
+                    aria-label="筛选历史账单"
+                    onChange={(e) => setBillsSearch(e.target.value)}
+                  />
+                </div>
+
+                <div className="wb-action-row" style={{ justifyContent: "space-between" }}>
                   <LumnoButton
                     variant="secondary"
                     compact
-                    icon="ri-file-upload-line"
-                    onClick={() => billsFileInputRef.current?.click()}
+                    icon="ri-refresh-line"
+                    busy={loadingBills}
+                    onClick={() =>
+                      void loadBillsData(billEntityFilterRef.current)
+                    }
                   >
-                    {billsImportFilename
-                      ? `已选：${billsImportFilename}`
-                      : "选择 .json / .csv"}
+                    刷新列表
                   </LumnoButton>
-                </div>
-
-                <input
-                  ref={billsFileInputRef}
-                  type="file"
-                  accept=".json,.csv,application/json,text/csv"
-                  style={{ display: "none" }}
-                  onChange={(e) => void handlePickBillsFile(e)}
-                />
-
-                <LumnoTextarea
-                  value={billsImportText}
-                  placeholder={
-                    '粘贴 JSON 数组（每行必填 charge_item、amount、currency、posting_type（AR/AP），如 [{"reference_no":"DN-202609-001","charge_item":"Handling Charge","amount":9007199254740991.01,"currency":"USD","posting_type":"AP"}]）或含必填表头的 CSV'
-                  }
-                  aria-label="历史账单 JSON 或 CSV 导入内容"
-                  style={{ minHeight: "100px", fontFamily: "var(--lumno-font-mono)" }}
-                  onChange={(e) => {
-                    setBillsImportText(e.target.value);
-                    setBillsImportError(null);
-                    setBillsImportRowErrors([]);
-                  }}
-                />
-
-                <div className="wb-form-grid-2">
-                  <div className="wb-form-field">
-                    <span className="wb-form-label">缺省归属记账主体</span>
-                    <LumnoSelect
-                      value={billsImportEntity}
-                      ariaLabel="导入历史账单默认归属主体"
-                      options={importEntityOptions}
-                      onChange={setBillsImportEntity}
-                    />
-                  </div>
-                  <div className="wb-switch-row">
-                    <div>
-                      <div style={{ fontSize: "12px", fontWeight: 600 }}>
-                        覆盖已有基准 (replace_existing)
-                      </div>
-                      <div className="wb-helper-note">
-                        开启后先清空对应主体共享旧账再导入
-                      </div>
-                    </div>
-                    <LumnoSwitch
-                      ariaLabel="导入前覆盖已有历史账单"
-                      compact
-                      checked={replaceExistingBills}
-                      onChange={setReplaceExistingBills}
-                    />
-                  </div>
-                </div>
-
-                {billsImportRowErrors.length > 0 ? (
-                  <div className="wb-alert-item" data-severity="BLOCKER" role="alert">
-                    <strong>
-                      共发现 {billsImportRowErrors.length} 处必填或格式校验错误（已拒绝本次导入，绝不静默填充默认币种或 AR/AP）
-                    </strong>
-                    <ul style={{ margin: "4px 0 0", paddingLeft: "18px", fontSize: "12px" }}>
-                      {billsImportRowErrors.map((errMsg, idx) => (
-                        <li key={idx}>{errMsg}</li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : billsImportError ? (
-                  <div className="wb-field-error">{billsImportError}</div>
-                ) : null}
-                {lastImportSummary ? (
-                  <div className="wb-notice-banner">
-                    <span>{lastImportSummary}</span>
-                  </div>
-                ) : null}
-
-                <div className="wb-action-row" style={{ justifyContent: "flex-end" }}>
                   <LumnoButton
-                    variant="primary"
-                    icon="ri-database-2-line"
-                    busy={importingBills}
-                    onClick={() => void handleImportBills()}
+                    variant="secondary"
+                    compact
+                    icon={billsImportOpen ? "ri-arrow-up-s-line" : "ri-upload-2-line"}
+                    onClick={() => setBillsImportOpen((v) => !v)}
                   >
-                    导入共享历史基准
+                    {billsImportOpen ? "收起导入与清理" : "导入与清理管理"}
                   </LumnoButton>
                 </div>
-              </div>
 
-              <div className="wb-section-box" aria-label="共享历史账单列表">
-                <div className="wb-field-label">
-                  <span>共享基准账单明细</span>
-                </div>
                 {billsLoadError ? (
                   <div className="wb-alert-item" data-severity="BLOCKER" role="alert">
                     <strong>查询共享历史账单失败</strong>
@@ -1276,15 +1235,19 @@ export function ManagementDrawer({
                   </div>
                 ) : loadingBills || billsLoadedForFilter !== billEntityFilter ? (
                   <div className="wb-empty-state">
-                    <span>正在读取共享历史账单基准...</span>
+                    <span>正在读取历史账单库...</span>
                   </div>
-                ) : existingBills.length === 0 ? (
+                ) : filteredExistingBills.length === 0 ? (
                   <div className="wb-empty-state">
-                    <span>当前筛选下暂无共享历史账单基准</span>
+                    <span>
+                      {existingBills.length === 0
+                        ? "当前记账公司下暂无历史账单"
+                        : "没有符合搜索条件的历史账单"}
+                    </span>
                   </div>
                 ) : (
                   <div className="wb-mgmt-list">
-                    {existingBills.map((bill) => (
+                    {filteredExistingBills.map((bill) => (
                       <div key={bill.id} className="wb-mgmt-card">
                         <div className="wb-mgmt-card-head">
                           <div style={{ minWidth: 0 }}>
@@ -1327,16 +1290,161 @@ export function ManagementDrawer({
                   </div>
                 )}
               </div>
+
+              {billsImportOpen ? (
+                <div className="wb-section-box" aria-label="导入共享历史账单与清理管理">
+                  <div className="wb-field-label">
+                    <span>导入共享历史账单（JSON / CSV）</span>
+                    <LumnoButton
+                      variant="secondary"
+                      compact
+                      icon="ri-file-upload-line"
+                      onClick={() => billsFileInputRef.current?.click()}
+                    >
+                      {billsImportFilename
+                        ? `已选：${billsImportFilename}`
+                        : "选择 .json / .csv"}
+                    </LumnoButton>
+                  </div>
+
+                  <input
+                    id="wb-mgmt-bills-file"
+                    name="existing_bills_import_file"
+                    ref={billsFileInputRef}
+                    type="file"
+                    accept=".json,.csv,application/json,text/csv"
+                    style={{ display: "none" }}
+                    onChange={(e) => void handlePickBillsFile(e)}
+                  />
+
+                  <LumnoTextarea
+                    id="wb-mgmt-bills-import"
+                    name="existing_bills_import_text"
+                    value={billsImportText}
+                    placeholder={
+                      '粘贴 JSON 数组（每行必填标准费用名称、金额、币种、AR/AP 方向）或含必填表头的 CSV'
+                    }
+                    aria-label="历史账单 JSON 或 CSV 导入内容"
+                    style={{ minHeight: "100px", fontFamily: "var(--lumno-font-mono)" }}
+                    onChange={(e) => {
+                      setBillsImportText(e.target.value);
+                      setBillsImportError(null);
+                      setBillsImportRowErrors([]);
+                    }}
+                  />
+
+                  <div className="wb-form-grid-2">
+                    <div className="wb-form-field">
+                      <span className="wb-form-label">缺省归属记账公司</span>
+                      <LumnoSelect
+                        value={billsImportEntity}
+                        ariaLabel="导入历史账单默认归属主体"
+                        options={importEntityOptions}
+                        onChange={setBillsImportEntity}
+                      />
+                    </div>
+                    <div className="wb-switch-row">
+                      <div>
+                        <div style={{ fontSize: "12px", fontWeight: 600 }}>
+                          覆盖已有历史账单
+                        </div>
+                        <div className="wb-helper-note">
+                          危险操作：开启后先清空对应公司旧账再导入
+                        </div>
+                      </div>
+                      <LumnoSwitch
+                        id="wb-mgmt-bills-replace"
+                        name="replace_existing_bills"
+                        ariaLabel="导入前覆盖已有历史账单"
+                        compact
+                        checked={replaceExistingBills}
+                        onChange={setReplaceExistingBills}
+                      />
+                    </div>
+                  </div>
+
+                  {billsImportRowErrors.length > 0 ? (
+                    <div className="wb-alert-item" data-severity="BLOCKER" role="alert">
+                      <strong>
+                        共发现 {billsImportRowErrors.length} 处必填或格式错误（已拦截导入）
+                      </strong>
+                      <ul style={{ margin: "4px 0 0", paddingLeft: "18px", fontSize: "12px" }}>
+                        {billsImportRowErrors.map((errMsg, idx) => (
+                          <li key={idx}>{errMsg}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : billsImportError ? (
+                    <div className="wb-field-error">{billsImportError}</div>
+                  ) : null}
+                  {lastImportSummary ? (
+                    <div className="wb-notice-banner">
+                      <span>{lastImportSummary}</span>
+                    </div>
+                  ) : null}
+
+                  <div className="wb-action-row" style={{ justifyContent: "space-between" }}>
+                    <LumnoPopconfirm
+                      title={
+                        billEntityFilter
+                          ? `确认清理「${billEntityFilter}」历史账单？`
+                          : "确认清空全部共享历史账单库？"
+                      }
+                      description="仅清理工作台共享历史账单库，不会影响已保存的各批次独立快照。"
+                      confirmLabel="确认清理"
+                      disabled={
+                        loadingBills ||
+                        Boolean(billsLoadError) ||
+                        existingBills.length === 0 ||
+                        billsLoadedForFilter !== billEntityFilter
+                      }
+                      onConfirm={() => void handleClearBills()}
+                    >
+                      {(triggerProps) => (
+                        <LumnoButton
+                          variant="ghost"
+                          compact
+                          icon="ri-delete-bin-6-line"
+                          disabled={
+                            loadingBills ||
+                            Boolean(billsLoadError) ||
+                            existingBills.length === 0 ||
+                            billsLoadedForFilter !== billEntityFilter
+                          }
+                          {...triggerProps}
+                        >
+                          {billEntityFilter ? "清理该公司历史账单" : "清空共享历史库"}
+                        </LumnoButton>
+                      )}
+                    </LumnoPopconfirm>
+
+                    <LumnoButton
+                      variant="primary"
+                      icon="ri-database-2-line"
+                      busy={importingBills}
+                      onClick={() => void handleImportBills()}
+                    >
+                      导入共享历史账单
+                    </LumnoButton>
+                  </div>
+                </div>
+              ) : null}
             </div>
           ) : null}
 
-          {/* Tab 4: Harness Evaluation Dashboard */}
+          {/* Tab 4: Administrator Harness Eval Dashboard (with fixed 13 组（16 项） counts) */}
           {activeTab === "eval_runs" ? (
             <div className="wb-drawer-stack">
+              <div className="wb-notice-banner">
+                <span>
+                  管理员自检区：用于运行 13 组（16 项）内置真值与多轮稳定性测试基准，不会修改您的业务账单数据。
+                </span>
+              </div>
+
               <div className="wb-section-box" aria-label="Harness 评测触发控制台">
                 <div className="wb-field-label">
                   <span>执行或刷新 Harness 评测基准</span>
-                  <span className="wb-helper-note">区分确定性真值与 k 轮稳定性</span>
+                  <span className="wb-helper-note">13 组（16 项）真值与稳定性度量</span>
                 </div>
 
                 <div className="wb-form-field">
@@ -1382,15 +1490,27 @@ export function ManagementDrawer({
                       busy={runningEval}
                       onClick={() => void handleTriggerEval()}
                     >
-                      运行评测
+                      {runningEval ? "评测运行中..." : "运行自检"}
                     </LumnoButton>
                   </div>
                 </div>
+
+                {runningEval ? (
+                  <div className="wb-notice-banner" role="status">
+                    <i
+                      className="ri-icon ri-icon--compact ri-loader-4-line"
+                      aria-hidden="true"
+                    />
+                    <span>
+                      评测运行中（含本地 OCR 样本，约需 30–60 秒）...
+                    </span>
+                  </div>
+                ) : null}
               </div>
 
               {evalLoadError ? (
                 <div className="wb-alert-item" data-severity="BLOCKER" role="alert">
-                  <strong>查询 Harness 评测记录失败</strong>
+                  <strong>查询评测记录失败</strong>
                   <div>{evalLoadError}</div>
                   <div>
                     <LumnoButton
@@ -1414,11 +1534,11 @@ export function ManagementDrawer({
                   />
                   <strong>
                     {loadingEval
-                      ? "正在读取 Harness 评测记录..."
+                      ? "正在读取系统自检评测记录..."
                       : "尚未运行过 Harness 评测基准"}
                   </strong>
                   <span>
-                    本看板绝不伪造任何示例高分。请选择上方「离线确定性基准」或「联机 LLM 稳定性」运行并查看真实观测指标。
+                    本看板绝不伪造任何示例高分。请选择上方基准模式运行并查看真实观测指标。
                   </span>
                 </div>
               ) : evalRuns.length > 0 ? (
@@ -1470,11 +1590,10 @@ export function ManagementDrawer({
                             实际完成轮次：{evalViewModel.trialsText}
                           </span>
                           <span className="wb-badge wb-badge--muted">
-                            用例总数：{evalViewModel.totalCases} 组
+                            基准用例：{evalViewModel.benchmarkCasesText}
                           </span>
                           <span className="wb-badge wb-badge--muted">
-                            已执行用例：
-                            {evalViewModel.executedCases ?? evalViewModel.totalCases} 组
+                            累计执行：{evalViewModel.executedCasesText}
                           </span>
                           <span className="wb-badge wb-badge--muted">
                             平均耗时：{evalViewModel.avgLatencyText}

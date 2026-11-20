@@ -1,6 +1,8 @@
 import {
   ApiClientError,
   BillingApiClient,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  EVAL_REQUEST_TIMEOUT_MS,
   MAX_SINGLE_FILE_BYTES,
   isValidIso4217Currency,
   normalizeBatchDetail,
@@ -75,12 +77,15 @@ import {
   getEffectiveDocTotalsValues,
   getEffectiveRecordFormValues,
   getRecordDraftVersion,
+  getRecordPartyDisplayMeta,
+  groupExcludedClauses,
   hasDocTotalsDraft,
   hasRecordDraft,
   hasStaleConfirmedFields,
   invalidateAuditHistoryForBatch,
   invalidateAuditHistoryForRecord,
   markRecordFieldsConfirmed,
+  normalizeExcludedClauseReason,
   resolveRecordAlertActions,
   setDocTotalsDraftField,
   setRecordDraftField,
@@ -3693,7 +3698,9 @@ export async function runDecimalJsonTests(): Promise<void> {
       });
       await flushActMicrotasks();
       const ui = createAppMountHelpers(hostEnv);
-      await ui.clickButton("导入复核包");
+      await ui.clickButton("管理与工具");
+      await ui.clickButton("导入他人复核结果");
+      await ui.clickButton("手工粘贴复核包内容");
       const invalidCases = [
         {
           label: "validation_alerts=null",
@@ -3956,8 +3963,8 @@ export async function runDecimalJsonTests(): Promise<void> {
         "F7 staged list shows first-batch.pdf before submit"
       );
 
-      // Click "开始智能解析" -> POST 202 resolves, GET #1 is held open
-      await ui.clickButton("开始智能解析");
+      // Click "解析 1 份单据" -> POST 202 resolves, GET #1 is held open
+      await ui.clickButton("解析 1 份单据");
       await detail1Started.promise;
       await flushActMicrotasks(4);
 
@@ -4018,11 +4025,11 @@ export async function runDecimalJsonTests(): Promise<void> {
         "F7 preserves next-batch.xlsx across detail GET 503 without wiping concurrent additions"
       );
       const submitBtnAfter503 = hostEnv.findNodes(
-        (n) => n.tagName === "BUTTON" && n.textContent.includes("开始智能解析")
+        (n) => n.tagName === "BUTTON" && n.textContent.includes("解析 1 份单据")
       )[0];
       assertTrue(
         Boolean(submitBtnAfter503) && !submitBtnAfter503.disabled,
-        "F7 keeps 开始智能解析 enabled for next-batch.xlsx after GET 503"
+        "F7 keeps 解析 1 份单据 enabled for next-batch.xlsx after GET 503"
       );
       const bodyTextOn503 = hostEnv.doc.body!.textContent;
       assertTrue(
@@ -4226,7 +4233,10 @@ export async function runDecimalJsonTests(): Promise<void> {
         })[0];
       const getSubmitButton = () =>
         hostEnv.findNodes(
-          (n) => n.tagName === "BUTTON" && n.textContent.includes("开始智能解析")
+          (n) =>
+            n.tagName === "BUTTON" &&
+            (n.textContent.includes("份单据") ||
+              n.textContent.includes("选择单据后开始解析"))
         )[0];
 
       // 1. Stage & submit batch 1 -> POST 202 resolves, detail GET #1 is held open
@@ -4239,7 +4249,7 @@ export async function runDecimalJsonTests(): Promise<void> {
           currentTarget: inp1,
         });
       });
-      await ui.clickButton("开始智能解析");
+      await ui.clickButton("解析 1 份单据");
       await batch1DetailStarted.promise;
       await flushActMicrotasks(4);
 
@@ -4255,7 +4265,7 @@ export async function runDecimalJsonTests(): Promise<void> {
           currentTarget: inp2,
         });
       });
-      await ui.clickButton("开始智能解析");
+      await ui.clickButton("解析 1 份单据");
       await batch2PostStarted.promise;
       await flushActMicrotasks(4);
       assertEqual(r4PostCount, 2, "R4-A1 batch 2 POST is in-flight");
@@ -4535,7 +4545,8 @@ export async function runDecimalJsonTests(): Promise<void> {
       assertEqual(auditGetCount, 1, "R3-A1 initial expand triggers audit GET #1");
 
       // 2. Edit amount + review_note "R3-LATEST" and save while GET #1 is held
-      await ui.changeInputByPlaceholder("9007199254740991.01", "246.01");
+      await ui.clickButton("更多字段与运输/历史匹配");
+      await ui.changeInputByPlaceholder("245.00", "246.01");
       await ui.changeInputByPlaceholder("仅本次提交写入审计历史", "R3-LATEST");
       await ui.clickButton("保存修订并重验");
       await flushActMicrotasks(8);
@@ -4573,7 +4584,7 @@ export async function runDecimalJsonTests(): Promise<void> {
       await staleErrGetStarted.promise;
       assertEqual(auditGetCount, 3, "R3-A1 re-expand triggers audit GET #3");
 
-      await ui.changeInputByPlaceholder("9007199254740991.01", "247.02");
+      await ui.changeInputByPlaceholder("245.00", "247.02");
       await ui.changeInputByPlaceholder("仅本次提交写入审计历史", "R3-LATEST-2");
       await ui.clickButton("保存修订并重验");
       await flushActMicrotasks(8);
@@ -4674,7 +4685,9 @@ export async function runDecimalJsonTests(): Promise<void> {
       });
       await flushActMicrotasks();
       const ui = createAppMountHelpers(hostEnv);
-      await ui.clickButton("导入复核包");
+      await ui.clickButton("管理与工具");
+      await ui.clickButton("导入他人复核结果");
+      await ui.clickButton("手工粘贴复核包内容");
 
       const getModalErrorText = () =>
         hostEnv
@@ -4788,7 +4801,9 @@ export async function runDecimalJsonTests(): Promise<void> {
       );
 
       // Case 4 (Outer override priority {**state, **displayed}): valid outer overrides superseded invalid snapshot
-      await ui.clickButton("导入复核包");
+      await ui.clickButton("管理与工具");
+      await ui.clickButton("导入他人复核结果");
+      await ui.clickButton("手工粘贴复核包内容");
       const r5Case4 = parseLosslessJson<Record<string, unknown>>(
         stringifyLosslessJson(baseValidBundleObj)
       );
@@ -5060,8 +5075,8 @@ export async function runDecimalJsonTests(): Promise<void> {
     );
     assertEqual(
       sameRefAction.actionButtons[0]?.label,
-      "确认采用原文值",
-      "W13: when form value === alert.expected, renders 确认采用原文值"
+      "保留当前原文（待保存）",
+      "W13: when form value === alert.expected, renders 保留当前原文（待保存）"
     );
     const diffIssuerAction = resolveRecordAlertActions(
       {
@@ -5098,7 +5113,7 @@ export async function runDecimalJsonTests(): Promise<void> {
     assertTrue(
       reportedAmtDescriptive.actionButtons.length === 1 &&
         reportedAmtDescriptive.actionButtons[0].label ===
-          "确认当前金额与费用项" &&
+          "确认当前金额与费用" &&
         reportedAmtDescriptive.actionButtons[0].updateField === undefined,
       "W13: descriptive expected string on reported_charge_amount is NEVER stuffed into amount input"
     );
@@ -5115,8 +5130,8 @@ export async function runDecimalJsonTests(): Promise<void> {
     );
     assertEqual(
       payeeHintAction.actionButtons[0]?.label,
-      "确认当前签发方原文值",
-      "W13: payee_hint matching current issuer offers 确认当前签发方原文值"
+      "保留签发方公司名（待保存）",
+      "W13: payee_hint matching current issuer offers 保留签发方公司名（待保存）"
     );
   }
   results.push(
@@ -5199,11 +5214,12 @@ export async function runDecimalJsonTests(): Promise<void> {
       await flushActMicrotasks();
       const ui = createAppMountHelpers(hostEnv);
 
-      // Verify TopBar renders clear "主数据 · 基准 0" instead of misleading "主数据 (0)"
+      // Verify TopBar stays clean and exposes 导出可入账 (0 条) + 管理与工具
       assertTrue(
-        mountEl.textContent.includes("主数据 · 基准 0") &&
+        mountEl.textContent.includes("导出可入账 (0 条)") &&
+          mountEl.textContent.includes("管理与工具") &&
           !mountEl.textContent.includes("主数据 (0)"),
-        "W13 UI: TopBar displays clear 主数据 · 基准 0 label"
+        "W13 UI: TopBar displays slim 导出可入账 (0 条) + 管理与工具"
       );
 
       // Verify form inputs carry id & name attributes
@@ -5221,13 +5237,14 @@ export async function runDecimalJsonTests(): Promise<void> {
       );
 
       // Verify Export modal shows PROCESSING warning banner & collapsed single-scroll summary by default
-      await ui.clickButton("导出标准 JSON");
+      await ui.clickButton("导出可入账");
       assertTrue(
         hostEnv.doc.body!.textContent.includes(
           "当前批次仍在后台解析中，以下导出仅包含截至当前已就绪的记录"
         ),
         "W13 UI: Export modal warns when batch.status === PROCESSING"
       );
+      await ui.clickButton("高级操作");
       assertTrue(
         hostEnv.doc.body!.textContent.includes("展开完整 JSON 预览（共 1 条）"),
         "W13 UI: Export modal collapses full JSON behind toggle by default to avoid nested scrollbars"
@@ -5243,9 +5260,9 @@ export async function runDecimalJsonTests(): Promise<void> {
         "W13 UI: Save button initially disabled before confirming original values"
       );
 
-      // Click 确认采用原文值 (for reference_no === "OCA17") AND 确认当前金额与费用项 (for reported_charge_amount)
-      await ui.clickButton("确认采用原文值");
-      await ui.clickButton("确认当前金额与费用项");
+      // Click 保留当前原文（待保存） (for reference_no === "OCA17") AND 确认当前金额与费用 (for reported_charge_amount)
+      await ui.clickButton("保留当前原文（待保存）");
+      await ui.clickButton("确认当前金额与费用");
 
       const saveBtnAfterConfirm = hostEnv.findNodes(
         (n) => n.tagName === "BUTTON" && n.textContent.includes("保存修订并重验")
@@ -5334,8 +5351,8 @@ export async function runDecimalJsonTests(): Promise<void> {
     );
     assertEqual(
       f2Actions.actionButtons[0].label,
-      "确认当前金额与费用项",
-      "F2: reported_charge_amount action is 确认当前金额与费用项"
+      "确认当前金额与费用",
+      "F2: reported_charge_amount action is 确认当前金额与费用"
     );
 
     // (F3) Confirming amount="40.00" -> server refreshes to "55.00" (updated_at changes) -> stale confirmation invalidated!
@@ -5951,7 +5968,7 @@ export async function runDecimalJsonTests(): Promise<void> {
       const ui = createAppMountHelpers(hostEnv);
 
       // 1. Export modal with 2 amount=null USD records MUST show "USD 金额待补（2 条）" and NEVER "0.00"
-      await ui.clickButton("导出标准 JSON");
+      await ui.clickButton("导出可入账");
       const exportSummaryBoxes = hostEnv.findNodes(
         (n) =>
           n.attributes["aria-label"] === "导出内容结构化摘要与预览"
@@ -5971,7 +5988,7 @@ export async function runDecimalJsonTests(): Promise<void> {
         mountEl.textContent.includes(CONTEXT_INFERRED_WARNING_GUIDANCE),
         "W13B UI: CONTEXT_INFERRED_FIELD displays accurate soft-warning guidance"
       );
-      await ui.clickButton("已核对推断值（去批准）");
+      await ui.clickButton("查看批准理由");
       assertTrue(
         mountEl.textContent.includes("填写批准理由（2–500 字符）") &&
           !mountEl.textContent.includes("有未保存修改"),
@@ -5979,27 +5996,31 @@ export async function runDecimalJsonTests(): Promise<void> {
       );
 
       // 3. Switch to rec-entity (ENTITY_NOT_MATCHED): renders 定位主体与方向 & clear guidance
-      await ui.clickButton("ZIM-02");
+      await ui.clickButton("Documentation Fee");
       assertTrue(
         mountEl.textContent.includes("定位主体与方向") &&
           mountEl.textContent.includes(ENTITY_NOT_MATCHED_GUIDANCE),
         "W13B UI: ENTITY_NOT_MATCHED displays 定位主体与方向 button and explanation"
       );
 
-      // 4. Switch to rec-auto-ready (AUTO_READY): renders explicit 已自动就绪（可直接正式导出） on footer & disabled button
-      await ui.clickButton("OCA17");
+      // 4. Switch to rec-auto-ready (AUTO_READY): renders explicit 已自动就绪（可直接导出） on footer & disabled button
+      await ui.clickButton("Ocean Freight");
       const autoReadyButtons = hostEnv.findNodes(
         (n) =>
           n.tagName === "BUTTON" &&
-          n.textContent.includes("已自动就绪（可直接正式导出）")
+          n.textContent.includes("已自动就绪（可直接导出）")
       );
       assertTrue(
         autoReadyButtons.length >= 1 && Boolean(autoReadyButtons[0].disabled),
-        "W13B UI: AUTO_READY record displays disabled button labeled 已自动就绪（可直接正式导出）"
+        "W13B UI: AUTO_READY record displays disabled button labeled 已自动就绪（可直接导出）"
       );
       assertTrue(
-        mountEl.textContent.includes("无须再次点击「人工批准」"),
-        "W13B UI: AUTO_READY footer banner clearly instructs user to go directly to export"
+        String(
+          autoReadyButtons[0].attributes.title ??
+            hostEnv.getProps(autoReadyButtons[0]).title ??
+            ""
+        ).includes("无须再次点击「人工批准」"),
+        "W13B UI: AUTO_READY button title clearly instructs user to go directly to export"
       );
     } finally {
       await ReactMod.act(async () => {
@@ -6010,6 +6031,1064 @@ export async function runDecimalJsonTests(): Promise<void> {
   }
   results.push(
     "PASS 35: Wave 13B Mounted UI E2E null-amount export summary, ENTITY_NOT_MATCHED locate, CONTEXT_INFERRED_FIELD guidance & AUTO_READY clarity"
+  );
+
+  // 36. Wave 15 Real-User UX Overhaul (P0-1/P0-2/P0-3, P1-1/P1-2/P1-3/P1-5, P2)
+  {
+    // P1-5: Harness Eval benchmark wording separates 13 groups vs 16 cases cleanly
+    const w15EvalVm = buildEvalRunViewModel({
+      ...b05RealShapeEvalRun,
+      total_cases: 16,
+      actual_trials: 3,
+      report: {
+        ...b05RealShapeEvalRun.report,
+        executed_cases: 48,
+      },
+    } as unknown as Parameters<typeof buildEvalRunViewModel>[0]);
+    assertEqual(
+      w15EvalVm.benchmarkCasesText,
+      "13 组（16 项）",
+      "W15 P1-5: 16 benchmark items format as 13 组（16 项）"
+    );
+    assertEqual(
+      w15EvalVm.executedCasesText,
+      "48 项次（3 轮 × 16 项）",
+      "W15 P1-5: 48 executed items format as 48 项次（3 轮 × 16 项）"
+    );
+
+    // W15 R2: getRecordPartyDisplayMeta shows accountingEntity as AR payee / AP payer when header party differs
+    assertEqual(
+      getRecordPartyDisplayMeta({
+        transaction_party: {
+          issuer: "Pilot Aiship Tech co., Ltd.",
+          recipient: null,
+        },
+        financial_attributes: {
+          accounting_entity: "NEPTUNE SHIPPING LIMITED",
+          posting_type: "AR",
+        },
+      }).flowSummary,
+      "付款方待确认 → NEPTUNE SHIPPING LIMITED（款付给我方 · 签发：Pilot Aiship Tech co., Ltd.）",
+      "W15 R2 AR flowSummary uses accounting_entity as payee when issuer differs (DC-108478 missing payer)"
+    );
+    assertEqual(
+      getRecordPartyDisplayMeta({
+        transaction_party: {
+          issuer: "Pilot Aiship Tech co., Ltd.",
+          recipient: "CLIENT CO",
+        },
+        financial_attributes: {
+          accounting_entity: "NEPTUNE SHIPPING LIMITED",
+          posting_type: "AR",
+        },
+      }).flowSummary,
+      "CLIENT CO → NEPTUNE SHIPPING LIMITED（款付给我方 · 签发：Pilot Aiship Tech co., Ltd.）",
+      "W15 R2 AR flowSummary uses accounting_entity as payee with known payer"
+    );
+    assertEqual(
+      getRecordPartyDisplayMeta({
+        transaction_party: {
+          issuer: "NEPTUNE SHIPPING LIMITED",
+          recipient: null,
+        },
+        financial_attributes: {
+          accounting_entity: "NEPTUNE SHIPPING LIMITED",
+          posting_type: "AR",
+        },
+      }).flowSummary,
+      "付款方待确认 → NEPTUNE SHIPPING LIMITED（款付给我方）",
+      "W15 R2 AR flowSummary keeps concise label when issuer matches accounting_entity"
+    );
+    assertEqual(
+      getRecordPartyDisplayMeta({
+        transaction_party: {
+          issuer: "CMA CGM",
+          recipient: "NEPTUNE (LAX)",
+        },
+        financial_attributes: {
+          accounting_entity: "NEPTUNE SHIPPING LIMITED",
+          posting_type: "AP",
+        },
+      }).flowSummary,
+      "NEPTUNE SHIPPING LIMITED → CMA CGM（我方需付款 · 原件抬头：NEPTUNE (LAX)）",
+      "W15 R2 AP flowSummary shows accounting_entity as payer and notes differing recipient"
+    );
+    assertEqual(
+      getRecordPartyDisplayMeta({
+        transaction_party: {
+          issuer: "CMA CGM",
+          recipient: null,
+        },
+        financial_attributes: {
+          accounting_entity: "NEPTUNE SHIPPING LIMITED",
+          posting_type: "AP",
+        },
+      }).flowSummary,
+      "NEPTUNE SHIPPING LIMITED → CMA CGM（我方需付款）",
+      "W15 R2 AP flowSummary shows accounting_entity as payer when recipient omitted"
+    );
+
+    // W15 R3: triggerEvalRun uses EVAL_REQUEST_TIMEOUT_MS (180s) & survives 45s (> 30s default) without aborting
+    assertEqual(
+      DEFAULT_REQUEST_TIMEOUT_MS,
+      30_000,
+      "W15 R3: DEFAULT_REQUEST_TIMEOUT_MS remains 30_000 ms"
+    );
+    assertEqual(
+      EVAL_REQUEST_TIMEOUT_MS,
+      180_000,
+      "W15 R3: EVAL_REQUEST_TIMEOUT_MS is 180_000 ms"
+    );
+    {
+      const scheduledTimers: Array<{
+        id: number;
+        ms: number;
+        cb: () => void;
+        cleared: boolean;
+      }> = [];
+      let nextTimerId = 9001;
+      const origSetTimeout = globalThis.setTimeout;
+      const origClearTimeout = globalThis.clearTimeout;
+      let evalTransportSignal: AbortSignal | null | undefined;
+      let listTimeoutCaptured = 0;
+      let evalTimeoutCaptured = 0;
+      let releaseDelayedEval!: (res: Response) => void;
+      let markEvalTransportStarted!: () => void;
+      const evalTransportStarted = new Promise<void>((resolve) => {
+        markEvalTransportStarted = resolve;
+      });
+
+      try {
+        (globalThis as Record<string, unknown>).setTimeout = ((
+          cb: () => void,
+          ms?: number
+        ) => {
+          const id = nextTimerId++;
+          scheduledTimers.push({
+            id,
+            ms: Number(ms ?? 0),
+            cb,
+            cleared: false,
+          });
+          return id as unknown as ReturnType<typeof setTimeout>;
+        }) as typeof setTimeout;
+        (globalThis as Record<string, unknown>).clearTimeout = ((
+          id?: ReturnType<typeof setTimeout>
+        ) => {
+          const found = scheduledTimers.find(
+            (t) => t.id === (id as unknown as number)
+          );
+          if (found) found.cleared = true;
+        }) as typeof clearTimeout;
+
+        const evalTimeoutClient = new BillingApiClient({
+          transport: async (input, init) => {
+            const url = typeof input === "string" ? input : input.toString();
+            const method = (init?.method ?? "GET").toUpperCase();
+            if (url.endsWith("/api/v1/eval-runs") && method === "GET") {
+              listTimeoutCaptured =
+                scheduledTimers[scheduledTimers.length - 1]?.ms ?? 0;
+              return new Response("[]", {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              });
+            }
+            evalTimeoutCaptured =
+              scheduledTimers[scheduledTimers.length - 1]?.ms ?? 0;
+            evalTransportSignal = init?.signal;
+            markEvalTransportStarted();
+            return await new Promise<Response>((res) => {
+              releaseDelayedEval = res;
+            });
+          },
+        });
+
+        await evalTimeoutClient.listEvalRuns();
+        assertEqual(
+          listTimeoutCaptured,
+          DEFAULT_REQUEST_TIMEOUT_MS,
+          "W15 R3: listEvalRuns uses 30s DEFAULT_REQUEST_TIMEOUT_MS"
+        );
+
+        const evalPromise = evalTimeoutClient.triggerEvalRun({
+          run_mode: "OFFLINE_DETERMINISTIC",
+          k_trials: 3,
+        });
+        await evalTransportStarted;
+        assertEqual(
+          evalTimeoutCaptured,
+          EVAL_REQUEST_TIMEOUT_MS,
+          "W15 R3: triggerEvalRun schedules 180s EVAL_REQUEST_TIMEOUT_MS"
+        );
+
+        // Simulate 45s (> 30s default timeout, < 180s eval timeout): timer must NOT fire or abort signal
+        const simulatedElapsedMs = 45_000;
+        for (const timer of scheduledTimers) {
+          if (!timer.cleared && timer.ms <= simulatedElapsedMs) {
+            timer.cb();
+          }
+        }
+        assertEqual(
+          Boolean(evalTransportSignal?.aborted),
+          false,
+          "W15 R3: triggerEvalRun signal stays non-aborted at 45s (> 30s default)"
+        );
+
+        releaseDelayedEval(
+          new Response(
+            stringifyLosslessJson({
+              ...b05RealShapeEvalRun,
+              id: "eval-45s",
+              status: "COMPLETED",
+            }),
+            {
+              status: 201,
+              headers: { "Content-Type": "application/json" },
+            }
+          )
+        );
+        const evalCreated = await evalPromise;
+        assertEqual(
+          evalCreated.id,
+          "eval-45s",
+          "W15 R3: triggerEvalRun completes cleanly at 45s with 201 EvalRunSummary"
+        );
+      } finally {
+        globalThis.setTimeout = origSetTimeout;
+        globalThis.clearTimeout = origClearTimeout;
+      }
+    }
+
+    // W15 R4: groupExcludedClauses normalizes English/Chinese reasons & globally deduplicates by (normKey, page)
+    assertEqual(
+      normalizeExcludedClauseReason("conditional charge"),
+      "条件收费或违约条款",
+      "W15 R4: normalizeExcludedClauseReason maps conditional charge -> 条件收费或违约条款"
+    );
+    assertEqual(
+      normalizeExcludedClauseReason("remittance instruction"),
+      "银行汇款信息",
+      "W15 R4: normalizeExcludedClauseReason maps remittance instruction -> 银行汇款信息"
+    );
+    assertEqual(
+      normalizeExcludedClauseReason("free time waiver"),
+      "免收费说明",
+      "W15 R4: normalizeExcludedClauseReason maps free time waiver -> 免收费说明"
+    );
+    const mixedExcluded = groupExcludedClauses([
+      {
+        text: "If chassis flip occurs, $100 fee applies.",
+        reason: "conditional charge",
+        page: 2,
+      },
+      {
+        text: "If chassis  flip occurs, $100 fee applies.",
+        reason: "条件收费或违约条款",
+        page: 2,
+      },
+      {
+        text: "Please wire remittance to CMA CGM bank account.",
+        reason: "remittance instruction",
+        page: 2,
+      },
+      {
+        text: "Conditional $25 fee if paid after 15 days.",
+        reason: "conditional",
+        page: 1,
+      },
+      {
+        text: "Conditional $25 fee if paid after 15 days.",
+        reason: "条件收费或违约条款",
+        page: 2,
+      },
+      {
+        text: "Conditional $25 fee if paid after 15 days.",
+        reason: "条件收费或违约条款",
+        page: 3,
+      },
+      {
+        text: "Free detention if cleared in 48h.",
+        reason: "free",
+        page: 1,
+      },
+    ]);
+    assertEqual(
+      mixedExcluded.map((g) => g.reason).join("|"),
+      "条件收费或违约条款|银行汇款信息|免收费说明",
+      "W15 R4: English and Chinese reasons consolidate strictly into 3 Chinese categories"
+    );
+    const allGroupedNormTexts = mixedExcluded
+      .flatMap((g) => g.items)
+      .map((item) => item.text.replace(/\s+/g, " ").toLowerCase());
+    assertEqual(
+      allGroupedNormTexts.length,
+      new Set(allGroupedNormTexts).size,
+      "W15 R4: Global deduplication guarantees each clause appears once across all categories"
+    );
+    const condGroup = mixedExcluded.find((g) => g.reason === "条件收费或违约条款")!;
+    const chassisItem = condGroup.items.find((i) => i.text.includes("chassis"))!;
+    const fee25Item = condGroup.items.find((i) => i.text.includes("$25"))!;
+    assertEqual(
+      chassisItem.count,
+      1,
+      "W15 R4: Dual English+Chinese page-2 chassis flip reports dedupe to count 1"
+    );
+    assertEqual(
+      chassisItem.pages.join(","),
+      "2",
+      "W15 R4: chassis flip preserves page 2"
+    );
+    assertEqual(
+      fee25Item.count,
+      3,
+      "W15 R4: Cross-page $25 clause merges across pages 1/2/3 with count 3"
+    );
+    assertEqual(
+      fee25Item.pages.join(","),
+      "1,2,3",
+      "W15 R4: Cross-page $25 clause merges pages [1,2,3]"
+    );
+    assertEqual(
+      condGroup.totalCount,
+      4,
+      "W15 R4: Conditional group totalCount equals deduplicated sum (1 + 3 = 4)"
+    );
+
+    const hostEnv = installFakeDomHost();
+    const w15InitialRawText = stringifyLosslessJson({
+      id: "batch-w15-1",
+      version: 1,
+      short_code: "B-W15-01",
+      accounting_entity: "NEPTUNE SHIPPING LIMITED",
+      source_channel: "WEB",
+      status: "COMPLETED",
+      stage: "COMPLETED",
+      stage_message: "解析完成",
+      ocr_mode: "REMOTE_WITH_LOCAL_FALLBACK",
+      total_files: 2,
+      succeeded_files: 2,
+      failed_files: 0,
+      counts: {
+        create: 2,
+        update: 0,
+        no_change: 0,
+        pending_review: 1,
+        rejected: 0,
+      },
+      created_at: "2026-11-20T01:00:00Z",
+      updated_at: "2026-11-20T01:05:00Z",
+      documents: [
+        {
+          id: "doc-w15-eml",
+          original_filename: "2026091201邮件账单内容示例.eml",
+          sanitized_filename: "2026091201邮件账单内容示例.eml",
+          source_kind: "EML",
+          extraction_channel: "LOCAL_TEXT",
+          status: "PARSED",
+          affected_record_ids: ["rec-w15-eml"],
+          total_amount: rawDecimal("50.00"),
+          total_currency: "USD",
+          excluded_clauses: [
+            {
+              text: "All charges subject to carrier tariff.",
+              reason: "通用免责条款",
+              page: 1,
+            },
+            {
+              text: "All charges subject to carrier tariff.",
+              reason: "通用免责条款",
+              page: 2,
+            },
+            {
+              text: "All charges subject to carrier tariff.",
+              reason: "generic clause",
+              page: 2,
+            },
+            {
+              text: "All charges subject to carrier tariff.",
+              reason: "通用免责条款",
+              page: 3,
+            },
+          ],
+        },
+        {
+          id: "doc-w15-pdf",
+          original_filename: "PDF_示例账单2.pdf",
+          sanitized_filename: "PDF_示例账单2.pdf",
+          source_kind: "PDF",
+          extraction_channel: "REMOTE_OCR",
+          status: "PARSED",
+          affected_record_ids: ["rec-w15-pdf-ar", "rec-w15-pdf-pending"],
+          total_amount: rawDecimal("185.00"),
+          total_currency: "USD",
+        },
+      ],
+      failed_documents: [],
+      records: [
+        {
+          id: "rec-w15-eml",
+          source_doc_id: "doc-w15-eml",
+          source_line_index: 0,
+          operation: "CREATE",
+          review_status: "AUTO_READY",
+          match_level: "NONE",
+          inherited_fields: [],
+          document_info: {
+            document_type: "Billing Evidence",
+            reference_no: "EML-1001",
+            document_date: "2026-09-12",
+          },
+          transaction_party: {
+            issuer: "MAERSK LINE",
+            recipient: "NEPTUNE SHIPPING LIMITED",
+          },
+          charge_details: {
+            charge_item: "Handling Charge",
+            raw_charge_name: "H/C",
+            quantity: null,
+            unit_price: null,
+            amount: rawDecimal("50.00"),
+            currency: "USD",
+            payment_term: "PP",
+          },
+          financial_attributes: {
+            accounting_entity: "NEPTUNE SHIPPING LIMITED",
+            posting_type: "AP",
+          },
+          ai_reasoning: [
+            "无法唯一匹配现有主数据",
+            "金额与原文一致",
+          ],
+          human_overrides: {},
+          source_evidence_snippet: "EML Handling Fee 50.00 USD",
+          validation_alerts: [
+            {
+              code: "CONTEXT_INFERRED_FIELD",
+              severity: "WARNING",
+              field: "currency",
+              message: "币种由邮件上下文推断",
+              expected: "USD",
+              actual: "USD",
+            },
+            {
+              code: "CONTEXT_INFERRED_FIELD",
+              severity: "WARNING",
+              field: "payment_term",
+              message: "付款方式由邮件上下文推断",
+              expected: "PP",
+              actual: "PP",
+            },
+            {
+              code: "AMOUNT_TOTAL_MISMATCH",
+              severity: "BLOCKER",
+              field: "amount",
+              message: "明细金额与单据合计不一致",
+              expected: "50.00",
+              actual: "40.00",
+            },
+            {
+              code: "OCR_NUMERIC_CONFUSION",
+              severity: "WARNING",
+              field: "mbl_no",
+              message: "请核对主提单号",
+              expected: null,
+              actual: "BL-EML-01",
+            },
+          ],
+        },
+        {
+          id: "rec-w15-pdf-ar",
+          source_doc_id: "doc-w15-pdf",
+          source_line_index: 0,
+          operation: "CREATE",
+          review_status: "AUTO_READY",
+          match_level: "NONE",
+          inherited_fields: [],
+          document_info: {
+            document_type: "Debit Note",
+            reference_no: "DC-108478",
+            document_date: "2026-09-12",
+            bl_no: "BL-PDF-02",
+          },
+          transaction_party: {
+            issuer: "Pilot Aiship Tech co., Ltd.",
+            recipient: null,
+          },
+          charge_details: {
+            charge_item: "Documentation Fee",
+            raw_charge_name: "DOC FEE",
+            quantity: null,
+            unit_price: null,
+            amount: rawDecimal("65.00"),
+            currency: "USD",
+            payment_term: "PP",
+          },
+          financial_attributes: {
+            accounting_entity: "NEPTUNE SHIPPING LIMITED",
+            posting_type: "AR",
+          },
+          ai_reasoning: ["应收账单原文清晰"],
+          human_overrides: {},
+          validation_alerts: [],
+        },
+        {
+          id: "rec-w15-pdf-pending",
+          source_doc_id: "doc-w15-pdf",
+          source_line_index: 1,
+          operation: "PENDING_REVIEW",
+          review_status: "NEEDS_REVIEW",
+          match_level: "NONE",
+          inherited_fields: [],
+          document_info: {
+            document_type: "Invoice",
+            reference_no: "DC-999999",
+            document_date: "2026-09-12",
+            bl_no: "BL-PEND-99",
+          },
+          transaction_party: {
+            issuer: "CMA CGM",
+            recipient: "NEPTUNE SHIPPING LIMITED",
+          },
+          charge_details: {
+            charge_item: "THC",
+            raw_charge_name: "THC",
+            quantity: null,
+            unit_price: null,
+            amount: rawDecimal("120.00"),
+            currency: "USD",
+            payment_term: "PP",
+          },
+          financial_attributes: {
+            accounting_entity: "NEPTUNE SHIPPING LIMITED",
+            posting_type: "AP",
+          },
+          ai_reasoning: ["需核对港口作业费数字"],
+          human_overrides: {},
+          validation_alerts: [
+            {
+              code: "OCR_NUMERIC_CONFUSION",
+              severity: "WARNING",
+              field: "amount",
+              message: "请核对数字 120.00",
+              expected: null,
+              actual: "120.00",
+            },
+          ],
+        },
+      ],
+    });
+    const w15Initial = ssrNormalizeBatchDetail(
+      ssrParseLosslessJson(w15InitialRawText)
+    );
+    const w15SecondProcessingRawText = stringifyLosslessJson({
+      id: "batch-w15-2",
+      version: 1,
+      short_code: "B-W15-02",
+      accounting_entity: "TAR",
+      source_channel: "WEB",
+      status: "PROCESSING",
+      stage: "PARSING",
+      stage_message: "正在解析第 1 份文件",
+      ocr_mode: "REMOTE_WITH_LOCAL_FALLBACK",
+      total_files: 1,
+      succeeded_files: 0,
+      failed_files: 0,
+      counts: {
+        create: 0,
+        update: 0,
+        no_change: 0,
+        pending_review: 0,
+        rejected: 0,
+      },
+      created_at: "2026-11-20T01:10:00Z",
+      updated_at: "2026-11-20T01:10:00Z",
+      documents: [],
+      failed_documents: [],
+      records: [],
+    });
+    const w15ExportResponseJson = stringifyLosslessJson({
+      mode: "accounting_ready",
+      included_count: 2,
+      excluded_pending_count: 1,
+      excluded_rejected_count: 0,
+      records: [
+        w15Initial.records[0],
+        w15Initial.records[1],
+      ],
+    });
+
+    let postedAccountingEntity: string | null = null;
+    let postedOcrMode: string | null = null;
+    let demoPostCalls = 0;
+    const uiEvalPostHolder: { resolve: ((res: Response) => void) | null } = {
+      resolve: null,
+    };
+    let evalRunsStore: unknown[] = [];
+
+    const w15Client = new SsrBillingApiClient({
+      transport: async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = String(init?.method ?? "GET").toUpperCase();
+        if (url.endsWith("/api/v1/eval-runs") && method === "GET") {
+          return new Response(stringifyLosslessJson(evalRunsStore), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.endsWith("/api/v1/eval-runs") && method === "POST") {
+          return await new Promise<Response>((resolve) => {
+            uiEvalPostHolder.resolve = resolve;
+          });
+        }
+        if (url.endsWith("/api/v1/health")) {
+          return new Response(
+            JSON.stringify({
+              status: "ok",
+              ocr_direct_mode: true,
+              public_relay_configured: false,
+              llm_configured: true,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        if (url.endsWith("/api/v1/entities")) {
+          return new Response(
+            JSON.stringify([
+              {
+                id: "ent-neptune",
+                canonical_name: "NEPTUNE SHIPPING LIMITED",
+                aliases: ["NEPTUNE"],
+                is_default: true,
+              },
+              {
+                id: "ent-tar",
+                canonical_name: "TAR",
+                aliases: [],
+                is_default: false,
+              },
+            ]),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        if (url.includes("/api/v1/batches/demo") && method === "POST") {
+          demoPostCalls += 1;
+          if (demoPostCalls === 1) {
+            return new Response(
+              JSON.stringify({ detail: "demo service busy" }),
+              { status: 503, headers: { "Content-Type": "application/json" } }
+            );
+          }
+          return new Response(w15SecondProcessingRawText, {
+            status: 202,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.includes("/api/v1/batches") && !url.includes("/api/v1/batches/") && method === "POST") {
+          if (init?.body instanceof FormData) {
+            postedAccountingEntity = String(init.body.get("accounting_entity") ?? "");
+            postedOcrMode = String(init.body.get("ocr_mode") ?? "");
+          }
+          return new Response(w15SecondProcessingRawText, {
+            status: 202,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.includes("/api/v1/batches/batch-w15-2")) {
+          return new Response(w15SecondProcessingRawText, {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.includes("/api/v1/batches/batch-w15-1/export")) {
+          return new Response(w15ExportResponseJson, {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("[]", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+
+    const mountEl = hostEnv.doc.createElement!("div");
+    hostEnv.doc.body!.appendChild(mountEl);
+    const root = ReactDomClient.createRoot(mountEl as unknown as HTMLElement);
+    try {
+      await ReactMod.act(async () => {
+        root.render(
+          ReactMod.createElement(AppComponentRef, {
+            apiClient: w15Client,
+            initialBatch: w15Initial,
+            initialBatches: [w15Initial],
+          })
+        );
+      });
+      await flushActMicrotasks(8);
+      const ui = createAppMountHelpers(hostEnv);
+
+      const getPaneText = (ariaLabel: string) => {
+        const pane = hostEnv.findNodes(
+          (n) => (n.attributes["aria-label"] ?? hostEnv.getProps(n)["aria-label"]) === ariaLabel
+        )[0];
+        assertTrue(Boolean(pane), `Expected pane with aria-label="${ariaLabel}"`);
+        return pane.textContent;
+      };
+
+      const assertAllFormControlsHaveIdAndName = (stage: string) => {
+        const controls = hostEnv.findNodes(
+          (n) =>
+            n.tagName === "INPUT" ||
+            n.tagName === "TEXTAREA" ||
+            n.tagName === "SELECT"
+        );
+        assertTrue(controls.length > 0, `${stage}: expected form controls present`);
+        for (const ctrl of controls) {
+          const props = hostEnv.getProps(ctrl);
+          const ctrlId = String(ctrl.attributes.id ?? props.id ?? "").trim();
+          const ctrlName = String(ctrl.attributes.name ?? props.name ?? "").trim();
+          assertTrue(
+            ctrlId.length > 0 && ctrlName.length > 0,
+            `${stage}: every ${ctrl.tagName} must have non-empty id & name (got id="${ctrlId}", name="${ctrlName}", placeholder="${String(ctrl.attributes.placeholder ?? props.placeholder ?? "")}")`
+          );
+        }
+      };
+
+      // P1-1: BLOCKER renders before WARNING & multiple CONTEXT_INFERRED_FIELD collapse into 1 card
+      const initialRightText = getPaneText("右栏费用详情与核对");
+      const blockerPos = initialRightText.indexOf("暂不能入账");
+      const inferredPos = initialRightText.indexOf("[请核对] 上下文自动补全线索（2 项）");
+      assertTrue(
+        blockerPos !== -1 && inferredPos !== -1 && blockerPos < inferredPos,
+        "W15 P1-1: BLOCKER 暂不能入账 renders before grouped CONTEXT_INFERRED_FIELD (2 items)"
+      );
+
+      // P1-1: Excluded clauses collapse and deduplicate on expand
+      assertTrue(
+        initialRightText.includes("已排除 1 类非计费条款（共 3 条原文）"),
+        "W15 P1-1: 3 identical excluded clauses summarize as 1 category (3 raw)"
+      );
+      await ui.clickButton("已排除 1 类非计费条款");
+      assertTrue(
+        getPaneText("右栏费用详情与核对").includes("×3"),
+        "W15 P1-1: Expanding excluded clauses shows deduplicated ×3 badge"
+      );
+
+      // P0-2: Active ai_reasoning hides stale 无法唯一匹配 when parties + posting_type resolved
+      assertTrue(
+        initialRightText.includes("金额与原文一致") &&
+          !initialRightText.includes("无法唯一匹配现有主数据"),
+        "W15 P0-2: Resolved AP record filters stale 无法唯一匹配 from active ai_reasoning"
+      );
+
+      // P2 + W15 R2: Initial EML record (even with bl_no warning) keeps secondaryFieldsOpen=false & updated copy
+      const getSecondaryToggle = () =>
+        hostEnv.findNodes(
+          (n) =>
+            n.tagName === "BUTTON" &&
+            n.textContent.includes("更多字段与运输/历史匹配")
+        )[0];
+      assertEqual(
+        getSecondaryToggle()?.attributes["aria-expanded"],
+        "false",
+        "W15 R2: secondaryFieldsOpen starts collapsed (false) even when EML record has mbl_no transport alert"
+      );
+      assertTrue(
+        initialRightText.includes("单据参考号（账单 / 运单参考）") &&
+          initialRightText.includes("原件费用原文 / 代码（只读对照）") &&
+          !initialRightText.includes("非费用代码") &&
+          !initialRightText.includes("请勿与单据参考号混填"),
+        "W15 R2: Updated reference_no and raw_charge_name labels appear cleanly"
+      );
+      const refNoInput = hostEnv.findNodes(
+        (n) =>
+          n.tagName === "INPUT" &&
+          (n.attributes.id ?? hostEnv.getProps(n).id) === "wb-rec-reference-no"
+      )[0];
+      assertEqual(
+        String(
+          refNoInput?.attributes.placeholder ??
+            hostEnv.getProps(refNoInput).placeholder ??
+            ""
+        ),
+        "如 DC-108478 / CMDUCHN4053601",
+        "W15 R3: reference_no placeholder aligns with DC-108478 / CMDUCHN4053601"
+      );
+
+      // Clicking 定位字段 on mbl_no alert expands secondaryFieldsOpen
+      const mblAlertCard = hostEnv.findNodes(
+        (n) =>
+          (n.attributes.class ?? "").includes("wb-alert-item") &&
+          n.textContent.includes("请核对主提单号")
+      )[0];
+      assertTrue(Boolean(mblAlertCard), "Expected mbl_no alert card");
+      const mblLocateBtn = mblAlertCard.childNodes
+        .flatMap(function collect(node): typeof mblAlertCard[] {
+          return [node, ...node.childNodes.flatMap(collect)];
+        })
+        .find((n) => n.tagName === "BUTTON" && n.textContent.includes("定位字段"));
+      assertTrue(Boolean(mblLocateBtn), "Expected 定位字段 button in mbl_no alert");
+      await ReactMod.act(async () => {
+        (hostEnv.getProps(mblLocateBtn!).onClick as () => void)();
+      });
+      await flushActMicrotasks(4);
+      assertEqual(
+        getSecondaryToggle()?.attributes["aria-expanded"],
+        "true",
+        "W15 R2: Clicking 定位字段 on secondary alert opens secondaryFieldsOpen"
+      );
+      // Collapse manually then re-expand via toggle button & verify form id/name completeness
+      await ui.clickButton("更多字段与运输/历史匹配");
+      assertEqual(
+        getSecondaryToggle()?.attributes["aria-expanded"],
+        "false",
+        "W15 R2: Toggle button collapses secondaryFieldsOpen"
+      );
+      assertAllFormControlsHaveIdAndName("W15 P2 initial mount");
+      await ui.clickButton("更多字段与运输/历史匹配");
+      assertEqual(
+        getSecondaryToggle()?.attributes["aria-expanded"],
+        "true",
+        "W15 R2: secondaryFieldsOpen opens when user clicks toggle"
+      );
+      assertAllFormControlsHaveIdAndName("W15 P2 expanded secondary fields");
+
+      // P0-1: Clicking PDF_示例账单2.pdf in left tree syncs right inspector immediately off EML record
+      const pdfDocNode = hostEnv.findNodes(
+        (n) =>
+          (n.attributes.class ?? "").includes("wb-doc-node") &&
+          n.textContent.includes("PDF_示例账单2.pdf")
+      )[0];
+      assertTrue(Boolean(pdfDocNode), "Expected PDF_示例账单2.pdf doc tree node");
+      await ReactMod.act(async () => {
+        const onClick = hostEnv.getProps(pdfDocNode).onClick as () => void;
+        onClick();
+      });
+      await flushActMicrotasks(4);
+
+      const afterPdfClickRight = getPaneText("右栏费用详情与核对");
+      assertTrue(
+        afterPdfClickRight.includes("DC-108478") &&
+          afterPdfClickRight.includes("65.00") &&
+          !afterPdfClickRight.includes("EML-1001"),
+        "W15 P0-1: Clicking PDF doc immediately switches right inspector from EML-1001 to DC-108478"
+      );
+      assertEqual(
+        getSecondaryToggle()?.attributes["aria-expanded"],
+        "false",
+        "W15 R2: Switching record resets secondaryFieldsOpen to false"
+      );
+
+      // P0-2 + W15 R2: Missing AR counterparty renders friendly 付款方待确认 -> NEPTUNE (签发：Pilot Aiship)
+      const expectedArFlow =
+        "付款方待确认 → NEPTUNE SHIPPING LIMITED（款付给我方 · 签发：Pilot Aiship Tech co., Ltd.）";
+      assertTrue(
+        afterPdfClickRight.includes(expectedArFlow) &&
+          getPaneText("账单待办队列").includes(expectedArFlow),
+        "W15 P0-2 + R2: DC-108478 AR flowSummary shows accounting_entity payee & Pilot Aiship issuer across queue & inspector"
+      );
+
+      // P0-1: Empty scoped filter clears selectedRecord, hides edit controls, and 显示全部记录 recovers
+      await ui.clickButton("更新");
+      const emptyFilterRight = getPaneText("右栏费用详情与核对");
+      assertTrue(
+        emptyFilterRight.includes("当前文件或筛选条件下暂无匹配账单记录"),
+        "W15 P0-1: Empty scoped filter clears inspector to scoped empty state"
+      );
+      const editButtonsWhileEmpty = hostEnv.findNodes(
+        (n) =>
+          n.tagName === "BUTTON" &&
+          (n.textContent.includes("保存修订并重验") ||
+            n.textContent.includes("人工批准"))
+      );
+      assertEqual(
+        editButtonsWhileEmpty.length,
+        0,
+        "W15 P0-1: Empty scoped filter must hide Save and Approve buttons"
+      );
+      await ui.clickButton("显示全部记录");
+      assertTrue(
+        getPaneText("右栏费用详情与核对").includes("EML-1001"),
+        "W15 P0-1: 显示全部记录 restores records and re-selects visible record"
+      );
+
+      // P1-2: Jump to next pending + queue search + missing party export notice
+      await ui.clickButton("定位下一条待核");
+      assertTrue(
+        getPaneText("右栏费用详情与核对").includes("DC-999999"),
+        "W15 P1-2: 定位下一条待核 jumps right inspector to pending DC-999999"
+      );
+      await ui.changeControlValue("搜索账单队列", "DC-108478");
+      await flushActMicrotasks(4);
+      assertTrue(
+        getPaneText("右栏费用详情与核对").includes("DC-108478") &&
+          !getPaneText("账单待办队列").includes("DC-999999"),
+        "W15 P1-2: Queue search filters list to DC-108478 and syncs inspector"
+      );
+      const clearSearchBtn = hostEnv.findNodes(
+        (n) =>
+          n.tagName === "BUTTON" &&
+          (n.attributes["aria-label"] ?? hostEnv.getProps(n)["aria-label"]) === "清除搜索"
+      )[0];
+      assertTrue(Boolean(clearSearchBtn), "Expected 清除搜索 button");
+      await ReactMod.act(async () => {
+        (hostEnv.getProps(clearSearchBtn).onClick as () => void)();
+      });
+      await flushActMicrotasks(4);
+
+      await ui.clickButton("导出可入账");
+      await flushActMicrotasks(4);
+      assertTrue(
+        hostEnv.doc.body!.textContent.includes("付款方待确认"),
+        "W15 P0-2: Export modal displays missing-counterparty 付款方待确认 note"
+      );
+      await ui.clickButton("关闭");
+
+      // P0-3: Upload entity temporary override does not mutate TopBar & auto-resets after submit
+      await ui.clickButton("临时更换");
+      await ui.changeControlValue("临时指定下一批记账公司", "TAR");
+      await flushActMicrotasks(4);
+      const leftOverrideText = getPaneText("单据上传与文件列表");
+      const headerNode = hostEnv.findNodes((n) => n.tagName === "HEADER")[0];
+      assertTrue(
+        leftOverrideText.includes("已临时覆盖：下一批将按 TAR 记账") &&
+          Boolean(headerNode?.textContent.includes("NEPTUNE SHIPPING LIMITED")),
+        "W15 P0-3: Upload entity override warns cleanly while keeping TopBar batch entity NEPTUNE SHIPPING LIMITED"
+      );
+      await ui.clickButton("恢复默认");
+      assertTrue(
+        !getPaneText("单据上传与文件列表").includes("已临时覆盖"),
+        "W15 P0-3: 恢复默认 clears temporary upload entity override"
+      );
+
+      await ui.clickButton("临时更换");
+      await ui.changeControlValue("临时指定下一批记账公司", "TAR");
+      const uploadInput = hostEnv.findNodes((n) => {
+        if (n.tagName !== "INPUT") return false;
+        const props = hostEnv.getProps(n);
+        return String(n.attributes.accept ?? props.accept ?? "").includes(".pdf");
+      })[0];
+      assertTrue(Boolean(uploadInput), "Expected upload file input");
+      uploadInput.files = [
+        new File(["%PDF-1.4\nw15"], "w15-tar.pdf", { type: "application/pdf" }),
+      ];
+      await ReactMod.act(async () => {
+        (hostEnv.getProps(uploadInput).onChange as (e: unknown) => void)({
+          target: uploadInput,
+          currentTarget: uploadInput,
+        });
+      });
+      await ui.clickButton("解析 1 份单据");
+      await flushActMicrotasks(8);
+      assertEqual(
+        postedAccountingEntity,
+        "TAR",
+        "W15 P0-3: Upload POST uses overridden accounting_entity=TAR"
+      );
+      assertEqual(
+        postedOcrMode,
+        "REMOTE_WITH_LOCAL_FALLBACK",
+        "W15 P1-3: Default upload ocr_mode is REMOTE_WITH_LOCAL_FALLBACK"
+      );
+      const leftAfterSubmitText = getPaneText("单据上传与文件列表");
+      assertTrue(
+        !leftAfterSubmitText.includes("已临时覆盖") &&
+          leftAfterSubmitText.includes("NEPTUNE SHIPPING LIMITED"),
+        "W15 P0-3: Upload entity resets to default NEPTUNE SHIPPING LIMITED after batch accepted"
+      );
+
+      // Failed demo submit keeps temporary entity override; successful demo submit resets it
+      await ui.clickButton("临时更换");
+      await ui.changeControlValue("临时指定下一批记账公司", "TAR");
+      await ui.clickButton("示例演练（内置 4 份真实样本）");
+      await ui.clickButton("一键载入 4 份真样本");
+      await flushActMicrotasks(4);
+      assertTrue(
+        getPaneText("单据上传与文件列表").includes("已临时覆盖：下一批将按 TAR 记账"),
+        "W15 Demo fail preserves temporary TAR entity override"
+      );
+      await ui.clickButton("一键载入 4 份真样本");
+      await flushActMicrotasks(8);
+      assertTrue(
+        !getPaneText("单据上传与文件列表").includes("已临时覆盖"),
+        "W15 Demo accepted resets temporary TAR entity override"
+      );
+
+      // P1-3: PROCESSING batch disables sync-to-baseline in 管理与工具 menu
+      await ui.clickButton("管理与工具");
+      const syncMenuBtn = hostEnv.findNodes(
+        (n) =>
+          n.tagName === "BUTTON" &&
+          n.textContent.includes("将本批已确认记录写入历史库")
+      )[0];
+      assertTrue(
+        Boolean(syncMenuBtn) &&
+          (Boolean(syncMenuBtn.disabled) ||
+            Boolean(hostEnv.getProps(syncMenuBtn).disabled)) &&
+          syncMenuBtn.textContent.includes("解析完成后可同步"),
+        "W15 P1-3: Sync baseline menu action is disabled during PROCESSING with clear reason"
+      );
+
+      // Open Existing Bills drawer & verify P2 id/name completeness on drawer controls
+      await ui.clickButton("历史账单库");
+      await flushActMicrotasks(4);
+      assertAllFormControlsHaveIdAndName("W15 P2 existing bills drawer");
+
+      // Switch to Harness tab & verify runningEval shows friendly 30-60s status notice while POST pending
+      await ui.clickButton("系统自检 (Harness)");
+      await flushActMicrotasks(4);
+      await ui.clickButton("运行自检");
+      assertTrue(
+        hostEnv.doc.body!.textContent.includes(
+          "评测运行中（含本地 OCR 样本，约需 30–60 秒）..."
+        ) && hostEnv.doc.body!.textContent.includes("评测运行中..."),
+        "W15 R3: ManagementDrawer displays 30-60s status notice while eval run is in progress"
+      );
+      assertTrue(
+        Boolean(uiEvalPostHolder.resolve),
+        "Expected pending POST /api/v1/eval-runs"
+      );
+      const createdEvalRun = {
+        ...b05RealShapeEvalRun,
+        id: "eval-ui-done",
+        status: "COMPLETED",
+      };
+      evalRunsStore = [createdEvalRun];
+      await ReactMod.act(async () => {
+        uiEvalPostHolder.resolve!(
+          new Response(stringifyLosslessJson(createdEvalRun), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          })
+        );
+        uiEvalPostHolder.resolve = null;
+      });
+      await flushActMicrotasks(8);
+      assertTrue(
+        !hostEnv.doc.body!.textContent.includes(
+          "评测运行中（含本地 OCR 样本，约需 30–60 秒）..."
+        ),
+        "W15 R3: Running status notice clears once eval POST completes"
+      );
+    } finally {
+      if (uiEvalPostHolder.resolve) {
+        uiEvalPostHolder.resolve(
+          new Response(stringifyLosslessJson(b05RealShapeEvalRun), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          })
+        );
+        uiEvalPostHolder.resolve = null;
+      }
+      await ReactMod.act(async () => {
+        root.unmount();
+      });
+      hostEnv.cleanup();
+    }
+  }
+  results.push(
+    "PASS 36: Wave 15 UX Overhaul E2E (doc-filter/inspector sync, missing-party clarity, entity override reset, alert priority, search/jump, eval group wording & form id/name completeness)"
   );
 
   } finally {

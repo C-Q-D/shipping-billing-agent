@@ -56,7 +56,7 @@ EML 解析 `multipart`、邮件头、正文和附件，按实际文件格式递�
 | 组 | 设计意图与断言重点 |
 | --- | --- |
 | C01 | `图片示例.png`，ZIM 为 AR、ALL AMERICA 为 AP。两条费用均保留，`Wharfage` 单价 `2.85`，数量留空，不从 `21.90` 反推。 |
-| C02 | `PDF示例账单1.pdf`，只计 `245.00 USD CC`。排除 `$25`、`$1100`、`$150` 预取消罚金以及汇款段数字。 |
+| C02 | `PDF示例账单1.pdf`，提取主提单号 `CMDUCHN4053601`（费用代码 `OCA17` 不混入参考号），`CMA CGM (AMERICA) LLC` 向 `NEPTUNE SHIPPING LIMITED` 签发，归入应付 `AP`（`245.00 USD CC`），排除 `$25`、`$1100`、`$150` 预取消与违约金以及第 2–3 页汇款段账号信息。 |
 | C03 | `PDF 示例账单2.pdf` 的 `DC-108478` 共 3 行。NEPTUNE 凭 `(LAX)` 收款证据取 AR，无关主体待复核。同名 `35.00`、`65.00` 分别命中独立旧账行。 |
 | C04 | PRE-ALERT EML 邮件根为空且无需 LLM，正文识别 `SHA pay TAR $50`，排除 `Carrier Free H/C`。附件换序结果一致，缺付款方式留空，提单冲突留待复核。 |
 | C05 | `DN-202609-001` 两种部分变更分别检验 `PP → CC` 与 `30.00 → 40.00`，对旧基线给 `UPDATE`，对更新后基线给 `NO_CHANGE`，其余字段继承。 |
@@ -74,25 +74,29 @@ EML 解析 `multipart`、邮件头、正文和附件，按实际文件格式递�
 
 ## 计分口径与实测结果
 
-主流程实测报告 `.wf-tmp/b05-offline-eval-k3.json` 记录 `run_mode=OFFLINE_DETERMINISTIC`、`status=COMPLETED`、`model_name=deterministic-rules`、`total_cases=16`、`k_trials=3`、`actual_trials=3`、`executed_cases=48`。13 个组中的 C13 有 4 项独立执行，48 次执行均为 `PASSED`。以下比率直接取该报告的分子和分母。 [计分实现](../src/shipping_billing_agent/harness/runner.py)
+离线 `eval --mode OFFLINE_DETERMINISTIC --k-trials 3` 与联机 `eval --mode LIVE_LLM --k-trials 3`（实接 `deepseek-flash`，本地多格式解析）均在终版代码完成 16 项 × 3 轮 = `48` 次执行。以下比率直接取自两份评估报告的精确分子与分母。 [计分实现](../src/shipping_billing_agent/harness/runner.py)
 
-| 指标 | 分子 / 分母 | 离线 k=3 |
-| --- | --- | --- |
-| `schema_valid_rate` | 非空且通过 Schema 的导出次数 / 应评分的导出次数。预期有行却为空、序列化失败或 Schema 报错时记失败。合法且符合预期的空导出参加行数检查。 | `1.0`（150/150） |
-| `field_exact_match` | 核心字段整体精确匹配的行对 / 全部评分行对。逐行配对并计入漏行和多行，比较单号、费用、金额、币种、双方、记账主体、收付方向、借贷属性及付款方式。 | `1.0`（141/141） |
-| `ar_ap_accuracy` | `posting_type` 与真值相同的行对 / 全部评分行对，含应为 `null` 的场景。 | `1.0`（141/141） |
-| `operation_accuracy` | 四态操作与真值相同的行对 / 全部评分行对。 | `1.0`（141/141） |
-| `amount_accuracy` | 金额与真值按 `Decimal` 精确相等的行对 / 全部评分行对。 | `1.0`（141/141） |
-| `currency_accuracy` | 币种代码或缺币种状态与真值相同的行对 / 全部评分行对。 | `1.0`（141/141） |
-| `conflict_recall` | 命中预期冲突告警且被挡在入账外的次数 / 真值中应出现的冲突告警次数。按旧账歧义、跨文档冲突、重复明细、提单冲突的告警代码与级别比较。 | `1.0`（21/21） |
-| `false_positive_rate` | 真值可正式出账、实际有对应行但被拦的次数 / 真值可正式出账的行数。漏行由行数和字段指标计分。 | `0.0`（0/69） |
-| `alert_precision` | 符合必需或允许项的现存告警数 / 实际发出的现存告警数。逐行按代码和级别去重，排除已解决告警。 | `1.0`（111/111） |
-| `pass_at_k`（`pass@k`） | 至少一轮全对的用例数 / 用例总数。 | `1.0`（16/16，`pass@3`） |
-| `pass_pow_k`（`pass^k`） | 全部 k 轮均全对的用例数 / 用例总数。 | `1.0`（16/16，`pass^3`） |
+| 指标 | 分子 / 分母 | 离线 k=3（`deterministic-rules`） | 联机 k=3（`deepseek-flash`） |
+| --- | --- | --- | --- |
+| `schema_valid_rate` | 非空且通过 Schema 的导出次数 / 应评分的导出次数。预期有行却为空、序列化失败或 Schema 报错时记失败。 | `1.0`（150/150） | `0.9935`（152/153） |
+| `field_exact_match` | 核心字段整体精确匹配的行对 / 全部评分行对，比较单号、费用、金额、币种、双方、记账主体、收付方向、借贷属性及付款方式。 | `1.0`（141/141） | `0.9375`（135/144） |
+| `ar_ap_accuracy` | `posting_type` 与真值相同的行对 / 全部评分行对，含应为 `null` 的场景。 | `1.0`（141/141） | `0.9792`（141/144） |
+| `operation_accuracy` | 四态操作与真值相同的行对 / 全部评分行对。 | `1.0`（141/141） | `0.9722`（140/144） |
+| `amount_accuracy` | 金额与真值按 `Decimal` 精确相等的行对 / 全部评分行对。 | `1.0`（141/141） | `0.9792`（141/144） |
+| `currency_accuracy` | 币种代码或缺币种状态与真值相同的行对 / 全部评分行对。 | `1.0`（141/141） | `0.9792`（141/144） |
+| `conflict_recall` | 命中预期冲突告警且被挡在入账外的次数 / 真值中应出现的冲突告警次数。 | `1.0`（21/21） | `1.0`（21/21） |
+| `false_positive_rate` | 真值可正式出账、实际有对应行但被拦的次数 / 真值可正式出账的行数。 | `0.0`（0/69） | `0.0139`（1/72） |
+| `alert_precision` | 符合必需或允许项的现存告警数 / 实际发出的现存告警数（排除已解决告警）。 | `1.0`（111/111） | `0.9375`（105/112） |
+| `pass_at_k`（`pass@k`） | 至少一轮全对的用例数 / 用例总数。 | `1.0`（16/16，`pass@3`） | `0.875`（14/16，`pass@3`） |
+| `pass_pow_k`（`pass^k`） | 全部 k 轮均全对的用例数 / 用例总数。 | `1.0`（16/16，`pass^3`） | `0.8125`（13/16，`pass^3`） |
 
-一次全对要求行数、核心字段、操作与复核状态、必需告警、误拦检查及该用例的额外断言均通过。单用例三轮为 `[False, True, False]` 时，单独计算得到 `pass@3=1.0`、`pass^3=0.0`。财务自动处理不能依靠偶尔答对。回归以 `pass^k=1.0` 要求这 k 次中通过与否零波动，同时保留每轮差异定位原因。
+一次全对要求行数、核心字段、操作与复核状态、必需告警、误拦检查及该用例的额外断言均通过。单用例三轮为 `[False, True, False]` 时，单独计算得到 `pass@3=1.0`、`pass^3=0.0`。财务自动处理不能依靠偶尔答对。离线确定性回归以 `pass^k=1.0` 保证规则门禁与解析零波动；联机真实模型同步暴露真实随机波动以便针对性加固提示词与原文接地守卫。
 
-该次报告的 `avg_latency_ms` 为 `310.12`，取 48 次完成执行的平均用时。`llm_calls=15` 指离线队列替身调用，`ocr_calls=3` 指本地 RapidOCR 对 `图片示例.png` 的识别，`failing_cases=[]`。同一主流程在 `master`（`c2afd91` 封版验证）运行 `uv run pytest -p no:cacheprovider -q`，结果为 **1796 passed, 0 failed, 0 skipped (547.38s)**。
+- 离线 `k=3` 报告：`avg_latency_ms = 632.96`，`llm_calls = 15`（离线队列替身），`ocr_calls = 3`（本地 RapidOCR），`failing_cases = []`；同期全量 `uv run pytest -p no:cacheprovider -q` 结果为 **1897 passed, 0 failed, 0 skipped (1040.68s)**。
+- 联机 `LIVE_LLM k=3`（`deepseek-flash`）报告：`avg_latency_ms = 25777.60`，`llm_calls = 115`，`ocr_calls = 3`。**全部 4 份原题真实文件用例（`C01`–`C04`）、`C05`、`C07`–`C12` 以及 `C13/xls`、`C13/xlsx` 均实现 `3/3 (100%)` 稳定全对**，冲突与对抗拦截 `conflict_recall = 1.0 (21/21)`。其余 3 项差异原因明确且无静默放错账：
+  1. `C06_SUPPLIER_CREDIT_NOTE_AP`（2/3 通过，`pass@3 = 1.0`）：第 3 轮在合成 `Credit Card Invoice` 上因名称含 `Credit` 而模型返回 `CREDIT` 借贷方向，被确定性防误冲减门禁如期拦入待复核（贡献 1 次 `false_positive` 与 1 次 `alert_precision` 差异）；
+  2. `C13_OFFICE_FORMATS/doc`（0/3）：夹具 `b01_empty_columns.doc` 原文首行存在 `Reference\tBill 081`，真实模型提取出 `Bill 081` 而确定性表基线期望为 `null`；
+  3. `C13_OFFICE_FORMATS/docx`（0/3）：夹具 `b01_interleaved.docx` 实际含第二张无表头表格 `Filing\t310.42`，真实模型将该行一并抽出而基线仅计主表首行 `65.25`。
 
 ### 自修复证据
 
@@ -117,7 +121,7 @@ EML 解析 `multipart`、邮件头、正文和附件，按实际文件格式递�
 
 ## 联机复验
 
-当前环境缺真实 LLM API Key，以及经授权、可由指定网关读取的公网文件输入或对象存储中转。**`LIVE_LLM`、`LIVE_E2E` 和 `self_repair_evidence` 均为 `UNVERIFIED`**。离线队列和本地 RapidOCR 的计数仅是本地证据。配置方式见 [README](../README.md)。
+当前本机已完成真实 `DEEPSEEK_API_KEY`（`deepseek-flash`）的 `LIVE_LLM`（`k=3`）48 项次全套件评测与真实 Chrome 工作台端到端实测；因未配置 `PUBLIC_RELAY_BASE_URL` 公开中转且未向公网发布文件，`LIVE_E2E`（远端 `gateway.pltplt.com` URL 识别）与 `self_repair_evidence` 当前仍为 **`UNVERIFIED`**（本地 RapidOCR 与 PDF 文本解析链路已全覆盖）。配置方式见 [README](../README.md)。
 
 准备好四份原题样本和真实 LLM 配置后，执行第一条命令。联机端到端再将 `SHIPPING_BILLING_OCR_SAMPLE_URL` 设为经授权、网关可访问的 `图片示例.png` 地址后，执行第二条。检查运行状态、`pass^k`、实际 OCR 来源和费用行。自修复证据须另按上面的第二轮条件判定。
 

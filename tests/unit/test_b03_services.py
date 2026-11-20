@@ -1319,6 +1319,49 @@ def test_public_url_retry_keeps_original_locator_out_of_details(make_service):
     assert "token=private" not in dumps_decimal_json(result)
 
 
+@pytest.mark.parametrize(
+    ("header", "patch", "expected_reason"),
+    [
+        (
+            [f"Issuer: {ENTITY}", f"Bill To: {ENTITY}"],
+            {"issuer": "CMA CGM (AMERICA) LLC"},
+            "记账主体匹配付款方，归入应付台账",
+        ),
+        (
+            [],
+            {"posting_type": "AP"},
+            "人工确认记账方向，归入应付台账",
+        ),
+    ],
+    ids=["patch-issuer", "patch-posting-type"],
+)
+def test_patch_party_or_posting_type_clears_stale_unresolvable_entity_reasoning(
+    make_service, header, patch, expected_reason
+):
+    notice = "\n".join(
+        [
+            "GENERAL NOTICE",
+            *header,
+            "On Carriage Additional 245.00 USD (CC)",
+            "Total USD 245.00",
+        ]
+    )
+    service = make_service(ocr=FixtureOcr(results={b"notice": notice}))
+    batch = _create(service, ("notice.png", b"notice"))
+    batch_id = batch["id"]
+    record = batch["records"][0]
+    stale = "当前记账主体无法唯一匹配单据的收款方或付款方"
+    assert stale in record["ai_reasoning"]
+    assert record["financial_attributes"]["posting_type"] is None
+
+    updated = ReviewService(service).patch_record(batch_id, record["id"], patch)
+    rechecked = updated["records"][0]
+    assert rechecked["financial_attributes"]["posting_type"] == "AP"
+    assert rechecked["review_status"] == "AUTO_READY"
+    assert stale not in rechecked["ai_reasoning"]
+    assert expected_reason in rechecked["ai_reasoning"]
+
+
 def test_services_import_neither_fastapi_nor_harness():
     services = Path(__file__).resolve().parents[2] / "src/shipping_billing_agent/services"
     imported = set()

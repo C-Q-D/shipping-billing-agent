@@ -106,9 +106,9 @@ uv run shipping-billing-agent eval --mode OFFLINE_DETERMINISTIC --k-trials 3 --o
 
 ## 自动化验证与实测
 
-主流程在 `master`（`c2afd91` 封版验证）的全量测试基线 `uv run pytest -p no:cacheprovider -q` 为 **1796 passed, 0 failed, 0 skipped (547.38s)**。离线 Harness `k=3` 完成 **16/16 个用例、48 次执行**。Schema 合规率、核心字段、AR/AP、操作、金额、币种、冲突召回、告警精确率以及 `pass@k`、`pass^k` 均为 `1.0`，正常记录误拦率为 `0.0`（`0/69`）。详细分子、分母和计分规则见 [Harness 设计报告](docs/harness-design.md)。
+全量自动化回归 `uv run pytest -p no:cacheprovider -q` 结果为 **1897 passed, 0 failed, 0 skipped (1040.68s)**。离线 Harness（`OFFLINE_DETERMINISTIC`, `k=3`）完成 **16/16 个用例、48 次执行**，十项核心指标及 `pass@3`、`pass^3` 均为 `1.0`，正常记录误拦率为 `0.0`（`0/69`）。真实大模型 `LIVE_LLM`（`deepseek-flash`, `k=3`, 115 次模型调用）中，**`C01`–`C04` 4 份原题真实样本及 `C05`、`C07`–`C12`、`C13/.xls,.xlsx` 共 13/16 项均达成 3/3 全通过（`pass^3 = 0.8125`，`pass@3 = 0.875`，`conflict_recall = 1.0 (21/21)`）**；详细分子、分母、真实浏览器实测边界与剩余 3 项合成夹具差异原因见 [Harness 设计报告](docs/harness-design.md)。
 
-**`LIVE_LLM`、`LIVE_E2E`、`self_repair_evidence` 当前为 `UNVERIFIED`。** 接入真实 LLM 后复验 `LIVE_LLM`。另有网关可访问的授权样本 URL 或受控中转发布器时复验 `LIVE_E2E`。自修复证据须有携带原文和差额的第二轮请求，并有重验通过结果。
+**`LIVE_E2E`（`gateway.pltplt.com` 远端 URL OCR）与 `self_repair_evidence` 当前仍为 `UNVERIFIED`。** 提供网关可访问的授权样本 URL 或受控中转发布器后可复验 `LIVE_E2E`。自修复证据须有携带原文和差额的第二轮请求，并有重验通过结果。
 
 只使用 ZIP 内文件即可运行下面的交付检查。它在仓库外空目录启动服务并验证健康端点，再验证离线样例的两条正式出账及 Schema。
 

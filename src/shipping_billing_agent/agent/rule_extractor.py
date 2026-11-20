@@ -87,9 +87,24 @@ _COMPANY = re.compile(
 )
 _BILL_TITLE = re.compile(
     rf"^(?:{CREDIT_DOCUMENT_PATTERN.pattern}|DEBIT\s*(?:NOTE|INVOICE)|"
-    r"(?:TAX\s+|CREDIT\s+CARD\s+)?INVOICE|LETTER\s+OF\s+CREDIT|GENERAL\s+NOTICE)"
+    r"(?:TAX\s+|CREDIT\s+CARD\s+)?INVOICE|LETTER\s+OF\s+CREDIT|(?:GENERAL|ARRIVAL)\s+NOTICE)"
     r"(?=\s|[:#=]|$)",
     re.I,
+)
+_NOTICE_TITLE = re.compile(r"^(?:GENERAL|ARRIVAL)\s+NOTICE$", re.I)
+_NOTICE_ADDRESSEE_PHRASE = re.compile(
+    r"\b(?:COMMUNICATE\s+THE\s+BELOW\s+INFORMATION\s+TO\s+YOU|"
+    r"TOTAL\s+CHARGES\s+TO\s+BE\s+PAID|PLEASE\s+PAY\s+FREIGHT)\b",
+    re.I,
+)
+_NOTICE_ISSUER_PATTERNS = (
+    re.compile(r"\bIF\s+(?P<company>[A-Z0-9][^\n,;]{2,80}?)\s+ARRANGES\b", re.I),
+    re.compile(
+        r"\bcontact\s+customer\s+service(?:\s+for\s+further\s+information)?\s*[:：]\s*"
+        r"(?P<company>.+)$",
+        re.I,
+    ),
+    re.compile(r"\bPAYABLE\s+TO\s*[:：]\s*(?P<company>.+)$", re.I),
 )
 _TITLE_REFERENCE = re.compile(
     rf"^\s*(?:(?:number|no\.?|id)(?=\W|$)\s*)?[:#=]?\s*({_REF})(?=\s|$)", re.I
@@ -1134,6 +1149,40 @@ def _first_company(text: str) -> str:
     return match[0] if match else text
 
 
+def _notice_addressee_matches_transport(company: str, lines: Sequence[_Line]) -> bool:
+    target = normalize_party_name(company)
+    if not target:
+        return False
+    for index, line in enumerate(lines):
+        if not re.search(r"\b(?:CONSIGNEE|NOTIFY)\b", line.text, re.I):
+            continue
+        for candidate in lines[index : index + 6]:
+            if _BILL_TITLE.match(candidate.text) or _REMITTANCE.search(candidate.text):
+                break
+            if entity_matches(candidate.text, company) or target in normalize_party_name(
+                candidate.text
+            ):
+                return True
+    return False
+
+
+def _extract_notice_issuer(lines: Sequence[_Line], recipient: str | None) -> str | None:
+    for pattern in _NOTICE_ISSUER_PATTERNS:
+        for line in lines:
+            if not (found := pattern.search(line.text)):
+                continue
+            candidate = found["company"].strip()
+            if not (company := _COMPANY.match(candidate)):
+                continue
+            name = company[0].strip()
+            if name.upper().startswith("AS AGENTS FOR"):
+                continue
+            if recipient and entity_matches(name, recipient):
+                continue
+            return name
+    return None
+
+
 def _party(lines: Sequence[_Line], label: str, *, company_only: bool = False) -> str | None:
     for value in _labeled_values(lines, label):
         if tail := _PARTY_VALUE_TAIL.search(value):
@@ -1168,7 +1217,8 @@ def _collect_text_headers(
                 break
     date = _value_after(
         lines,
-        r"(?:invoice|document|issue|D/C|D/N|C/N|debit note|credit note)?\s*date|general notice",
+        r"(?:invoice|document|issue|D/C|D/N|C/N|debit note|credit note)?\s*date"
+        r"|(?:general|arrival)\s+notice",
         _DATE,
     )
     if date is None and doc.source_kind is SourceKind.EML_BODY:
@@ -1188,20 +1238,44 @@ def _collect_text_headers(
         if field_name not in evidence.fields and (value := _party(lines, label, company_only=True)):
             evidence.fields[field_name] = value
     if title:
-        leading_companies = []
-        for line in lines[:18]:
+        title_index = next(
+            (index for index, line in enumerate(lines) if _BILL_TITLE.match(line.text)),
+            len(lines),
+        )
+        leading_companies: list[tuple[int, str]] = []
+        for index, line in enumerate(lines[:18]):
             if (
                 _REMITTANCE.search(line.text)
                 or "PAYMENTS MUST BE ISSUED" in line.text.upper()
                 or re.match(r"(?:SHIPPER|CONSIGNEE)\b", line.text, re.I)
             ):
                 break
-            if _COMPANY.match(line.text) and not line.text.upper().startswith("AS AGENTS FOR"):
-                leading_companies.append(_first_company(line.text))
-        if leading_companies:
-            evidence.fields.setdefault("issuer", leading_companies[0])
+            if (
+                not _PARTY_HEADER.match(line.text)
+                and not _BILL_TITLE.match(line.text)
+                and _COMPANY.match(line.text)
+                and not line.text.upper().startswith("AS AGENTS FOR")
+            ):
+                leading_companies.append((index, _first_company(line.text)))
+        is_notice = bool(_NOTICE_TITLE.fullmatch(title_type))
+        if is_notice and leading_companies:
+            lead_index, lead_company = leading_companies[0]
+            has_addressee_phrase = any(
+                _NOTICE_ADDRESSEE_PHRASE.search(line.text) for line in lines
+            )
+            if _notice_addressee_matches_transport(lead_company, lines) or (
+                lead_index < title_index and has_addressee_phrase
+            ):
+                evidence.fields.setdefault("recipient", lead_company)
+            else:
+                evidence.fields.setdefault("issuer", lead_company)
+        elif leading_companies:
+            evidence.fields.setdefault("issuer", leading_companies[0][1])
             if len(leading_companies) > 1 and title[0].upper() == "INVOICE":
-                evidence.fields.setdefault("recipient", leading_companies[1])
+                evidence.fields.setdefault("recipient", leading_companies[1][1])
+        if is_notice and "issuer" not in evidence.fields:
+            if notice_issuer := _extract_notice_issuer(lines, evidence.fields.get("recipient")):
+                evidence.fields["issuer"] = notice_issuer
     payer = evidence.fields.get("payer_hint")
     if payer and evidence.fields.get("recipient") and re.fullmatch(r"[A-Z0-9]{8,}", payer):
         # A printed internal payer account code is separate from the named invoice recipient.
@@ -1928,13 +2002,18 @@ def _collect_text_charges(
                 )
                 continue
         if waybill := re.match(
-            rf"^(?:[A-Z]{{4}}\s+({_REF})\s+)?Waybill\s+({_REF})\s+(.+)$", text, re.I
+            rf"^(?:(?P<scac>[A-Z]{{4}})\s+(?P<bl>{_REF})\s+)?"
+            rf"Waybill\s+(?P<code>{_REF})\s+(?P<rest>.+)$",
+            text,
+            re.I,
         ):
-            if row := _TEXT_ROW.fullmatch(waybill[3]):
-                evidence.fields.setdefault("reference_no", waybill[2].upper())
-                if waybill[1]:
-                    evidence.add_mbl(waybill[1], doc.sanitized_filename)
-                text = waybill[3]
+            if row := _TEXT_ROW.fullmatch(waybill["rest"]):
+                if waybill["scac"] and waybill["bl"]:
+                    evidence.fields.setdefault(
+                        "reference_no", f"{waybill['scac']}{waybill['bl']}".upper()
+                    )
+                    evidence.add_mbl(waybill["bl"], doc.sanitized_filename)
+                text = waybill["rest"]
         if in_ledger and (ledger := _LEDGER_ROW.fullmatch(text)):
             fields = {key: ledger[key] for key in ("quantity", "unit_price", "payment_term")}
             fields.update(

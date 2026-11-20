@@ -351,6 +351,43 @@ def test_wrong_field_types_are_audited_without_losing_other_fields() -> None:
     assert charge.raw_invalid_fields == {"payment_term": "PP or CC", "page": "unknown"}
 
 
+def test_shipment_refs_unpacks_value_objects_in_container_nos_and_keeps_invalid_checks() -> None:
+    raw = """{
+        "reference_no": "CMDUCHN4053601",
+        "shipment_refs": {
+            "mbl_nos": [{"value": "CMDUCHN4053601", "source": "page 1"}],
+            "container_nos": [
+                {"value": "SAPU2040689", "source": "page 1"},
+                {"value": "JXLU4504463"},
+                "MSCU6639870"
+            ]
+        },
+        "charges": [
+            {"raw_charge_name": "On Carriage Additional", "amount": "245.00", "currency": "USD"}
+        ]
+    }"""
+    parsed = parse_llm_raw_extraction(raw)
+    assert parsed.raw_invalid_fields == {}
+    assert parsed.raw_parse_issues == []
+    assert parsed.extraction.shipment_refs.container_nos == [
+        "SAPU2040689",
+        "JXLU4504463",
+        "MSCU6639870",
+    ]
+    typed = RawDocumentExtraction.model_validate_json(raw)
+    assert typed.shipment_refs.container_nos == ["SAPU2040689", "JXLU4504463", "MSCU6639870"]
+
+    for bad_container in ({"source": "page 1"}, {"value": 123}, 123):
+        invalid = parse_llm_raw_extraction(
+            f'{{"shipment_refs": {{"container_nos": [{dumps_decimal_json(bad_container)}]}}, '
+            '"charges": [{"raw_charge_name": "H/C", "amount": "10", "currency": "USD"}]}'
+        )
+        assert "shipment_refs" in invalid.raw_invalid_fields
+        assert [alert.code for alert in invalid.raw_parse_issues] == [
+            AlertCode.LLM_EXTRACTION_FAILED
+        ]
+
+
 def test_decimal_json_numbers_round_trip_byte_for_byte() -> None:
     raw = '{"amount":9007199254740991.01,"prices":[0.0025,1,-0.00],"note":"9007199254740991.01"}'
     loaded = loads_decimal_json(raw)

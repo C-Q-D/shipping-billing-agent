@@ -73,6 +73,8 @@ export function LumnoButton({
 }
 
 export interface LumnoSwitchProps {
+  id?: string;
+  name?: string;
   checked: boolean;
   onChange: (checked: boolean) => void;
   ariaLabel: string;
@@ -81,15 +83,25 @@ export interface LumnoSwitchProps {
 }
 
 export function LumnoSwitch({
+  id,
+  name,
   checked,
   onChange,
   ariaLabel,
   compact = false,
   disabled = false,
 }: LumnoSwitchProps) {
+  const autoId = useId();
+  const inputId = id ?? `lumno-switch-${autoId}`;
+  const inputName = name ?? inputId;
   return (
-    <label className={`lumno-switch ${compact ? "lumno-switch--compact" : ""}`}>
+    <label
+      htmlFor={inputId}
+      className={`lumno-switch ${compact ? "lumno-switch--compact" : ""}`}
+    >
       <input
+        id={inputId}
+        name={inputName}
         type="checkbox"
         role="switch"
         aria-label={ariaLabel}
@@ -605,6 +617,7 @@ export function LumnoPopconfirm({
   });
   const anchorElRef = useRef<HTMLButtonElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const reasonInputId = useId();
 
   const reposition = useCallback(() => {
     const anchor = anchorElRef.current;
@@ -715,13 +728,15 @@ export function LumnoPopconfirm({
 
               {requireReason ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                  <div className="wb-field-label">
+                  <label htmlFor={reasonInputId} className="wb-field-label">
                     <span>原因说明（2–500 字符）</span>
                     <span className="wb-tabular">
                       {countCodePoints(reason)} / 500
                     </span>
-                  </div>
+                  </label>
                   <LumnoInput
+                    id={reasonInputId}
+                    name="popconfirm_reason"
                     value={reason}
                     placeholder={reasonPlaceholder}
                     aria-label={reasonPlaceholder}

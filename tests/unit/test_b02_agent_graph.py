@@ -17,7 +17,10 @@ from shipping_billing_agent.agent import (
     run_billing_pipeline,
 )
 from shipping_billing_agent.agent import graph as billing_graph
-from shipping_billing_agent.agent.prompts import select_minimal_document_snippet
+from shipping_billing_agent.agent.prompts import (
+    build_extraction_messages,
+    select_minimal_document_snippet,
+)
 from shipping_billing_agent.config.limits import ResourceLimits
 from shipping_billing_agent.domain import serialize_records
 from shipping_billing_agent.domain.models import (
@@ -1705,3 +1708,196 @@ def test_model_extra_fee_cannot_reuse_a_recognized_fee_as_evidence() -> None:
     assert len(result.records) == 2
     assert all(row.operation is OperationType.PENDING_REVIEW for row in result.records)
     assert serialize_records(result.records, "official") == []
+
+
+def test_extraction_prompt_specifies_plain_container_strings_and_waybill_reference() -> None:
+    doc = _document(
+        "waybill-prompt",
+        f"GENERAL NOTICE\nIssuer: {_ENTITY}\n"
+        "CMDU CHN4053601 Waybill OCA17 On Carriage Additional 245.00 USD",
+    )
+    system, _ = build_extraction_messages(doc, accounting_entity=_ENTITY)
+    content = system["content"]
+    assert "container_nos must be an array of plain container-number strings" in content
+    assert 'never {"value", "source"} objects' in content
+    assert "Acme Shipping" in content and "Beta Trading" in content
+    assert "Example Carrier" not in content and "Example Customer" not in content
+    assert (
+        '"OCA17" is the charge code (never reference_no)' in content
+        and "reference_no" in content
+        and "mbl_nos" in content
+    )
+    assert "set reference_no to null" in content
+    assert "<UNTRUSTED_DOCUMENT_CONTENT>" in content and "Accounting entity" in content
+    assert "Payer: USIAHALLAM" in content
+    assert "never duplicate the same company on both issuer and recipient" in content
+    assert "IGNORE ALL" in content and "APPROVED" in content
+
+
+@pytest.mark.parametrize(
+    ("is_invoice", "proposed_ref", "blocked"),
+    [
+        (False, "CMDUCHN4053601", False),
+        (False, "CHN4053601", False),
+        (False, "CMDU CHN4053601", False),
+        (False, "OCA17", True),
+        (False, "INV-200", True),
+        (False, "FAKECHN4053601", True),
+        (True, "CHN4053601", True),
+        (True, "INV-200", True),
+    ],
+    ids=[
+        "waybill-scac-mbl",
+        "waybill-bare-mbl",
+        "waybill-spaced-scac-mbl",
+        "waybill-charge-code-as-reference-blocked",
+        "waybill-conflicting-ref",
+        "waybill-forged-scac-mbl",
+        "explicit-invoice-with-mbl",
+        "explicit-invoice-conflicting-ref",
+    ],
+)
+def test_waybill_notice_allows_printed_mbl_reference_without_weakening_conflicts(
+    is_invoice: bool, proposed_ref: str, blocked: bool
+) -> None:
+    if is_invoice:
+        text = (
+            f"Invoice No. INV-100\nIssuer: {_ENTITY}\nMBL No.: CHN4053601\n"
+            "Container No.: SAPU2040689\nHandling Charge 245.00 USD\nTotal USD 245.00"
+        )
+        charge_name, expected_ref = "Handling Charge", "INV-100"
+    else:
+        text = (
+            f"GENERAL NOTICE 10/19/2026 05:58 PM\nIssuer: {_ENTITY}\n"
+            "Please clear your cargo with Customs against the following B/L\nCMDUCHN4053601\n"
+            "CMDU CHN4053601 Waybill OCA17 On Carriage Additional - US Em USD 245.0000 C\n"
+            "TOTAL CHARGES TO BE PAID: USD 245.0000\nContainer No.: SAPU2040689"
+        )
+        charge_name, expected_ref = "On Carriage Additional - US Em", "CMDUCHN4053601"
+    doc = _document("waybill-mbl-ref", text)
+    payload = json.dumps(
+        {
+            "document_type": "INVOICE" if is_invoice else "GENERAL NOTICE",
+            "reference_no": proposed_ref,
+            "issuer": _ENTITY,
+            "shipment_refs": {
+                "mbl_nos": [{"value": "CMDUCHN4053601", "source": "page 1"}],
+                "hbl_no": None,
+                "booking_no": None,
+                "container_nos": [{"value": "SAPU2040689", "source": "page 1"}],
+            },
+            "total_amount": "245.00",
+            "total_currency": "USD",
+            "charges": [
+                {
+                    "raw_charge_name": charge_name,
+                    "amount": "245.00",
+                    "currency": "USD",
+                    "payment_term": None if is_invoice else "CC",
+                }
+            ],
+        }
+    )
+    client = FakeStructuredLlmClient(
+        [StructuredLlmResponse(None, payload, None, "fake")]
+    )
+    result = run_billing_pipeline([doc], _ENTITY, llm_client=client)
+
+    assert result.llm_calls_used == 1 and not result.failed_doc_ids
+    (row,) = result.records
+    assert row.retry_count == 0
+    assert row.reference_no == expected_ref
+    assert row.shipment_refs.container_nos == ["SAPU2040689"]
+    if blocked:
+        assert row.operation is OperationType.PENDING_REVIEW
+        assert any(
+            alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT
+            and alert.severity is AlertSeverity.BLOCKER
+            and alert.field == "reference_no"
+            for alert in row.validation_alerts
+        )
+        assert serialize_records(result.records, "official") == []
+    else:
+        assert row.validation_alerts == []
+        assert row.operation is OperationType.CREATE
+        assert row.review_status is ReviewStatus.AUTO_READY
+        (official,) = serialize_records(result.records, "official")
+        assert official["document_info"]["reference_no"] == expected_ref
+
+
+@pytest.mark.parametrize("filename", ["b01_merged.xls", "b01_empty_columns.doc"])
+def test_headerless_office_document_clears_hallucinated_entity_and_prompt_examples(
+    filename: str,
+) -> None:
+    path = Path(__file__).resolve().parents[1] / "fixtures" / filename
+    is_excel = path.suffix == ".xls"
+    text, tables = (
+        parse_excel(path.read_bytes(), filename)
+        if is_excel
+        else parse_word(path.read_bytes(), filename)
+    )
+    doc = _document(
+        filename,
+        text,
+        tables=tables,
+        source_kind="EXCEL" if is_excel else "WORD",
+    )
+    payload = json.dumps(
+        {
+            "document_type": "INVOICE",
+            "reference_no": "Bill 081" if filename.endswith(".doc") else None,
+            "issuer": _ENTITY,
+            "recipient": "Beta Trading",
+            "payer_hint": _ENTITY,
+            "payee_hint": "Acme Shipping",
+            "charges": [
+                {"raw_charge_name": "THC", "amount": amount, "currency": None}
+                for amount in ("65.25", "310.42")
+            ],
+        }
+    )
+    client = FakeStructuredLlmClient([StructuredLlmResponse(None, payload, None, "fake")])
+
+    result = run_billing_pipeline([doc], _ENTITY, llm_client=client)
+
+    assert result.llm_calls_used == 1 and not result.failed_doc_ids
+    assert len(result.records) == 2
+    for row in result.records:
+        assert (row.issuer, row.recipient, row.payer_hint, row.payee_hint) == (
+            None,
+            None,
+            None,
+            None,
+        )
+        assert row.posting_type is None
+        assert row.operation is OperationType.PENDING_REVIEW
+        assert any(alert.code is AlertCode.ENTITY_NOT_MATCHED for alert in row.validation_alerts)
+    assert serialize_records(result.records, "official") == []
+
+
+def test_unprinted_party_with_profile_alias_in_source_is_preserved() -> None:
+    doc = _document(
+        "alias-email", "Payment note: SHA fee\nHandling Charge 50 USD", source_kind="EML_BODY"
+    )
+    profiles = (
+        AccountingEntityProfile(
+            canonical_name="SUN TRACK EXPRESS (CHINA) CO., LTD.",
+            aliases=["SHA"],
+        ),
+    )
+    payload = json.dumps(
+        {
+            "document_type": "EMAIL SETTLEMENT INSTRUCTION",
+            "payer_hint": "SUN TRACK EXPRESS (CHINA) CO., LTD.",
+            "charges": [{"raw_charge_name": "Handling Charge", "amount": "50", "currency": "USD"}],
+        }
+    )
+    client = FakeStructuredLlmClient([StructuredLlmResponse(None, payload, None, "fake")])
+
+    result = run_billing_pipeline(
+        [doc], "SUN TRACK EXPRESS (CHINA) CO., LTD.", profiles=profiles, llm_client=client
+    )
+
+    (row,) = result.records
+    assert row.payer_hint == "SUN TRACK EXPRESS (CHINA) CO., LTD."
+    assert row.posting_type is PostingType.AP

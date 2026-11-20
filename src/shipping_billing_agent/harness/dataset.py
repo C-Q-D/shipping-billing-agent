@@ -239,15 +239,16 @@ def _png(ctx: EvalContext) -> None:
 def _general_notice(ctx: EvalContext) -> None:
     result = ctx.run(ctx.sample_documents(), _NEPTUNE)
     ctx.score(
-        "OCA17",
+        "CMDUCHN4053601",
         result,
         [
             _row(
-                "OCA17",
+                "CMDUCHN4053601",
                 "245.00",
-                issuer=_NEPTUNE,
-                recipient=None,
+                issuer="CMA CGM (AMERICA) LLC",
+                recipient=_NEPTUNE,
                 accounting_entity=_NEPTUNE,
+                posting_type="AP",
                 charge_item="On Carriage Additional",
                 payment_term="CC",
             )

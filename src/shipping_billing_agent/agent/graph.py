@@ -101,6 +101,103 @@ _DEFAULT_LIMITS = ResourceLimits()
 _SHEET_ROW = re.compile(r"^\[Sheet: (.+?) \| Row (\d+)\] \[Row (\d+)\]")
 _TABLE_ROW = re.compile(r"^\[[^]]+\] \[Row (\d+)\]")
 _EMAIL_SETTLEMENT_TYPES = frozenset({"email", "email settlement", "email settlement instruction"})
+_EMAIL_COMPATIBLE_TYPES = _EMAIL_SETTLEMENT_TYPES | frozenset(
+    {
+        "billing instruction",
+        "billing notice",
+        "billing statement",
+        "charge notice",
+        "debit invoice",
+        "debit memo",
+        "debit note",
+        "debit notice",
+        "email billing",
+        "email notice",
+        "fee notice",
+        "general notice",
+        "invoice",
+        "notice",
+        "payment instruction",
+        "payment notice",
+        "pre alert",
+        "pre alert email",
+        "prealert",
+        "settlement instruction",
+        "settlement notice",
+        "statement",
+    }
+)
+_EMAIL_SALUTATION_COMPANY_WORDS = frozenset(
+    {
+        "ag",
+        "bank",
+        "bv",
+        "cargo",
+        "carrier",
+        "co",
+        "company",
+        "corp",
+        "corporation",
+        "express",
+        "forwarding",
+        "freight",
+        "gmbh",
+        "group",
+        "holdings",
+        "inc",
+        "international",
+        "kg",
+        "limited",
+        "line",
+        "lines",
+        "llc",
+        "logistics",
+        "ltd",
+        "nv",
+        "plc",
+        "pte",
+        "sa",
+        "service",
+        "services",
+        "shipping",
+        "tech",
+        "trading",
+        "transport",
+    }
+)
+_PARTY_CODE_TOKEN = re.compile(r"(?=[A-Z0-9]*[A-Z])[A-Z0-9]{6,24}")
+_PARTY_CODE_PREFIX = (
+    r"(?:Payer|Payee|Customer(?:\s+(?:No\.?|Number|Code|ID))?"
+    r"|Code|Account(?:\s+(?:No\.?|Number|Code|ID))?)"
+)
+_PARTY_LEGAL_SUFFIXES = frozenset(
+    {
+        "ag",
+        "bv",
+        "co",
+        "company",
+        "corp",
+        "corporation",
+        "gmbh",
+        "inc",
+        "incorporated",
+        "kg",
+        "limited",
+        "llc",
+        "llp",
+        "lp",
+        "ltd",
+        "nv",
+        "plc",
+        "pte",
+        "sa",
+    }
+)
+_BILINGUAL_HEADER_NOISE = re.compile(
+    r"\b(?:bill\s+to|shipper|consignee|notify|payer|payee|recipient|issuer|"
+    r"debit\s+note|invoice)\b",
+    re.IGNORECASE,
+)
 _AGENCY_DECLARATION = re.compile(r"(?P<agent>.+?) as agents? for (?P<principal>.+)")
 _AGENCY_LEGAL_SUFFIXES = frozenset({"co", "ltd", "inc", "llc"})
 _AGENCY_MIN_COMPACT_NAME_LENGTH = 8
@@ -407,7 +504,13 @@ def _ground_printed_fields(
         if field == "reference_no":
             return "".join(key.split())
         if field == "document_type":
-            key = " ".join(key.replace("_", " ").split())
+            key = " ".join(key.replace("_", " ").replace("-", " ").split())
+            if (
+                getattr(printed, field, None) == "EMAIL SETTLEMENT INSTRUCTION"
+                and not is_credit_document_type(value)
+                and key in _EMAIL_COMPATIBLE_TYPES
+            ):
+                return "email"
             return "email" if key in _EMAIL_SETTLEMENT_TYPES else key
         return key.strip()
 
@@ -432,6 +535,73 @@ def _printed_field_conflict(field: str, printed: str, proposed: str) -> Validati
         expected=printed,
         actual=proposed,
     )
+
+
+def _document_source_text(doc: ParsedDocument) -> str:
+    parts = [doc.raw_text]
+    if doc.tables:
+        parts.extend("\t".join(row) for table in doc.tables for row in table.rows)
+    if doc.ocr_payload is not None:
+        parts.extend(
+            dumps_decimal_json(item.model_dump(mode="json", by_alias=True, exclude_none=True))
+            for item in doc.ocr_payload.items
+        )
+    return normalize("NFKC", "\n".join(part for part in parts if part))
+
+
+def _reference_key(value: str) -> str:
+    return "".join(normalize("NFKC", value).upper().split())
+
+
+def _is_waybill_mbl_reference(
+    proposed: str,
+    printed: RawDocumentExtraction,
+    doc: ParsedDocument,
+) -> bool:
+    """Allow bare MBL or spaced SCAC+MBL when Waybill line supplies SCAC+MBL as reference_no."""
+    observed = printed.reference_no
+    if not observed:
+        return False
+    doc_type = (printed.document_type or "").upper()
+    if is_credit_document_type(doc_type) or "INVOICE" in doc_type or "DEBIT" in doc_type:
+        return False
+    printed_mbls = {
+        key
+        for ref in printed.shipment_refs.mbl_nos
+        if (key := _reference_key(ref.value))
+    }
+    if not printed_mbls:
+        return False
+    observed_key = _reference_key(observed)
+    scac_prefix = (
+        len(observed_key) > 4
+        and observed_key[:4].isascii()
+        and observed_key[:4].isalpha()
+        and observed_key[4:] in printed_mbls
+    )
+    if observed_key not in printed_mbls and not scac_prefix:
+        return False
+    source_text = _document_source_text(doc)
+    observed_pattern = (
+        rf"{re.escape(observed_key[:4])}[ \t]*{re.escape(observed_key[4:])}"
+        if scac_prefix
+        else re.escape(observed.strip())
+    )
+    if not re.search(
+        rf"(?<![A-Za-z0-9]){observed_pattern}[ \t]+Waybill(?![A-Za-z0-9])",
+        source_text,
+        re.I,
+    ):
+        return False
+    if re.search(
+        rf"\b(?:invoice|debit\s*note|credit\s*note|d/c|d/n|c/n|reference|ref\.?)"
+        rf"(?:\s*(?:number|no\.?|#|id))?\s*[:#=]?\s*{observed_pattern}(?![A-Za-z0-9])",
+        source_text,
+        re.I,
+    ):
+        return False
+    key = _reference_key(proposed)
+    return key == observed_key or key in printed_mbls
 
 
 def _preserve_invalid_fields(
@@ -529,15 +699,34 @@ def _ground_charge(
         candidate = getattr(model, field)
         if field != "amount" and candidate is not None and candidate != value:
             issues.append(_printed_field_conflict(field, str(value), str(candidate)))
-    _ground_printed_fields(model, printed, ("payment_term", "debit_credit"), updates, issues)
-    if (
-        document_type
-        and not is_credit_document_type(document_type)
-        and printed.debit_credit == "UNKNOWN"
-        and model.debit_credit == "CREDIT"
-    ):
+    _ground_printed_fields(model, printed, ("payment_term",), updates, issues)
+    if printed.debit_credit == "UNKNOWN":
+        if model.debit_credit == "DEBIT":
+            updates["debit_credit"] = "UNKNOWN"
+        elif (
+            document_type
+            and not is_credit_document_type(document_type)
+            and model.debit_credit == "CREDIT"
+        ):
+            updates["debit_credit"] = "UNKNOWN"
+            issues.append(
+                _printed_field_conflict("debit_credit", document_type, model.debit_credit)
+            )
+    else:
         updates["debit_credit"] = printed.debit_credit
-        issues.append(_printed_field_conflict("debit_credit", document_type, model.debit_credit))
+        credit_note_debit_column = (
+            is_credit_document_type(document_type)
+            and printed.debit_credit == "DEBIT"
+            and model.debit_credit == "CREDIT"
+        )
+        if (
+            model.debit_credit != "UNKNOWN"
+            and model.debit_credit != printed.debit_credit
+            and not credit_note_debit_column
+        ):
+            issues.append(
+                _printed_field_conflict("debit_credit", printed.debit_credit, model.debit_credit)
+            )
     corroborated = _preserve_invalid_fields(
         observed.raw_invalid_fields, model, printed, independent, updates
     )
@@ -944,12 +1133,179 @@ def _matches_agency_declaration(model: str, printed: str) -> bool:
     )
 
 
+def _is_printed_party_code(
+    code_candidate: str, target_company: str, doc: ParsedDocument
+) -> bool:
+    code = normalize("NFKC", code_candidate).strip()
+    target = normalize("NFKC", target_company).strip()
+    if (
+        not target
+        or _PARTY_CODE_TOKEN.fullmatch(target)
+        or not (" " in target or any(not ch.isalnum() for ch in target))
+        or _PARTY_CODE_TOKEN.fullmatch(code) is None
+        or (len(code) < 8 and not any(ch.isdigit() for ch in code))
+    ):
+        return False
+    source_text = _document_source_text(doc)
+    return bool(
+        re.search(
+            rf"(?i:(?<![A-Za-z0-9]){_PARTY_CODE_PREFIX})\s*[:=#]\s*{re.escape(code)}(?![A-Za-z0-9])",
+            source_text,
+        )
+    )
+
+
+def _matches_printed_issuer_variant(model: str, printed: str, doc: ParsedDocument) -> bool:
+    """Allow a same-document brand short name or Beneficiary entity for a locked carrier."""
+    model_stem, model_branch = _party_key(model)
+    printed_stem, printed_branch = _party_key(printed)
+    if not model_stem or not printed_stem or model_branch != printed_branch:
+        return False
+    model_words = model_stem.split()
+    printed_words = printed_stem.split()
+    if len(model_words) < 2 or len("".join(model_words)) < 5:
+        return False
+    source_text = _document_source_text(doc)
+    word_pattern = r"[\W_]+".join(map(re.escape, model_words))
+    is_short_brand = (
+        len(model_words) < len(printed_words)
+        and printed_words[: len(model_words)] == model_words
+        and bool(re.search(rf"(?i:(?<![A-Za-z0-9]){word_pattern}(?![A-Za-z0-9]))", source_text))
+    )
+    if is_short_brand:
+        return True
+    brand_prefix = "".join(printed_words[:2])
+    return (
+        len(printed_words) >= 2
+        and len(brand_prefix) >= 5
+        and "".join(model_words).startswith(brand_prefix)
+        and bool(
+            re.search(
+                rf"(?i:\bbeneficiary\s*[:：]\s*{word_pattern}(?![A-Za-z0-9]))",
+                source_text,
+            )
+        )
+    )
+
+
+def _matches_printed_payee_as_issuer(
+    model: str,
+    observed: RawDocumentExtraction,
+    transport_names: Sequence[str],
+    profiles: Sequence[AccountingEntityProfile],
+) -> bool:
+    """Allow issuer echo of an explicit payee_hint on software-prepared notices/debit notes."""
+    printed_payee = observed.payee_hint
+    if not printed_payee:
+        return False
+    debtors = (observed.recipient, observed.payer_hint, *transport_names)
+    if any(debtor and entity_matches(model, debtor, profiles) for debtor in debtors):
+        return False
+    return (
+        entity_matches(model, printed_payee, profiles)
+        or _matches_agency_declaration(model, printed_payee)
+    )
+
+
+def _is_email_salutation_name(
+    model: str,
+    doc: ParsedDocument,
+    known_parties: Sequence[str | None],
+    profiles: Sequence[AccountingEntityProfile],
+) -> bool:
+    if doc.source_kind is not SourceKind.EML_BODY:
+        return False
+    name = normalize("NFKC", model).strip()
+    if (
+        not re.fullmatch(r"[A-Za-z][A-Za-z'-]{0,23}", name)
+        or name.casefold() in _EMAIL_SALUTATION_COMPANY_WORDS
+        or any(party and entity_matches(name, party, profiles) for party in known_parties)
+    ):
+        return False
+    return bool(
+        re.search(
+            rf"(?i:\b(?:dear|hi|hello)\s+{re.escape(name)}\b)",
+            _document_source_text(doc),
+        )
+    )
+
+
+def _matches_bilingual_header_extension(model: str, printed: str, doc: ParsedDocument) -> bool:
+    """Allow adjacent bilingual header concatenation verbatim from the source document."""
+    compact_model = " ".join(normalize("NFKC", model).split())
+    compact_printed = " ".join(normalize("NFKC", printed).split())
+    if not compact_model or not compact_printed or len(compact_model) <= len(compact_printed):
+        return False
+    contained = re.search(
+        rf"(?i:(?<![A-Za-z0-9]){re.escape(compact_printed)}(?![A-Za-z0-9]))",
+        compact_model,
+    )
+    if not contained:
+        return False
+    extra = f"{compact_model[: contained.start()]} {compact_model[contained.end() :]}".strip()
+    if not extra or _BILINGUAL_HEADER_NOISE.search(extra):
+        return False
+    compact_source = " ".join(_document_source_text(doc).split())
+    return bool(
+        re.search(
+            rf"(?i:(?<![A-Za-z0-9]){re.escape(compact_model)}(?![A-Za-z0-9]))",
+            compact_source,
+        )
+    )
+
+
+def _name_core_appears_in_sources(name: str, haystacks: Sequence[str]) -> bool:
+    stem, _ = _party_key(name)
+    words = stem.split()
+    while len(words) > 1 and words[-1] in _PARTY_LEGAL_SUFFIXES:
+        words.pop()
+    if not words or (len(words) == 1 and len(words[0]) < 2):
+        return False
+    pattern = r"[\W_]+".join(map(re.escape, words))
+    regex = re.compile(rf"(?i:(?<![A-Za-z0-9]){pattern}(?![A-Za-z0-9]))")
+    return any(regex.search(text) for text in haystacks if text)
+
+
+def _has_source_party_evidence(
+    model: str,
+    doc: ParsedDocument,
+    transport_names: Sequence[str],
+    observed: RawDocumentExtraction,
+    profiles: Sequence[AccountingEntityProfile],
+) -> bool:
+    haystacks = [
+        _document_source_text(doc),
+        *transport_names,
+        *(
+            val
+            for val in (
+                observed.issuer,
+                observed.recipient,
+                observed.payer_hint,
+                observed.payee_hint,
+            )
+            if val
+        ),
+    ]
+    if _name_core_appears_in_sources(model, haystacks):
+        return True
+    for profile in profiles:
+        candidates = (profile.canonical_name, *profile.aliases)
+        if any(entity_matches(model, entry, profiles) for entry in candidates) and any(
+            _name_core_appears_in_sources(entry, haystacks) for entry in candidates
+        ):
+            return True
+    return False
+
+
 def _ground_parties(
     data: RawDocumentExtraction,
     observed: RawDocumentExtraction,
     doc: ParsedDocument,
     profiles: Sequence[AccountingEntityProfile],
+    accounting_entity: str | None = None,
 ) -> tuple[dict[str, str | None], list[ValidationAlert]]:
+    del accounting_entity
     transport_names = [
         label.partition(": ")[2]
         for label in doc.metadata.get("transport_context", ())
@@ -959,8 +1315,9 @@ def _ground_parties(
     transport_only = bool(doc.ocr_payload and transport_names) and not any(
         (observed.issuer, observed.recipient, observed.payer_hint, observed.payee_hint)
     )
-    updates = {}
+    updates: dict[str, str | None] = {}
     issues = []
+    code_resolutions: dict[str, tuple[str | None, str]] = {}
     for field, counterpart in (
         ("issuer", "payee_hint"),
         ("recipient", "payer_hint"),
@@ -971,23 +1328,63 @@ def _ground_parties(
         if printed:
             updates[field] = printed
         if not model or (
-            printed and (
+            printed
+            and (
                 entity_matches(model, printed, profiles)
                 or _matches_agency_declaration(model, printed)
+                or (
+                    field in ("issuer", "recipient")
+                    and _matches_bilingual_header_extension(model, printed, doc)
+                )
+                or (
+                    field == "issuer"
+                    and (
+                        _matches_printed_issuer_variant(model, printed, doc)
+                        or _matches_printed_payee_as_issuer(
+                            model, observed, transport_names, profiles
+                        )
+                    )
+                )
             )
         ):
             continue
+        if not printed and field in ("issuer", "recipient"):
+            opposite_printed = getattr(observed, "recipient" if field == "issuer" else "issuer")
+            if opposite_printed and (
+                entity_matches(model, opposite_printed, profiles)
+                or _matches_agency_declaration(model, opposite_printed)
+            ):
+                updates[field] = None
+                continue
+            if has_payment_direction and _is_email_salutation_name(
+                model, doc, (observed.payer_hint, observed.payee_hint, *transport_names), profiles
+            ):
+                updates[field] = None
+                continue
         alternative = getattr(observed, counterpart)
+        if field in ("payer_hint", "payee_hint") and (target := printed or alternative):
+            if _is_printed_party_code(model, target, doc):
+                code_resolutions[field] = (printed, target)
+                continue
         matches_transport = any(entity_matches(model, name, profiles) for name in transport_names)
         needs_source_party = (
             has_payment_direction or alternative or transport_only or matches_transport
         )
         alternative_agency = bool(alternative and _matches_agency_declaration(model, alternative))
+        alternative_issuer_variant = bool(
+            field == "payee_hint"
+            and alternative
+            and _matches_printed_issuer_variant(model, alternative, doc)
+        )
         contradicts_source = printed or (
             needs_source_party
             and not (
                 alternative
-                and (entity_matches(model, alternative, profiles) or alternative_agency)
+                and (
+                    entity_matches(model, alternative, profiles)
+                    or alternative_agency
+                    or alternative_issuer_variant
+                )
             )
         )
         if contradicts_source:
@@ -1001,12 +1398,61 @@ def _ground_parties(
                     actual=model,
                 )
             )
-        elif not printed and alternative_agency:
+        elif not printed and (
+            alternative_agency or (alternative_issuer_variant and not has_payment_direction)
+        ):
             updates[field] = alternative
         elif has_payment_direction and field in ("payer_hint", "payee_hint"):
             # A labeled issuer or recipient does not supply the missing leg of the instruction.
             updates[field] = printed
+        elif not printed and not _has_source_party_evidence(
+            model, doc, transport_names, observed, profiles
+        ):
+            updates[field] = None
+    for field, (printed, target) in code_resolutions.items():
+        counterpart_hint = "payee_hint" if field == "payer_hint" else "payer_hint"
+        counterpart_value = (
+            updates[counterpart_hint]
+            if counterpart_hint in updates
+            else getattr(data, counterpart_hint)
+        )
+        if printed:
+            updates[field] = printed
+        elif counterpart_value or getattr(observed, counterpart_hint):
+            updates[field] = target
+        else:
+            updates[field] = None
+    if not has_payment_direction and observed.issuer and observed.recipient:
+        # Preserve (issuer, recipient) direction when a model echoes only one unprinted leg.
+        final_payer = updates.get("payer_hint", data.payer_hint)
+        final_payee = updates.get("payee_hint", data.payee_hint)
+        if bool(final_payer) != bool(final_payee):
+            updates["payer_hint" if final_payer else "payee_hint"] = None
     return updates, issues
+
+
+def _is_email_transport_reference(
+    proposed: str,
+    printed: RawDocumentExtraction,
+    proposed_doc: RawDocumentExtraction,
+) -> bool:
+    def alnum_key(value: str | None) -> str:
+        return re.sub(r"[^A-Za-z0-9]+", "", normalize("NFKC", value or "")).casefold()
+
+    target = alnum_key(proposed)
+    if not target:
+        return False
+    transport_values = (
+        *(ref.value for ref in printed.shipment_refs.mbl_nos),
+        *(ref.value for ref in proposed_doc.shipment_refs.mbl_nos),
+        printed.shipment_refs.hbl_no,
+        proposed_doc.shipment_refs.hbl_no,
+        printed.shipment_refs.booking_no,
+        proposed_doc.shipment_refs.booking_no,
+        *printed.shipment_refs.container_nos,
+        *proposed_doc.shipment_refs.container_nos,
+    )
+    return target in {key for item in transport_values if (key := alnum_key(item))}
 
 
 def _ground_model_extraction(
@@ -1015,15 +1461,27 @@ def _ground_model_extraction(
     doc: ParsedDocument,
     profiles: Sequence[AccountingEntityProfile],
     dictionary: Sequence[ChargeDictionaryItem],
+    accounting_entity: str | None = None,
 ) -> RawExtractionEnvelope:
     """Check model proposals against independent billing evidence from the source."""
     data = extraction.extraction
     printed = rules.extraction
     independent = _independent_source_extractions(doc, rules)
-    updates, issues = _ground_parties(data, printed, doc, profiles)
+    updates, issues = _ground_parties(data, printed, doc, profiles, accounting_entity)
+    field_issues: list[ValidationAlert] = []
     _ground_printed_fields(
-        data, printed, ("reference_no", "document_date", "document_type"), updates, issues
+        data, printed, ("reference_no", "document_date", "document_type"), updates, field_issues
     )
+    if data.reference_no and _is_waybill_mbl_reference(data.reference_no, printed, doc):
+        field_issues = [issue for issue in field_issues if issue.field != "reference_no"]
+    if (
+        doc.source_kind is SourceKind.EML_BODY
+        and printed.reference_no is None
+        and data.reference_no
+        and _is_email_transport_reference(data.reference_no, printed, data)
+    ):
+        updates["reference_no"] = None
+    issues.extend(field_issues)
     has_source_summary = _has_billing_summary(rules) or rules.tax_amount is not None
     for field, code in (
         ("subtotal_amount", AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH),
@@ -1298,6 +1756,7 @@ class _BillingNodes:
                     doc,
                     state.get("profiles", ()),
                     state.get("charge_dictionary", ()),
+                    state.get("accounting_entity"),
                 )
             except LlmBudgetExhaustedError:
                 return _ModelAttempt(failure=_BUDGET_EXHAUSTED, invoked=True)

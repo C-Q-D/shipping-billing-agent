@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Never, Self, TypeVar
@@ -16,6 +17,7 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -245,6 +247,22 @@ class ShipmentRefs(BaseModel):
     hbl_no: str | None = None
     booking_no: str | None = None
     container_nos: list[str] = Field(default_factory=list)
+
+    @field_validator("container_nos", mode="before")
+    @classmethod
+    def _unpack_container_nos(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        return [
+            item.value
+            if isinstance(item, SourceRefValue)
+            else (
+                item["value"]
+                if isinstance(item, Mapping) and isinstance(item.get("value"), str)
+                else item
+            )
+            for item in value
+        ]
 
 
 class PackageShipmentRefs(BaseModel):

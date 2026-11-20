@@ -1818,10 +1818,10 @@ const NON_FILLABLE_PLACEHOLDER_VALUES: ReadonlySet<string> = new Set([
 ]);
 
 export const ENTITY_NOT_MATCHED_GUIDANCE =
-  "请核对签发方、接收方名称是否包含当前记账主体/别名，或手工指定 AR/AP 台账方向（注意：仅在签发方与接收方不存在显式反向冲突时允许单改方向）";
+  "请核对签发方、接收方是否包含当前记账公司或别名，或确认应收/应付方向（若双方名称与方向存在明确矛盾，请先修正公司名称再保存）";
 
 export const CONTEXT_INFERRED_WARNING_GUIDANCE =
-  "这是上下文推断软告警；核对金额与币种无误后，请直接在下方填写批准理由点击『人工批准』放行，仅保存修订（PATCH）不会自动消除推断告警";
+  "此项为上下文自动补全供核对；金额与币种确认无误后，请直接填写批准理由放行（仅保存字段不会消除补全提示）";
 
 function parseFillableTextValue(raw: string | null | undefined): string | null {
   if (typeof raw !== "string") return null;
@@ -2010,35 +2010,35 @@ const DIRECT_ALERT_FIELD_TABLE: Readonly<Record<string, DirectAlertFieldMeta>> =
     charge_item: {
       formKey: "charge_item",
       patchKey: "charge_item",
-      label: "标准费用名称 (charge_item)",
+      label: "标准费用名称",
       parseExpected: parseFillableTextValue,
       isCurrentValid: (v) => v.charge_item.trim().length > 0,
     },
     quantity: {
       formKey: "quantity",
       patchKey: "quantity",
-      label: "数量 (quantity)",
+      label: "数量",
       parseExpected: parseFillableDecimalValue,
       isCurrentValid: (v) => parseFillableDecimalValue(v.quantity) !== null,
     },
     unit_price: {
       formKey: "unit_price",
       patchKey: "unit_price",
-      label: "单价 (unit_price)",
+      label: "单价",
       parseExpected: parseFillableDecimalValue,
       isCurrentValid: (v) => parseFillableDecimalValue(v.unit_price) !== null,
     },
     amount: {
       formKey: "amount",
       patchKey: "amount",
-      label: "金额 (amount)",
+      label: "金额",
       parseExpected: parseFillableDecimalValue,
       isCurrentValid: (v) => parseFillableDecimalValue(v.amount) !== null,
     },
     currency: {
       formKey: "currency",
       patchKey: "currency",
-      label: "币种 (currency)",
+      label: "币种",
       parseExpected: (raw) => {
         if (typeof raw !== "string") return null;
         const upper = raw.trim().toUpperCase();
@@ -2050,7 +2050,7 @@ const DIRECT_ALERT_FIELD_TABLE: Readonly<Record<string, DirectAlertFieldMeta>> =
     payment_term: {
       formKey: "payment_term",
       patchKey: "payment_term",
-      label: "付款条款 (payment_term)",
+      label: "付款条款",
       parseExpected: (raw) => {
         if (typeof raw !== "string") return null;
         const upper = raw.trim().toUpperCase();
@@ -2061,7 +2061,7 @@ const DIRECT_ALERT_FIELD_TABLE: Readonly<Record<string, DirectAlertFieldMeta>> =
     posting_type: {
       formKey: "posting_type",
       patchKey: "posting_type",
-      label: "记账方向 (posting_type)",
+      label: "记账方向",
       parseExpected: (raw) => {
         if (typeof raw !== "string") return null;
         const upper = raw.trim().toUpperCase();
@@ -2072,21 +2072,21 @@ const DIRECT_ALERT_FIELD_TABLE: Readonly<Record<string, DirectAlertFieldMeta>> =
     document_type: {
       formKey: "document_type",
       patchKey: "document_type",
-      label: "单据类型 (document_type)",
+      label: "单据类型",
       parseExpected: parseFillableTextValue,
       isCurrentValid: (v) => v.document_type.trim().length > 0,
     },
     reference_no: {
       formKey: "reference_no",
       patchKey: "reference_no",
-      label: "单据编号 (reference_no)",
+      label: "单据参考号",
       parseExpected: parseFillableTextValue,
       isCurrentValid: (v) => v.reference_no.trim().length > 0,
     },
     document_date: {
       formKey: "document_date",
       patchKey: "document_date",
-      label: "单据日期 (document_date)",
+      label: "单据日期",
       parseExpected: (raw) => {
         if (typeof raw !== "string") return null;
         const trimmed = raw.trim();
@@ -2097,49 +2097,49 @@ const DIRECT_ALERT_FIELD_TABLE: Readonly<Record<string, DirectAlertFieldMeta>> =
     issuer: {
       formKey: "issuer",
       patchKey: "issuer",
-      label: "签发方 (issuer)",
+      label: "签发方",
       parseExpected: parseFillableTextValue,
       isCurrentValid: (v) => v.issuer.trim().length > 0,
     },
     recipient: {
       formKey: "recipient",
       patchKey: "recipient",
-      label: "接收方 (recipient)",
+      label: "接收方",
       parseExpected: parseFillableTextValue,
       isCurrentValid: (v) => v.recipient.trim().length > 0,
     },
     mbl_no: {
       formKey: "mbl_no",
       patchKey: "mbl_no",
-      label: "主提单号 (mbl_no)",
+      label: "主提单号",
       parseExpected: parseFillableTextValue,
       isCurrentValid: (v) => v.mbl_no.trim().length > 0,
     },
     mbl_nos: {
       formKey: "mbl_no",
       patchKey: "mbl_no",
-      label: "主提单号 (mbl_no)",
+      label: "主提单号",
       parseExpected: parseFillableTextValue,
       isCurrentValid: (v) => v.mbl_no.trim().length > 0,
     },
     hbl_no: {
       formKey: "hbl_no",
       patchKey: "hbl_no",
-      label: "分提单号 (hbl_no)",
+      label: "分提单号",
       parseExpected: parseFillableTextValue,
       isCurrentValid: (v) => v.hbl_no.trim().length > 0,
     },
     booking_no: {
       formKey: "booking_no",
       patchKey: "booking_no",
-      label: "订舱号 (booking_no)",
+      label: "订舱号",
       parseExpected: parseFillableTextValue,
       isCurrentValid: (v) => v.booking_no.trim().length > 0,
     },
     container_nos: {
       formKey: "container_nos_text",
       patchKey: "container_nos",
-      label: "箱号列表 (container_nos)",
+      label: "箱号列表",
       parseExpected: parseFillableContainersValue,
       isCurrentValid: (v) =>
         parseContainerNosInput(v.container_nos_text).length > 0,
@@ -2322,7 +2322,7 @@ export function resolveRecordAlertActions(
         } else if (isContextInferredSoft) {
           actionButtons.push({
             kind: "confirm_current",
-            label: "已核对推断值（去批准）",
+            label: "查看批准理由",
             title: CONTEXT_INFERRED_WARNING_GUIDANCE,
             focusFieldKey: directMeta.formKey,
             confirmFields: [],
@@ -2340,24 +2340,28 @@ export function resolveRecordAlertActions(
             currTokens.length === 1 && currNorm === parsedExpected;
           actionButtons.push({
             kind: "confirm_current",
-            label: exactSingleMatch ? "确认采用原文值" : "确认当前箱号列表",
+            label: exactSingleMatch ? "保留当前原文（待保存）" : "保留当前箱号（待保存）",
             title: exactSingleMatch
               ? `确认保留当前原文值: ${currNorm}`
               : `目标箱号已手工修正，保留现有列表: ${currNorm}`,
             focusFieldKey: directMeta.formKey,
             confirmFields: ["container_nos"],
             feedbackMessage: exactSingleMatch
-              ? `已标记确认当前原文值（${currNorm}），请点击下方「保存修订并重验」解除告警`
-              : `目标箱号已手工修正，保留现有列表（${currNorm}），请点击下方「保存修订并重验」解除告警`,
+              ? `已标记保留当前原文值（${currNorm}），请点击底部「保存修订并重验」完成校验`
+              : `目标箱号已手工修正，保留现有列表（${currNorm}），请点击底部「保存修订并重验」完成校验`,
           });
         } else {
           actionButtons.push({
             kind: "confirm_current",
-            label: "确认采用原文值",
+            label:
+              directMeta.patchKey === "issuer" ||
+              directMeta.patchKey === "recipient"
+                ? "保留公司名（待保存）"
+                : "保留当前原文（待保存）",
             title: `确认保留当前原文值: ${parsedExpected}`,
             focusFieldKey: directMeta.formKey,
             confirmFields: [directMeta.patchKey],
-            feedbackMessage: `已标记确认当前原文值（${parsedExpected}），请点击下方「保存修订并重验」解除告警`,
+            feedbackMessage: `已标记保留当前原文值（${parsedExpected}），请点击底部「保存修订并重验」完成校验`,
           });
         }
       } else if (
@@ -2367,11 +2371,15 @@ export function resolveRecordAlertActions(
         const currentText = String(formValues[directMeta.formKey]).trim();
         actionButtons.push({
           kind: "confirm_current",
-          label: "确认采用原文值",
+          label:
+            directMeta.patchKey === "issuer" ||
+            directMeta.patchKey === "recipient"
+              ? "保留公司名（待保存）"
+              : "保留当前原文（待保存）",
           title: `确认保留当前原文值: ${currentText}`,
           focusFieldKey: directMeta.formKey,
           confirmFields: [directMeta.patchKey],
-          feedbackMessage: `已标记确认当前原文值（${currentText}），请点击下方「保存修订并重验」解除告警`,
+          feedbackMessage: `已标记保留当前原文值（${currentText}），请点击底部「保存修订并重验」完成校验`,
         });
       }
     }
@@ -2384,15 +2392,17 @@ export function resolveRecordAlertActions(
     const targetField: "issuer" | "recipient" =
       rawField === "payee_hint" ? "issuer" : "recipient";
     const targetLabel =
-      rawField === "payee_hint" ? "签发方 (issuer)" : "接收方 (recipient)";
+      rawField === "payee_hint" ? "签发方" : "接收方";
+    const hintRoleLabel =
+      rawField === "payee_hint" ? "收款方线索" : "付款方线索";
     const confirmButtonLabel =
       rawField === "payee_hint"
-        ? "确认当前签发方原文值"
-        : "确认当前接收方原文值";
+        ? "保留签发方公司名（待保存）"
+        : "保留接收方公司名（待保存）";
     const helperNote =
       rawField === "payee_hint"
-        ? "核对指引：payee_hint（收款方证据）仅关联「签发方 (issuer)」与「记账方向 (posting_type)」，不等同于直接覆写签发方；请按单据原文核对签发方、接收方，或明确选择 AR/AP 台账方向后保存重验。"
-        : "核对指引：payer_hint（付款方证据）仅关联「接收方 (recipient)」与「记账方向 (posting_type)」，不等同于直接覆写接收方；请按单据原文核对接收方、签发方，或明确选择 AR/AP 台账方向后保存重验。";
+        ? "核对指引：收款方线索仅关联「签发方」与「记账方向」，不会自动改写公司名；请对照原件核对签发方、接收方或明确选择应收/应付方向后保存重验。"
+        : "核对指引：付款方线索仅关联「接收方」与「记账方向」，不会自动改写公司名；请对照原件核对接收方、签发方或明确选择应收/应付方向后保存重验。";
 
     const currentParty = formValues[targetField].trim();
     const expectedParty = parseFillableTextValue(alert.expected);
@@ -2413,9 +2423,9 @@ export function resolveRecordAlertActions(
       label: "定位主体与方向",
       focusFieldKey: locateFocusKey,
       emptyFieldHint: !currentParty
-        ? `请对照单据原文填写${targetLabel}（切勿将收付款提示直接混填为开票/接收主体），并核对 AR/AP 台账方向后点击「保存修订并重验」`
+        ? `请对照单据原文填写${targetLabel}（切勿将收付款线索直接混填为开票/接收公司），并核对 AR/AP 方向后点击「保存修订并重验」`
         : !partyAlreadyMatchesExpected
-          ? `当前${targetLabel}与 ${rawField} 提示不同，请按单据原文分别核对签发方、接收方及 AR/AP 台账方向后点击「保存修订并重验」`
+          ? `当前${targetLabel}与${hintRoleLabel}不同，请对照单据原文分别核对签发方、接收方及 AR/AP 方向后点击「保存修订并重验」`
           : undefined,
     };
     const actionButtons: AlertActionButtonSpec[] = [];
@@ -2427,7 +2437,7 @@ export function resolveRecordAlertActions(
         title: `确认保留当前${targetLabel}: ${currentParty}`,
         focusFieldKey: targetField,
         confirmFields: [targetField],
-        feedbackMessage: `已标记确认当前${targetLabel}（${currentParty}），请点击下方「保存修订并重验」解除告警`,
+        feedbackMessage: `已标记保留当前${targetLabel}（${currentParty}），请点击底部「保存修订并重验」完成校验`,
       });
     }
 
@@ -2438,8 +2448,8 @@ export function resolveRecordAlertActions(
   if (rawField === "reported_charge_amount") {
     const helperNote =
       alert.code === "AMOUNT_TOTAL_MISMATCH"
-        ? "关联字段说明：此项为源单级费用差异核对提示（严禁直接覆写当前行金额），请人工对照原件核对下方「金额 (amount)」与「标准费用名称 (charge_item)」后再确认或修改。"
-        : "关联字段说明：对应可编辑字段「金额 (amount)」与「标准费用名称 (charge_item)」，请人工核对原件后再确认保存。";
+        ? "关联字段说明：此项为单据级费用差异核对提示（不会自动改写当前行金额），请人工对照原件核对「金额」与「标准费用名称」后再确认或修改。"
+        : "关联字段说明：对应可编辑字段「金额」与「标准费用名称」，请人工核对原件后再确认保存。";
 
     const currAmt = formValues.amount.trim();
     const currCharge = formValues.charge_item.trim();
@@ -2459,7 +2469,7 @@ export function resolveRecordAlertActions(
     if (alert.severity !== "RESOLVED") {
       actionButtons.push({
         kind: "confirm_current",
-        label: "确认当前金额与费用项",
+        label: "确认当前金额与费用",
         title:
           hasValidAmt && hasValidCharge
             ? `确认保留当前金额 ${currAmt} 与费用项 ${currCharge}`
@@ -2484,7 +2494,7 @@ export function resolveRecordAlertActions(
                   feedbackMessage:
                     "当前金额为空或格式不合法，已定位输入框，请修正后再确认保存",
                 },
-        feedbackMessage: `已标记确认当前金额（${currAmt}）与费用项（${currCharge}），请点击下方「保存修订并重验」解除告警`,
+        feedbackMessage: `已标记确认当前金额（${currAmt}）与费用项（${currCharge}），请点击底部「保存修订并重验」完成校验`,
       });
     }
 
@@ -2503,7 +2513,7 @@ export function resolveRecordAlertActions(
         focusFieldKey: docFocusTarget,
       },
       helperNote:
-        "关联字段说明：此项涉及所属单据汇总金额，可在下方「单据汇总金额修订」区核对小计、税额与总计。",
+        "关联字段说明：此项涉及所属单据汇总金额，可在下方「核对单据合计」区核对小计、税额与总计。",
       actionButtons: [],
     };
   }
@@ -2833,4 +2843,495 @@ export function shouldAcceptAuditHistoryResult(
     return false;
   }
   return tracker.latestSeqByKey[ticket.key] === ticket.reqSeq;
+}
+
+export type RecordFilterTab =
+  | "all"
+  | "pending_review"
+  | "create"
+  | "update"
+  | "no_change"
+  | "rejected";
+
+export interface ScopedRecordCounts {
+  all: number;
+  pending_review: number;
+  create: number;
+  update: number;
+  no_change: number;
+  rejected: number;
+  exportable_official: number;
+}
+
+export interface RecordScopeFilterArgs {
+  activeDocFilterId: string | null;
+  filterTab?: RecordFilterTab;
+  searchQuery?: string;
+  docFilenameById?: ReadonlyMap<string, string>;
+}
+
+export function isRecordOfficialExportable(rec: BillingRecordDetail): boolean {
+  return (
+    (rec.review_status === "AUTO_READY" || rec.review_status === "APPROVED") &&
+    rec.operation !== "PENDING_REVIEW"
+  );
+}
+
+export function matchesRecordSearchQuery(
+  rec: BillingRecordDetail,
+  searchQuery: string,
+  docFilenameById?: ReadonlyMap<string, string>
+): boolean {
+  const q = searchQuery.trim().toLowerCase();
+  if (!q) return true;
+  const haystacks: Array<string | null | undefined> = [
+    rec.document_info?.reference_no,
+    rec.document_info?.document_type,
+    rec.charge_details?.charge_item,
+    rec.charge_details?.raw_charge_name,
+    rec.transaction_party?.issuer,
+    rec.transaction_party?.recipient,
+    rec.matched_bill_ref,
+    rec.shipment_refs?.hbl_no,
+    rec.shipment_refs?.booking_no,
+    docFilenameById?.get(rec.source_doc_id),
+    ...(rec.shipment_refs?.mbl_nos ?? []).map((m) => m.value),
+    ...(rec.shipment_refs?.container_nos ?? []),
+  ];
+  return haystacks.some((val) =>
+    typeof val === "string" && val.toLowerCase().includes(q)
+  );
+}
+
+export function filterRecordsByDocAndSearch(
+  records: ReadonlyArray<BillingRecordDetail>,
+  args: Pick<
+    RecordScopeFilterArgs,
+    "activeDocFilterId" | "searchQuery" | "docFilenameById"
+  >
+): BillingRecordDetail[] {
+  const q = args.searchQuery ?? "";
+  return records.filter((rec) => {
+    if (args.activeDocFilterId && rec.source_doc_id !== args.activeDocFilterId) {
+      return false;
+    }
+    return matchesRecordSearchQuery(rec, q, args.docFilenameById);
+  });
+}
+
+export function computeScopedRecordCounts(
+  records: ReadonlyArray<BillingRecordDetail>,
+  args: Pick<
+    RecordScopeFilterArgs,
+    "activeDocFilterId" | "searchQuery" | "docFilenameById"
+  >
+): ScopedRecordCounts {
+  const scoped = filterRecordsByDocAndSearch(records, args);
+  const counts: ScopedRecordCounts = {
+    all: scoped.length,
+    pending_review: 0,
+    create: 0,
+    update: 0,
+    no_change: 0,
+    rejected: 0,
+    exportable_official: 0,
+  };
+  for (const rec of scoped) {
+    if (isRecordOfficialExportable(rec)) {
+      counts.exportable_official += 1;
+    }
+    if (rec.review_status === "REJECTED") {
+      counts.rejected += 1;
+      continue;
+    }
+    if (
+      rec.operation === "PENDING_REVIEW" ||
+      rec.review_status === "NEEDS_REVIEW"
+    ) {
+      counts.pending_review += 1;
+    } else if (rec.operation === "CREATE") {
+      counts.create += 1;
+    } else if (rec.operation === "UPDATE") {
+      counts.update += 1;
+    } else if (rec.operation === "NO_CHANGE") {
+      counts.no_change += 1;
+    }
+  }
+  return counts;
+}
+
+export function filterBatchRecords(
+  records: ReadonlyArray<BillingRecordDetail>,
+  args: RecordScopeFilterArgs
+): BillingRecordDetail[] {
+  const scoped = filterRecordsByDocAndSearch(records, args);
+  const tab = args.filterTab ?? "all";
+  if (tab === "all") return scoped;
+  return scoped.filter((rec) => {
+    if (tab === "rejected") return rec.review_status === "REJECTED";
+    if (rec.review_status === "REJECTED") return false;
+    if (tab === "pending_review") {
+      return (
+        rec.operation === "PENDING_REVIEW" ||
+        rec.review_status === "NEEDS_REVIEW"
+      );
+    }
+    if (tab === "create") return rec.operation === "CREATE";
+    if (tab === "update") return rec.operation === "UPDATE";
+    if (tab === "no_change") return rec.operation === "NO_CHANGE";
+    return true;
+  });
+}
+
+export function syncSelectedRecordId(
+  currentSelectedId: string | null,
+  visibleRecords: ReadonlyArray<BillingRecordDetail>
+): string | null {
+  if (visibleRecords.length === 0) {
+    return null;
+  }
+  if (
+    currentSelectedId &&
+    visibleRecords.some((rec) => rec.id === currentSelectedId)
+  ) {
+    return currentSelectedId;
+  }
+  return visibleRecords[0].id;
+}
+
+const ALERT_SEVERITY_ORDER: Record<ValidationAlert["severity"], number> = {
+  BLOCKER: 0,
+  WARNING: 1,
+  RESOLVED: 2,
+};
+
+export function sortValidationAlerts(
+  alerts: ReadonlyArray<ValidationAlert> | undefined
+): ValidationAlert[] {
+  if (!alerts || alerts.length === 0) return [];
+  return [...alerts].sort((a, b) => {
+    const rankA = ALERT_SEVERITY_ORDER[a.severity] ?? 3;
+    const rankB = ALERT_SEVERITY_ORDER[b.severity] ?? 3;
+    return rankA - rankB;
+  });
+}
+
+export interface ExcludedClauseItemSummary {
+  text: string;
+  count: number;
+  pages: number[];
+}
+
+export interface ExcludedClauseGroup {
+  reason: string;
+  totalCount: number;
+  items: ExcludedClauseItemSummary[];
+}
+
+const STANDARD_EXCLUDED_CLAUSE_REASONS = new Set([
+  "条件收费或违约条款",
+  "银行汇款信息",
+  "免收费说明",
+]);
+
+export function normalizeExcludedClauseReason(
+  rawReason: string | null | undefined
+): string {
+  const trimmed = (rawReason ?? "").trim();
+  if (!trimmed) return "其他非计费说明";
+  const lower = trimmed.toLowerCase();
+  if (
+    /(?:conditional|penalty|third[-\s]?party|misuse|wait\s*time|chassis)|条件收费|违约/.test(
+      lower
+    )
+  ) {
+    return "条件收费或违约条款";
+  }
+  if (
+    /(?:remit|bank|wire|\bach\b|routing|beneficiary|payment[\s_-]*instruction|\bcheck\b)|汇款|银行/.test(
+      lower
+    )
+  ) {
+    return "银行汇款信息";
+  }
+  if (/(?:free|waiv|exempt|zero|no[\s_-]*charge)|免收|免费/.test(lower)) {
+    return "免收费说明";
+  }
+  if (/\bclause\b/.test(lower)) {
+    return "条件收费或违约条款";
+  }
+  return trimmed;
+}
+
+export function groupExcludedClauses(
+  clauses:
+    | ReadonlyArray<{ page?: number | null; text: string; reason: string }>
+    | undefined
+): ExcludedClauseGroup[] {
+  if (!clauses || clauses.length === 0) return [];
+  const globalByNormKey = new Map<
+    string,
+    {
+      text: string;
+      reason: string;
+      hasChineseReason: boolean;
+      pages: Set<number>;
+    }
+  >();
+
+  for (const clause of clauses) {
+    const text = clause.text?.trim() ?? "";
+    if (!text) continue;
+    const normKey = text.replace(/\s+/g, " ").toLowerCase();
+    const rawReasonTrimmed = (clause.reason ?? "").trim();
+    const normalizedReason = normalizeExcludedClauseReason(rawReasonTrimmed);
+    const isStandardOrChinese =
+      STANDARD_EXCLUDED_CLAUSE_REASONS.has(normalizedReason) ||
+      /[\u4e00-\u9fff]/.test(rawReasonTrimmed);
+
+    let entry = globalByNormKey.get(normKey);
+    if (!entry) {
+      entry = {
+        text,
+        reason: normalizedReason,
+        hasChineseReason: isStandardOrChinese,
+        pages: new Set<number>(),
+      };
+      globalByNormKey.set(normKey, entry);
+    } else if (!entry.hasChineseReason && isStandardOrChinese) {
+      entry.reason = normalizedReason;
+      entry.hasChineseReason = true;
+    }
+
+    if (typeof clause.page === "number" && Number.isFinite(clause.page)) {
+      entry.pages.add(clause.page);
+    }
+  }
+
+  const groupMap = new Map<
+    string,
+    {
+      reason: string;
+      totalCount: number;
+      items: ExcludedClauseItemSummary[];
+    }
+  >();
+  for (const entry of globalByNormKey.values()) {
+    const count = entry.pages.size > 0 ? entry.pages.size : 1;
+    const pages = Array.from(entry.pages).sort((a, b) => a - b);
+    let group = groupMap.get(entry.reason);
+    if (!group) {
+      group = { reason: entry.reason, totalCount: 0, items: [] };
+      groupMap.set(entry.reason, group);
+    }
+    group.totalCount += count;
+    group.items.push({
+      text: entry.text,
+      count,
+      pages,
+    });
+  }
+
+  return Array.from(groupMap.values());
+}
+
+export interface RecordPartyDisplayMeta {
+  postingType: "AR" | "AP" | null;
+  directionLabel: string;
+  issuerLabel: string;
+  recipientLabel: string;
+  isPayerMissing: boolean;
+  isPayeeMissing: boolean;
+  missingPartyHint: string | null;
+  flowSummary: string;
+}
+
+const normParty = (value: string): string =>
+  value.trim().replace(/\s+/g, " ").toLowerCase();
+
+export function getRecordPartyDisplayMeta(
+  record: Pick<BillingRecordDetail, "transaction_party" | "financial_attributes">
+): RecordPartyDisplayMeta {
+  const postingType = record.financial_attributes?.posting_type ?? null;
+  const accountingEntity = (
+    record.financial_attributes?.accounting_entity ?? ""
+  ).trim();
+  const issuer = (record.transaction_party?.issuer ?? "").trim();
+  const recipient = (record.transaction_party?.recipient ?? "").trim();
+  const isPayerMissing = postingType === "AR" && recipient.length === 0;
+  const isPayeeMissing = postingType === "AP" && issuer.length === 0;
+
+  const directionLabel =
+    postingType === "AR"
+      ? "我司应收 (AR)"
+      : postingType === "AP"
+        ? "我司应付 (AP)"
+        : "方向待定";
+
+  const issuerLabel =
+    issuer || (isPayeeMissing ? "收款方待确认" : "未识别签发方");
+  const recipientLabel =
+    recipient || (isPayerMissing ? "付款方待确认" : "未识别接收方");
+
+  const missingPartyHint = isPayerMissing
+    ? "付款方待确认"
+    : isPayeeMissing
+      ? "收款方待确认"
+      : null;
+
+  let flowSummary: string;
+  if (postingType === "AR") {
+    const payerSide = isPayerMissing ? "付款方待确认" : recipientLabel;
+    const sameIssuer =
+      Boolean(accountingEntity && issuer) &&
+      normParty(issuer) === normParty(accountingEntity);
+    if (accountingEntity && issuer && !sameIssuer) {
+      flowSummary = `${payerSide} → ${accountingEntity}（款付给我方 · 签发：${issuerLabel}）`;
+    } else {
+      flowSummary = `${payerSide} → ${issuerLabel}（款付给我方）`;
+    }
+  } else if (postingType === "AP") {
+    const payeeSide = isPayeeMissing ? "收款方待确认" : issuerLabel;
+    const sameRecipient =
+      Boolean(accountingEntity && recipient) &&
+      normParty(recipient) === normParty(accountingEntity);
+    if (accountingEntity && !sameRecipient) {
+      flowSummary = `${accountingEntity} → ${payeeSide}（我方需付款${recipient ? ` · 原件抬头：${recipient}` : ""}）`;
+    } else {
+      flowSummary = `${recipientLabel} → ${payeeSide}（我方需付款）`;
+    }
+  } else {
+    flowSummary = `${issuerLabel} → ${recipientLabel}`;
+  }
+
+  return {
+    postingType,
+    directionLabel,
+    issuerLabel,
+    recipientLabel,
+    isPayerMissing,
+    isPayeeMissing,
+    missingPartyHint,
+    flowSummary,
+  };
+}
+
+const STALE_UNMATCHED_REASONING_PATTERN =
+  /无法唯一匹配|当前记账主体无法匹配|记账主体无法唯一匹配|尚未确定.*(?:应收|应付|AR|AP)/;
+
+export function splitRecordAiReasoning(
+  record: Pick<
+    BillingRecordDetail,
+    "ai_reasoning" | "financial_attributes" | "validation_alerts"
+  >
+): { activeReasons: string[]; archivedReasons: string[] } {
+  const raw = record.ai_reasoning ?? [];
+  const posting = record.financial_attributes?.posting_type ?? null;
+  const hasActiveEntityBlocker = (record.validation_alerts ?? []).some(
+    (a) => a.code === "ENTITY_NOT_MATCHED" && a.severity !== "RESOLVED"
+  );
+  if ((posting !== "AR" && posting !== "AP") || hasActiveEntityBlocker) {
+    return { activeReasons: raw, archivedReasons: [] };
+  }
+  const activeReasons: string[] = [];
+  const archivedReasons: string[] = [];
+  for (const line of raw) {
+    if (STALE_UNMATCHED_REASONING_PATTERN.test(line)) {
+      archivedReasons.push(line);
+    } else {
+      activeReasons.push(line);
+    }
+  }
+  return { activeReasons, archivedReasons };
+}
+
+const FRIENDLY_FIELD_LABELS: Readonly<Record<string, string>> = {
+  charge_item: "标准费用名称",
+  raw_charge_name: "原件费用原文",
+  quantity: "数量",
+  unit_price: "单价",
+  amount: "金额",
+  currency: "币种",
+  payment_term: "付款条款",
+  posting_type: "记账方向",
+  debit_credit: "借贷属性",
+  document_type: "单据类型",
+  reference_no: "单据参考号",
+  document_date: "单据日期",
+  issuer: "签发方",
+  recipient: "接收方",
+  mbl_no: "主提单号",
+  mbl_nos: "主提单号",
+  hbl_no: "分提单号",
+  booking_no: "订舱号",
+  container_nos: "箱号列表",
+  payee_hint: "收款方线索",
+  payer_hint: "付款方线索",
+  reported_charge_amount: "源单费用与金额",
+  accounting_entity: "记账公司",
+  transaction_party: "交易双方",
+  total_amount: "单据总计",
+  subtotal_amount: "未税小计",
+  tax_amount: "税额",
+  total_currency: "单据汇总币种",
+};
+
+export function getFieldFriendlyLabel(rawField: string | null | undefined): string {
+  if (!rawField) return "";
+  const trimmed = rawField.trim();
+  return FRIENDLY_FIELD_LABELS[trimmed] ?? trimmed;
+}
+
+const FRIENDLY_ALERT_TITLES: Readonly<Record<string, string>> = {
+  ENTITY_NOT_MATCHED: "记账公司与收付方向待确认",
+  CROSS_DOCUMENT_CONFLICT: "跨单据信息存在差异",
+  AMOUNT_TOTAL_MISMATCH: "金额与单据合计不一致",
+  AMOUNT_SUBTOTAL_TAX_MISMATCH: "小计与税额加总不平",
+  MULTI_CURRENCY_TOTAL_AMBIGUITY: "多币种汇总需分币种核对",
+  LINE_ARITHMETIC_MISMATCH: "数量 × 单价与金额不符",
+  NEGATIVE_NON_CREDIT_AMOUNT: "非贷项凭证出现负数金额",
+  INVALID_OR_MISSING_CURRENCY: "币种缺失或格式无效",
+  INVALID_DOCUMENT_DATE: "单据日期缺失或无效",
+  OCR_NUMERIC_CONFUSION: "识别数字疑有混淆请复核",
+  AMBIGUOUS_EXISTING_BILL: "命中多笔历史账单待指定",
+  DUPLICATE_LINE_EXTRACTED: "疑似重复费用行",
+  LLM_EXTRACTION_FAILED: "模型解析未通过校验",
+  CONTAINER_ISO6346_MISMATCH: "箱号校验位异常",
+  OCR_SUSPICIOUS_FLAG: "识别字符存疑请核对",
+  MULTI_SOURCE_BL_MISMATCH: "多附件提单号存在差异",
+  CONTEXT_INFERRED_FIELD: "同批上下文自动补全",
+};
+
+export function getAlertFriendlyTitle(alert: Pick<ValidationAlert, "code" | "field">): string {
+  const base = FRIENDLY_ALERT_TITLES[alert.code] ?? "账单核对提醒";
+  const fieldLabel = getFieldFriendlyLabel(alert.field);
+  return fieldLabel ? `${base} · ${fieldLabel}` : base;
+}
+
+export function formatOcrChannelLabel(channel: string | null | undefined): string {
+  if (!channel) return "未记录识别方式";
+  const upper = channel.trim().toUpperCase();
+  switch (upper) {
+    case "LOCAL_PDF_TEXT_FALLBACK":
+      return "本地 PDF 文本提取（已自动回退）";
+    case "LOCAL_TEXT":
+      return "本地文本解析";
+    case "LOCAL_RAPIDOCR_FALLBACK":
+      return "本地图片识别（已自动回退）";
+    case "EML_TEXT_PARSER":
+      return "邮件正文解析";
+    case "REMOTE_OCR":
+    case "PLTPLT_OCR":
+      return "远端 OCR 识别";
+    case "SKIPPED_SIGNATURE":
+      return "已跳过签名图片";
+    case "EXCEL_PARSER":
+      return "Excel 表格解析";
+    case "WORD_PARSER":
+      return "Word 文档解析";
+    case "MANUAL":
+      return "人工补录";
+    default:
+      return channel;
+  }
 }
