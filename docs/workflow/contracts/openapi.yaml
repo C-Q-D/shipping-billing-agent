@@ -545,6 +545,23 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/v1/batches/{batch_id}/reapply-dictionary:
+    post:
+      tags: [Batches]
+      operationId: reapplyBatchChargeDictionary
+      summary: 按当前费用映射词典仅重新标准化指定批次的费用名称（保留人工锁定）
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+      responses:
+        "200":
+          description: 重新标准化后的批次详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetail"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /api/v1/batches/{batch_id}/documents/{doc_id}/retry:
     post:
       tags: [Batches]
@@ -1418,6 +1435,13 @@ components:
           type: string
         matched_existing_bill_id:
           type: ["string", "null"]
+        matched_bill_ref:
+          type: ["string", "null"]
+        inherited_fields:
+          type: array
+          items:
+            type: string
+          default: []
         candidate_bills:
           type: array
           items:

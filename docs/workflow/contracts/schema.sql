@@ -85,6 +85,9 @@ CREATE TABLE IF NOT EXISTS batches (
     total_files INTEGER NOT NULL DEFAULT 0 CHECK (total_files >= 0),
     succeeded_files INTEGER NOT NULL DEFAULT 0 CHECK (succeeded_files >= 0),
     failed_files INTEGER NOT NULL DEFAULT 0 CHECK (failed_files >= 0),
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    batch_existing_bills_json TEXT,
+    failed_documents_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -125,6 +128,7 @@ CREATE TABLE IF NOT EXISTS source_documents (
     error_message TEXT,
     raw_text TEXT,
     raw_ocr_json TEXT,
+    extraction_snapshot_json TEXT,
     excluded_clauses_json TEXT NOT NULL DEFAULT '[]',
     shipment_refs_json TEXT NOT NULL DEFAULT '{}',
     subtotal_amount TEXT CHECK (subtotal_amount IS NULL OR (subtotal_amount NOT GLOB '*[^0-9.-]*' AND subtotal_amount GLOB '*[0-9]*')),
@@ -180,6 +184,7 @@ CREATE TABLE IF NOT EXISTS billing_records (
     validation_alerts_json TEXT NOT NULL DEFAULT '[]',
     ai_reasoning_json TEXT NOT NULL DEFAULT '[]',
     human_overrides_json TEXT NOT NULL DEFAULT '{}',
+    record_state_json TEXT NOT NULL DEFAULT '{}',
     reject_reason TEXT,
     confidence REAL CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
     retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count BETWEEN 0 AND 1),

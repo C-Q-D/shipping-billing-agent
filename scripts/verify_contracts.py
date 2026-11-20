@@ -50,7 +50,7 @@ def verify_schema_sql() -> None:
         ),
     )
     conn.execute(
-        "INSERT INTO batches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO batches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             "b1",
             "B-1119-01",
@@ -63,12 +63,15 @@ def verify_schema_sql() -> None:
             1,
             1,
             0,
+            1,
+            None,
+            "[]",
             "2026-11-19T00:00:00Z",
             "2026-11-19T00:00:00Z",
         ),
     )
     conn.execute(
-        "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             "d1",
             "b1",
@@ -85,6 +88,7 @@ def verify_schema_sql() -> None:
             None,
             "raw",
             "{}",
+            None,
             "[]",
             "{}",
             None,
@@ -124,7 +128,7 @@ def verify_schema_sql() -> None:
         ),
     )
     conn.execute(
-        "INSERT INTO billing_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO billing_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             "r1",
             "b1",
@@ -154,6 +158,7 @@ def verify_schema_sql() -> None:
             "[]",
             "[]",
             json.dumps(["Matched L1"]),
+            "{}",
             "{}",
             None,
             0.99,
@@ -186,11 +191,11 @@ def verify_schema_sql() -> None:
     # Reject retry_count = 2
     try:
         conn.execute(
-            "INSERT INTO billing_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO billing_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "r2", "b1", "d1", 1, "CREATE", "AUTO_READY", "NONE", None, "[]",
                 "Debit Note", "DC-1", "2026-10-24", "A", "B", "Handling Charge", "HC",
-                "1", "10", "10", "USD", "CC", "A", "AR", "{}", "{}", "[]", "[]", "[]", "{}",
+                "1", "10", "10", "USD", "CC", "A", "AR", "{}", "{}", "[]", "[]", "[]", "{}", "{}",
                 None, 0.9, 2, "2026-11-19T00:00:00Z", "2026-11-19T00:00:00Z",
             ),
         )
@@ -215,7 +220,7 @@ def verify_schema_sql() -> None:
 
     # Verify URL source_kind accepts NULL content_sha256 while local PDF rejects NULL content_sha256
     conn.execute(
-        "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             "d-url",
             "b1",
@@ -232,6 +237,7 @@ def verify_schema_sql() -> None:
             None,
             "raw",
             "{}",
+            None,
             "[]",
             "{}",
             None,
@@ -243,7 +249,7 @@ def verify_schema_sql() -> None:
     )
     try:
         conn.execute(
-            "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO source_documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "d-bad-pdf",
                 "b1",
@@ -260,6 +266,7 @@ def verify_schema_sql() -> None:
                 None,
                 "raw",
                 "{}",
+                None,
                 "[]",
                 "{}",
                 None,

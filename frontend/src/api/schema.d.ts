@@ -212,6 +212,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/batches/{batch_id}/reapply-dictionary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 按当前费用映射词典仅重新标准化指定批次的费用名称（保留人工锁定） */
+        post: operations["reapplyBatchChargeDictionary"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/batches/{batch_id}/documents/{doc_id}/retry": {
         parameters: {
             query?: never;
@@ -610,6 +627,9 @@ export interface components {
             review_status: "AUTO_READY" | "NEEDS_REVIEW" | "APPROVED" | "REJECTED";
             match_level: string;
             matched_existing_bill_id?: string | null;
+            matched_bill_ref?: string | null;
+            /** @default [] */
+            inherited_fields: string[];
             candidate_bills?: components["schemas"]["CandidateBillOption"][];
             document_info: components["schemas"]["DocumentInfo"];
             transaction_party: components["schemas"]["TransactionParty"];
@@ -1214,6 +1234,29 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SwitchEntityResponse"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    reapplyBatchChargeDictionary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                batch_id: components["parameters"]["BatchId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 重新标准化后的批次详情 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchDetail"];
                 };
             };
             404: components["responses"]["NotFound"];
