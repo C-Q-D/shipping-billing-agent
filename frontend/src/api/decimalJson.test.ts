@@ -2639,6 +2639,414 @@ export async function runDecimalJsonTests(): Promise<void> {
     );
   }
 
+  // R5-A1: Validate effective record_state fallback fields per B03 {**record_state, **displayed} without injecting keys
+  {
+    const assertFallbackError = (
+      label: string,
+      expectedPath: string,
+      expectedKeyword: string | null,
+      mutate: (rec0: Record<string, unknown>) => void,
+      forbidRecordStatePrefix = false
+    ) => {
+      const clone = parseLosslessJson<Record<string, unknown>>(
+        stringifyLosslessJson(baseValidBundleObj)
+      );
+      const recs = clone.records as Array<Record<string, unknown>>;
+      mutate(recs[0]);
+      const check = validateReviewBundleInput(stringifyLosslessJson(clone));
+      assertEqual(check.valid, false, `R5-A1 rejects ${label}`);
+      if (check.valid) throw new Error("unreachable");
+      assertTrue(
+        check.error.includes(expectedPath),
+        `R5-A1 error for ${label} includes "${expectedPath}", got: ${check.error}`
+      );
+      if (forbidRecordStatePrefix) {
+        assertTrue(
+          !check.error.includes("record_state."),
+          `R5-A1 error for ${label} does not report record_state prefix, got: ${check.error}`
+        );
+      }
+      if (expectedKeyword) {
+        assertTrue(
+          check.error.includes(expectedKeyword),
+          `R5-A1 error for ${label} includes "${expectedKeyword}", got: ${check.error}`
+        );
+      }
+    };
+
+    const assertOverridePass = (
+      label: string,
+      mutate: (rec0: Record<string, unknown>) => void
+    ) => {
+      const clone = parseLosslessJson<Record<string, unknown>>(
+        stringifyLosslessJson(baseValidBundleObj)
+      );
+      const recs = clone.records as Array<Record<string, unknown>>;
+      mutate(recs[0]);
+      const check = validateReviewBundleInput(stringifyLosslessJson(clone));
+      assertEqual(
+        check.valid,
+        true,
+        `R5-A1 outer override allows ${label}: ${check.valid ? "" : check.error}`
+      );
+    };
+
+    // record_state.validation_alerts fallbacks
+    assertFallbackError(
+      "record_state.validation_alerts unknown code",
+      "record_state.validation_alerts",
+      "code",
+      (rec) => {
+        delete rec.validation_alerts;
+        rec.record_state = {
+          validation_alerts: [
+            { code: "R4_UNKNOWN_ALERT", severity: "BLOCKER", message: "unknown" },
+          ],
+        };
+      }
+    );
+    assertFallbackError(
+      "record_state.validation_alerts invalid severity CRITICAL",
+      "record_state.validation_alerts",
+      "severity",
+      (rec) => {
+        delete rec.validation_alerts;
+        rec.record_state = {
+          validation_alerts: [
+            { code: "AMOUNT_TOTAL_MISMATCH", severity: "CRITICAL", message: "bad sev" },
+          ],
+        };
+      }
+    );
+    assertFallbackError(
+      "record_state.validation_alerts BLOCKER downgraded to WARNING",
+      "record_state.validation_alerts",
+      "severity",
+      (rec) => {
+        delete rec.validation_alerts;
+        rec.record_state = {
+          validation_alerts: [
+            { code: "OCR_NUMERIC_CONFUSION", severity: "WARNING", message: "downgraded" },
+          ],
+        };
+      }
+    );
+    assertFallbackError(
+      "record_state.validation_alerts = null",
+      "record_state.validation_alerts",
+      null,
+      (rec) => {
+        delete rec.validation_alerts;
+        rec.record_state = { validation_alerts: null };
+      }
+    );
+
+    // raw_parse_issues outer & record_state fallback
+    assertFallbackError(
+      "outer raw_parse_issues unknown code",
+      "raw_parse_issues",
+      "code",
+      (rec) => {
+        rec.raw_parse_issues = [
+          { code: "R4_UNKNOWN_ALERT", severity: "BLOCKER", message: "outer bad" },
+        ];
+      },
+      true
+    );
+    assertFallbackError(
+      "outer raw_parse_issues = null",
+      "raw_parse_issues",
+      null,
+      (rec) => {
+        rec.raw_parse_issues = null;
+      },
+      true
+    );
+    assertFallbackError(
+      "record_state.raw_parse_issues unknown code",
+      "record_state.raw_parse_issues",
+      "code",
+      (rec) => {
+        delete rec.raw_parse_issues;
+        rec.record_state = {
+          raw_parse_issues: [
+            { code: "R4_UNKNOWN_ALERT", severity: "BLOCKER", message: "snap bad" },
+          ],
+        };
+      }
+    );
+    assertFallbackError(
+      "record_state.raw_parse_issues invalid severity CRITICAL",
+      "record_state.raw_parse_issues",
+      "severity",
+      (rec) => {
+        delete rec.raw_parse_issues;
+        rec.record_state = {
+          raw_parse_issues: [
+            { code: "AMOUNT_TOTAL_MISMATCH", severity: "CRITICAL", message: "bad sev" },
+          ],
+        };
+      }
+    );
+    assertFallbackError(
+      "record_state.raw_parse_issues = null",
+      "record_state.raw_parse_issues",
+      null,
+      (rec) => {
+        delete rec.raw_parse_issues;
+        rec.record_state = { raw_parse_issues: null };
+      }
+    );
+    assertOverridePass("outer [] overrides invalid record_state.raw_parse_issues", (rec) => {
+      rec.raw_parse_issues = [];
+      rec.record_state = {
+        raw_parse_issues: [
+          { code: "R4_UNKNOWN_ALERT", severity: "BLOCKER", message: "superseded" },
+        ],
+      };
+    });
+
+    // record_state.source_evidence fallback & override
+    assertFallbackError(
+      "record_state.source_evidence = null",
+      "record_state.source_evidence",
+      null,
+      (rec) => {
+        delete rec.source_evidence;
+        rec.record_state = { source_evidence: null };
+      }
+    );
+    assertFallbackError(
+      "record_state.source_evidence invalid source_paths",
+      "record_state.source_evidence.source_paths",
+      null,
+      (rec) => {
+        delete rec.source_evidence;
+        rec.record_state = { source_evidence: { source_paths: [123] } };
+      }
+    );
+    assertFallbackError(
+      "record_state.source_evidence invalid row type",
+      "record_state.source_evidence",
+      null,
+      (rec) => {
+        delete rec.source_evidence;
+        rec.record_state = { source_evidence: { row: "6" } };
+      }
+    );
+    assertOverridePass("outer source_evidence overrides invalid record_state.source_evidence", (rec) => {
+      rec.source_evidence = { source_file: "outer.pdf", page: 1 };
+      rec.record_state = { source_evidence: null };
+    });
+
+    // record_state.shipment_refs fallback & override
+    assertFallbackError(
+      "record_state.shipment_refs = null",
+      "record_state.shipment_refs",
+      null,
+      (rec) => {
+        delete rec.shipment_refs;
+        rec.record_state = { shipment_refs: null };
+      }
+    );
+    assertFallbackError(
+      "record_state.shipment_refs invalid mbl_nos",
+      "record_state.shipment_refs.mbl_nos",
+      null,
+      (rec) => {
+        delete rec.shipment_refs;
+        rec.record_state = {
+          shipment_refs: { mbl_nos: [{ value: 123, source: "PDF" }] },
+        };
+      }
+    );
+    assertFallbackError(
+      "record_state.shipment_refs invalid container_nos",
+      "record_state.shipment_refs.container_nos",
+      null,
+      (rec) => {
+        delete rec.shipment_refs;
+        rec.record_state = { shipment_refs: { container_nos: [123] } };
+      }
+    );
+    assertOverridePass("outer shipment_refs overrides invalid record_state.shipment_refs", (rec) => {
+      rec.shipment_refs = { mbl_nos: [], container_nos: [] };
+      rec.record_state = { shipment_refs: null };
+    });
+
+    // record_state.candidate_bills fallback & override
+    assertFallbackError(
+      "record_state.candidate_bills = null",
+      "record_state.candidate_bills",
+      null,
+      (rec) => {
+        delete rec.candidate_bills;
+        rec.record_state = { candidate_bills: null };
+      }
+    );
+    assertFallbackError(
+      "record_state.candidate_bills invalid entry",
+      "record_state.candidate_bills",
+      null,
+      (rec) => {
+        delete rec.candidate_bills;
+        rec.record_state = {
+          candidate_bills: [
+            {
+              id: "",
+              label: "bad",
+              charge_item: "Freight",
+              amount: "bad",
+              currency: "USD",
+            },
+          ],
+        };
+      }
+    );
+    assertOverridePass("outer candidate_bills [] overrides invalid record_state.candidate_bills", (rec) => {
+      rec.candidate_bills = [];
+      rec.record_state = { candidate_bills: null };
+    });
+
+    // record_state.field_diffs fallback & override
+    assertFallbackError(
+      "record_state.field_diffs = null",
+      "record_state.field_diffs",
+      null,
+      (rec) => {
+        delete rec.field_diffs;
+        rec.record_state = { field_diffs: null };
+      }
+    );
+    assertFallbackError(
+      "record_state.field_diffs missing changed boolean",
+      "record_state.field_diffs",
+      null,
+      (rec) => {
+        delete rec.field_diffs;
+        rec.record_state = {
+          field_diffs: [{ field: "amount", old_value: "1", new_value: "2" }],
+        };
+      }
+    );
+    assertOverridePass("outer field_diffs [] overrides invalid record_state.field_diffs", (rec) => {
+      rec.field_diffs = [];
+      rec.record_state = { field_diffs: null };
+    });
+
+    // record_state.human_overrides fallback & override
+    assertFallbackError(
+      "record_state.human_overrides = null",
+      "record_state.human_overrides",
+      null,
+      (rec) => {
+        delete rec.human_overrides;
+        rec.record_state = { human_overrides: null };
+      }
+    );
+    assertFallbackError(
+      "record_state.human_overrides = []",
+      "record_state.human_overrides",
+      null,
+      (rec) => {
+        delete rec.human_overrides;
+        rec.record_state = { human_overrides: [] };
+      }
+    );
+    assertOverridePass("outer human_overrides {} overrides invalid record_state.human_overrides", (rec) => {
+      rec.human_overrides = {};
+      rec.record_state = { human_overrides: null };
+    });
+
+    // Zero-injection fidelity check: valid record_state fallback fields pass without injecting omitted outer keys
+    const omittedAllKeys = [
+      "validation_alerts",
+      "raw_parse_issues",
+      "source_evidence",
+      "shipment_refs",
+      "candidate_bills",
+      "field_diffs",
+      "human_overrides",
+    ] as const;
+    const zeroInjBundle = parseLosslessJson<Record<string, unknown>>(
+      stringifyLosslessJson(baseValidBundleObj)
+    );
+    const zeroInjRec0 = (zeroInjBundle.records as Array<Record<string, unknown>>)[0];
+    for (const key of omittedAllKeys) {
+      delete zeroInjRec0[key];
+    }
+    zeroInjRec0.record_state = {
+      validation_alerts: [
+        {
+          code: "AMOUNT_TOTAL_MISMATCH",
+          severity: "BLOCKER",
+          message: "valid fallback blocker",
+        },
+      ],
+      raw_parse_issues: [
+        {
+          code: "CONTEXT_INFERRED_FIELD",
+          severity: "WARNING",
+          message: "valid fallback issue",
+        },
+      ],
+      source_evidence: {
+        source_file: "cli-invoice.xlsx",
+        sheet: "Sheet",
+        row: 6,
+        line_number: 2,
+        source_paths: ["cli-invoice.xlsx"],
+      },
+      shipment_refs: {
+        mbl_nos: [{ value: "OOLU123456", source: "EXCEL" }],
+        hbl_no: null,
+        booking_no: null,
+        container_nos: ["ABCD1234567"],
+      },
+      candidate_bills: [
+        {
+          id: "cand-1",
+          label: "Candidate 1",
+          charge_item: "Handling Charge",
+          amount: rawDecimal("245.00"),
+          currency: "USD",
+          reference_no: "CLI-MEGA-9007",
+          document_date: "2026-11-19",
+        },
+      ],
+      field_diffs: [
+        {
+          field: "amount",
+          old_value: rawDecimal("100.00"),
+          new_value: rawDecimal("245.00"),
+          changed: true,
+        },
+      ],
+      human_overrides: { currency: "USD" },
+    };
+    const zeroInjCheck = validateReviewBundleInput(
+      stringifyLosslessJson(zeroInjBundle)
+    );
+    assertEqual(
+      zeroInjCheck.valid,
+      true,
+      `R5-A1 accepts valid all-fallback record_state: ${zeroInjCheck.valid ? "" : zeroInjCheck.error}`
+    );
+    if (!zeroInjCheck.valid) throw new Error("unreachable");
+    const serializedZeroInjRec0 = (
+      parseLosslessJson<Record<string, unknown>>(
+        stringifyLosslessJson(zeroInjCheck.bundle)
+      ).records as Array<Record<string, unknown>>
+    )[0];
+    for (const key of omittedAllKeys) {
+      assertEqual(
+        key in serializedZeroInjRec0,
+        false,
+        `R5-A1 zero-injection fidelity omits outer "${key}" when read from record_state`
+      );
+    }
+  }
+
   // Interactive App mount helper for F6, F7 (PASS 28) & R3-A1 (PASS 30)
   function createDeferred<T>() {
     let resolve!: (val: T) => void;
@@ -3967,6 +4375,241 @@ export async function runDecimalJsonTests(): Promise<void> {
   }
   results.push(
     "PASS 30: R3-A1 save invalidates stale in-flight audit GET/error & auto-refetches while expanded"
+  );
+
+  // 31. R5-A1: Real App import modal validates effective record_state.validation_alerts & respects outer override
+  {
+    const hostEnv = installFakeDomHost();
+    let r5ImportPosts = 0;
+    const capturedR5Bodies: string[] = [];
+    const r5ImportedDetail = parseLosslessJson<Record<string, unknown>>(
+      openApiBatchEdge01RawText
+    );
+    r5ImportedDetail.id = "batch-r5-imported";
+    r5ImportedDetail.short_code = "B-CLI-R5";
+    r5ImportedDetail.stage = "COMPLETED";
+    r5ImportedDetail.status = "COMPLETED";
+
+    const r5UiClient = new SsrBillingApiClient({
+      transport: async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        if (
+          url.includes("/api/v1/batches/import-review-bundle") &&
+          method === "POST"
+        ) {
+          r5ImportPosts++;
+          capturedR5Bodies.push(String(init?.body ?? ""));
+          return new Response(stringifyLosslessJson(r5ImportedDetail), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.endsWith("/api/v1/health")) {
+          return new Response(
+            stringifyLosslessJson({
+              status: "ok",
+              llm_configured: false,
+              ocr_gateway_url: "http://localhost:8080",
+              ocr_direct_mode: false,
+              public_relay_configured: false,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        return new Response("[]", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+
+    const mountEl = hostEnv.doc.createElement!("div");
+    hostEnv.doc.body!.appendChild(mountEl);
+    const root = ReactDomClient.createRoot(mountEl);
+    try {
+      await ReactMod.act(async () => {
+        root.render(
+          ReactMod.createElement(AppComponentRef, {
+            apiClient: r5UiClient,
+            initialBatches: [],
+          })
+        );
+      });
+      await flushActMicrotasks();
+      const ui = createAppMountHelpers(hostEnv);
+      await ui.clickButton("导入复核包");
+
+      const getModalErrorText = () =>
+        hostEnv
+          .findNodes((n) => (n.attributes.class ?? "").includes("wb-field-error"))
+          .map((n) => n.textContent)
+          .join("\n");
+
+      // Case 1 (R5-A1 unknown code): omitted outer validation_alerts + record_state unknown code -> blocked, POST = 0
+      const r5Case1 = parseLosslessJson<Record<string, unknown>>(
+        stringifyLosslessJson(baseValidBundleObj)
+      );
+      const r5Recs1 = r5Case1.records as Array<Record<string, unknown>>;
+      delete r5Recs1[0].validation_alerts;
+      r5Recs1[0].id = "rec-r5-unknown-code";
+      r5Recs1[0].record_state = {
+        validation_alerts: [
+          {
+            code: "R4_UNKNOWN_ALERT",
+            severity: "BLOCKER",
+            message: "unknown snapshot alert",
+          },
+        ],
+      };
+      await ui.changeControlValue(
+        "ReviewBundleV1 JSON 内容",
+        stringifyLosslessJson(r5Case1)
+      );
+      await ui.clickButton("导入并接手复核");
+      const case1Err = getModalErrorText();
+      assertTrue(
+        case1Err.includes("rec-r5-unknown-code") &&
+          case1Err.includes("record_state.validation_alerts") &&
+          case1Err.includes("code"),
+        `R5-A1 case 1 displays record_state.validation_alerts code error, got: ${case1Err}`
+      );
+      assertEqual(r5ImportPosts, 0, "R5-A1 case 1 triggers ZERO POSTs");
+
+      // Case 2 (R5-A1 invalid severity): omitted outer validation_alerts + record_state CRITICAL -> blocked, POST = 0
+      const r5Case2 = parseLosslessJson<Record<string, unknown>>(
+        stringifyLosslessJson(baseValidBundleObj)
+      );
+      const r5Recs2 = r5Case2.records as Array<Record<string, unknown>>;
+      delete r5Recs2[0].validation_alerts;
+      r5Recs2[0].id = "rec-r5-bad-severity";
+      r5Recs2[0].record_state = {
+        validation_alerts: [
+          {
+            code: "AMOUNT_TOTAL_MISMATCH",
+            severity: "CRITICAL",
+            message: "bad snapshot severity",
+          },
+        ],
+      };
+      await ui.changeControlValue(
+        "ReviewBundleV1 JSON 内容",
+        stringifyLosslessJson(r5Case2)
+      );
+      await ui.clickButton("导入并接手复核");
+      const case2Err = getModalErrorText();
+      assertTrue(
+        case2Err.includes("rec-r5-bad-severity") &&
+          case2Err.includes("record_state.validation_alerts") &&
+          case2Err.includes("severity"),
+        `R5-A1 case 2 displays record_state.validation_alerts severity error, got: ${case2Err}`
+      );
+      assertEqual(r5ImportPosts, 0, "R5-A1 case 2 triggers ZERO POSTs");
+
+      // Case 3 (R5-A1 valid fallback): omitted outer validation_alerts + valid AMOUNT_TOTAL_MISMATCH/BLOCKER -> POST = 1 & outer stays omitted
+      const r5Case3 = parseLosslessJson<Record<string, unknown>>(
+        stringifyLosslessJson(baseValidBundleObj)
+      );
+      const r5Recs3 = r5Case3.records as Array<Record<string, unknown>>;
+      delete r5Recs3[0].validation_alerts;
+      r5Recs3[0].record_state = {
+        validation_alerts: [
+          {
+            code: "AMOUNT_TOTAL_MISMATCH",
+            severity: "BLOCKER",
+            message: "valid snapshot blocker",
+          },
+        ],
+      };
+      await ui.changeControlValue(
+        "ReviewBundleV1 JSON 内容",
+        stringifyLosslessJson(r5Case3)
+      );
+      await ui.clickButton("导入并接手复核");
+      await flushActMicrotasks(6);
+      assertEqual(r5ImportPosts, 1, "R5-A1 case 3 allows valid snapshot fallback POST");
+      const sentCase3 = parseLosslessJson<Record<string, unknown>>(
+        capturedR5Bodies[0]
+      );
+      const sentCase3Rec0 = (sentCase3.records as Array<Record<string, unknown>>)[0];
+      assertEqual(
+        "validation_alerts" in sentCase3Rec0,
+        false,
+        "R5-A1 case 3 outbound record does NOT inject outer validation_alerts"
+      );
+      const sentCase3SnapAlerts = (
+        sentCase3Rec0.record_state as Record<string, unknown>
+      ).validation_alerts as Array<Record<string, unknown>>;
+      assertEqual(
+        sentCase3SnapAlerts[0].code,
+        "AMOUNT_TOTAL_MISMATCH",
+        "R5-A1 case 3 preserves record_state.validation_alerts code"
+      );
+      assertEqual(
+        sentCase3SnapAlerts[0].severity,
+        "BLOCKER",
+        "R5-A1 case 3 preserves record_state.validation_alerts severity"
+      );
+
+      // Case 4 (Outer override priority {**state, **displayed}): valid outer overrides superseded invalid snapshot
+      await ui.clickButton("导入复核包");
+      const r5Case4 = parseLosslessJson<Record<string, unknown>>(
+        stringifyLosslessJson(baseValidBundleObj)
+      );
+      const r5Recs4 = r5Case4.records as Array<Record<string, unknown>>;
+      r5Recs4[0].validation_alerts = [
+        {
+          code: "CONTAINER_ISO6346_MISMATCH",
+          severity: "WARNING",
+          message: "active outer warning",
+        },
+      ];
+      r5Recs4[0].record_state = {
+        validation_alerts: [
+          {
+            code: "R4_UNKNOWN_ALERT",
+            severity: "CRITICAL",
+            message: "superseded snapshot alert",
+          },
+        ],
+      };
+      await ui.changeControlValue(
+        "ReviewBundleV1 JSON 内容",
+        stringifyLosslessJson(r5Case4)
+      );
+      await ui.clickButton("导入并接手复核");
+      await flushActMicrotasks(6);
+      assertEqual(
+        r5ImportPosts,
+        2,
+        "R5-A1 case 4 allows valid outer validation_alerts even when superseded snapshot has unknown code"
+      );
+      const sentCase4 = parseLosslessJson<Record<string, unknown>>(
+        capturedR5Bodies[1]
+      );
+      const sentCase4Rec0 = (sentCase4.records as Array<Record<string, unknown>>)[0];
+      assertEqual(
+        (sentCase4Rec0.validation_alerts as Array<Record<string, unknown>>)[0].code,
+        "CONTAINER_ISO6346_MISMATCH",
+        "R5-A1 case 4 preserves outer validation_alerts"
+      );
+      const sentCase4SnapAlerts = (
+        sentCase4Rec0.record_state as Record<string, unknown>
+      ).validation_alerts as Array<Record<string, unknown>>;
+      assertEqual(
+        sentCase4SnapAlerts[0].code,
+        "R4_UNKNOWN_ALERT",
+        "R5-A1 case 4 preserves record_state intact without mutation"
+      );
+    } finally {
+      await ReactMod.act(async () => {
+        root.unmount();
+      });
+      hostEnv.cleanup();
+    }
+  }
+  results.push(
+    "PASS 31: R5-A1 App import modal validates effective record_state fallbacks & respects outer override priority"
   );
 
   } finally {

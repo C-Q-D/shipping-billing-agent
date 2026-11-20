@@ -982,10 +982,28 @@ function isValidValidationAlert(alert: unknown): boolean {
   );
 }
 
-function validateShipmentRefsShape(val: unknown, label: string): string | null {
+function resolveEffectiveRecordField(
+  rawRec: Record<string, unknown>,
+  recordState: Record<string, unknown> | undefined,
+  fieldKey: string
+): { value: unknown; fieldPath: string } {
+  if (rawRec[fieldKey] !== undefined) {
+    return { value: rawRec[fieldKey], fieldPath: fieldKey };
+  }
+  if (recordState && recordState[fieldKey] !== undefined) {
+    return { value: recordState[fieldKey], fieldPath: `record_state.${fieldKey}` };
+  }
+  return { value: undefined, fieldPath: fieldKey };
+}
+
+function validateShipmentRefsShape(
+  val: unknown,
+  label: string,
+  fieldPath = "shipment_refs"
+): string | null {
   if (val === undefined) return null;
   if (!isPlainObject(val)) {
-    return `${label} shipment_refs 须为 JSON 对象（不得为 null）`;
+    return `${label} ${fieldPath} 须为 JSON 对象（不得为 null）`;
   }
   if (val.mbl_nos !== undefined) {
     if (
@@ -997,17 +1015,109 @@ function validateShipmentRefsShape(val: unknown, label: string): string | null {
           typeof item.source !== "string"
       )
     ) {
-      return `${label} shipment_refs.mbl_nos 须为含 value 与 source 的对象数组`;
+      return `${label} ${fieldPath}.mbl_nos 须为含 value 与 source 的对象数组`;
     }
   }
   if (!isOptionalNullableString(val.hbl_no)) {
-    return `${label} shipment_refs.hbl_no 须为字符串或 null`;
+    return `${label} ${fieldPath}.hbl_no 须为字符串或 null`;
   }
   if (!isOptionalNullableString(val.booking_no)) {
-    return `${label} shipment_refs.booking_no 须为字符串或 null`;
+    return `${label} ${fieldPath}.booking_no 须为字符串或 null`;
   }
   if (val.container_nos !== undefined && !isStringArray(val.container_nos)) {
-    return `${label} shipment_refs.container_nos 须为字符串数组`;
+    return `${label} ${fieldPath}.container_nos 须为字符串数组`;
+  }
+  return null;
+}
+
+function validateHumanOverridesShape(
+  val: unknown,
+  label: string,
+  fieldPath = "human_overrides"
+): string | null {
+  if (val === undefined) return null;
+  if (!isPlainObject(val)) {
+    return `${label} ${fieldPath} 须为 JSON 对象（不得为 null）`;
+  }
+  return null;
+}
+
+function validateSourceEvidenceShape(
+  val: unknown,
+  label: string,
+  fieldPath = "source_evidence"
+): string | null {
+  if (val === undefined) return null;
+  if (!isPlainObject(val)) {
+    return `${label} ${fieldPath} 须为 JSON 对象（不得为 null）`;
+  }
+  if (val.source_paths !== undefined && !isStringArray(val.source_paths)) {
+    return `${label} ${fieldPath}.source_paths 须为字符串数组`;
+  }
+  if (
+    !isOptionalNullableString(val.source_file) ||
+    !isOptionalNullableString(val.source_doc_id) ||
+    !isOptionalNullableString(val.sheet) ||
+    !isOptionalNullableString(val.extraction_channel) ||
+    !isOptionalNullableString(val.snippet) ||
+    !isOptionalNullableInteger(val.page) ||
+    !isOptionalNullableInteger(val.row) ||
+    !isOptionalNullableInteger(val.line_number)
+  ) {
+    return `${label} ${fieldPath} 字段类型不合法`;
+  }
+  return null;
+}
+
+function validateCandidateBillsShape(
+  val: unknown,
+  label: string,
+  fieldPath = "candidate_bills"
+): string | null {
+  if (val === undefined) return null;
+  if (
+    !Array.isArray(val) ||
+    val.some(
+      (cand) =>
+        !isPlainObject(cand) ||
+        typeof cand.id !== "string" ||
+        !cand.id.trim() ||
+        typeof cand.label !== "string" ||
+        !cand.label.trim() ||
+        typeof cand.charge_item !== "string" ||
+        !cand.charge_item.trim() ||
+        !hasValidDecimalNumber(cand.amount) ||
+        typeof cand.currency !== "string" ||
+        !cand.currency.trim() ||
+        !isOptionalNullableString(cand.reference_no) ||
+        !isOptionalNullableString(cand.document_date)
+    )
+  ) {
+    return `${label} ${fieldPath} 结构无效`;
+  }
+  return null;
+}
+
+function validateValidationAlertsShape(
+  val: unknown,
+  label: string,
+  fieldPath: string
+): string | null {
+  if (val === undefined) return null;
+  if (!Array.isArray(val) || val.some((alert) => !isValidValidationAlert(alert))) {
+    return `${label} ${fieldPath} 结构、code 或 severity 枚举无效`;
+  }
+  return null;
+}
+
+function validateFieldDiffsShape(
+  val: unknown,
+  label: string,
+  fieldPath = "field_diffs"
+): string | null {
+  if (val === undefined) return null;
+  if (!isFieldDiffArray(val)) {
+    return `${label} ${fieldPath} 结构无效`;
   }
   return null;
 }
@@ -1459,6 +1569,21 @@ export function validateReviewBundleInput(
       };
     }
 
+    const recordLabel = `第 ${rowNo} 条账单记录 (${id})`;
+
+    if (
+      rawRec.record_state !== undefined &&
+      !isPlainObject(rawRec.record_state)
+    ) {
+      return {
+        valid: false,
+        error: `${recordLabel} record_state 须为 JSON 对象`,
+      };
+    }
+    const recordState = isPlainObject(rawRec.record_state)
+      ? rawRec.record_state
+      : undefined;
+
     for (const optStrKey of [
       "matched_existing_bill_id",
       "matched_bill_ref",
@@ -1466,10 +1591,15 @@ export function validateReviewBundleInput(
       "created_at",
       "updated_at",
     ] as const) {
-      if (!isOptionalNullableString(rawRec[optStrKey])) {
+      const effectiveOptStr = resolveEffectiveRecordField(
+        rawRec,
+        recordState,
+        optStrKey
+      );
+      if (!isOptionalNullableString(effectiveOptStr.value)) {
         return {
           valid: false,
-          error: `第 ${rowNo} 条账单记录 (${id}) ${optStrKey} 须为字符串或 null`,
+          error: `${recordLabel} ${effectiveOptStr.fieldPath} 须为字符串或 null`,
         };
       }
     }
@@ -1480,113 +1610,35 @@ export function validateReviewBundleInput(
     ) {
       return {
         valid: false,
-        error: `第 ${rowNo} 条账单记录 (${id}) inherited_fields 须为字符串数组`,
-      };
-    }
-    if (
-      rawRec.record_state !== undefined &&
-      !isPlainObject(rawRec.record_state)
-    ) {
-      return {
-        valid: false,
-        error: `第 ${rowNo} 条账单记录 (${id}) record_state 须为 JSON 对象`,
-      };
-    }
-    if (
-      rawRec.human_overrides !== undefined &&
-      !isPlainObject(rawRec.human_overrides)
-    ) {
-      return {
-        valid: false,
-        error: `第 ${rowNo} 条账单记录 (${id}) human_overrides 须为 JSON 对象（不得为 null）`,
+        error: `${recordLabel} inherited_fields 须为字符串数组`,
       };
     }
 
-    const recShipErr = validateShipmentRefsShape(
-      rawRec.shipment_refs,
-      `第 ${rowNo} 条账单记录 (${id})`
-    );
-    if (recShipErr) {
-      return { valid: false, error: recShipErr };
-    }
-
-    if (rawRec.source_evidence !== undefined) {
-      if (!isPlainObject(rawRec.source_evidence)) {
-        return {
-          valid: false,
-          error: `第 ${rowNo} 条账单记录 (${id}) source_evidence 须为 JSON 对象（不得为 null）`,
-        };
-      }
-      if (
-        rawRec.source_evidence.source_paths !== undefined &&
-        !isStringArray(rawRec.source_evidence.source_paths)
-      ) {
-        return {
-          valid: false,
-          error: `第 ${rowNo} 条账单记录 (${id}) source_evidence.source_paths 须为字符串数组`,
-        };
-      }
-      if (
-        !isOptionalNullableString(rawRec.source_evidence.source_file) ||
-        !isOptionalNullableString(rawRec.source_evidence.source_doc_id) ||
-        !isOptionalNullableString(rawRec.source_evidence.sheet) ||
-        !isOptionalNullableString(rawRec.source_evidence.extraction_channel) ||
-        !isOptionalNullableString(rawRec.source_evidence.snippet) ||
-        !isOptionalNullableInteger(rawRec.source_evidence.page) ||
-        !isOptionalNullableInteger(rawRec.source_evidence.row) ||
-        !isOptionalNullableInteger(rawRec.source_evidence.line_number)
-      ) {
-        return {
-          valid: false,
-          error: `第 ${rowNo} 条账单记录 (${id}) source_evidence 字段类型不合法`,
-        };
-      }
-    }
-
-    if (rawRec.candidate_bills !== undefined) {
-      if (
-        !Array.isArray(rawRec.candidate_bills) ||
-        rawRec.candidate_bills.some(
-          (cand) =>
-            !isPlainObject(cand) ||
-            typeof cand.id !== "string" ||
-            !cand.id.trim() ||
-            typeof cand.label !== "string" ||
-            !cand.label.trim() ||
-            typeof cand.charge_item !== "string" ||
-            !cand.charge_item.trim() ||
-            !hasValidDecimalNumber(cand.amount) ||
-            typeof cand.currency !== "string" ||
-            !cand.currency.trim() ||
-            !isOptionalNullableString(cand.reference_no) ||
-            !isOptionalNullableString(cand.document_date)
-        )
-      ) {
-        return {
-          valid: false,
-          error: `第 ${rowNo} 条账单记录 (${id}) candidate_bills 结构无效`,
-        };
-      }
-    }
-
-    if (rawRec.validation_alerts !== undefined) {
-      if (
-        !Array.isArray(rawRec.validation_alerts) ||
-        rawRec.validation_alerts.some((alert) => !isValidValidationAlert(alert))
-      ) {
-        return {
-          valid: false,
-          error: `第 ${rowNo} 条账单记录 (${id}) validation_alerts 结构、code 或 severity 枚举无效`,
-        };
-      }
-    }
-
-    if (rawRec.field_diffs !== undefined) {
-      if (!isFieldDiffArray(rawRec.field_diffs)) {
-        return {
-          valid: false,
-          error: `第 ${rowNo} 条账单记录 (${id}) field_diffs 结构无效`,
-        };
+    const effectiveFieldChecks: ReadonlyArray<{
+      key: string;
+      validate: (val: unknown, label: string, fieldPath: string) => string | null;
+    }> = [
+      { key: "human_overrides", validate: validateHumanOverridesShape },
+      { key: "shipment_refs", validate: validateShipmentRefsShape },
+      { key: "source_evidence", validate: validateSourceEvidenceShape },
+      { key: "candidate_bills", validate: validateCandidateBillsShape },
+      { key: "validation_alerts", validate: validateValidationAlertsShape },
+      { key: "raw_parse_issues", validate: validateValidationAlertsShape },
+      { key: "field_diffs", validate: validateFieldDiffsShape },
+    ];
+    for (const fieldCheck of effectiveFieldChecks) {
+      const effective = resolveEffectiveRecordField(
+        rawRec,
+        recordState,
+        fieldCheck.key
+      );
+      const err = fieldCheck.validate(
+        effective.value,
+        recordLabel,
+        effective.fieldPath
+      );
+      if (err) {
+        return { valid: false, error: err };
       }
     }
 
