@@ -968,19 +968,88 @@ def test_wrapped_note_excludes_the_preceding_table_row(notes: tuple[str, ...]) -
     assert clause.page == 2 and "50000" in clause.text and "is a quotation only" in clause.text
 
 
-def test_waiver_can_refer_to_the_preceding_fee_by_its_normalized_name() -> None:
+@pytest.mark.parametrize(
+    "note",
+    [
+        "Storage Charge is waived",
+        "This charge is a quotation\nonly",
+        "This fee is waived",
+        "The above fee is already included",
+    ],
+)
+def test_exclusion_can_refer_to_the_preceding_fee(note: str) -> None:
     doc = _document(
         "waived-alias",
         f"Invoice INV-1\nIssuer: {_ENTITY}\nHandling Fee 30 USD (PP)\n"
-        "Storage Fee 500 USD\nStorage Charge is waived",
+        f"Storage Fee 500 USD\n{note}",
     )
 
     (row,) = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only").records
 
     assert row.charge_item == "Handling Charge" and row.operation is OperationType.CREATE
     assert [clause.text for clause in row.excluded_clauses] == [
-        "Storage Fee 500 USD Storage Charge is waived"
+        f"Storage Fee 500 USD {' '.join(note.splitlines())}"
     ]
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "\nStorage Fee is not waived",
+        "\nThis fee has never been waived",
+        "\nThis fee is no longer free of charge",
+        "\nThe above fee is not included in freight",
+        "\nThis charge is not a quotation\nonly",
+        "\nThis charge cannot be a quotation only",
+        " (not waived)",
+        " is not waived",
+    ],
+)
+def test_negated_non_billing_note_preserves_the_payable_fee(note: str) -> None:
+    doc = _document(
+        "payable-fee", f"Invoice INV-1\nIssuer: {_ENTITY}\nStorage Fee 500 USD{note}"
+    )
+
+    extraction = extract_document_by_rules(doc)
+
+    (row,) = extraction.charges
+    assert (row.charge.raw_charge_name, row.charge.amount, row.charge.currency) == (
+        "Storage Fee", Decimal(500), "USD",
+    )
+    assert not extraction.extraction.excluded_clauses
+
+
+def test_not_payable_still_excludes_a_fee_when_it_is_not_waived() -> None:
+    doc = _document(
+        "unpayable-fee",
+        f"Invoice INV-1\nIssuer: {_ENTITY}\nStorage Fee 500 USD\n"
+        "This fee is not waived but is not payable",
+    )
+
+    extraction = extract_document_by_rules(doc)
+
+    assert not extraction.charges
+    (clause,) = extraction.extraction.excluded_clauses
+    assert clause.text == "Storage Fee 500 USD This fee is not waived but is not payable"
+
+
+@pytest.mark.parametrize(
+    "note", ["Handling Fee is waived", "[Page 2]\nStorage Fee (excluded)"]
+)
+def test_exclusion_does_not_reach_outside_the_labeled_charge(note: str) -> None:
+    doc = _document(
+        "separate-block-note",
+        f"[Page 1]\nInvoice INV-1\nIssuer: {_ENTITY}\nHandling Fee 30 USD (PP)\n"
+        f"Charge: Storage Fee\nAmount: EUR 500\nPayment Term: CC\n{note}",
+    )
+
+    extraction = extract_document_by_rules(doc)
+
+    assert [(row.charge.amount, row.charge.currency) for row in extraction.charges] == [
+        (Decimal(30), "USD"), (Decimal(500), "EUR"),
+    ]
+    (clause,) = extraction.extraction.excluded_clauses
+    assert clause.text == note.splitlines()[-1]
 
 
 @pytest.mark.parametrize("charge_name", ["THC", "DOC", "HANDLING FEE"])
@@ -1028,6 +1097,13 @@ def test_rules_block_currency_disagreement_in_alternate_detail_layouts(detail: s
         "Wharfage @ ZZZ 15 30 USD",
         "Wharfage at ZZZ 15 line total 30 USD",
         "Wharfage rate: 15 ZZZ line amount 30 USD",
+        "Wharfage @ ZZZ 15/TEU 30 USD",
+        "Wharfage @ ZZZ 15/FEU 30 USD",
+        "Wharfage @ ZZZ 15/CNTR 30 USD",
+        "Wharfage @ ZZZ 15/CBM 30 USD",
+        "Wharfage @ ZZZ 15/TON 30 USD",
+        "Wharfage @ ZZZ 15 per container 30 USD",
+        "Wharfage @ ZZZ 15 x 2 30 USD",
     ],
 )
 def test_printed_rate_currency_is_preserved_without_polluting_the_fee_name(detail: str) -> None:
@@ -1041,6 +1117,24 @@ def test_printed_rate_currency_is_preserved_without_polluting_the_fee_name(detai
         "Wharfage", Decimal(15), Decimal(30),
     )
     assert set(row.raw_invalid_fields["currency"].split(" / ")) == {"ZZZ", "USD"}
+    assert any(
+        alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT and alert.field == "currency"
+        for alert in row.validation_alerts
+    )
+    assert serialize_records([row], "official") == []
+
+
+def test_text_row_fallback_keeps_the_marked_rate_currency() -> None:
+    doc = _document(
+        "rate-currency-fallback",
+        f"Invoice INV-1\nIssuer: {_ENTITY}\nWharfage @ ZZZ 15 daily 30 USD\nTotal (USD): 30",
+    )
+
+    (row,) = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only").records
+
+    assert row.amount == Decimal(30)
+    assert row.unit_price is None
+    assert row.raw_invalid_fields["currency"] == "ZZZ / USD"
     assert any(
         alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT and alert.field == "currency"
         for alert in row.validation_alerts

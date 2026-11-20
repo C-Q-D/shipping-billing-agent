@@ -74,6 +74,13 @@ _OCR_LETTERS = {"0": "O", "1": "IL", "2": "Z", "5": "S", "8": "B"}
 _OCR_DIGITS = {letter: digit for digit, letters in _OCR_LETTERS.items() for letter in letters}
 _NO_SUMMARY_REASON = "单据无汇总行，免汇总对账"
 _SHARED_HBL_MESSAGE = "同一费用单据在不同邮件包中对应不同的分提单号，待复核"
+_PRINTED_CURRENCY_ALIASES = {"CA$": "CAD", "AU$": "AUD", "HK$": "HKD", "SG$": "SGD", "CN¥": "CNY"}
+_SOURCE_CURRENCY_TOKEN = re.compile(r"(?<![A-Z])(?:[A-Z]{2}[$¥]|[A-Z]{3}|[$€£¥])(?![A-Z])", re.I)
+
+
+def _printed_currency_token(raw: str) -> str:
+    token = raw.strip()
+    return _PRINTED_CURRENCY_ALIASES.get(token.upper(), token)
 
 
 def compute_iso6346_check_digit(prefix10: str) -> int:
@@ -1154,6 +1161,52 @@ def _document_parse_issues(extraction: RawExtractionEnvelope) -> list[Validation
     return [issue for issue in extraction.raw_parse_issues if issue not in line_conflicts]
 
 
+def _printed_conflict_owners(
+    records: Sequence[ProcessedBillingRecord], issues: Sequence[ValidationAlert]
+) -> dict[tuple[str | None, str | None], set[int]]:
+    if not issues:
+        return {}
+
+    def currency_key(token: str) -> str:
+        printed = _printed_currency_token(normalize("NFKC", token))
+        return normalize_currency(printed)[0] or printed.upper()
+
+    audited = [
+        {
+            currency_key(token)
+            for token in record.raw_invalid_fields.get("currency", "").split("/")
+            if token.strip()
+        }
+        for record in records
+    ]
+    from_snippet = [
+        {
+            currency_key(token)
+            for token in _SOURCE_CURRENCY_TOKEN.findall(record.source_evidence.snippet or "")
+        }
+        if len(currencies) == 1
+        else set()
+        for record, currencies in zip(records, audited, strict=True)
+    ]
+    owners = {}
+    for issue in issues:
+        key = (issue.expected, issue.actual)
+        if key in owners or not (issue.expected and issue.actual):
+            continue
+        actual = currency_key(issue.actual)
+        pair = {currency_key(issue.expected), actual}
+        matches = {
+            index
+            for index, currencies in enumerate(audited)
+            if currencies & pair and pair <= currencies | from_snippet[index]
+        }
+        # Single-token audits can identify the differing currency when the full pair is missing.
+        owners[key] = matches or {
+            index for index, tokens in enumerate(audited) if tokens == {actual}
+        }
+    return owners
+
+
 def _validate_document(
     doc_id: str, records: Sequence[ProcessedBillingRecord], bundle: DocumentExtractionBundle | None
 ) -> tuple[list[_PreparedLine], set[AlertCode]]:
@@ -1167,17 +1220,9 @@ def _validate_document(
         for issue in record.raw_parse_issues
         if _is_currency_conflict(issue) and issue.message == PRINTED_CURRENCY_CONFLICT_MESSAGE
     ]
-    source_currencies = [
-        {
-            normalize_currency(token)[0] or token.strip().upper()
-            for token in record.raw_invalid_fields.get("currency", "").split("/")
-            if token.strip()
-        }
-        for record in records
-    ]
-    all_source_currencies = set().union(*source_currencies)
+    printed_owners = _printed_conflict_owners(records, printed_conflicts)
     prepared = []
-    for record, currencies in zip(records, source_currencies, strict=True):
+    for index, record in enumerate(records):
         raw_issues = record.raw_parse_issues
         updates: dict[str, Any] = {}
         if extraction is not None:
@@ -1188,13 +1233,13 @@ def _validate_document(
             raw_issues = [
                 *raw_issues, *(issue for issue in document_issues if issue not in raw_issues)
             ]
-        if printed_conflicts:
-            other_currencies = all_source_currencies - currencies
+        if printed_owners:
             raw_issues = [
                 issue
                 for issue in raw_issues
                 if issue not in printed_conflicts
-                or (currencies and issue.actual not in other_currencies)
+                or not (owners := printed_owners.get((issue.expected, issue.actual)))
+                or index in owners
             ]
         if raw_issues is not record.raw_parse_issues:
             updates["raw_parse_issues"] = raw_issues

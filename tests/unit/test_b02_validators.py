@@ -125,26 +125,42 @@ def _assert_review(record: ProcessedBillingRecord, code: AlertCode) -> None:
     )
 
 
-@pytest.mark.parametrize("prefix", ["", "US$ / "], ids=["single-token", "printed-pair"])
-def test_legacy_currency_override_keeps_only_other_lines_own_conflicts(prefix: str) -> None:
+@pytest.mark.parametrize(
+    ("raw_currencies", "pairs", "snippets"),
+    [
+        (("EUR", "GBP"), (("USD", "EUR"), ("USD", "GBP")), (None, None)),
+        (("US$ / EUR", "US$ / GBP"), (("USD", "EUR"), ("USD", "GBP")), (None, None)),
+        (("EUR / USD", "GBP / USD"), (("EUR", "USD"), ("GBP", "USD")), (None, None)),
+        (("CA$ / USD", "GBP / USD"), (("CAD", "USD"), ("GBP", "USD")), (None, None)),
+        (("USD", "USD"), (("EUR", "USD"), ("GBP", "USD")), ("EUR 30 USD", "GBP 15 USD")),
+    ],
+    ids=["single-token", "shared-expected", "shared-actual", "symbol", "snippet-pair"],
+)
+def test_legacy_currency_override_keeps_only_other_lines_own_conflicts(
+    raw_currencies: tuple[str, str],
+    pairs: tuple[tuple[str, str], tuple[str, str]],
+    snippets: tuple[str | None, str | None],
+) -> None:
     eur, gbp = [
         ValidationAlert.from_code(
             AlertCode.CROSS_DOCUMENT_CONFLICT,
             PRINTED_CURRENCY_CONFLICT_MESSAGE,
             field="currency",
-            expected="USD",
-            actual=code,
+            expected=expected,
+            actual=actual,
         )
-        for code in ("EUR", "GBP")
+        for expected, actual in pairs
     ]
     first = _line(
-        "handling", currency=None, raw_invalid_fields={"currency": f"{prefix}EUR"},
+        "handling", currency=None, raw_invalid_fields={"currency": raw_currencies[0]},
+        source_evidence={"snippet": snippets[0]},
         raw_parse_issues=[eur, gbp], validation_alerts=[eur, gbp],
         human_overrides={"currency": "USD"},
     )
     second = _line(
         "storage", charge_item="Storage Charge", currency=None,
-        raw_invalid_fields={"currency": f"{prefix}GBP"},
+        raw_invalid_fields={"currency": raw_currencies[1]},
+        source_evidence={"snippet": snippets[1]},
         raw_parse_issues=[eur, gbp], validation_alerts=[eur, gbp],
     )
 
