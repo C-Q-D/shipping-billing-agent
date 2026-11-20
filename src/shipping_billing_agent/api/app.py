@@ -16,6 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.responses import Response
+from starlette.routing import Match, Mount
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
@@ -35,13 +36,23 @@ from .security import ApiSettings, OriginMiddleware, allowed_origin_tuples
 _ROOT = Path(__file__).resolve().parents[3]
 _CONTRACT = _ROOT / "docs/workflow/contracts/openapi.yaml"
 _FRONTEND_DIST = _ROOT / "frontend/dist"
+_RESERVED_PATH_SEGMENTS = {"api", "docs", "redoc", "openapi.json"}
+
+
+class _FrontendMount(Mount):
+    def matches(self, scope: Scope) -> tuple[Match, Scope]:
+        first_segment = scope.get("path", "").lstrip("/").split("/", 1)[0]
+        if first_segment in _RESERVED_PATH_SEGMENTS:
+            # Let the router handle method mismatches on API and documentation routes.
+            return Match.NONE, {}
+        return super().matches(scope)
 
 
 class _FrontendFiles(StaticFiles):
     async def get_response(self, path: str, scope: Scope) -> Response:
         segments = Path(path).parts
         first_segment = segments[0] if segments else ""
-        if first_segment in {"api", "docs", "redoc", "openapi.json"}:
+        if first_segment in _RESERVED_PATH_SEGMENTS:
             raise HTTPException(404)
         try:
             return await super().get_response(path, scope)
@@ -201,7 +212,9 @@ def create_app(
 
     dist = frontend_dir if frontend_dir is not None else _FRONTEND_DIST
     if (dist / "index.html").is_file():
-        fastapi_app.mount("/", _FrontendFiles(directory=dist, html=True), name="workbench")
+        fastapi_app.router.routes.append(
+            _FrontendMount("/", app=_FrontendFiles(directory=dist, html=True), name="workbench")
+        )
 
     return fastapi_app
 

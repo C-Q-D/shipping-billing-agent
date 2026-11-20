@@ -702,17 +702,27 @@ def test_static_workbench_keeps_api_docs_and_errors_reachable(tmp_path: Path) ->
     (dist / "assets").mkdir()
     (dist / "assets/app.js").write_text("console.log('test')", encoding="utf-8")
     with TestClient(create_app(settings=_settings(tmp_path), frontend_dir=dist)) as client:
-        assert "Billing workspace" in client.get("/").text
-        assert "Billing workspace" in client.get("/workbench/review").text
+        for path in ("/", "/workbench/review"):
+            page = client.get(path)
+            assert page.status_code == 200
+            assert "Billing workspace" in page.text
         assert "console.log" in client.get("/assets/app.js").text
         assert client.get("/assets/missing.js").status_code == 404
         assert client.get(f"{API}/health").json()["status"] == "ok"
-        assert (
-            client.get("/docs").status_code == 200
-            and client.get("/openapi.json").status_code == 200
-        )
+
+        created = client.post(f"{API}/entities", json={"canonical_name": "Workbench Entity"})
+        assert created.status_code == 201
+        wrong_method = client.delete(f"{API}/entities/{created.json()['id']}")
+        assert wrong_method.status_code == 405
+        assert wrong_method.json()["code"] == "METHOD_NOT_ALLOWED"
         missing = client.get(f"{API}/missing")
         assert (missing.status_code, missing.json()["code"]) == (404, "NOT_FOUND")
+
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            assert client.get(path).status_code == 200
+            wrong_method = client.post(path)
+            assert wrong_method.status_code == 405
+            assert wrong_method.json()["code"] == "METHOD_NOT_ALLOWED"
 
 
 def test_bundle_service_does_not_import_fastapi_or_harness() -> None:
