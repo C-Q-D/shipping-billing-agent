@@ -285,6 +285,8 @@ export default function App({
 
   const [submittingBatch, setSubmittingBatch] = useState(false);
   const [submittingDemo, setSubmittingDemo] = useState(false);
+  const inFlightBatchPostsRef = useRef(0);
+  const inFlightDemoPostsRef = useRef(0);
   const [retryingDocId, setRetryingDocId] = useState<string | null>(null);
   const [forcingDocId, setForcingDocId] = useState<string | null>(null);
   const [savingDocTotals, setSavingDocTotals] = useState(false);
@@ -799,7 +801,6 @@ export default function App({
       }
       setPendingBatchDetail(null);
       applyFreshBatchDetail(detail);
-      void refreshBatchesList().catch(() => undefined);
       pushToast(`已加载批次 ${detail.short_code} 详情`);
     } catch (err) {
       const msg =
@@ -821,9 +822,11 @@ export default function App({
     existingBillsJsonText: string;
     onAccepted?: () => void;
   }): Promise<boolean> => {
+    inFlightBatchPostsRef.current += 1;
     setSubmittingBatch(true);
+    let res: BatchSummary | BatchDetail;
     try {
-      const res = await api.createBatch({
+      res = await api.createBatch({
         accounting_entity: args.accountingEntity,
         ocr_mode: args.ocrMode,
         files: args.files,
@@ -831,11 +834,6 @@ export default function App({
         existing_bills_json: args.existingBillsJsonText,
         wait: false,
       });
-      // F7: Remove submitted snapshot & release submit button as soon as POST is accepted,
-      // before awaiting initial detail GET so files added during GET window are preserved and submittable.
-      args.onAccepted?.();
-      setSubmittingBatch(false);
-      return await activateNewlyCreatedBatch(res, false);
     } catch (err) {
       pushToast(
         err instanceof Error ? err.message : "提交解析批次失败",
@@ -843,30 +841,45 @@ export default function App({
       );
       return false;
     } finally {
-      setSubmittingBatch(false);
+      inFlightBatchPostsRef.current = Math.max(
+        0,
+        inFlightBatchPostsRef.current - 1
+      );
+      setSubmittingBatch(inFlightBatchPostsRef.current > 0);
     }
+    // F7 + R4-A1: Remove submitted snapshot immediately after POST 202,
+    // and run activateNewlyCreatedBatch strictly outside the POST lock try/finally.
+    args.onAccepted?.();
+    return await activateNewlyCreatedBatch(res, false);
   };
 
   const handleSubmitDemo = async (args: {
     accountingEntity: string;
     ocrMode: OcrMode;
   }) => {
+    inFlightDemoPostsRef.current += 1;
     setSubmittingDemo(true);
+    let res: BatchSummary | BatchDetail;
     try {
-      const res = await api.createDemoBatch({
+      res = await api.createDemoBatch({
         accounting_entity: args.accountingEntity,
         ocr_mode: args.ocrMode,
         wait: false,
       });
-      await activateNewlyCreatedBatch(res, true);
     } catch (err) {
       pushToast(
         err instanceof Error ? err.message : "载入演示样本失败",
         "error"
       );
+      return;
     } finally {
-      setSubmittingDemo(false);
+      inFlightDemoPostsRef.current = Math.max(
+        0,
+        inFlightDemoPostsRef.current - 1
+      );
+      setSubmittingDemo(inFlightDemoPostsRef.current > 0);
     }
+    await activateNewlyCreatedBatch(res, true);
   };
 
   const handleConfirmSwitchEntity = async (nextEntity: string) => {

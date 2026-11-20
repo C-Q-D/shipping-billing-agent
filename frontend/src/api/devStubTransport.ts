@@ -1799,12 +1799,35 @@ export function createDevStubTransport(): FetchLike {
       const clonedDocs = parseLosslessJson<SourceDocumentSummary[]>(
         stringifyLosslessJson(bundle.documents)
       );
+      const rawRecs = Array.isArray(rawParsed.records)
+        ? (rawParsed.records as Array<Record<string, unknown>>)
+        : [];
       const clonedRecs = parseLosslessJson<BillingRecordDetail[]>(
         stringifyLosslessJson(bundle.records)
-      ).map((rec) => ({
-        ...rec,
-        charge_details: preserveChargeDetailsDecimals(rec.charge_details),
-      }));
+      ).map((rec, idx) => {
+        const rawRec = rawRecs[idx];
+        const rawRecordState = rawRec?.record_state;
+        const stateEvidence =
+          rawRecordState &&
+          typeof rawRecordState === "object" &&
+          !Array.isArray(rawRecordState)
+            ? (rawRecordState as Record<string, unknown>).source_evidence
+            : undefined;
+        const restoredEvidence =
+          rec.source_evidence === undefined &&
+          stateEvidence &&
+          typeof stateEvidence === "object" &&
+          !Array.isArray(stateEvidence)
+            ? (stateEvidence as BillingRecordDetail["source_evidence"])
+            : rec.source_evidence;
+        return {
+          ...rec,
+          ...(restoredEvidence !== undefined
+            ? { source_evidence: restoredEvidence }
+            : {}),
+          charge_details: preserveChargeDetailsDecimals(rec.charge_details),
+        };
+      });
       const meta = createBatchAuditMeta();
       const rawDocs = Array.isArray(rawParsed.documents)
         ? (rawParsed.documents as Array<Record<string, unknown>>)
@@ -1818,9 +1841,6 @@ export function createDevStubTransport(): FetchLike {
           meta.docRetryCount.set(rawDoc.id, rawDoc.retry_count);
         }
       }
-      const rawRecs = Array.isArray(rawParsed.records)
-        ? (rawParsed.records as Array<Record<string, unknown>>)
-        : [];
       for (let idx = 0; idx < clonedRecs.length; idx++) {
         const rec = clonedRecs[idx];
         const rawRec = rawRecs[idx] ?? {};

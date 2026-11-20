@@ -25,6 +25,7 @@ import { createDevStubTransport } from "./devStubTransport.ts";
 import { ACTIVE_ISO4217_CODES, ACTIVE_ISO4217_CURRENCIES } from "./iso4217.ts";
 import {
   NO_EVAL_RESULT_LABEL,
+  VALID_ALERT_CODES,
   beginExistingBillsLoad,
   buildEvalRunViewModel,
   completeExistingBillsLoadFailure,
@@ -2404,8 +2405,8 @@ export async function runDecimalJsonTests(): Promise<void> {
   assertInvalidBundleVariant("top-level failed_documents = null", (b) => {
     b.failed_documents = null;
   });
-  assertInvalidBundleVariant("top-level accounting_entity_profile = null", (b) => {
-    b.accounting_entity_profile = null;
+  assertInvalidBundleVariant("top-level accounting_entity_profile = []", (b) => {
+    b.accounting_entity_profile = [];
   });
   assertInvalidBundleVariant("documents[0].affected_record_ids = null", (b) => {
     const docs = b.documents as Array<Record<string, unknown>>;
@@ -2501,6 +2502,12 @@ export async function runDecimalJsonTests(): Promise<void> {
       { code: "OCR_NUMERIC_CONFUSION", severity: "WARNING", message: "mismatched severity" },
     ];
   });
+  assertInvalidBundleVariant("validation_alerts[0] unknown AlertCode R4_UNKNOWN_ALERT", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].validation_alerts = [
+      { code: "R4_UNKNOWN_ALERT", severity: "BLOCKER", message: "unknown code" },
+    ];
+  });
 
   // Normalizers supply defaults only for undefined, never silently coerce explicit null
   const nullAlertRecCheck = normalizeBillingRecord({
@@ -2537,6 +2544,100 @@ export async function runDecimalJsonTests(): Promise<void> {
     true,
     "F6 accepts valid bundle with CLF bill and RawDecimalLiteral amount"
   );
+
+  // R4-A2, R4-A3 & B-class AlertCode checks
+  assertEqual(VALID_ALERT_CODES.size, 17, "B03 fixed AlertCode whitelist has 17 codes");
+  {
+    const nullProfileBundle = parseLosslessJson<Record<string, unknown>>(
+      stringifyLosslessJson(baseValidBundleObj)
+    );
+    nullProfileBundle.accounting_entity_profile = null;
+    const nullProfileCheck = validateReviewBundleInput(
+      stringifyLosslessJson(nullProfileBundle)
+    );
+    assertEqual(
+      nullProfileCheck.valid,
+      true,
+      "R4-A3 accepts explicit accounting_entity_profile: null"
+    );
+    if (!nullProfileCheck.valid) throw new Error("unreachable");
+    assertEqual(
+      (nullProfileCheck.bundle as unknown as Record<string, unknown>)
+        .accounting_entity_profile,
+      null,
+      "R4-A3 preserves accounting_entity_profile: null on validated bundle"
+    );
+
+    const omittedEvidenceBundle = parseLosslessJson<Record<string, unknown>>(
+      stringifyLosslessJson(baseValidBundleObj)
+    );
+    const evRecs = omittedEvidenceBundle.records as Array<Record<string, unknown>>;
+    delete evRecs[0].source_evidence;
+    evRecs[0].record_state = {
+      source_evidence: {
+        source_file: "cli-invoice.xlsx",
+        sheet: "Sheet",
+        row: 6,
+        line_number: 2,
+        source_paths: ["cli-invoice.xlsx"],
+      },
+    };
+    const omittedEvCheck = validateReviewBundleInput(
+      stringifyLosslessJson(omittedEvidenceBundle)
+    );
+    assertEqual(
+      omittedEvCheck.valid,
+      true,
+      "R4-A2 accepts ReviewBundleV1 when optional records[0].source_evidence is omitted"
+    );
+    if (!omittedEvCheck.valid) throw new Error("unreachable");
+    const validatedRec0 = omittedEvCheck.bundle.records[0] as unknown as Record<
+      string,
+      unknown
+    >;
+    assertEqual(
+      "source_evidence" in validatedRec0,
+      false,
+      "R4-A2 does NOT inject default source_evidence on validated bundle record"
+    );
+    const serializedValidatedRecs = parseLosslessJson<Record<string, unknown>>(
+      stringifyLosslessJson(omittedEvCheck.bundle)
+    ).records as Array<Record<string, unknown>>;
+    assertEqual(
+      "source_evidence" in serializedValidatedRecs[0],
+      false,
+      "R4-A2 serialized bundle record omits source_evidence instead of injecting {source_paths:[]}"
+    );
+    const stubEvClient = new BillingApiClient({
+      transport: createDevStubTransport(),
+    });
+    const stubEvImported = await stubEvClient.importReviewBundle(
+      omittedEvCheck.bundle
+    );
+    const stubEvRec0 = stubEvImported.records.find(
+      (r) => r.id === "rec-precision-blocker"
+    )!;
+    assertEqual(
+      stubEvRec0.source_evidence?.source_file,
+      "cli-invoice.xlsx",
+      "R4-A2 restores source_file from record_state.source_evidence"
+    );
+    assertEqual(
+      stubEvRec0.source_evidence?.sheet,
+      "Sheet",
+      "R4-A2 restores sheet from record_state.source_evidence"
+    );
+    assertEqual(
+      stubEvRec0.source_evidence?.row,
+      6,
+      "R4-A2 restores row from record_state.source_evidence"
+    );
+    assertEqual(
+      stubEvRec0.source_evidence?.line_number,
+      2,
+      "R4-A2 restores line_number from record_state.source_evidence"
+    );
+  }
 
   // Interactive App mount helper for F6, F7 (PASS 28) & R3-A1 (PASS 30)
   function createDeferred<T>() {
@@ -2891,16 +2992,30 @@ export async function runDecimalJsonTests(): Promise<void> {
     return { clickButton, changeControlValue, changeInputByPlaceholder };
   }
 
-  // F6 UI-entry assertion in real mounted App: invalid bundles trigger ZERO POSTs
+  // F6 + R4-A2 + R4-A3 + B-class AlertCode UI-entry assertion in real mounted App
   {
     const hostEnv = installFakeDomHost();
     let f6ImportPosts = 0;
+    let capturedImportBody: string | null = null;
+    const f6ImportedDetail = parseLosslessJson<Record<string, unknown>>(
+      openApiBatchEdge01RawText
+    );
+    f6ImportedDetail.id = "batch-f6-imported";
+    f6ImportedDetail.short_code = "B-CLI-R4";
+    f6ImportedDetail.stage = "COMPLETED";
+    f6ImportedDetail.status = "COMPLETED";
+
     const f6UiClient = new SsrBillingApiClient({
       transport: async (input, init) => {
         const url = typeof input === "string" ? input : input.toString();
         const method = init?.method ?? "GET";
         if (url.includes("/api/v1/batches/import-review-bundle") && method === "POST") {
           f6ImportPosts++;
+          capturedImportBody = String(init?.body ?? "");
+          return new Response(stringifyLosslessJson(f6ImportedDetail), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          });
         }
         if (url.endsWith("/api/v1/health")) {
           return new Response(
@@ -2956,6 +3071,14 @@ export async function runDecimalJsonTests(): Promise<void> {
             ];
           },
         },
+        {
+          label: "code=R4_UNKNOWN_ALERT",
+          mutate: (b: Record<string, unknown>) => {
+            (b.records as Array<Record<string, unknown>>)[0].validation_alerts = [
+              { code: "R4_UNKNOWN_ALERT", severity: "BLOCKER", message: "unknown" },
+            ];
+          },
+        },
       ];
       for (const tc of invalidCases) {
         const clone = parseLosslessJson<Record<string, unknown>>(
@@ -2978,7 +3101,63 @@ export async function runDecimalJsonTests(): Promise<void> {
       assertEqual(
         f6ImportPosts,
         0,
-        "F6 UI import triggers ZERO POST requests for null collections or invalid severity"
+        "F6 UI import triggers ZERO POST requests for null collections, invalid severity or unknown AlertCode"
+      );
+
+      // R4-A2 + R4-A3 UI import: accounting_entity_profile: null + omitted source_evidence sends clean body
+      const validR4Bundle = parseLosslessJson<Record<string, unknown>>(
+        stringifyLosslessJson(baseValidBundleObj)
+      );
+      validR4Bundle.accounting_entity_profile = null;
+      const validR4Recs = validR4Bundle.records as Array<Record<string, unknown>>;
+      delete validR4Recs[0].source_evidence;
+      validR4Recs[0].record_state = {
+        source_evidence: {
+          source_file: "cli-invoice.xlsx",
+          sheet: "Sheet",
+          row: 6,
+          line_number: 2,
+          source_paths: ["cli-invoice.xlsx"],
+        },
+      };
+      await ui.changeControlValue(
+        "ReviewBundleV1 JSON 内容",
+        stringifyLosslessJson(validR4Bundle)
+      );
+      await ui.clickButton("导入并接手复核");
+      await flushActMicrotasks(6);
+      assertEqual(
+        f6ImportPosts,
+        1,
+        "R4-A3 UI import sends POST /api/v1/batches/import-review-bundle when accounting_entity_profile is null"
+      );
+      assertTrue(
+        capturedImportBody !== null,
+        "R4-A2 captured outbound import-review-bundle JSON payload"
+      );
+      const sentPayload = parseLosslessJson<Record<string, unknown>>(
+        capturedImportBody!
+      );
+      assertEqual(
+        sentPayload.accounting_entity_profile,
+        null,
+        "R4-A3 outbound payload preserves accounting_entity_profile: null"
+      );
+      const sentRec0 = (sentPayload.records as Array<Record<string, unknown>>)[0];
+      assertEqual(
+        "source_evidence" in sentRec0,
+        false,
+        "R4-A2 outbound payload does NOT inject source_evidence onto record omitting it"
+      );
+      assertEqual(
+        (
+          (sentRec0.record_state as Record<string, unknown>).source_evidence as Record<
+            string,
+            unknown
+          >
+        ).source_file,
+        "cli-invoice.xlsx",
+        "R4-A2 outbound payload preserves record_state.source_evidence intact"
       );
     } finally {
       await ReactMod.act(async () => {
@@ -2988,14 +3167,15 @@ export async function runDecimalJsonTests(): Promise<void> {
     }
   }
   results.push(
-    "PASS 27: F6 strict ReviewBundleV1 raw-type & non-null validation + 0-POST UI import interception"
+    "PASS 27: F6+R4-A2+R4-A3+AlertCode strict ReviewBundleV1 validation, omitted evidence & null profile round-trip"
   );
 
-  // 28. C2 + F7: Real App + UploadAndFileTree submission removes POST-accepted snapshot while preserving concurrent files & same batch ID across 503 retry
+  // 28. C2 + F7 + R4-A1 + C-class: Real App + UploadAndFileTree submission, single-GET retry & overlapping POST lock
   {
     const hostEnv = installFakeDomHost();
     let f7PostCount = 0;
     let f7DetailGetCount = 0;
+    const f7OutboundRequests: Array<{ method: string; url: string }> = [];
     const postedFileNames: string[] = [];
     const detail1Started = createDeferred<void>();
     const detail1Release = createDeferred<Response>();
@@ -3011,6 +3191,7 @@ export async function runDecimalJsonTests(): Promise<void> {
       transport: async (input, init) => {
         const url = typeof input === "string" ? input : input.toString();
         const method = init?.method ?? "GET";
+        f7OutboundRequests.push({ method, url });
         if (method === "GET" && url.endsWith("/api/v1/health")) {
           return new Response(
             stringifyLosslessJson({
@@ -3207,9 +3388,26 @@ export async function runDecimalJsonTests(): Promise<void> {
         "F7 renders recovery card with exact batch-f7-new ID and 重试读取此批次 button"
       );
 
-      // Click "重试读取此批次" -> must issue GET /batches/batch-f7-new (no second POST) and restore same batch ID
+      // Click "重试读取此批次" -> must issue ONLY 1 GET /batches/batch-f7-new (zero list GET, zero POST) and restore same batch ID
+      const retryStartReqIdx = f7OutboundRequests.length;
       await ui.clickButton("重试读取此批次");
       await flushActMicrotasks(6);
+
+      const retryOutbound = f7OutboundRequests.slice(retryStartReqIdx);
+      assertEqual(
+        retryOutbound.length,
+        1,
+        "C-class: clicking 重试读取此批次 emits strictly 1 outbound HTTP request total (no batches?limit=20)"
+      );
+      assertEqual(
+        retryOutbound[0].method,
+        "GET",
+        "C-class: retry outbound request method is GET"
+      );
+      assertTrue(
+        retryOutbound[0].url.endsWith("/api/v1/batches/batch-f7-new"),
+        "C-class: retry outbound request targets /api/v1/batches/batch-f7-new"
+      );
 
       assertEqual(
         f7PostCount,
@@ -3246,8 +3444,254 @@ export async function runDecimalJsonTests(): Promise<void> {
       hostEnv.cleanup();
     }
   }
+  {
+    // R4-A1: Overlapping batch1 detail GET 200 resolution MUST NOT unlock in-flight batch2 POST
+    const hostEnv = installFakeDomHost();
+    let r4PostCount = 0;
+    const r4PostedBatches: Array<{ batchId: string; files: string[] }> = [];
+    const batch1DetailStarted = createDeferred<void>();
+    const batch1DetailRelease = createDeferred<Response>();
+    const batch2PostStarted = createDeferred<void>();
+    const batch2PostRelease = createDeferred<Response>();
+
+    const makeR4Summary = (batchId: string, shortCode: string, fileCount: number) => ({
+      id: batchId,
+      short_code: shortCode,
+      accounting_entity: "NEPTUNE SHIPPING LIMITED",
+      source_channel: "WEB",
+      status: "PROCESSING",
+      stage: "QUEUED",
+      stage_message: "已入队",
+      ocr_mode: "REMOTE_ONLY",
+      total_files: fileCount,
+      succeeded_files: 0,
+      failed_files: 0,
+      counts: { create: 0, update: 0, no_change: 0, pending_review: 0, rejected: 0 },
+      created_at: "2026-11-20T08:00:00Z",
+      updated_at: "2026-11-20T08:00:00Z",
+    });
+
+    const batch1CompletedDetail = parseLosslessJson<Record<string, unknown>>(
+      openApiBatchEdge01RawText
+    );
+    batch1CompletedDetail.id = "batch-r4-a1-1";
+    batch1CompletedDetail.short_code = "B-R4-01";
+    batch1CompletedDetail.accounting_entity = "NEPTUNE SHIPPING LIMITED";
+    batch1CompletedDetail.status = "COMPLETED";
+    batch1CompletedDetail.stage = "COMPLETED";
+
+    const batch2CompletedDetail = parseLosslessJson<Record<string, unknown>>(
+      openApiBatchEdge01RawText
+    );
+    batch2CompletedDetail.id = "batch-r4-a1-2";
+    batch2CompletedDetail.short_code = "B-R4-02";
+    batch2CompletedDetail.accounting_entity = "NEPTUNE SHIPPING LIMITED";
+    batch2CompletedDetail.status = "COMPLETED";
+    batch2CompletedDetail.stage = "COMPLETED";
+
+    const r4A1Client = new SsrBillingApiClient({
+      transport: async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        if (method === "GET" && url.endsWith("/api/v1/health")) {
+          return new Response(
+            stringifyLosslessJson({
+              status: "ok",
+              llm_configured: false,
+              ocr_gateway_url: "http://localhost:8080",
+              ocr_direct_mode: false,
+              public_relay_configured: false,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        if (
+          method === "GET" &&
+          (url.endsWith("/api/v1/entities") ||
+            url.endsWith("/api/v1/existing-bills") ||
+            url.endsWith("/api/v1/dictionary") ||
+            url.includes("/api/v1/batches?limit="))
+        ) {
+          return new Response("[]", {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (method === "POST" && url.includes("/api/v1/batches?")) {
+          r4PostCount++;
+          const callIdx = r4PostCount;
+          const batchId = `batch-r4-a1-${callIdx}`;
+          const files: string[] = [];
+          const fd = init?.body as FormData | undefined;
+          if (fd && typeof fd.getAll === "function") {
+            for (const f of fd.getAll("files")) {
+              if (typeof f === "object" && f !== null && "name" in f) {
+                files.push(String((f as { name: string }).name));
+              }
+            }
+          }
+          r4PostedBatches.push({ batchId, files });
+          if (callIdx === 1) {
+            return new Response(
+              stringifyLosslessJson(makeR4Summary(batchId, "B-R4-01", files.length)),
+              { status: 202, headers: { "Content-Type": "application/json" } }
+            );
+          }
+          if (callIdx === 2) {
+            batch2PostStarted.resolve();
+            return await batch2PostRelease.promise;
+          }
+          return new Response(
+            stringifyLosslessJson(makeR4Summary(batchId, `B-R4-0${callIdx}`, files.length)),
+            { status: 202, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        if (method === "GET" && url.endsWith("/api/v1/batches/batch-r4-a1-1")) {
+          batch1DetailStarted.resolve();
+          return await batch1DetailRelease.promise;
+        }
+        if (method === "GET" && url.endsWith("/api/v1/batches/batch-r4-a1-2")) {
+          return new Response(stringifyLosslessJson(batch2CompletedDetail), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("{}", { status: 404 });
+      },
+    });
+
+    const mountEl = hostEnv.doc.createElement!("div");
+    hostEnv.doc.body!.appendChild(mountEl);
+    const root = ReactDomClient.createRoot(mountEl);
+    try {
+      await ReactMod.act(async () => {
+        root.render(
+          ReactMod.createElement(AppComponentRef, { apiClient: r4A1Client })
+        );
+      });
+      await flushActMicrotasks();
+      const ui = createAppMountHelpers(hostEnv);
+
+      const getUploadFileInput = () =>
+        hostEnv.findNodes((n) => {
+          if (n.tagName !== "INPUT") return false;
+          const props = hostEnv.getProps(n);
+          const inputType = n.type || n.attributes.type || props.type;
+          const accept = String(n.attributes.accept ?? props.accept ?? "");
+          return inputType === "file" && accept.includes(".xlsx");
+        })[0];
+      const getSubmitButton = () =>
+        hostEnv.findNodes(
+          (n) => n.tagName === "BUTTON" && n.textContent.includes("开始智能解析")
+        )[0];
+
+      // 1. Stage & submit batch 1 -> POST 202 resolves, detail GET #1 is held open
+      const f1 = new File(["%PDF-1.4\nb1"], "batch1.pdf", { type: "application/pdf" });
+      const inp1 = getUploadFileInput();
+      inp1.files = [f1];
+      await ReactMod.act(async () => {
+        (hostEnv.getProps(inp1).onChange as (e: unknown) => void)({
+          target: inp1,
+          currentTarget: inp1,
+        });
+      });
+      await ui.clickButton("开始智能解析");
+      await batch1DetailStarted.promise;
+      await flushActMicrotasks(4);
+
+      // 2. Stage next-batch.xlsx & click submit -> POST #2 stays in-flight
+      const f2 = new File(["PK\x03\x04next"], "next-batch.xlsx", {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+      const inp2 = getUploadFileInput();
+      inp2.files = [f2];
+      await ReactMod.act(async () => {
+        (hostEnv.getProps(inp2).onChange as (e: unknown) => void)({
+          target: inp2,
+          currentTarget: inp2,
+        });
+      });
+      await ui.clickButton("开始智能解析");
+      await batch2PostStarted.promise;
+      await flushActMicrotasks(4);
+      assertEqual(r4PostCount, 2, "R4-A1 batch 2 POST is in-flight");
+
+      // 3. Release batch 1 detail GET 200 while batch 2 POST is still pending
+      await ReactMod.act(async () => {
+        batch1DetailRelease.resolve(
+          new Response(stringifyLosslessJson(batch1CompletedDetail), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        );
+      });
+      await flushActMicrotasks(8);
+
+      // 4. Submit button MUST remain disabled & busy so a duplicate 3rd POST cannot fire
+      const submitBtnOverlap = getSubmitButton();
+      const submitBtnOverlapProps = hostEnv.getProps(submitBtnOverlap);
+      assertTrue(
+        Boolean(submitBtnOverlap) &&
+          (submitBtnOverlap.disabled || Boolean(submitBtnOverlapProps.disabled)) &&
+          submitBtnOverlap.attributes["aria-busy"] === "true",
+        "R4-A1 resolving batch 1 detail GET 200 keeps submit button disabled while batch 2 POST is in-flight"
+      );
+      await ReactMod.act(async () => {
+        const maybeHandler = submitBtnOverlapProps.onClick as
+          | ((e: unknown) => unknown)
+          | undefined;
+        if (maybeHandler && !submitBtnOverlap.disabled && !submitBtnOverlapProps.disabled) {
+          await maybeHandler({
+            preventDefault() {},
+            stopPropagation() {},
+            target: submitBtnOverlap,
+            currentTarget: submitBtnOverlap,
+          });
+        }
+      });
+      assertEqual(
+        r4PostCount,
+        2,
+        "R4-A1 strictly prevents duplicate 3rd POST during overlapping batch1 GET / batch2 POST window"
+      );
+
+      // 5. Release batch 2 POST 202 -> lock releases cleanly and both batches carry distinct files
+      await ReactMod.act(async () => {
+        batch2PostRelease.resolve(
+          new Response(
+            stringifyLosslessJson(makeR4Summary("batch-r4-a1-2", "B-R4-02", 1)),
+            { status: 202, headers: { "Content-Type": "application/json" } }
+          )
+        );
+      });
+      await flushActMicrotasks(8);
+      assertEqual(r4PostCount, 2, "R4-A1 total batch POST count remains 2");
+      assertEqual(
+        r4PostedBatches.map((b) => b.files.join(",")).join("|"),
+        "batch1.pdf|next-batch.xlsx",
+        "R4-A1 batches carry distinct files without duplicate next-batch.xlsx submission"
+      );
+      const submitBtnAfter = getSubmitButton();
+      assertTrue(
+        submitBtnAfter.attributes["aria-busy"] !== "true",
+        "R4-A1 clears aria-busy after batch 2 POST finishes"
+      );
+    } finally {
+      batch1DetailRelease.resolve(new Response("{}", { status: 200 }));
+      batch2PostRelease.resolve(
+        new Response(
+          stringifyLosslessJson(makeR4Summary("batch-r4-a1-2", "B-R4-02", 1)),
+          { status: 202, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      await ReactMod.act(async () => {
+        root.unmount();
+      });
+      hostEnv.cleanup();
+    }
+  }
   results.push(
-    "PASS 28: C2+F7 real component upload -> POST 202 snapshot removal -> concurrent file retained across 503 -> same-batch GET retry"
+    "PASS 28: C2+F7+R4-A1+C-class upload snapshot removal, single-GET 503 retry & overlapping POST lock"
   );
 
   // 29. F8: Authoritative 176 active ISO 4217 whitelist matches backend (CLF ok, HRK/XXX/XTS rejected)

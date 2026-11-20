@@ -1,19 +1,14 @@
 import {
   hasValidDecimalNumber,
   isValidIso4217Currency,
-  normalizeBillingRecord,
-  normalizeExistingBill,
-  normalizeSourceDocument,
   type AccountingEntity,
   type AccountingEntityUpsert,
-  type BillingRecordDetail,
   type ChargeDictionaryCreate,
   type EvalRunSummary,
   type ExistingBill,
   type ExportMode,
   type ExportResponse,
   type ReviewBundleV1,
-  type SourceDocumentSummary,
 } from "./client.ts";
 import {
   copyDecimalMeta,
@@ -918,6 +913,9 @@ const ALERT_CODE_DEFAULT_SEVERITY: Record<string, "BLOCKER" | "WARNING"> = {
   MULTI_SOURCE_BL_MISMATCH: "WARNING",
   CONTEXT_INFERRED_FIELD: "WARNING",
 };
+export const VALID_ALERT_CODES: ReadonlySet<string> = new Set(
+  Object.keys(ALERT_CODE_DEFAULT_SEVERITY)
+);
 
 function isNullableString(val: unknown): val is string | null {
   return val === null || typeof val === "string";
@@ -956,7 +954,9 @@ function isFieldDiffArray(val: unknown): boolean {
 
 function isValidValidationAlert(alert: unknown): boolean {
   if (!isPlainObject(alert)) return false;
-  if (typeof alert.code !== "string" || !alert.code.trim()) return false;
+  if (typeof alert.code !== "string" || !VALID_ALERT_CODES.has(alert.code)) {
+    return false;
+  }
   if (typeof alert.message !== "string" || !alert.message.trim()) return false;
   if (
     typeof alert.severity !== "string" ||
@@ -1101,12 +1101,16 @@ export function validateReviewBundleInput(
       error: "ReviewBundleV1 中的 failed_documents 必须为数组",
     };
   }
-  if (parsed.accounting_entity_profile !== undefined) {
+  if (
+    parsed.accounting_entity_profile !== undefined &&
+    parsed.accounting_entity_profile !== null
+  ) {
     const profile = parsed.accounting_entity_profile;
     if (!isPlainObject(profile)) {
       return {
         valid: false,
-        error: "ReviewBundleV1 中的 accounting_entity_profile 必须为 JSON 对象",
+        error:
+          "ReviewBundleV1 中的 accounting_entity_profile 须为 JSON 对象或 null",
       };
     }
     if (
@@ -1141,7 +1145,7 @@ export function validateReviewBundleInput(
 
   const docIds = new Set<string>();
   const rawAffectedChecks: Array<{ docId: string; recordIds: string[] }> = [];
-  const normalizedDocs: SourceDocumentSummary[] = [];
+  const parentDocRefs: Array<{ id: string; parentDocId: string }> = [];
   for (let i = 0; i < parsed.documents.length; i++) {
     const rawDoc = parsed.documents[i];
     const rowNo = i + 1;
@@ -1289,22 +1293,21 @@ export function validateReviewBundleInput(
         error: `第 ${rowNo} 份来源单据 (${id}) 汇总金额字段须为 JSON 数值或 null`,
       };
     }
-    normalizedDocs.push(
-      normalizeSourceDocument(rawDoc as unknown as SourceDocumentSummary)
-    );
+    if (typeof rawDoc.parent_doc_id === "string" && rawDoc.parent_doc_id) {
+      parentDocRefs.push({ id, parentDocId: rawDoc.parent_doc_id });
+    }
   }
 
-  for (const doc of normalizedDocs) {
-    if (doc.parent_doc_id && !docIds.has(doc.parent_doc_id)) {
+  for (const ref of parentDocRefs) {
+    if (!docIds.has(ref.parentDocId)) {
       return {
         valid: false,
-        error: `来源单据 "${doc.id}" 引用了不存在的 parent_doc_id "${doc.parent_doc_id}"`,
+        error: `来源单据 "${ref.id}" 引用了不存在的 parent_doc_id "${ref.parentDocId}"`,
       };
     }
   }
 
   const recordIds = new Set<string>();
-  const normalizedRecords: BillingRecordDetail[] = [];
   for (let i = 0; i < parsed.records.length; i++) {
     const rawRec = parsed.records[i];
     const rowNo = i + 1;
@@ -1573,7 +1576,7 @@ export function validateReviewBundleInput(
       ) {
         return {
           valid: false,
-          error: `第 ${rowNo} 条账单记录 (${id}) validation_alerts 结构或 severity 枚举无效`,
+          error: `第 ${rowNo} 条账单记录 (${id}) validation_alerts 结构、code 或 severity 枚举无效`,
         };
       }
     }
@@ -1615,10 +1618,6 @@ export function validateReviewBundleInput(
         };
       }
     }
-
-    normalizedRecords.push(
-      normalizeBillingRecord(rawRec as unknown as BillingRecordDetail)
-    );
   }
 
   for (const check of rawAffectedChecks) {
@@ -1679,7 +1678,7 @@ export function validateReviewBundleInput(
     ? parsed.existing_bills_snapshot
     : [];
   const billIds = new Set<string>();
-  const normalizedBills: ExistingBill[] = [];
+  const validatedBills: ExistingBill[] = [];
   for (let i = 0; i < rawBills.length; i++) {
     const rawBill = rawBills[i];
     const rowNo = i + 1;
@@ -1784,7 +1783,7 @@ export function validateReviewBundleInput(
         error: `existing_bills_snapshot 第 ${rowNo} 条 (${id}) extra_fields 须为 JSON 对象`,
       };
     }
-    const normalizedBillInput = copyDecimalMeta(rawBill, {
+    const validatedBillInput = copyDecimalMeta(rawBill, {
       ...rawBill,
       currency: rawBill.currency.trim().toUpperCase(),
       amount:
@@ -1798,22 +1797,22 @@ export function validateReviewBundleInput(
         ? { unit_price: toSchemaDecimal(rawBill.unit_price) }
         : {}),
     });
-    normalizedBills.push(
-      normalizeExistingBill(normalizedBillInput as unknown as ExistingBill)
-    );
+    validatedBills.push(validatedBillInput as unknown as ExistingBill);
   }
 
-  const bundle: ReviewBundleV1 = {
+  // R4-A2 + R4-A3: Preserve validated original documents, records, accounting_entity_profile (including null),
+  // and omitted optional keys so backend restores record_state.source_evidence instead of overwriting it.
+  const bundleObj = copyDecimalMeta(parsed, {
     ...(parsed as Record<string, unknown>),
     bundle_version: "1.0",
-    short_code: parsed.short_code ?? null,
     accounting_entity: parsed.accounting_entity.trim(),
-    ocr_mode: ocrMode as ReviewBundleV1["ocr_mode"],
-    documents: normalizedDocs,
-    records: normalizedRecords,
-    existing_bills_snapshot: normalizedBills,
-  };
-  return { valid: true, bundle };
+    documents: parsed.documents,
+    records: parsed.records,
+    ...(parsed.existing_bills_snapshot !== undefined
+      ? { existing_bills_snapshot: validatedBills }
+      : {}),
+  });
+  return { valid: true, bundle: bundleObj as unknown as ReviewBundleV1 };
 }
 
 // A3: Pure batch-scoped & failure-cleared export preview cache state machine

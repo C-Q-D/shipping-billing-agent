@@ -244,6 +244,9 @@ export function UploadAndFileTree({
   };
 
   const handleSubmit = async () => {
+    if (submittingBatch || submittingDemo) {
+      return;
+    }
     setHasAttemptedSubmit(true);
     if (!validation.valid) {
       return;
