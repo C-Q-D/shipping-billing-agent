@@ -4,6 +4,8 @@ import {
   MAX_SINGLE_FILE_BYTES,
   isValidIso4217Currency,
   normalizeBatchDetail,
+  normalizeBillingRecord,
+  normalizeSourceDocument,
   validateBatchIngestionInput,
 } from "./client.ts";
 import {
@@ -44,6 +46,7 @@ import {
 } from "./managementHelpers.ts";
 import {
   acceptPollResult,
+  beginAuditHistoryRequest,
   beginDocTotalsSave,
   beginRecordSave,
   buildDocTotalsDiffPatch,
@@ -52,6 +55,7 @@ import {
   clearBatchScopedMap,
   clearRecordDraft,
   countCodePoints,
+  createAuditHistoryTracker,
   createEmptyDraftStore,
   createPollRaceTracker,
   extractMutationErrorBanner,
@@ -67,8 +71,11 @@ import {
   getRecordDraftVersion,
   hasDocTotalsDraft,
   hasRecordDraft,
+  invalidateAuditHistoryForBatch,
+  invalidateAuditHistoryForRecord,
   setDocTotalsDraftField,
   setRecordDraftField,
+  shouldAcceptAuditHistoryResult,
   shouldContinuePollingAfterDiscard,
   startMutation,
   startPoll,
@@ -1467,12 +1474,21 @@ export async function runDecimalJsonTests(): Promise<void> {
     logLevel: "silent",
   });
   let renderAppSsrHtml!: (props: Record<string, unknown>) => string;
+  let AppComponentRef: unknown;
   try {
     const ReactMod = req("react") as {
       createElement: (
         type: unknown,
-        props: Record<string, unknown> | null
+        props: Record<string, unknown> | null,
+        ...children: unknown[]
       ) => unknown;
+      act: (fn: () => Promise<void> | void) => Promise<void>;
+    };
+    const ReactDomClient = req("react-dom/client") as {
+      createRoot: (container: unknown) => {
+        render: (el: unknown) => void;
+        unmount: () => void;
+      };
     };
     const ReactDomServer = req("react-dom/server") as {
       renderToStaticMarkup: (el: unknown) => string;
@@ -1480,6 +1496,18 @@ export async function runDecimalJsonTests(): Promise<void> {
     const { default: AppComponent } = (await viteServer.ssrLoadModule(
       "/src/App.tsx"
     )) as { default: unknown };
+    AppComponentRef = AppComponent;
+    const {
+      BillingApiClient: SsrBillingApiClient,
+      normalizeBatchDetail: ssrNormalizeBatchDetail,
+    } = (await viteServer.ssrLoadModule("/src/api/client.ts")) as {
+      BillingApiClient: typeof BillingApiClient;
+      normalizeBatchDetail: typeof normalizeBatchDetail;
+    };
+    const { parseLosslessJson: ssrParseLosslessJson } =
+      (await viteServer.ssrLoadModule("/src/api/decimalJson.ts")) as {
+        parseLosslessJson: typeof parseLosslessJson;
+      };
     const { ReviewInspector } = (await viteServer.ssrLoadModule(
       "/src/components/ReviewInspector.tsx"
     )) as { ReviewInspector: unknown };
@@ -1569,9 +1597,6 @@ export async function runDecimalJsonTests(): Promise<void> {
         f7RecoveryHtml.includes("重试读取此批次"),
       "full App SSR mount renders F7 recovery card with batch ID, shortCode and retry GET button"
     );
-  } finally {
-    await viteServer.close();
-  }
   results.push(
     "PASS 16: Real OpenAPI batch-edge-01 full App SSR mount (-40.0, 0-record fail card, sheet/line_number) + F7 recovery UI"
   );
@@ -2366,6 +2391,137 @@ export async function runDecimalJsonTests(): Promise<void> {
     bills[0].currency = "HRK";
   });
 
+  // F6: Explicit null on non-nullable contract fields must be rejected (not coerced to []/{})
+  assertInvalidBundleVariant("top-level documents = null", (b) => {
+    b.documents = null;
+  });
+  assertInvalidBundleVariant("top-level records = null", (b) => {
+    b.records = null;
+  });
+  assertInvalidBundleVariant("top-level existing_bills_snapshot = null", (b) => {
+    b.existing_bills_snapshot = null;
+  });
+  assertInvalidBundleVariant("top-level failed_documents = null", (b) => {
+    b.failed_documents = null;
+  });
+  assertInvalidBundleVariant("top-level accounting_entity_profile = null", (b) => {
+    b.accounting_entity_profile = null;
+  });
+  assertInvalidBundleVariant("documents[0].affected_record_ids = null", (b) => {
+    const docs = b.documents as Array<Record<string, unknown>>;
+    docs[0].affected_record_ids = null;
+  });
+  assertInvalidBundleVariant("documents[0].excluded_clauses = null", (b) => {
+    const docs = b.documents as Array<Record<string, unknown>>;
+    docs[0].excluded_clauses = null;
+  });
+  assertInvalidBundleVariant("documents[0].shipment_refs = null", (b) => {
+    const docs = b.documents as Array<Record<string, unknown>>;
+    docs[0].shipment_refs = null;
+  });
+  assertInvalidBundleVariant("records[0].validation_alerts = null", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].validation_alerts = null;
+  });
+  assertInvalidBundleVariant("records[0].field_diffs = null", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].field_diffs = null;
+  });
+  assertInvalidBundleVariant("records[0].candidate_bills = null", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].candidate_bills = null;
+  });
+  assertInvalidBundleVariant("records[0].review_audit_logs = null", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].review_audit_logs = null;
+  });
+  assertInvalidBundleVariant("records[0].source_evidence = null", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].source_evidence = null;
+  });
+  assertInvalidBundleVariant("records[0].human_overrides = null", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].human_overrides = null;
+  });
+  assertInvalidBundleVariant("records[0].shipment_refs = null", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].shipment_refs = null;
+  });
+  assertInvalidBundleVariant("records[0].inherited_fields = null", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].inherited_fields = null;
+  });
+  assertInvalidBundleVariant("records[0].ai_reasoning = null", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].ai_reasoning = null;
+  });
+  assertInvalidBundleVariant("records[0].record_state = null", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].record_state = null;
+  });
+  assertInvalidBundleVariant("validation_alerts[0].severity = CRITICAL", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].validation_alerts = [
+      { code: "OCR_NUMERIC_CONFUSION", severity: "CRITICAL", message: "bad severity" },
+    ];
+  });
+  assertInvalidBundleVariant("validation_alerts[0].severity = INFO", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].validation_alerts = [
+      { code: "OCR_NUMERIC_CONFUSION", severity: "INFO", message: "unsupported enum" },
+    ];
+  });
+  assertInvalidBundleVariant("validation_alerts[0].severity = 123", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].validation_alerts = [
+      { code: "OCR_NUMERIC_CONFUSION", severity: 123, message: "numeric severity" },
+    ];
+  });
+  assertInvalidBundleVariant("validation_alerts[0] empty code", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].validation_alerts = [
+      { code: "  ", severity: "BLOCKER", message: "missing code" },
+    ];
+  });
+  assertInvalidBundleVariant("validation_alerts[0] empty message", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].validation_alerts = [
+      { code: "OCR_NUMERIC_CONFUSION", severity: "BLOCKER", message: "  " },
+    ];
+  });
+  assertInvalidBundleVariant("validation_alerts[0] non-string field", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].validation_alerts = [
+      { code: "OCR_NUMERIC_CONFUSION", severity: "BLOCKER", message: "bad field", field: 42 },
+    ];
+  });
+  assertInvalidBundleVariant("validation_alerts[0] BLOCKER code downgraded to WARNING", (b) => {
+    const recs = b.records as Array<Record<string, unknown>>;
+    recs[0].validation_alerts = [
+      { code: "OCR_NUMERIC_CONFUSION", severity: "WARNING", message: "mismatched severity" },
+    ];
+  });
+
+  // Normalizers supply defaults only for undefined, never silently coerce explicit null
+  const nullAlertRecCheck = normalizeBillingRecord({
+    ...(baseValidBundleObj.records as Array<Record<string, unknown>>)[0],
+    validation_alerts: null,
+  } as unknown as Parameters<typeof normalizeBillingRecord>[0]);
+  assertEqual(
+    nullAlertRecCheck.validation_alerts,
+    null as unknown as typeof nullAlertRecCheck.validation_alerts,
+    "normalizeBillingRecord does NOT coerce explicit validation_alerts: null into []"
+  );
+  const nullShipDocCheck = normalizeSourceDocument({
+    ...(baseValidBundleObj.documents as Array<Record<string, unknown>>)[0],
+    shipment_refs: null,
+  } as unknown as Parameters<typeof normalizeSourceDocument>[0]);
+  assertEqual(
+    nullShipDocCheck.shipment_refs,
+    null as unknown as typeof nullShipDocCheck.shipment_refs,
+    "normalizeSourceDocument does NOT coerce explicit shipment_refs: null into {}"
+  );
+
   // Valid bundle with CLF snapshot bill & RawDecimalLiteral passes
   const clfBundle = parseLosslessJson<Record<string, unknown>>(
     stringifyLosslessJson(baseValidBundleObj)
@@ -2381,93 +2537,717 @@ export async function runDecimalJsonTests(): Promise<void> {
     true,
     "F6 accepts valid bundle with CLF bill and RawDecimalLiteral amount"
   );
-  results.push(
-    "PASS 27: F6 strict ReviewBundleV1 raw-type validation (no silent coercion on short_code/document_date)"
-  );
 
-  // 28. F7: Batch POST 202 succeeds + initial GET 503 retains new batch ID and recovers via GET only
-  let f7PostCount = 0;
-  let f7GetCount = 0;
-  const f7Client = new BillingApiClient({
-    transport: async (input, init) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const method = init?.method ?? "GET";
-      if (method === "POST" && url.includes("/api/v1/batches")) {
-        f7PostCount++;
-        return new Response(
-          stringifyLosslessJson({
-            id: "batch-f7-new",
-            short_code: "B-F7-01",
-            accounting_entity: "NEPTUNE SHIPPING LIMITED",
-            source_channel: "WEB",
-            status: "PROCESSING",
-            stage: "QUEUED",
-            stage_message: "已入队",
-            ocr_mode: "REMOTE_ONLY",
-            total_files: 1,
-            succeeded_files: 0,
-            failed_files: 0,
-            counts: {
-              create: 0,
-              update: 0,
-              no_change: 0,
-              pending_review: 0,
-              rejected: 0,
-            },
-            created_at: "2026-11-20T08:00:00Z",
-            updated_at: "2026-11-20T08:00:00Z",
-          }),
-          { status: 202, headers: { "Content-Type": "application/json" } }
+  // Interactive App mount helper for F6, F7 (PASS 28) & R3-A1 (PASS 30)
+  function createDeferred<T>() {
+    let resolve!: (val: T) => void;
+    let reject!: (err: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function installFakeDomHost() {
+    const g = globalThis as Record<string, unknown>;
+    const prevWindow = g.window;
+    const prevDocument = g.document;
+    const prevResizeObserver = g.ResizeObserver;
+    const prevActEnv = g.IS_REACT_ACT_ENVIRONMENT;
+    const activeTimers = new Set<ReturnType<typeof setTimeout>>();
+
+    class FakeDomNode {
+      nodeType: number;
+      nodeName: string;
+      tagName?: string;
+      namespaceURI = "http://www.w3.org/1999/xhtml";
+      ownerDocument: FakeDomNode | null;
+      defaultView?: unknown;
+      documentElement?: FakeDomNode;
+      body?: FakeDomNode;
+      activeElement?: FakeDomNode | null;
+      parentNode: FakeDomNode | null = null;
+      childNodes: FakeDomNode[] = [];
+      attributes: Record<string, string> = {};
+      style: Record<string, unknown> = {
+        setProperty(k: string, v: unknown) {
+          this[k] = v;
+        },
+        removeProperty(k: string) {
+          delete this[k];
+        },
+      };
+      dataset: Record<string, string> = {};
+      offsetWidth = 0;
+      offsetHeight = 0;
+      offsetLeft = 0;
+      offsetTop = 0;
+      value = "";
+      checked = false;
+      disabled = false;
+      type = "";
+      files: unknown = null;
+      nodeValue?: string;
+      createElement?: (tag: string) => FakeDomNode;
+      createElementNS?: (_ns: string, tag: string) => FakeDomNode;
+      createTextNode?: (v: string) => FakeDomNode;
+      createComment?: (v: string) => FakeDomNode;
+
+      constructor(nodeType: number, nodeName: string, ownerDoc: FakeDomNode | null) {
+        this.nodeType = nodeType;
+        this.nodeName = nodeName;
+        this.tagName = nodeType === 1 ? nodeName : undefined;
+        this.ownerDocument = ownerDoc;
+      }
+      get firstChild(): FakeDomNode | null {
+        return this.childNodes[0] ?? null;
+      }
+      get nextSibling(): FakeDomNode | null {
+        if (!this.parentNode) return null;
+        const idx = this.parentNode.childNodes.indexOf(this);
+        return this.parentNode.childNodes[idx + 1] ?? null;
+      }
+      appendChild(child: FakeDomNode): FakeDomNode {
+        if (child.parentNode) child.parentNode.removeChild(child);
+        child.parentNode = this;
+        this.childNodes.push(child);
+        return child;
+      }
+      prepend(child: FakeDomNode): FakeDomNode {
+        return this.insertBefore(child, this.firstChild);
+      }
+      insertBefore(child: FakeDomNode, ref: FakeDomNode | null): FakeDomNode {
+        if (!ref) return this.appendChild(child);
+        if (child.parentNode) child.parentNode.removeChild(child);
+        const idx = this.childNodes.indexOf(ref);
+        child.parentNode = this;
+        this.childNodes.splice(idx < 0 ? this.childNodes.length : idx, 0, child);
+        return child;
+      }
+      removeChild(child: FakeDomNode): FakeDomNode {
+        const idx = this.childNodes.indexOf(child);
+        if (idx >= 0) {
+          this.childNodes.splice(idx, 1);
+          child.parentNode = null;
+        }
+        return child;
+      }
+      contains(target: FakeDomNode | null): boolean {
+        let cur = target;
+        while (cur) {
+          if (cur === this) return true;
+          cur = cur.parentNode;
+        }
+        return false;
+      }
+      setAttribute(k: string, v: unknown) {
+        this.attributes[k] = String(v);
+        if (k === "disabled") this.disabled = true;
+      }
+      getAttribute(k: string): string | null {
+        return Object.prototype.hasOwnProperty.call(this.attributes, k)
+          ? this.attributes[k]
+          : null;
+      }
+      removeAttribute(k: string) {
+        delete this.attributes[k];
+        if (k === "disabled") this.disabled = false;
+      }
+      addEventListener() {}
+      removeEventListener() {}
+      focus() {}
+      scrollTo() {}
+      scrollIntoView() {}
+      getBoundingClientRect() {
+        return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+      }
+      querySelector() {
+        return null;
+      }
+      querySelectorAll() {
+        return [];
+      }
+      get textContent(): string {
+        if (this.nodeType === 3) return this.nodeValue ?? "";
+        return this.childNodes.map((c) => c.textContent).join("");
+      }
+      set textContent(val: string) {
+        if (this.nodeType === 3) {
+          this.nodeValue = String(val);
+        } else {
+          this.childNodes = [];
+          if (val && this.ownerDocument) {
+            const txt = new FakeDomNode(3, "#text", this.ownerDocument);
+            txt.nodeValue = String(val);
+            this.appendChild(txt);
+          }
+        }
+      }
+    }
+
+    const storageMap = new Map<string, string>();
+    const win = {
+      HTMLIFrameElement: class {},
+      HTMLElement: FakeDomNode,
+      Node: FakeDomNode,
+      addEventListener() {},
+      removeEventListener() {},
+      setTimeout: (fn: () => void, ms?: number) => {
+        const handle = globalThis.setTimeout(() => {
+          activeTimers.delete(handle);
+          fn();
+        }, ms);
+        activeTimers.add(handle);
+        return handle;
+      },
+      clearTimeout: (handle: ReturnType<typeof setTimeout> | undefined) => {
+        if (handle !== undefined) {
+          activeTimers.delete(handle);
+          globalThis.clearTimeout(handle);
+        }
+      },
+      innerWidth: 1280,
+      innerHeight: 800,
+      location: { href: "http://127.0.0.1:5173/", search: "" },
+      localStorage: {
+        getItem: (k: string) => storageMap.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          storageMap.set(k, String(v));
+        },
+        removeItem: (k: string) => {
+          storageMap.delete(k);
+        },
+      },
+      history: {
+        replaceState(_s: unknown, _t: string, url: string) {
+          const parsedUrl = new URL(url, win.location.href);
+          win.location.href = parsedUrl.toString();
+          win.location.search = parsedUrl.search;
+        },
+      },
+      document: undefined as unknown,
+    };
+
+    const doc = new FakeDomNode(9, "#document", null);
+    doc.defaultView = win;
+    win.document = doc;
+    doc.documentElement = new FakeDomNode(1, "HTML", doc);
+    doc.body = new FakeDomNode(1, "BODY", doc);
+    doc.activeElement = doc.body;
+    doc.createElement = (tag: string) =>
+      new FakeDomNode(1, String(tag).toUpperCase(), doc);
+    doc.createElementNS = (_ns: string, tag: string) =>
+      new FakeDomNode(1, String(tag).toUpperCase(), doc);
+    doc.createTextNode = (v: string) => {
+      const n = new FakeDomNode(3, "#text", doc);
+      n.nodeValue = String(v);
+      return n;
+    };
+    doc.createComment = (v: string) => {
+      const n = new FakeDomNode(8, "#comment", doc);
+      n.nodeValue = String(v);
+      return n;
+    };
+
+    g.IS_REACT_ACT_ENVIRONMENT = true;
+    g.window = win;
+    g.document = doc;
+    g.ResizeObserver = class {
+      observe() {}
+      disconnect() {}
+    };
+
+    const findNodes = (
+      root: FakeDomNode,
+      pred: (n: FakeDomNode) => boolean
+    ): FakeDomNode[] => {
+      const out: FakeDomNode[] = [];
+      const walk = (n: FakeDomNode) => {
+        if (pred(n)) out.push(n);
+        for (const ch of n.childNodes) walk(ch);
+      };
+      walk(root);
+      return out;
+    };
+
+    const getProps = (node: FakeDomNode): Record<string, unknown> => {
+      const rec = node as unknown as Record<string, unknown>;
+      const k = Object.keys(rec).find((key) => key.startsWith("__reactProps"));
+      return k ? (rec[k] as Record<string, unknown>) : {};
+    };
+
+    const cleanup = () => {
+      for (const t of activeTimers) {
+        globalThis.clearTimeout(t);
+      }
+      activeTimers.clear();
+      g.window = prevWindow;
+      g.document = prevDocument;
+      g.ResizeObserver = prevResizeObserver;
+      g.IS_REACT_ACT_ENVIRONMENT = prevActEnv;
+    };
+
+    return {
+      win,
+      doc,
+      storageMap,
+      findNodes: (pred: (n: FakeDomNode) => boolean) =>
+        findNodes(doc.body!, pred),
+      getProps,
+      cleanup,
+    };
+  }
+
+  async function flushActMicrotasks(rounds = 8) {
+    for (let i = 0; i < rounds; i++) {
+      await ReactMod.act(async () => {
+        await Promise.resolve();
+      });
+    }
+  }
+
+  function createAppMountHelpers(hostEnv: ReturnType<typeof installFakeDomHost>) {
+    const clickButton = async (labelNeedle: string) => {
+      const buttons = hostEnv.findNodes(
+        (n) => n.tagName === "BUTTON" && n.textContent.includes(labelNeedle)
+      );
+      const btn = buttons[0];
+      assertTrue(Boolean(btn), `Expected button containing "${labelNeedle}"`);
+      const btnProps = hostEnv.getProps(btn);
+      assertTrue(
+        !btn.disabled &&
+          !btnProps.disabled &&
+          btn.attributes["aria-busy"] !== "true",
+        `Button "${labelNeedle}" must be enabled and not busy`
+      );
+      const onClick = btnProps.onClick as
+        | ((e: unknown) => unknown)
+        | undefined;
+      assertTrue(typeof onClick === "function", `Button "${labelNeedle}" has onClick`);
+      await ReactMod.act(async () => {
+        await onClick!({
+          preventDefault() {},
+          stopPropagation() {},
+          target: btn,
+          currentTarget: btn,
+        });
+      });
+      await flushActMicrotasks(4);
+    };
+
+    const changeControlValue = async (ariaLabel: string, value: string) => {
+      const controls = hostEnv.findNodes(
+        (n) =>
+          (n.tagName === "INPUT" || n.tagName === "TEXTAREA") &&
+          (n.attributes["aria-label"] ?? hostEnv.getProps(n)["aria-label"]) ===
+            ariaLabel
+      );
+      const ctrl = controls[0];
+      assertTrue(Boolean(ctrl), `Expected control with aria-label "${ariaLabel}"`);
+      ctrl.value = value;
+      const onChange = hostEnv.getProps(ctrl).onChange as
+        | ((e: unknown) => unknown)
+        | undefined;
+      assertTrue(typeof onChange === "function", `Control "${ariaLabel}" has onChange`);
+      await ReactMod.act(async () => {
+        await onChange!({
+          target: ctrl,
+          currentTarget: ctrl,
+          preventDefault() {},
+          stopPropagation() {},
+        });
+      });
+    };
+
+    const changeInputByPlaceholder = async (placeholderNeedle: string, value: string) => {
+      const controls = hostEnv.findNodes(
+        (n) =>
+          (n.tagName === "INPUT" || n.tagName === "TEXTAREA") &&
+          String(
+            n.attributes.placeholder ?? hostEnv.getProps(n).placeholder ?? ""
+          ).includes(placeholderNeedle)
+      );
+      const ctrl = controls[0];
+      assertTrue(
+        Boolean(ctrl),
+        `Expected control with placeholder "${placeholderNeedle}"`
+      );
+      ctrl.value = value;
+      const onChange = hostEnv.getProps(ctrl).onChange as
+        | ((e: unknown) => unknown)
+        | undefined;
+      assertTrue(typeof onChange === "function", "Input has onChange");
+      await ReactMod.act(async () => {
+        await onChange!({
+          target: ctrl,
+          currentTarget: ctrl,
+          preventDefault() {},
+          stopPropagation() {},
+        });
+      });
+    };
+
+    return { clickButton, changeControlValue, changeInputByPlaceholder };
+  }
+
+  // F6 UI-entry assertion in real mounted App: invalid bundles trigger ZERO POSTs
+  {
+    const hostEnv = installFakeDomHost();
+    let f6ImportPosts = 0;
+    const f6UiClient = new SsrBillingApiClient({
+      transport: async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        if (url.includes("/api/v1/batches/import-review-bundle") && method === "POST") {
+          f6ImportPosts++;
+        }
+        if (url.endsWith("/api/v1/health")) {
+          return new Response(
+            stringifyLosslessJson({
+              status: "ok",
+              llm_configured: false,
+              ocr_gateway_url: "http://localhost:8080",
+              ocr_direct_mode: false,
+              public_relay_configured: false,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        return new Response("[]", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+    const mountEl = hostEnv.doc.createElement!("div");
+    hostEnv.doc.body!.appendChild(mountEl);
+    const root = ReactDomClient.createRoot(mountEl);
+    try {
+      await ReactMod.act(async () => {
+        root.render(
+          ReactMod.createElement(AppComponentRef, {
+            apiClient: f6UiClient,
+            initialBatches: [],
+          })
+        );
+      });
+      await flushActMicrotasks();
+      const ui = createAppMountHelpers(hostEnv);
+      await ui.clickButton("导入复核包");
+      const invalidCases = [
+        {
+          label: "validation_alerts=null",
+          mutate: (b: Record<string, unknown>) => {
+            (b.records as Array<Record<string, unknown>>)[0].validation_alerts = null;
+          },
+        },
+        {
+          label: "shipment_refs=null",
+          mutate: (b: Record<string, unknown>) => {
+            (b.documents as Array<Record<string, unknown>>)[0].shipment_refs = null;
+          },
+        },
+        {
+          label: "severity=CRITICAL",
+          mutate: (b: Record<string, unknown>) => {
+            (b.records as Array<Record<string, unknown>>)[0].validation_alerts = [
+              { code: "OCR_NUMERIC_CONFUSION", severity: "CRITICAL", message: "bad" },
+            ];
+          },
+        },
+      ];
+      for (const tc of invalidCases) {
+        const clone = parseLosslessJson<Record<string, unknown>>(
+          stringifyLosslessJson(baseValidBundleObj)
+        );
+        tc.mutate(clone);
+        await ui.changeControlValue(
+          "ReviewBundleV1 JSON 内容",
+          stringifyLosslessJson(clone)
+        );
+        await ui.clickButton("导入并接手复核");
+        const errNodes = hostEnv.findNodes(
+          (n) => (n.attributes.class ?? "").includes("wb-field-error")
+        );
+        assertTrue(
+          errNodes.some((n) => n.textContent.trim().length > 0),
+          `F6 UI import shows local validation error for ${tc.label}`
         );
       }
-      if (method === "GET" && url.endsWith("/api/v1/batches/batch-f7-new")) {
-        f7GetCount++;
-        if (f7GetCount === 1) {
+      assertEqual(
+        f6ImportPosts,
+        0,
+        "F6 UI import triggers ZERO POST requests for null collections or invalid severity"
+      );
+    } finally {
+      await ReactMod.act(async () => {
+        root.unmount();
+      });
+      hostEnv.cleanup();
+    }
+  }
+  results.push(
+    "PASS 27: F6 strict ReviewBundleV1 raw-type & non-null validation + 0-POST UI import interception"
+  );
+
+  // 28. C2 + F7: Real App + UploadAndFileTree submission removes POST-accepted snapshot while preserving concurrent files & same batch ID across 503 retry
+  {
+    const hostEnv = installFakeDomHost();
+    let f7PostCount = 0;
+    let f7DetailGetCount = 0;
+    const postedFileNames: string[] = [];
+    const detail1Started = createDeferred<void>();
+    const detail1Release = createDeferred<Response>();
+
+    const f7CompletedDetail = parseLosslessJson<Record<string, unknown>>(
+      openApiBatchEdge01RawText
+    );
+    f7CompletedDetail.id = "batch-f7-new";
+    f7CompletedDetail.short_code = "B-F7-01";
+    f7CompletedDetail.accounting_entity = "NEPTUNE SHIPPING LIMITED";
+
+    const f7Client = new SsrBillingApiClient({
+      transport: async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        if (method === "GET" && url.endsWith("/api/v1/health")) {
           return new Response(
+            stringifyLosslessJson({
+              status: "ok",
+              llm_configured: false,
+              ocr_gateway_url: "http://localhost:8080",
+              ocr_direct_mode: false,
+              public_relay_configured: false,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        if (
+          method === "GET" &&
+          (url.endsWith("/api/v1/entities") ||
+            url.endsWith("/api/v1/existing-bills") ||
+            url.endsWith("/api/v1/dictionary") ||
+            url.includes("/api/v1/batches?limit="))
+        ) {
+          return new Response("[]", {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (method === "POST" && url.includes("/api/v1/batches?")) {
+          f7PostCount++;
+          const fd = init?.body as FormData | undefined;
+          if (fd && typeof fd.getAll === "function") {
+            for (const f of fd.getAll("files")) {
+              if (typeof f === "object" && f !== null && "name" in f) {
+                postedFileNames.push(String((f as { name: string }).name));
+              }
+            }
+          }
+          return new Response(
+            stringifyLosslessJson({
+              id: "batch-f7-new",
+              short_code: "B-F7-01",
+              accounting_entity: "NEPTUNE SHIPPING LIMITED",
+              source_channel: "WEB",
+              status: "PROCESSING",
+              stage: "QUEUED",
+              stage_message: "已入队",
+              ocr_mode: "REMOTE_ONLY",
+              total_files: 1,
+              succeeded_files: 0,
+              failed_files: 0,
+              counts: {
+                create: 0,
+                update: 0,
+                no_change: 0,
+                pending_review: 0,
+                rejected: 0,
+              },
+              created_at: "2026-11-20T08:00:00Z",
+              updated_at: "2026-11-20T08:00:00Z",
+            }),
+            { status: 202, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        if (method === "GET" && url.endsWith("/api/v1/batches/batch-f7-new")) {
+          f7DetailGetCount++;
+          if (f7DetailGetCount === 1) {
+            detail1Started.resolve();
+            return await detail1Release.promise;
+          }
+          return new Response(stringifyLosslessJson(f7CompletedDetail), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("{}", { status: 404 });
+      },
+    });
+
+    const mountEl = hostEnv.doc.createElement!("div");
+    hostEnv.doc.body!.appendChild(mountEl);
+    const root = ReactDomClient.createRoot(mountEl);
+    try {
+      await ReactMod.act(async () => {
+        root.render(
+          ReactMod.createElement(AppComponentRef, { apiClient: f7Client })
+        );
+      });
+      await flushActMicrotasks();
+      const ui = createAppMountHelpers(hostEnv);
+
+      const getUploadFileInput = () => {
+        const inputs = hostEnv.findNodes((n) => {
+          if (n.tagName !== "INPUT") return false;
+          const props = hostEnv.getProps(n);
+          const inputType = n.type || n.attributes.type || props.type;
+          const accept = String(n.attributes.accept ?? props.accept ?? "");
+          return inputType === "file" && accept.includes(".xlsx");
+        });
+        assertTrue(Boolean(inputs[0]), "Upload file input present");
+        return inputs[0];
+      };
+      const getStagedListText = () =>
+        hostEnv
+          .findNodes(
+            (n) => n.attributes["aria-label"] === "待提交文件列表"
+          )
+          .map((n) => n.textContent)
+          .join("\n");
+
+      const firstFile = new File(["%PDF-1.4\nfirst"], "first-batch.pdf", {
+        type: "application/pdf",
+      });
+      const fileInput = getUploadFileInput();
+      fileInput.files = [firstFile];
+      await ReactMod.act(async () => {
+        const onChange = hostEnv.getProps(fileInput).onChange as (e: unknown) => void;
+        onChange({ target: fileInput, currentTarget: fileInput });
+      });
+      assertTrue(
+        getStagedListText().includes("first-batch.pdf"),
+        "F7 staged list shows first-batch.pdf before submit"
+      );
+
+      // Click "开始智能解析" -> POST 202 resolves, GET #1 is held open
+      await ui.clickButton("开始智能解析");
+      await detail1Started.promise;
+      await flushActMicrotasks(4);
+
+      assertEqual(f7PostCount, 1, "F7 triggers single POST /api/v1/batches");
+      assertEqual(
+        postedFileNames.join(","),
+        "first-batch.pdf",
+        "F7 POST sends first-batch.pdf"
+      );
+      assertTrue(
+        !getStagedListText().includes("first-batch.pdf"),
+        "F7 immediately removes POST-accepted first-batch.pdf before detail GET resolves"
+      );
+      assertEqual(
+        hostEnv.storageMap.get("wb_last_batch_id"),
+        "batch-f7-new",
+        "F7 persists new batch-f7-new ID"
+      );
+      assertTrue(
+        hostEnv.win.location.search.includes("batch=batch-f7-new"),
+        "F7 updates URL query to batch=batch-f7-new"
+      );
+
+      // User adds next-batch.xlsx while initial detail GET is still in-flight!
+      const nextFile = new File(["PK\x03\x04next"], "next-batch.xlsx", {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+      const fileInputDuringGet = getUploadFileInput();
+      fileInputDuringGet.files = [nextFile];
+      await ReactMod.act(async () => {
+        const onChange = hostEnv.getProps(fileInputDuringGet).onChange as (
+          e: unknown
+        ) => void;
+        onChange({ target: fileInputDuringGet, currentTarget: fileInputDuringGet });
+      });
+      assertTrue(
+        getStagedListText().includes("next-batch.xlsx"),
+        "F7 stages next-batch.xlsx while GET #1 is in-flight"
+      );
+
+      // Now initial detail GET returns 503
+      await ReactMod.act(async () => {
+        detail1Release.resolve(
+          new Response(
             stringifyLosslessJson({
               code: "SERVICE_UNAVAILABLE",
               message: "临时 503 读取失败",
             }),
             { status: 503, headers: { "Content-Type": "application/json" } }
-          );
-        }
-        return new Response(openApiBatchEdge01RawText, {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      return new Response("{}", { status: 404 });
-    },
-  });
-  const f7Created = await f7Client.createBatch({
-    accounting_entity: "NEPTUNE SHIPPING LIMITED",
-    ocr_mode: "REMOTE_ONLY",
-    files: [new Blob(["%PDF-1.4"], { type: "application/pdf" })],
-    wait: false,
-  });
-  assertEqual(f7Created.id, "batch-f7-new", "F7 POST returns created batch id");
-  const f7InitialGetErr = await assertRejectsAsync(
-    f7Client.getBatchDetail(f7Created.id),
-    "F7 initial GET 503"
-  );
-  assertTrue(
-    f7InitialGetErr instanceof ApiClientError && f7InitialGetErr.status === 503,
-    "F7 initial detail GET surfaces 503 while retaining batch-f7-new"
-  );
-  const f7RetryGetDetail = await f7Client.getBatchDetail(f7Created.id);
-  assertEqual(
-    f7PostCount,
-    1,
-    "F7 retry flow triggers zero duplicate POSTs (POST count remains 1)"
-  );
-  assertEqual(f7GetCount, 2, "F7 retry invokes GET a second time");
-  assertEqual(
-    f7RetryGetDetail.id,
-    "batch-edge-01",
-    "F7 retry GET recovers full batch detail"
-  );
+          )
+        );
+      });
+      await flushActMicrotasks(6);
+
+      assertTrue(
+        getStagedListText().includes("next-batch.xlsx") &&
+          !getStagedListText().includes("first-batch.pdf"),
+        "F7 preserves next-batch.xlsx across detail GET 503 without wiping concurrent additions"
+      );
+      const submitBtnAfter503 = hostEnv.findNodes(
+        (n) => n.tagName === "BUTTON" && n.textContent.includes("开始智能解析")
+      )[0];
+      assertTrue(
+        Boolean(submitBtnAfter503) && !submitBtnAfter503.disabled,
+        "F7 keeps 开始智能解析 enabled for next-batch.xlsx after GET 503"
+      );
+      const bodyTextOn503 = hostEnv.doc.body!.textContent;
+      assertTrue(
+        bodyTextOn503.includes("batch-f7-new") &&
+          bodyTextOn503.includes("B-F7-01") &&
+          bodyTextOn503.includes("重试读取此批次"),
+        "F7 renders recovery card with exact batch-f7-new ID and 重试读取此批次 button"
+      );
+
+      // Click "重试读取此批次" -> must issue GET /batches/batch-f7-new (no second POST) and restore same batch ID
+      await ui.clickButton("重试读取此批次");
+      await flushActMicrotasks(6);
+
+      assertEqual(
+        f7PostCount,
+        1,
+        "F7 retry button triggers ZERO duplicate POSTs (POST count remains 1)"
+      );
+      assertEqual(
+        f7DetailGetCount,
+        2,
+        "F7 retry button issues second GET /api/v1/batches/batch-f7-new"
+      );
+      const shellTextRecovered = mountEl.textContent;
+      const retryButtonsAfter = hostEnv.findNodes(
+        (n) => n.tagName === "BUTTON" && n.textContent.includes("重试读取此批次")
+      );
+      assertTrue(
+        shellTextRecovered.includes("B-F7-01") &&
+          shellTextRecovered.includes("scan_corrupted.png") &&
+          shellTextRecovered.includes("H/D Fee Rebate") &&
+          !shellTextRecovered.includes("batch-edge-01") &&
+          !shellTextRecovered.includes("批次详情读取失败") &&
+          retryButtonsAfter.length === 0,
+        "F7 retry recovers full detail of SAME batch batch-f7-new (not another batch ID)"
+      );
+      assertTrue(
+        getStagedListText().includes("next-batch.xlsx"),
+        "F7 next-batch.xlsx remains staged and ready after retry recovery"
+      );
+    } finally {
+      detail1Release.resolve(new Response("{}", { status: 200 }));
+      await ReactMod.act(async () => {
+        root.unmount();
+      });
+      hostEnv.cleanup();
+    }
+  }
   results.push(
-    "PASS 28: F7 preserves created batch ID across detail GET 503 and recovers via GET only"
+    "PASS 28: C2+F7 real component upload -> POST 202 snapshot removal -> concurrent file retained across 503 -> same-batch GET retry"
   );
 
   // 29. F8: Authoritative 176 active ISO 4217 whitelist matches backend (CLF ok, HRK/XXX/XTS rejected)
@@ -2490,6 +3270,264 @@ export async function runDecimalJsonTests(): Promise<void> {
   results.push(
     "PASS 29: F8 176-code ISO 4217 whitelist aligns with backend (CLF accepted, HRK/XXX/XTS rejected)"
   );
+
+  // 30. R3-A1: Saving invalidates in-flight stale audit GET & auto-refetches when audit panel is expanded
+  {
+    let tracker = createAuditHistoryTracker();
+    const t1 = beginAuditHistoryRequest(tracker, "b-r3", "rec-1");
+    tracker = t1.nextTracker;
+    assertEqual(
+      shouldAcceptAuditHistoryResult(tracker, t1.ticket, "b-r3"),
+      true,
+      "R3-A1 tracker accepts current in-flight ticket"
+    );
+    tracker = invalidateAuditHistoryForRecord(tracker, "b-r3", "rec-1");
+    assertEqual(
+      shouldAcceptAuditHistoryResult(tracker, t1.ticket, "b-r3"),
+      false,
+      "R3-A1 record invalidation discards stale in-flight audit GET ticket"
+    );
+    const t2 = beginAuditHistoryRequest(tracker, "b-r3", "rec-1");
+    tracker = t2.nextTracker;
+    assertEqual(
+      shouldAcceptAuditHistoryResult(tracker, t2.ticket, "b-r3"),
+      true,
+      "R3-A1 tracker accepts newer audit GET ticket"
+    );
+    assertEqual(
+      shouldAcceptAuditHistoryResult(tracker, t1.ticket, "b-r3"),
+      false,
+      "R3-A1 stale ticket stays rejected even after new GET starts"
+    );
+    tracker = invalidateAuditHistoryForBatch(tracker, "b-r3");
+    assertEqual(
+      shouldAcceptAuditHistoryResult(tracker, t2.ticket, "b-r3"),
+      false,
+      "R3-A1 batch-level invalidation discards all in-flight tickets for that batch"
+    );
+
+    const hostEnv = installFakeDomHost();
+    const initialR3Batch = parseLosslessJson<Record<string, unknown>>(
+      stringifyLosslessJson(normalizedEdgeBatch)
+    );
+    initialR3Batch.id = "batch-r3-a1";
+    initialR3Batch.short_code = "B-R3-A1";
+    const r3Recs = initialR3Batch.records as Array<Record<string, unknown>>;
+    const targetRec: Record<string, unknown> = {
+      ...r3Recs[0],
+      id: "rec-r3-1",
+      updated_at: "2026-11-20T09:00:00Z",
+      charge_details: {
+        ...(r3Recs[0].charge_details as Record<string, unknown>),
+        quantity: 1,
+        unit_price: rawDecimal("245.00"),
+        amount: rawDecimal("245.00"),
+      },
+      document_info: {
+        ...(r3Recs[0].document_info as Record<string, unknown>),
+        document_type: "Debit Note",
+      },
+    };
+    initialR3Batch.records = [targetRec];
+
+    let auditGetCount = 0;
+    const staleGet1Started = createDeferred<void>();
+    const staleGet1Release = createDeferred<Response>();
+    const staleErrGetStarted = createDeferred<void>();
+    const staleErrGetRelease = createDeferred<Response>();
+    const serverAuditEntries: Array<Record<string, unknown>> = [];
+
+    const makeAuditExportResponse = (
+      entries: Array<Record<string, unknown>>
+    ): Response =>
+      new Response(
+        stringifyLosslessJson({
+          mode: "audit",
+          included_count: 1,
+          excluded_pending_count: 0,
+          excluded_rejected_count: 0,
+          records: [
+            {
+              operation: "CREATE",
+              document_info: targetRec.document_info,
+              transaction_party: targetRec.transaction_party,
+              charge_details: targetRec.charge_details,
+              financial_attributes: targetRec.financial_attributes,
+              audit_trail: {
+                record_id: "rec-r3-1",
+                ai_reasoning: [],
+                extraction_channel: "REMOTE_OCR",
+                retry_count: 0,
+                human_review_history: entries,
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+
+    const r3Client = new SsrBillingApiClient({
+      transport: async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        if (
+          method === "PATCH" &&
+          url.endsWith("/api/v1/batches/batch-r3-a1/records/rec-r3-1")
+        ) {
+          const patchBody = parseLosslessJson<Record<string, unknown>>(
+            String(init?.body ?? "{}")
+          );
+          const note =
+            typeof patchBody.review_note === "string"
+              ? patchBody.review_note
+              : "SAVED";
+          const curCharge = targetRec.charge_details as Record<string, unknown>;
+          const nextAmount =
+            patchBody.amount !== undefined
+              ? patchBody.amount
+              : curCharge.amount;
+          targetRec.charge_details = {
+            ...curCharge,
+            amount: nextAmount,
+          };
+          targetRec.updated_at = `2026-11-20T09:00:0${serverAuditEntries.length + 1}Z`;
+          serverAuditEntries.push({
+            action: "PATCH_RECORD",
+            operator: "财务复核员",
+            timestamp: targetRec.updated_at,
+            reason: note,
+          });
+          return new Response(
+            stringifyLosslessJson({
+              ...initialR3Batch,
+              records: [targetRec],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        if (
+          method === "GET" &&
+          url.includes("/api/v1/batches/batch-r3-a1/export?mode=audit")
+        ) {
+          auditGetCount++;
+          if (auditGetCount === 1) {
+            staleGet1Started.resolve();
+            return await staleGet1Release.promise;
+          }
+          if (auditGetCount === 3) {
+            staleErrGetStarted.resolve();
+            return await staleErrGetRelease.promise;
+          }
+          return makeAuditExportResponse([...serverAuditEntries]);
+        }
+        return new Response("{}", { status: 404 });
+      },
+    });
+
+    const mountEl = hostEnv.doc.createElement!("div");
+    hostEnv.doc.body!.appendChild(mountEl);
+    const root = ReactDomClient.createRoot(mountEl);
+    try {
+      await ReactMod.act(async () => {
+        root.render(
+          ReactMod.createElement(AppComponentRef, {
+            apiClient: r3Client,
+            initialBatch: ssrNormalizeBatchDetail(
+              ssrParseLosslessJson(stringifyLosslessJson(initialR3Batch))
+            ),
+          })
+        );
+      });
+      await flushActMicrotasks();
+      const ui = createAppMountHelpers(hostEnv);
+
+      // 1. Expand audit details -> slow GET #1 (will return empty []) is held
+      await ui.clickButton("展开审计详情");
+      await staleGet1Started.promise;
+      assertEqual(auditGetCount, 1, "R3-A1 initial expand triggers audit GET #1");
+
+      // 2. Edit amount + review_note "R3-LATEST" and save while GET #1 is held
+      await ui.changeInputByPlaceholder("9007199254740991.01", "246.01");
+      await ui.changeInputByPlaceholder("仅本次提交写入审计历史", "R3-LATEST");
+      await ui.clickButton("保存修订并重验");
+      await flushActMicrotasks(8);
+
+      // 3. Audit panel stays expanded & automatically fires GET #2 with R3-LATEST
+      assertEqual(
+        auditGetCount,
+        2,
+        "R3-A1 expanded panel auto-refetches GET #2 after PATCH 200 without collapse/re-expand"
+      );
+      const getAuditBoxText = () =>
+        hostEnv
+          .findNodes((n) => (n.attributes.class ?? "").includes("wb-audit-box"))
+          .map((n) => n.textContent)
+          .join("\n");
+      assertTrue(
+        getAuditBoxText().includes("R3-LATEST"),
+        "R3-A1 displays R3-LATEST immediately from auto-refetched GET #2"
+      );
+
+      // 4. Release stale held GET #1 returning [] -> MUST be discarded, NOT overwrite R3-LATEST
+      await ReactMod.act(async () => {
+        staleGet1Release.resolve(makeAuditExportResponse([]));
+      });
+      await flushActMicrotasks(6);
+      assertTrue(
+        getAuditBoxText().includes("R3-LATEST") &&
+          !getAuditBoxText().includes("暂无人工作业审计记录"),
+        "R3-A1 discards stale empty GET #1 response instead of overwriting R3-LATEST"
+      );
+
+      // 5. Collapse & re-expand -> hold GET #3 (will fail 500) -> save R3-LATEST-2 -> release stale error GET #3
+      await ui.clickButton("收起审计详情");
+      await ui.clickButton("展开审计详情");
+      await staleErrGetStarted.promise;
+      assertEqual(auditGetCount, 3, "R3-A1 re-expand triggers audit GET #3");
+
+      await ui.changeInputByPlaceholder("9007199254740991.01", "247.02");
+      await ui.changeInputByPlaceholder("仅本次提交写入审计历史", "R3-LATEST-2");
+      await ui.clickButton("保存修订并重验");
+      await flushActMicrotasks(8);
+      assertEqual(auditGetCount, 4, "R3-A1 second save auto-triggers audit GET #4");
+      assertTrue(
+        getAuditBoxText().includes("R3-LATEST-2"),
+        "R3-A1 renders R3-LATEST-2 from GET #4"
+      );
+
+      await ReactMod.act(async () => {
+        staleErrGetRelease.resolve(
+          new Response(
+            stringifyLosslessJson({
+              code: "INTERNAL_ERROR",
+              message: "旧慢速请求异常不应覆盖最新审计",
+            }),
+            { status: 500, headers: { "Content-Type": "application/json" } }
+          )
+        );
+      });
+      await flushActMicrotasks(6);
+      assertTrue(
+        getAuditBoxText().includes("R3-LATEST-2") &&
+          !getAuditBoxText().includes("旧慢速请求异常不应覆盖最新审计"),
+        "R3-A1 discards stale GET #3 error instead of overwriting R3-LATEST-2"
+      );
+    } finally {
+      staleGet1Release.resolve(makeAuditExportResponse([]));
+      staleErrGetRelease.resolve(makeAuditExportResponse([]));
+      await ReactMod.act(async () => {
+        root.unmount();
+      });
+      hostEnv.cleanup();
+    }
+  }
+  results.push(
+    "PASS 30: R3-A1 save invalidates stale in-flight audit GET/error & auto-refetches while expanded"
+  );
+
+  } finally {
+    await viteServer.close();
+  }
 
   for (const line of results) {
     console.log(line);

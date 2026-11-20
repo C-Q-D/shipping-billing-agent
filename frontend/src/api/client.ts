@@ -351,47 +351,79 @@ function normalizeDecimalField(
 }
 
 export function normalizeShipmentRefs(
-  raw: ShipmentRefs | undefined | null
+  raw: ShipmentRefs | undefined
 ): ShipmentRefs {
-  const safe = raw && typeof raw === "object" ? raw : {};
+  if (raw === undefined) {
+    return {
+      mbl_nos: [],
+      hbl_no: null,
+      booking_no: null,
+      container_nos: [],
+    };
+  }
+  if (!isPlainObject(raw)) {
+    return raw as unknown as ShipmentRefs;
+  }
   return {
-    mbl_nos: Array.isArray(safe.mbl_nos) ? safe.mbl_nos : [],
-    hbl_no: safe.hbl_no ?? null,
-    booking_no: safe.booking_no ?? null,
-    container_nos: Array.isArray(safe.container_nos) ? safe.container_nos : [],
+    mbl_nos: raw.mbl_nos === undefined ? [] : raw.mbl_nos,
+    hbl_no: raw.hbl_no ?? null,
+    booking_no: raw.booking_no ?? null,
+    container_nos: raw.container_nos === undefined ? [] : raw.container_nos,
   };
 }
 
 export function normalizeSourceEvidence(
-  raw: Record<string, unknown> | undefined | null
+  raw: Record<string, unknown> | undefined
 ): Record<string, unknown> {
-  const safe = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-  const next = copyDecimalMeta(safe, {
-    ...safe,
-    source_paths: Array.isArray(safe.source_paths) ? safe.source_paths : [],
+  if (raw === undefined) {
+    return { source_paths: [] };
+  }
+  if (!isPlainObject(raw)) {
+    return raw as unknown as Record<string, unknown>;
+  }
+  return copyDecimalMeta(raw, {
+    ...raw,
+    source_paths: raw.source_paths === undefined ? [] : raw.source_paths,
   });
-  return next;
 }
 
 export function normalizeSourceDocument(
   raw: SourceDocumentSummary
 ): SourceDocumentSummary {
-  return copyDecimalMeta(raw, {
+  const rawRecord = raw as unknown as Record<string, unknown>;
+  const hasExtractionSnapshot =
+    rawRecord.extraction_snapshot !== undefined &&
+    rawRecord.extraction_snapshot !== null;
+  const normalized: Record<string, unknown> = {
     ...raw,
     parent_doc_id: raw.parent_doc_id ?? null,
     error_message: raw.error_message ?? null,
-    affected_record_ids: Array.isArray(raw.affected_record_ids)
-      ? raw.affected_record_ids
-      : [],
-    excluded_clauses: Array.isArray(raw.excluded_clauses)
-      ? raw.excluded_clauses
-      : [],
-    shipment_refs: normalizeShipmentRefs(raw.shipment_refs),
-    subtotal_amount: raw.subtotal_amount ?? null,
-    tax_amount: raw.tax_amount ?? null,
-    total_amount: raw.total_amount ?? null,
-    total_currency: raw.total_currency ?? null,
-  });
+    affected_record_ids:
+      raw.affected_record_ids === undefined ? [] : raw.affected_record_ids,
+  };
+  if (raw.excluded_clauses !== undefined) {
+    normalized.excluded_clauses = raw.excluded_clauses;
+  } else if (!hasExtractionSnapshot) {
+    normalized.excluded_clauses = [];
+  }
+  if (raw.shipment_refs !== undefined) {
+    normalized.shipment_refs = normalizeShipmentRefs(raw.shipment_refs);
+  } else if (!hasExtractionSnapshot) {
+    normalized.shipment_refs = normalizeShipmentRefs(undefined);
+  }
+  if (!hasExtractionSnapshot || raw.subtotal_amount !== undefined) {
+    normalized.subtotal_amount = raw.subtotal_amount ?? null;
+  }
+  if (!hasExtractionSnapshot || raw.tax_amount !== undefined) {
+    normalized.tax_amount = raw.tax_amount ?? null;
+  }
+  if (!hasExtractionSnapshot || raw.total_amount !== undefined) {
+    normalized.total_amount = raw.total_amount ?? null;
+  }
+  if (!hasExtractionSnapshot || raw.total_currency !== undefined) {
+    normalized.total_currency = raw.total_currency ?? null;
+  }
+  return copyDecimalMeta(raw, normalized as unknown as SourceDocumentSummary);
 }
 
 export function normalizeBillingRecord(
@@ -440,12 +472,14 @@ export function normalizeBillingRecord(
     ...raw,
     matched_existing_bill_id: raw.matched_existing_bill_id ?? null,
     matched_bill_ref: raw.matched_bill_ref ?? null,
-    inherited_fields: Array.isArray(raw.inherited_fields)
-      ? raw.inherited_fields
-      : [],
-    candidate_bills: Array.isArray(raw.candidate_bills)
-      ? raw.candidate_bills.map((cand) => copyDecimalMeta(cand, { ...cand }))
-      : [],
+    inherited_fields:
+      raw.inherited_fields === undefined ? [] : raw.inherited_fields,
+    candidate_bills:
+      raw.candidate_bills === undefined
+        ? []
+        : Array.isArray(raw.candidate_bills)
+          ? raw.candidate_bills.map((cand) => copyDecimalMeta(cand, { ...cand }))
+          : raw.candidate_bills,
     document_info: {
       document_type: safeDocInfo.document_type ?? null,
       reference_no: safeDocInfo.reference_no ?? null,
@@ -459,19 +493,21 @@ export function normalizeBillingRecord(
     financial_attributes: safeFinancial,
     shipment_refs: normalizeShipmentRefs(raw.shipment_refs),
     source_evidence: normalizeSourceEvidence(raw.source_evidence),
-    field_diffs: Array.isArray(raw.field_diffs)
-      ? raw.field_diffs.map((diff) => copyDecimalMeta(diff, { ...diff }))
-      : [],
-    validation_alerts: Array.isArray(raw.validation_alerts)
-      ? raw.validation_alerts
-      : [],
-    ai_reasoning: Array.isArray(raw.ai_reasoning) ? raw.ai_reasoning : [],
+    field_diffs:
+      raw.field_diffs === undefined
+        ? []
+        : Array.isArray(raw.field_diffs)
+          ? raw.field_diffs.map((diff) => copyDecimalMeta(diff, { ...diff }))
+          : raw.field_diffs,
+    validation_alerts:
+      raw.validation_alerts === undefined ? [] : raw.validation_alerts,
+    ai_reasoning: raw.ai_reasoning === undefined ? [] : raw.ai_reasoning,
     human_overrides:
-      raw.human_overrides &&
-      typeof raw.human_overrides === "object" &&
-      !Array.isArray(raw.human_overrides)
-        ? copyDecimalMeta(raw.human_overrides, { ...raw.human_overrides })
-        : {},
+      raw.human_overrides === undefined
+        ? {}
+        : isPlainObject(raw.human_overrides)
+          ? copyDecimalMeta(raw.human_overrides, { ...raw.human_overrides })
+          : raw.human_overrides,
     reject_reason: raw.reject_reason ?? null,
   });
 }

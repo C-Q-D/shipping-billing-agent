@@ -205,6 +205,7 @@ export function ReviewInspector({
   const replaceFileInputRef = useRef<HTMLInputElement | null>(null);
   const replaceTargetDocIdRef = useRef<string | null>(null);
   const fieldRefs = useRef<Record<string, HTMLElement | null>>({});
+  const lastAuditStampRef = useRef<string | null>(null);
 
   const [highlightedField, setHighlightedField] = useState<string | null>(null);
   const [recordValidationErrors, setRecordValidationErrors] = useState<
@@ -239,8 +240,37 @@ export function ReviewInspector({
     setApproveReason("");
     setApproveReasonError(null);
     setAuditExpanded(false);
+    lastAuditStampRef.current = null;
     setHighlightedField(null);
   }, [batch?.id, selectedRecord?.id]);
+
+  useEffect(() => {
+    if (!auditExpanded || !batch || !selectedRecord) {
+      return;
+    }
+    if (lastAuditStampRef.current === null) {
+      return;
+    }
+    const key = `${batch.id}::${selectedRecord.id}`;
+    const stamp = `${key}::${selectedRecord.updated_at ?? ""}`;
+    const currentEntry = auditHistoryByKey[key];
+    if (!currentEntry) {
+      lastAuditStampRef.current = stamp;
+      onRequestAuditHistory(batch.id, selectedRecord.id);
+      return;
+    }
+    if (lastAuditStampRef.current !== stamp && !currentEntry.loading) {
+      lastAuditStampRef.current = stamp;
+      onRequestAuditHistory(batch.id, selectedRecord.id);
+    }
+  }, [
+    auditExpanded,
+    auditHistoryByKey,
+    batch?.id,
+    selectedRecord?.id,
+    selectedRecord?.updated_at,
+    onRequestAuditHistory,
+  ]);
 
   useEffect(() => {
     setDocValidationErrors({});
@@ -1739,7 +1769,10 @@ export function ReviewInspector({
                     const nextOpen = !auditExpanded;
                     setAuditExpanded(nextOpen);
                     if (nextOpen) {
+                      lastAuditStampRef.current = `${batch.id}::${selectedRecord.id}::${selectedRecord.updated_at ?? ""}`;
                       onRequestAuditHistory(batch.id, selectedRecord.id);
+                    } else {
+                      lastAuditStampRef.current = null;
                     }
                   }}
                 >
@@ -1749,11 +1782,11 @@ export function ReviewInspector({
 
               {auditExpanded ? (
                 <div className="wb-audit-box">
-                  {auditState?.loading ? (
+                  {auditState?.loading || !auditState ? (
                     <div className="wb-helper-note">正在按需拉取审计轨迹...</div>
-                  ) : auditState?.error ? (
+                  ) : auditState.error ? (
                     <div className="wb-field-error">{auditState.error}</div>
-                  ) : auditState ? (
+                  ) : (
                     <>
                       <div className="wb-chip-row wb-tabular">
                         {auditState.extractionChannel ? (
@@ -1782,7 +1815,7 @@ export function ReviewInspector({
                         </ul>
                       )}
                     </>
-                  ) : null}
+                  )}
                 </div>
               ) : null}
             </div>

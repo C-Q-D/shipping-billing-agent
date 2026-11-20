@@ -128,6 +128,7 @@ export interface UploadAndFileTreeProps {
     files: File[];
     publicUrls: string[];
     existingBillsJsonText: string;
+    onAccepted?: () => void;
   }) => Promise<boolean>;
   onSubmitDemo: (args: {
     accountingEntity: string;
@@ -163,8 +164,10 @@ export function UploadAndFileTree({
   const [publicUrlLinesText, setPublicUrlLinesText] = useState("");
   const [customEntityInput, setCustomEntityInput] = useState("");
   const [ocrMode, setOcrMode] = useState<OcrMode>("REMOTE_ONLY");
-  const [batchBillsName, setBatchBillsName] = useState<string | null>(null);
-  const [batchBillsText, setBatchBillsText] = useState("");
+  const [batchBills, setBatchBills] = useState<{
+    name: string | null;
+    text: string;
+  }>({ name: null, text: "" });
   const [hasAttemptedSubmit, setHasAttemptedSubmit] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -190,9 +193,9 @@ export function UploadAndFileTree({
         accountingEntity: effectiveEntity,
         files: stagedFiles,
         publicUrlLinesText,
-        existingBillsJsonText: batchBillsText,
+        existingBillsJsonText: batchBills.text,
       }),
-    [effectiveEntity, stagedFiles, publicUrlLinesText, batchBillsText]
+    [effectiveEntity, stagedFiles, publicUrlLinesText, batchBills.text]
   );
 
   const appendFiles = (incoming: File[]) => {
@@ -237,8 +240,7 @@ export function UploadAndFileTree({
     e.target.value = "";
     if (!file) return;
     const text = await file.text();
-    setBatchBillsName(file.name);
-    setBatchBillsText(text);
+    setBatchBills({ name: file.name, text });
   };
 
   const handleSubmit = async () => {
@@ -246,19 +248,36 @@ export function UploadAndFileTree({
     if (!validation.valid) {
       return;
     }
+    const submittedFiles = [...stagedFiles];
+    const submittedSet = new Set(submittedFiles);
+    const submittedUrlText = publicUrlLinesText;
+    const submittedBills = batchBills;
+    const parsedUrls = [...validation.parsedUrls];
+    let accepted = false;
+
+    const handleAccepted = () => {
+      if (accepted) return;
+      accepted = true;
+      setStagedFiles((prev) => prev.filter((file) => !submittedSet.has(file)));
+      setPublicUrlLinesText((prev) => (prev === submittedUrlText ? "" : prev));
+      setBatchBills((prev) =>
+        prev.text === submittedBills.text && prev.name === submittedBills.name
+          ? { name: null, text: "" }
+          : prev
+      );
+      setHasAttemptedSubmit(false);
+    };
+
     const ok = await onSubmitBatch({
       accountingEntity: effectiveEntity,
       ocrMode,
-      files: stagedFiles,
-      publicUrls: validation.parsedUrls,
-      existingBillsJsonText: batchBillsText,
+      files: submittedFiles,
+      publicUrls: parsedUrls,
+      existingBillsJsonText: submittedBills.text,
+      onAccepted: handleAccepted,
     });
-    if (ok) {
-      setStagedFiles([]);
-      setPublicUrlLinesText("");
-      setBatchBillsName(null);
-      setBatchBillsText("");
-      setHasAttemptedSubmit(false);
+    if (ok && !accepted) {
+      handleAccepted();
     }
   };
 
@@ -471,17 +490,14 @@ export function UploadAndFileTree({
                 icon="ri-file-code-line"
                 onClick={() => billsFileInputRef.current?.click()}
               >
-                {batchBillsName ? `已选：${batchBillsName}` : "挂载随批 JSON"}
+                {batchBills.name ? `已选：${batchBills.name}` : "挂载随批 JSON"}
               </LumnoButton>
-              {batchBillsName ? (
+              {batchBills.name ? (
                 <LumnoButton
                   variant="ghost"
                   compact
                   icon="ri-close-line"
-                  onClick={() => {
-                    setBatchBillsName(null);
-                    setBatchBillsText("");
-                  }}
+                  onClick={() => setBatchBills({ name: null, text: "" })}
                 >
                   移除
                 </LumnoButton>

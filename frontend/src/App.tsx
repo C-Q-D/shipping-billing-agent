@@ -26,6 +26,7 @@ import { rawDecimal } from "./api/decimalJson.ts";
 import { validateReviewBundleInput } from "./api/managementHelpers.ts";
 import {
   acceptPollResult,
+  beginAuditHistoryRequest,
   beginDocTotalsSave,
   beginRecordSave,
   buildDocTotalsDiffPatch,
@@ -35,6 +36,7 @@ import {
   clearDocTotalsDraft,
   clearRecordDraft,
   countUnsavedDraftsInBatch,
+  createAuditHistoryTracker,
   createEmptyDraftStore,
   createPollRaceTracker,
   extractMutationErrorBanner,
@@ -49,16 +51,21 @@ import {
   getDocTotalsDraftVersion,
   getRecordDraftVersion,
   hasRecordDraft,
+  invalidateAuditHistoryForBatch,
+  invalidateAuditHistoryForRecord,
   isActiveBatchStage,
+  makeAuditHistoryKey,
   makeDocDraftKey,
   makeRecordDraftKey,
   setDocTotalsDraftField,
   setRecordDraftField,
   setTrackerActiveBatch,
+  shouldAcceptAuditHistoryResult,
   shouldContinuePollingAfterDiscard,
   startMutation,
   startPoll,
   validateReviewReason,
+  type AuditHistoryRequestTracker,
   type DraftStoreState,
   type MutationErrorBanner,
   type PendingBatchDetailRecovery,
@@ -107,6 +114,7 @@ export interface AppProps {
   initialBatch?: BatchDetail | null;
   initialBatches?: BatchSummary[];
   initialPendingBatchRecovery?: PendingBatchDetailRecovery | null;
+  apiClient?: BillingApiClient;
 }
 
 function toBatchSummary(item: BatchSummary | BatchDetail): BatchSummary {
@@ -162,8 +170,9 @@ export default function App({
   initialBatch = null,
   initialBatches,
   initialPendingBatchRecovery = null,
+  apiClient,
 }: AppProps = {}) {
-  const api = useMemo(() => new BillingApiClient(), []);
+  const api = useMemo(() => apiClient ?? new BillingApiClient(), [apiClient]);
   const stubMode = useMemo(() => isStubModeActive(), []);
 
   const [theme, setTheme] = useState<LumnoTheme>("light");
@@ -231,6 +240,35 @@ export default function App({
   const [auditHistoryByKey, setAuditHistoryByKey] = useState<
     Record<string, RecordAuditHistoryState>
   >({});
+  const auditTrackerRef = useRef<AuditHistoryRequestTracker>(
+    createAuditHistoryTracker()
+  );
+
+  const invalidateAuditHistory = useCallback(
+    (target: { batchId: string; recordId?: string }) => {
+      if (target.recordId) {
+        const key = makeAuditHistoryKey(target.batchId, target.recordId);
+        auditTrackerRef.current = invalidateAuditHistoryForRecord(
+          auditTrackerRef.current,
+          target.batchId,
+          target.recordId
+        );
+        setAuditHistoryByKey((prev) => {
+          if (!(key in prev)) return prev;
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
+        return;
+      }
+      auditTrackerRef.current = invalidateAuditHistoryForBatch(
+        auditTrackerRef.current,
+        target.batchId
+      );
+      setAuditHistoryByKey((prev) => clearBatchScopedMap(prev, target.batchId));
+    },
+    []
+  );
 
   // T02: Monotonic revision, poll-race guard & polling transient resilience
   const pollTrackerRef = useRef(
@@ -781,6 +819,7 @@ export default function App({
     files: File[];
     publicUrls: string[];
     existingBillsJsonText: string;
+    onAccepted?: () => void;
   }): Promise<boolean> => {
     setSubmittingBatch(true);
     try {
@@ -792,6 +831,10 @@ export default function App({
         existing_bills_json: args.existingBillsJsonText,
         wait: false,
       });
+      // F7: Remove submitted snapshot & release submit button as soon as POST is accepted,
+      // before awaiting initial detail GET so files added during GET window are preserved and submittable.
+      args.onAccepted?.();
+      setSubmittingBatch(false);
       return await activateNewlyCreatedBatch(res, false);
     } catch (err) {
       pushToast(
@@ -848,7 +891,7 @@ export default function App({
       setBatchRevision(finished.nextTracker.batchRevision);
       // F2: Only clear drafts and audit cache belonging to targetBatchId
       updateDraftStore((prev) => clearBatchDrafts(prev, targetBatchId));
-      setAuditHistoryByKey((prev) => clearBatchScopedMap(prev, targetBatchId));
+      invalidateAuditHistory({ batchId: targetBatchId });
       if (finished.shouldApply) {
         applyFreshBatchDetail(res.batch);
         setMutationError(null);
@@ -871,20 +914,22 @@ export default function App({
 
   const handleForceParseDoc = async (docId: string) => {
     if (!activeBatch) return;
+    const targetBatchId = activeBatch.id;
     setForcingDocId(docId);
     const { nextTracker, ticket } = startMutation(
       pollTrackerRef.current,
-      activeBatch.id
+      targetBatchId
     );
     pollTrackerRef.current = nextTracker;
     try {
       const updated = await api.forceParseSkippedDocument(
-        activeBatch.id,
+        targetBatchId,
         docId
       );
       const finished = finishMutationSuccess(pollTrackerRef.current, ticket);
       pollTrackerRef.current = finished.nextTracker;
       setBatchRevision(finished.nextTracker.batchRevision);
+      invalidateAuditHistory({ batchId: targetBatchId });
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
         setMutationError(null);
@@ -921,7 +966,7 @@ export default function App({
       const finished = finishMutationSuccess(pollTrackerRef.current, ticket);
       pollTrackerRef.current = finished.nextTracker;
       setBatchRevision(finished.nextTracker.batchRevision);
-      setAuditHistoryByKey((prev) => clearBatchScopedMap(prev, targetBatchId));
+      invalidateAuditHistory({ batchId: targetBatchId });
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
         setMutationError(null);
@@ -989,7 +1034,7 @@ export default function App({
           submittedVersion ?? undefined
         )
       );
-      setAuditHistoryByKey((prev) => clearBatchScopedMap(prev, batchId));
+      invalidateAuditHistory({ batchId });
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
         setMutationError(null);
@@ -1058,11 +1103,7 @@ export default function App({
           submittedVersion ?? undefined
         )
       );
-      setAuditHistoryByKey((prev) => {
-        const next = { ...prev };
-        delete next[`${batchId}::${record.id}`];
-        return next;
-      });
+      invalidateAuditHistory({ batchId, recordId: record.id });
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
         setMutationError(null);
@@ -1109,14 +1150,10 @@ export default function App({
       const finished = finishMutationSuccess(pollTrackerRef.current, ticket);
       pollTrackerRef.current = finished.nextTracker;
       setBatchRevision(finished.nextTracker.batchRevision);
+      invalidateAuditHistory({ batchId, recordId: record.id });
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
         setMutationError(null);
-        setAuditHistoryByKey((prev) => {
-          const next = { ...prev };
-          delete next[`${batchId}::${record.id}`];
-          return next;
-        });
       }
       pushToast("已批准该条费用记录入账");
     } catch (err) {
@@ -1157,14 +1194,10 @@ export default function App({
       const finished = finishMutationSuccess(pollTrackerRef.current, ticket);
       pollTrackerRef.current = finished.nextTracker;
       setBatchRevision(finished.nextTracker.batchRevision);
+      invalidateAuditHistory({ batchId, recordId: record.id });
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
         setMutationError(null);
-        setAuditHistoryByKey((prev) => {
-          const next = { ...prev };
-          delete next[`${batchId}::${record.id}`];
-          return next;
-        });
       }
       pushToast("已将该费用记录驳回并从 official 口径排除");
     } catch (err) {
@@ -1183,7 +1216,13 @@ export default function App({
 
   const handleRequestAuditHistory = useCallback(
     async (batchId: string, recordId: string) => {
-      const key = `${batchId}::${recordId}`;
+      const { nextTracker, ticket } = beginAuditHistoryRequest(
+        auditTrackerRef.current,
+        batchId,
+        recordId
+      );
+      auditTrackerRef.current = nextTracker;
+      const key = ticket.key;
       setAuditHistoryByKey((prev) => ({
         ...prev,
         [key]: {
@@ -1196,6 +1235,15 @@ export default function App({
       }));
       try {
         const res = await api.exportBatchJson(batchId, "audit");
+        if (
+          !shouldAcceptAuditHistoryResult(
+            auditTrackerRef.current,
+            ticket,
+            pollTrackerRef.current.activeBatchId
+          )
+        ) {
+          return;
+        }
         const matched = (res.records ?? []).find(
           (item) => item.audit_trail.record_id === recordId
         );
@@ -1217,28 +1265,59 @@ export default function App({
             typeof entry.reason === "string" ? entry.reason : undefined,
         }));
 
-        setAuditHistoryByKey((prev) => ({
-          ...prev,
-          [key]: {
-            loading: false,
-            error: null,
-            retryCount,
-            extractionChannel,
-            history,
-          },
-        }));
+        setAuditHistoryByKey((prev) => {
+          if (
+            !shouldAcceptAuditHistoryResult(
+              auditTrackerRef.current,
+              ticket,
+              pollTrackerRef.current.activeBatchId
+            )
+          ) {
+            return prev;
+          }
+          return {
+            ...prev,
+            [key]: {
+              loading: false,
+              error: null,
+              retryCount,
+              extractionChannel,
+              history,
+            },
+          };
+        });
       } catch (err) {
-        setAuditHistoryByKey((prev) => ({
-          ...prev,
-          [key]: {
-            loading: false,
-            error:
-              err instanceof Error ? err.message : "按需加载审计历史失败",
-            retryCount: null,
-            extractionChannel: null,
-            history: [],
-          },
-        }));
+        if (
+          !shouldAcceptAuditHistoryResult(
+            auditTrackerRef.current,
+            ticket,
+            pollTrackerRef.current.activeBatchId
+          )
+        ) {
+          return;
+        }
+        setAuditHistoryByKey((prev) => {
+          if (
+            !shouldAcceptAuditHistoryResult(
+              auditTrackerRef.current,
+              ticket,
+              pollTrackerRef.current.activeBatchId
+            )
+          ) {
+            return prev;
+          }
+          return {
+            ...prev,
+            [key]: {
+              loading: false,
+              error:
+                err instanceof Error ? err.message : "按需加载审计历史失败",
+              retryCount: null,
+              extractionChannel: null,
+              history: [],
+            },
+          };
+        });
       }
     },
     [api]
@@ -1288,7 +1367,7 @@ export default function App({
       const finished = finishMutationSuccess(pollTrackerRef.current, ticket);
       pollTrackerRef.current = finished.nextTracker;
       setBatchRevision(finished.nextTracker.batchRevision);
-      setAuditHistoryByKey((prev) => clearBatchScopedMap(prev, targetBatchId));
+      invalidateAuditHistory({ batchId: targetBatchId });
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
         setMutationError(null);
@@ -1336,7 +1415,7 @@ export default function App({
       );
       setBatchRevision(pollTrackerRef.current.batchRevision);
       applyFreshBatchDetail(imported);
-      setAuditHistoryByKey((prev) => clearBatchScopedMap(prev, imported.id));
+      invalidateAuditHistory({ batchId: imported.id });
       setEntityNotice(null);
       await refreshBatchesList().catch(() => undefined);
       setImportModalOpen(false);
@@ -1455,6 +1534,7 @@ export default function App({
       const finished = finishMutationSuccess(pollTrackerRef.current, ticket);
       pollTrackerRef.current = finished.nextTracker;
       setBatchRevision(finished.nextTracker.batchRevision);
+      invalidateAuditHistory({ batchId: activeBatch.id });
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
         const safeRecords = updated.records ?? [];

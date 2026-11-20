@@ -1343,3 +1343,115 @@ export interface PendingBatchDetailRecovery {
   loading: boolean;
   errorMessage: string | null;
 }
+
+export interface AuditHistoryRequestTracker {
+  nextSeq: number;
+  latestSeqByKey: Record<string, number>;
+  batchEpochs: Record<string, number>;
+}
+
+export interface AuditHistoryRequestTicket {
+  key: string;
+  batchId: string;
+  recordId: string;
+  reqSeq: number;
+  batchEpoch: number;
+}
+
+export function makeAuditHistoryKey(batchId: string, recordId: string): string {
+  return `${batchId}::${recordId}`;
+}
+
+export function createAuditHistoryTracker(): AuditHistoryRequestTracker {
+  return {
+    nextSeq: 0,
+    latestSeqByKey: {},
+    batchEpochs: {},
+  };
+}
+
+export function beginAuditHistoryRequest(
+  tracker: AuditHistoryRequestTracker,
+  batchId: string,
+  recordId: string
+): {
+  nextTracker: AuditHistoryRequestTracker;
+  ticket: AuditHistoryRequestTicket;
+} {
+  const key = makeAuditHistoryKey(batchId, recordId);
+  const nextSeq = tracker.nextSeq + 1;
+  const batchEpoch = tracker.batchEpochs[batchId] ?? 0;
+  return {
+    nextTracker: {
+      ...tracker,
+      nextSeq,
+      latestSeqByKey: {
+        ...tracker.latestSeqByKey,
+        [key]: nextSeq,
+      },
+    },
+    ticket: {
+      key,
+      batchId,
+      recordId,
+      reqSeq: nextSeq,
+      batchEpoch,
+    },
+  };
+}
+
+export function invalidateAuditHistoryForRecord(
+  tracker: AuditHistoryRequestTracker,
+  batchId: string,
+  recordId: string
+): AuditHistoryRequestTracker {
+  const key = makeAuditHistoryKey(batchId, recordId);
+  const nextSeq = tracker.nextSeq + 1;
+  return {
+    ...tracker,
+    nextSeq,
+    latestSeqByKey: {
+      ...tracker.latestSeqByKey,
+      [key]: nextSeq,
+    },
+  };
+}
+
+export function invalidateAuditHistoryForBatch(
+  tracker: AuditHistoryRequestTracker,
+  batchId: string
+): AuditHistoryRequestTracker {
+  const prefix = `${batchId}::`;
+  const nextSeq = tracker.nextSeq + 1;
+  const nextBatchEpoch = (tracker.batchEpochs[batchId] ?? 0) + 1;
+  const nextLatestSeqByKey: Record<string, number> = {
+    ...tracker.latestSeqByKey,
+  };
+  for (const key of Object.keys(nextLatestSeqByKey)) {
+    if (key.startsWith(prefix)) {
+      nextLatestSeqByKey[key] = nextSeq;
+    }
+  }
+  return {
+    nextSeq,
+    latestSeqByKey: nextLatestSeqByKey,
+    batchEpochs: {
+      ...tracker.batchEpochs,
+      [batchId]: nextBatchEpoch,
+    },
+  };
+}
+
+export function shouldAcceptAuditHistoryResult(
+  tracker: AuditHistoryRequestTracker,
+  ticket: AuditHistoryRequestTicket,
+  activeBatchId: string | null
+): boolean {
+  if (activeBatchId !== ticket.batchId) {
+    return false;
+  }
+  if ((tracker.batchEpochs[ticket.batchId] ?? 0) !== ticket.batchEpoch) {
+    return false;
+  }
+  return tracker.latestSeqByKey[ticket.key] === ticket.reqSeq;
+}

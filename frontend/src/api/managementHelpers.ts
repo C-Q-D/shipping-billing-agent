@@ -898,6 +898,26 @@ const VALID_REVIEW_STATUSES = new Set([
   "APPROVED",
   "REJECTED",
 ]);
+const VALID_ALERT_SEVERITIES = new Set(["BLOCKER", "WARNING", "RESOLVED"]);
+const ALERT_CODE_DEFAULT_SEVERITY: Record<string, "BLOCKER" | "WARNING"> = {
+  LINE_ARITHMETIC_MISMATCH: "BLOCKER",
+  NEGATIVE_NON_CREDIT_AMOUNT: "BLOCKER",
+  INVALID_OR_MISSING_CURRENCY: "BLOCKER",
+  INVALID_DOCUMENT_DATE: "BLOCKER",
+  ENTITY_NOT_MATCHED: "BLOCKER",
+  AMOUNT_SUBTOTAL_TAX_MISMATCH: "BLOCKER",
+  AMOUNT_TOTAL_MISMATCH: "BLOCKER",
+  MULTI_CURRENCY_TOTAL_AMBIGUITY: "BLOCKER",
+  OCR_NUMERIC_CONFUSION: "BLOCKER",
+  AMBIGUOUS_EXISTING_BILL: "BLOCKER",
+  DUPLICATE_LINE_EXTRACTED: "BLOCKER",
+  CROSS_DOCUMENT_CONFLICT: "BLOCKER",
+  LLM_EXTRACTION_FAILED: "BLOCKER",
+  CONTAINER_ISO6346_MISMATCH: "WARNING",
+  OCR_SUSPICIOUS_FLAG: "WARNING",
+  MULTI_SOURCE_BL_MISMATCH: "WARNING",
+  CONTEXT_INFERRED_FIELD: "WARNING",
+};
 
 function isNullableString(val: unknown): val is string | null {
   return val === null || typeof val === "string";
@@ -909,14 +929,63 @@ function isOptionalNullableString(
   return val === undefined || val === null || typeof val === "string";
 }
 
+function isOptionalNullableInteger(val: unknown): boolean {
+  return (
+    val === undefined ||
+    val === null ||
+    (typeof val === "number" && Number.isInteger(val))
+  );
+}
+
 function isStringArray(val: unknown): val is string[] {
   return Array.isArray(val) && val.every((item) => typeof item === "string");
 }
 
+function isFieldDiffArray(val: unknown): boolean {
+  return (
+    Array.isArray(val) &&
+    val.every(
+      (diff) =>
+        isPlainObject(diff) &&
+        typeof diff.field === "string" &&
+        diff.field.trim().length > 0 &&
+        typeof diff.changed === "boolean"
+    )
+  );
+}
+
+function isValidValidationAlert(alert: unknown): boolean {
+  if (!isPlainObject(alert)) return false;
+  if (typeof alert.code !== "string" || !alert.code.trim()) return false;
+  if (typeof alert.message !== "string" || !alert.message.trim()) return false;
+  if (
+    typeof alert.severity !== "string" ||
+    !VALID_ALERT_SEVERITIES.has(alert.severity)
+  ) {
+    return false;
+  }
+  const defaultSeverity = ALERT_CODE_DEFAULT_SEVERITY[alert.code];
+  if (defaultSeverity === "BLOCKER" && alert.severity !== "BLOCKER") {
+    return false;
+  }
+  if (
+    defaultSeverity === "WARNING" &&
+    alert.severity !== "WARNING" &&
+    alert.severity !== "RESOLVED"
+  ) {
+    return false;
+  }
+  return (
+    isOptionalNullableString(alert.field) &&
+    isOptionalNullableString(alert.expected) &&
+    isOptionalNullableString(alert.actual)
+  );
+}
+
 function validateShipmentRefsShape(val: unknown, label: string): string | null {
-  if (val === undefined || val === null) return null;
+  if (val === undefined) return null;
   if (!isPlainObject(val)) {
-    return `${label} shipment_refs 须为 JSON 对象`;
+    return `${label} shipment_refs 须为 JSON 对象（不得为 null）`;
   }
   if (val.mbl_nos !== undefined) {
     if (
@@ -1031,6 +1100,43 @@ export function validateReviewBundleInput(
       valid: false,
       error: "ReviewBundleV1 中的 failed_documents 必须为数组",
     };
+  }
+  if (parsed.accounting_entity_profile !== undefined) {
+    const profile = parsed.accounting_entity_profile;
+    if (!isPlainObject(profile)) {
+      return {
+        valid: false,
+        error: "ReviewBundleV1 中的 accounting_entity_profile 必须为 JSON 对象",
+      };
+    }
+    if (
+      typeof profile.canonical_name !== "string" ||
+      countCodePoints(profile.canonical_name) < 1 ||
+      countCodePoints(profile.canonical_name) > 120
+    ) {
+      return {
+        valid: false,
+        error:
+          "ReviewBundleV1 中的 accounting_entity_profile.canonical_name 须为 1–120 字符非空字符串",
+      };
+    }
+    if (profile.aliases !== undefined && !isStringArray(profile.aliases)) {
+      return {
+        valid: false,
+        error:
+          "ReviewBundleV1 中的 accounting_entity_profile.aliases 须为字符串数组",
+      };
+    }
+    if (
+      profile.is_default !== undefined &&
+      typeof profile.is_default !== "boolean"
+    ) {
+      return {
+        valid: false,
+        error:
+          "ReviewBundleV1 中的 accounting_entity_profile.is_default 须为布尔值",
+      };
+    }
   }
 
   const docIds = new Set<string>();
@@ -1385,12 +1491,11 @@ export function validateReviewBundleInput(
     }
     if (
       rawRec.human_overrides !== undefined &&
-      rawRec.human_overrides !== null &&
       !isPlainObject(rawRec.human_overrides)
     ) {
       return {
         valid: false,
-        error: `第 ${rowNo} 条账单记录 (${id}) human_overrides 须为对象或 null`,
+        error: `第 ${rowNo} 条账单记录 (${id}) human_overrides 须为 JSON 对象（不得为 null）`,
       };
     }
 
@@ -1402,11 +1507,11 @@ export function validateReviewBundleInput(
       return { valid: false, error: recShipErr };
     }
 
-    if (rawRec.source_evidence !== undefined && rawRec.source_evidence !== null) {
+    if (rawRec.source_evidence !== undefined) {
       if (!isPlainObject(rawRec.source_evidence)) {
         return {
           valid: false,
-          error: `第 ${rowNo} 条账单记录 (${id}) source_evidence 须为对象或 null`,
+          error: `第 ${rowNo} 条账单记录 (${id}) source_evidence 须为 JSON 对象（不得为 null）`,
         };
       }
       if (
@@ -1420,16 +1525,22 @@ export function validateReviewBundleInput(
       }
       if (
         !isOptionalNullableString(rawRec.source_evidence.source_file) ||
-        !isOptionalNullableString(rawRec.source_evidence.snippet)
+        !isOptionalNullableString(rawRec.source_evidence.source_doc_id) ||
+        !isOptionalNullableString(rawRec.source_evidence.sheet) ||
+        !isOptionalNullableString(rawRec.source_evidence.extraction_channel) ||
+        !isOptionalNullableString(rawRec.source_evidence.snippet) ||
+        !isOptionalNullableInteger(rawRec.source_evidence.page) ||
+        !isOptionalNullableInteger(rawRec.source_evidence.row) ||
+        !isOptionalNullableInteger(rawRec.source_evidence.line_number)
       ) {
         return {
           valid: false,
-          error: `第 ${rowNo} 条账单记录 (${id}) source_evidence 文本字段须为字符串或 null`,
+          error: `第 ${rowNo} 条账单记录 (${id}) source_evidence 字段类型不合法`,
         };
       }
     }
 
-    if (rawRec.candidate_bills !== undefined && rawRec.candidate_bills !== null) {
+    if (rawRec.candidate_bills !== undefined) {
       if (
         !Array.isArray(rawRec.candidate_bills) ||
         rawRec.candidate_bills.some(
@@ -1438,9 +1549,14 @@ export function validateReviewBundleInput(
             typeof cand.id !== "string" ||
             !cand.id.trim() ||
             typeof cand.label !== "string" ||
+            !cand.label.trim() ||
             typeof cand.charge_item !== "string" ||
+            !cand.charge_item.trim() ||
             !hasValidDecimalNumber(cand.amount) ||
-            typeof cand.currency !== "string"
+            typeof cand.currency !== "string" ||
+            !cand.currency.trim() ||
+            !isOptionalNullableString(cand.reference_no) ||
+            !isOptionalNullableString(cand.document_date)
         )
       ) {
         return {
@@ -1450,37 +1566,20 @@ export function validateReviewBundleInput(
       }
     }
 
-    if (
-      rawRec.validation_alerts !== undefined &&
-      rawRec.validation_alerts !== null
-    ) {
+    if (rawRec.validation_alerts !== undefined) {
       if (
         !Array.isArray(rawRec.validation_alerts) ||
-        rawRec.validation_alerts.some(
-          (alert) =>
-            !isPlainObject(alert) ||
-            typeof alert.code !== "string" ||
-            typeof alert.severity !== "string" ||
-            typeof alert.message !== "string"
-        )
+        rawRec.validation_alerts.some((alert) => !isValidValidationAlert(alert))
       ) {
         return {
           valid: false,
-          error: `第 ${rowNo} 条账单记录 (${id}) validation_alerts 结构无效`,
+          error: `第 ${rowNo} 条账单记录 (${id}) validation_alerts 结构或 severity 枚举无效`,
         };
       }
     }
 
-    if (rawRec.field_diffs !== undefined && rawRec.field_diffs !== null) {
-      if (
-        !Array.isArray(rawRec.field_diffs) ||
-        rawRec.field_diffs.some(
-          (diff) =>
-            !isPlainObject(diff) ||
-            typeof diff.field !== "string" ||
-            typeof diff.changed !== "boolean"
-        )
-      ) {
+    if (rawRec.field_diffs !== undefined) {
+      if (!isFieldDiffArray(rawRec.field_diffs)) {
         return {
           valid: false,
           error: `第 ${rowNo} 条账单记录 (${id}) field_diffs 结构无效`,
@@ -1488,19 +1587,26 @@ export function validateReviewBundleInput(
       }
     }
 
-    if (
-      rawRec.review_audit_logs !== undefined &&
-      rawRec.review_audit_logs !== null
-    ) {
+    if (rawRec.review_audit_logs !== undefined) {
       if (
         !Array.isArray(rawRec.review_audit_logs) ||
         rawRec.review_audit_logs.some(
           (entry) =>
             !isPlainObject(entry) ||
             typeof entry.action !== "string" ||
+            !entry.action.trim() ||
             typeof entry.operator !== "string" ||
+            !entry.operator.trim() ||
             typeof entry.timestamp !== "string" ||
-            !isOptionalNullableString(entry.reason)
+            !entry.timestamp.trim() ||
+            !isOptionalNullableString(entry.reason) ||
+            (entry.before !== undefined &&
+              entry.before !== null &&
+              !isPlainObject(entry.before)) ||
+            (entry.after !== undefined &&
+              entry.after !== null &&
+              !isPlainObject(entry.after)) ||
+            (entry.diff !== undefined && !isFieldDiffArray(entry.diff))
         )
       ) {
         return {
@@ -1668,6 +1774,15 @@ export function validateReviewBundleInput(
           error: `existing_bills_snapshot 第 ${rowNo} 条 (${id}) ${optStrKey} 须为字符串或 null`,
         };
       }
+    }
+    if (
+      rawBill.extra_fields !== undefined &&
+      !isPlainObject(rawBill.extra_fields)
+    ) {
+      return {
+        valid: false,
+        error: `existing_bills_snapshot 第 ${rowNo} 条 (${id}) extra_fields 须为 JSON 对象`,
+      };
     }
     const normalizedBillInput = copyDecimalMeta(rawBill, {
       ...rawBill,
