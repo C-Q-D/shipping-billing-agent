@@ -1,0 +1,16 @@
+[
+  {
+    "id": "example-dn-202609-001-handling",
+    "document_type": "Debit Note",
+    "reference_no": "DN-202609-001",
+    "document_date": "2026-09-20",
+    "charge_item": "Handling Charge",
+    "amount": 30.00,
+    "currency": "USD",
+    "payment_term": "PP",
+    "accounting_entity": "NEPTUNE SHIPPING LIMITED",
+    "posting_type": "AR",
+    "issuer": "NEPTUNE SHIPPING LIMITED",
+    "recipient": "ALL AMERICA FORWARDING, INC."
+  }
+]

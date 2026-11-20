@@ -1,0 +1,17 @@
+From: NEPTUNE SHIPPING LIMITED <billing@neptune.example>
+To: "ALL AMERICA FORWARDING, INC." <accounts@all-america.example>
+Subject: Debit Note DN-202609-001
+Date: Sun, 20 Sep 2026 09:00:00 +0000
+Message-ID: <DN-202609-001@neptune.example>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+
+Debit Note DN-202609-001
+Date: 2026-09-20
+Issuer: NEPTUNE SHIPPING LIMITED
+Recipient: ALL AMERICA FORWARDING, INC.
+
+Handling Fee 40.00 USD PP
+THC 120.50 USD CC
+Total: 160.50 USD
