@@ -106,7 +106,7 @@ uv run shipping-billing-agent eval --mode OFFLINE_DETERMINISTIC --k-trials 3 --o
 
 ## 自动化验证与实测
 
-主流程在 `master`（`0771c17` 独立终验）的全量测试基线 `uv run pytest -p no:cacheprovider -q` 为 **1789 passed, 0 failed, 0 skipped (668.59s)**。离线 Harness `k=3` 完成 **16/16 个用例、48 次执行**。Schema 合规率、核心字段、AR/AP、操作、金额、币种、冲突召回、告警精确率以及 `pass@k`、`pass^k` 均为 `1.0`，正常记录误拦率为 `0.0`（`0/69`）。详细分子、分母和计分规则见 [Harness 设计报告](docs/harness-design.md)。
+主流程在 `master`（`c2afd91` 封版验证）的全量测试基线 `uv run pytest -p no:cacheprovider -q` 为 **1796 passed, 0 failed, 0 skipped (547.38s)**。离线 Harness `k=3` 完成 **16/16 个用例、48 次执行**。Schema 合规率、核心字段、AR/AP、操作、金额、币种、冲突召回、告警精确率以及 `pass@k`、`pass^k` 均为 `1.0`，正常记录误拦率为 `0.0`（`0/69`）。详细分子、分母和计分规则见 [Harness 设计报告](docs/harness-design.md)。
 
 **`LIVE_LLM`、`LIVE_E2E`、`self_repair_evidence` 当前为 `UNVERIFIED`。** 接入真实 LLM 后复验 `LIVE_LLM`。另有网关可访问的授权样本 URL 或受控中转发布器时复验 `LIVE_E2E`。自修复证据须有携带原文和差额的第二轮请求，并有重验通过结果。
 

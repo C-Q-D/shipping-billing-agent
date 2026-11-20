@@ -18,9 +18,9 @@ EML 解析 `multipart`、邮件头、正文和附件，按实际文件格式递�
 
 ### 2. LangGraph 有界编排与原文核验
 
-优先走结构化 OCR 字段和规则抽取，规则证据不足时才请 LangChain 模型补抽候选。`agent/graph.py` 的 `_ground_model_extraction` 用原文核验候选行、字段和数值。没有原文凭据的费用行不能凭空加入。对识别到的非法日期、币种或金额，`raw_invalid_fields` 保留原始错值，便于人工核对，规则据此阻止出账。
+离线无密钥模式（`llm_client=None`）由结构化 OCR 字段与确定性规则直接抽取并进入校验匹配；配好有效模型密钥后（`llm_client is not None`），`extract_documents` 会先以确定性规则构建原文基线 `rule_extractions`，再在 LangGraph 中调度 LangChain 模型（`ChatOpenAI.with_structured_output`）对所有已解析文档做双路语义抽取，并通过 `agent/graph.py` 的 `_ground_model_extraction` 逐行核对候选行、字段和数值（当前坚持单文档 fail-closed 策略：首轮模型调用或预算失败生成失败卡而不静默降级跳过模型校验；高吞吐场景可在其前置高置信规则直通分流以压降 Token 成本）。没有原文凭据的费用行不能凭空加入。对识别到的非法日期、币种或金额，`raw_invalid_fields` 保留原始错值，便于人工核对，规则据此阻止出账。
 
-满足修复条件时，第二轮携带原文和首轮校验差异，结果再走相同门禁。每份单据最多补救一次，`retry_count <= 1`。仍有业务阻断的记录进入 `PENDING_REVIEW`，不可处理的单据产生失败卡。 [LangGraph 编排](../src/shipping_billing_agent/agent/graph.py) · [校验规则](../src/shipping_billing_agent/domain/validators.py)
+满足修复条件时，第二轮携带原文和首轮校验差异，结果再走相同门禁。每份单据最多补救一次，`retry_count <= 1`。若第 2 轮自修复失败，则保留首轮候选并附加 `LLM_EXTRACTION_FAILED` 阻塞进入 `PENDING_REVIEW`；不可处理的单据产生失败卡。 [LangGraph 编排](../src/shipping_billing_agent/agent/graph.py) · [校验规则](../src/shipping_billing_agent/domain/validators.py)
 
 ### 3. 四级匹配、增量继承与账务视角
 
@@ -92,7 +92,7 @@ EML 解析 `multipart`、邮件头、正文和附件，按实际文件格式递�
 
 一次全对要求行数、核心字段、操作与复核状态、必需告警、误拦检查及该用例的额外断言均通过。单用例三轮为 `[False, True, False]` 时，单独计算得到 `pass@3=1.0`、`pass^3=0.0`。财务自动处理不能依靠偶尔答对。回归以 `pass^k=1.0` 要求这 k 次中通过与否零波动，同时保留每轮差异定位原因。
 
-该次报告的 `avg_latency_ms` 为 `320.41`，取 48 次完成执行的平均用时。`llm_calls=15` 指离线队列替身调用，`ocr_calls=3` 指本地 RapidOCR 对 `图片示例.png` 的识别，`failing_cases=[]`。同一主流程在 `master`（`0771c17` 独立终验）运行 `uv run pytest -p no:cacheprovider -q`，结果为 **1789 passed, 0 failed, 0 skipped (668.59s)**。
+该次报告的 `avg_latency_ms` 为 `310.12`，取 48 次完成执行的平均用时。`llm_calls=15` 指离线队列替身调用，`ocr_calls=3` 指本地 RapidOCR 对 `图片示例.png` 的识别，`failing_cases=[]`。同一主流程在 `master`（`c2afd91` 封版验证）运行 `uv run pytest -p no:cacheprovider -q`，结果为 **1796 passed, 0 failed, 0 skipped (547.38s)**。
 
 ### 自修复证据
 
