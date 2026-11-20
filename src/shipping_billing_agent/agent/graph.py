@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from functools import partial
 from threading import Lock
 from typing import Any, NotRequired, TypedDict
+from unicodedata import normalize
 
 import anyio
 from langgraph.graph import END, START, StateGraph
@@ -26,6 +27,7 @@ from shipping_billing_agent.domain import (
     DocumentExtractionBundle,
     ExistingBillRecord,
     FailedDocumentAlert,
+    PackageShipmentRefs,
     ParsedDocument,
     ProcessedBillingRecord,
     RawChargeEnvelope,
@@ -34,6 +36,7 @@ from shipping_billing_agent.domain import (
     RawExtractionEnvelope,
     SourceDocTotalsSnapshot,
     SourceEvidence,
+    SourceRefValue,
     ValidationAlert,
     dumps_decimal_json,
     entity_matches,
@@ -42,11 +45,16 @@ from shipping_billing_agent.domain import (
     parse_llm_raw_extraction,
     resolve_entity_perspective,
     validate_batch,
+    validate_record,
 )
-from shipping_billing_agent.domain.entity_resolver import FIELD_FORMAT_ALERT_CODES
+from shipping_billing_agent.domain.entity_resolver import (
+    FIELD_FORMAT_ALERT_CODES,
+    is_credit_document_type,
+)
 from shipping_billing_agent.domain.models import DocumentStatus, SourceKind, sanitize_source_path
 from shipping_billing_agent.gateways.llm_client import (
     LlmBudgetExhaustedError,
+    LlmGatewayError,
     StructuredLlmClient,
     llm_request_budget,
 )
@@ -204,6 +212,31 @@ def _source_evidence(doc: ParsedDocument, charge: RawChargeItem, path: str) -> S
     )
 
 
+def _package_shipment_refs(doc: ParsedDocument, state: _BillingState) -> list[PackageShipmentRefs]:
+    siblings = state["package_sources"][doc.doc_id]
+    if not doc.parent_doc_id and not siblings:
+        return []
+    snapshots = []
+    for source, envelope in ((doc, state["rule_extractions"][doc.doc_id]), *siblings):
+        refs = envelope.extraction.shipment_refs
+        mbls = None
+        if source.source_kind is not SourceKind.EML_BODY:
+            mbls = [
+                SourceRefValue(
+                    value="".join(normalize("NFKC", ref.value).upper().split()),
+                    source=sanitize_source_path(ref.source) or state["paths"][source.doc_id],
+                )
+                for ref in refs.mbl_nos
+            ]
+        hbl = "".join(normalize("NFKC", refs.hbl_no or "").upper().split())
+        snapshots.append(
+            PackageShipmentRefs(
+                source_doc_id=source.doc_id, mbl_nos=mbls, hbl_nos=[hbl] if hbl else []
+            )
+        )
+    return snapshots
+
+
 def _records_for_bundle(
     bundle: DocumentExtractionBundle,
     state: _BillingState,
@@ -214,6 +247,7 @@ def _records_for_bundle(
         return []
     data = envelope.extraction
     totals = SourceDocTotalsSnapshot.from_extraction(doc.doc_id, envelope)
+    package_refs = _package_shipment_refs(doc, state)
     records = []
     for index, entry in enumerate(envelope.charges):
         charge = entry.charge
@@ -267,6 +301,7 @@ def _records_for_bundle(
                 raw_unit_price_text=entry.raw_unit_price_text,
                 raw_quantity_text=entry.raw_quantity_text,
                 shipment_refs=data.shipment_refs,
+                package_sibling_refs=package_refs,
                 source_evidence=_source_evidence(doc, charge, state["paths"][doc.doc_id]),
                 source_doc_totals=totals,
                 validation_alerts=perspective.validation_alerts,
@@ -308,22 +343,27 @@ def _source_audit(
     proposed: RawExtractionEnvelope | RawChargeEnvelope,
     observed: RawExtractionEnvelope | RawChargeEnvelope,
     values: RawDocumentExtraction | RawChargeItem,
+    corroborated_fields: set[str],
 ) -> dict[str, Any]:
     invalid = {
         **proposed.raw_invalid_fields,
         **{
             field: token
             for field, token in observed.raw_invalid_fields.items()
-            if getattr(values, field, None) is None
+            if field not in corroborated_fields
         },
     }
     explicit = proposed.explicit_fields | observed.explicit_fields
     issues = list(proposed.raw_parse_issues)
     for issue in observed.raw_parse_issues:
         if issue.code in FIELD_FORMAT_ALERT_CODES and issue.field:
-            if getattr(values, issue.field, None) is not None:
+            if issue.field in corroborated_fields:
                 continue
-            if issue.field in type(values).model_fields and issue.field in explicit:
+            if (
+                issue.field in type(values).model_fields
+                and issue.field in explicit
+                and getattr(values, issue.field) is None
+            ):
                 invalid.setdefault(issue.field, issue.actual or "")
         if issue not in issues:
             issues.append(issue)
@@ -334,7 +374,95 @@ def _source_audit(
     }
 
 
-def _ground_charge(proposed: RawChargeEnvelope, observed: RawChargeEnvelope) -> RawChargeEnvelope:
+def _ground_printed_fields(
+    model: RawDocumentExtraction | RawChargeItem,
+    printed: RawDocumentExtraction | RawChargeItem,
+    fields: Sequence[str],
+    updates: dict[str, Any],
+    issues: list[ValidationAlert],
+) -> None:
+    def comparable(field: str, value: str) -> str:
+        key = normalize("NFKC", value).casefold()
+        if field == "reference_no":
+            return "".join(key.split())
+        if field == "document_type":
+            return " ".join(key.replace("_", " ").split())
+        return key.strip()
+
+    for field in fields:
+        observed, proposed = getattr(printed, field), getattr(model, field)
+        if not observed or (field == "debit_credit" and observed == "UNKNOWN"):
+            continue
+        updates[field] = observed
+        if (
+            proposed
+            and (field != "debit_credit" or proposed != "UNKNOWN")
+            and comparable(field, proposed) != comparable(field, observed)
+        ):
+            issues.append(_printed_field_conflict(field, observed, proposed))
+
+
+def _printed_field_conflict(field: str, printed: str, proposed: str) -> ValidationAlert:
+    return ValidationAlert.from_code(
+        AlertCode.CROSS_DOCUMENT_CONFLICT,
+        "模型提取的字段与原文不符",
+        field=field,
+        expected=printed,
+        actual=proposed,
+    )
+
+
+def _preserve_invalid_fields(
+    invalid: dict[str, str],
+    model: RawDocumentExtraction | RawChargeItem,
+    printed: RawDocumentExtraction | RawChargeItem,
+    independent: Sequence[RawExtractionEnvelope | RawChargeEnvelope],
+    updates: dict[str, Any],
+) -> set[str]:
+    corroborated = set()
+    for field in invalid.keys() & type(model).model_fields.keys():
+        candidate = updates.get(field, getattr(model, field))
+        if invalid[field] != "$" and candidate is not None:
+            source_values = []
+            for source in independent:
+                if field not in source.explicit_fields or field in source.raw_invalid_fields:
+                    continue
+                values = (
+                    source.charge if isinstance(source, RawChargeEnvelope) else source.extraction
+                )
+                if (value := getattr(values, field)) is not None:
+                    source_values.append(value)
+            if source_values and all(value == candidate for value in source_values):
+                corroborated.add(field)
+                continue
+        updates[field] = getattr(printed, field)
+    return corroborated
+
+
+def _independent_source_extractions(
+    doc: ParsedDocument, rules: RawExtractionEnvelope
+) -> list[RawExtractionEnvelope]:
+    if not (rules.raw_invalid_fields or any(row.raw_invalid_fields for row in rules.charges)):
+        return []
+    views = []
+    if doc.raw_text.strip():
+        views.append({"tables": [], "ocr_payload": None})
+    if doc.ocr_payload is not None:
+        views.append({"raw_text": "", "tables": []})
+    if doc.tables:
+        table_text = "\n".join("\t".join(row) for table in doc.tables for row in table.rows)
+        views.append({"raw_text": table_text, "ocr_payload": None})
+    if len(views) < 2:
+        return []
+    return [extract_document_by_rules(doc.model_copy(update=view)) for view in views]
+
+
+def _ground_charge(
+    proposed: RawChargeEnvelope,
+    observed: RawChargeEnvelope,
+    independent: Sequence[RawChargeEnvelope],
+    document_type: str | None,
+) -> RawChargeEnvelope:
     printed, model = observed.charge, proposed.charge
     updates = {
         field: value
@@ -348,10 +476,22 @@ def _ground_charge(proposed: RawChargeEnvelope, observed: RawChargeEnvelope) -> 
     currency_conflict = printed.currency and model.currency and printed.currency != model.currency
     if bare_dollar or printed.currency:
         updates["currency"] = printed.currency
-    if printed.payment_term is not None and model.payment_term is None:
-        updates["payment_term"] = printed.payment_term
+    issues = []
+    _ground_printed_fields(model, printed, ("payment_term", "debit_credit"), updates, issues)
+    if (
+        document_type
+        and not is_credit_document_type(document_type)
+        and printed.debit_credit == "UNKNOWN"
+        and model.debit_credit == "CREDIT"
+    ):
+        updates["debit_credit"] = printed.debit_credit
+        issues.append(_printed_field_conflict("debit_credit", document_type, model.debit_credit))
+    corroborated = _preserve_invalid_fields(
+        observed.raw_invalid_fields, model, printed, independent, updates
+    )
     charge = model.model_copy(update=updates)
-    audit = _source_audit(proposed, observed, charge)
+    audit = _source_audit(proposed, observed, charge, corroborated)
+    audit["raw_parse_issues"].extend(issues)
     if currency_conflict:
         audit["raw_parse_issues"].append(
             ValidationAlert.from_code(
@@ -383,6 +523,7 @@ def _ground_charges(
     proposed: list[RawChargeEnvelope],
     rules: RawExtractionEnvelope,
     dictionary: Sequence[ChargeDictionaryItem],
+    independent: Sequence[RawExtractionEnvelope],
 ) -> tuple[list[RawChargeEnvelope], list[ValidationAlert]]:
     def indexes_by_name(rows: list[RawChargeEnvelope]) -> dict[str, list[int]]:
         indexes = defaultdict(list)
@@ -394,43 +535,81 @@ def _ground_charges(
     def amounts_text(rows: Sequence[RawChargeEnvelope], indexes: Sequence[int]) -> str:
         return ", ".join(rows[index].raw_amount_text or "缺失" for index in indexes) or "无费用行"
 
+    def exact_key(
+        amount: Fraction, currency: str, row: RawChargeEnvelope
+    ) -> tuple[Fraction, str, str | None, str]:
+        return amount, currency, row.charge.payment_term, row.charge.debit_credit
+
     observed = rules.charges
     grounded = proposed.copy()
     issues = []
     model_groups = indexes_by_name(proposed)
     source_groups = indexes_by_name(observed)
+    independent_groups = [
+        (source.charges, indexes_by_name(source.charges)) for source in independent
+    ]
+    document_type = rules.extraction.document_type
     for name, source_indexes in source_groups.items():
         model_indexes = model_groups.get(name, [])
         source_amounts = _amount_pairs(observed, source_indexes)
         model_amounts = _amount_pairs(proposed, model_indexes)
-        paired_source, paired_model = set(), set()
+        corroborating_rows = []
+        if len(source_indexes) == 1:
+            printed = observed[source_indexes[0]].charge
+            comparable_fields = ("amount", "currency", "quantity", "unit_price", "payment_term")
+            for rows, groups in independent_groups:
+                if len(indexes := groups.get(name, ())) == 1:
+                    candidate = rows[indexes[0]].charge
+                    if all(
+                        getattr(printed, field) is None
+                        or getattr(candidate, field) is None
+                        or getattr(printed, field) == getattr(candidate, field)
+                        for field in comparable_fields
+                    ):
+                        corroborating_rows.append(rows[indexes[0]])
+
+        exact_rows = defaultdict(deque)
+        for amount, currency, source_index in source_amounts:
+            exact_rows[exact_key(amount, currency, observed[source_index])].append(source_index)
+        pairs = {}
+        for amount, currency, model_index in model_amounts:
+            if candidates := exact_rows.get(exact_key(amount, currency, proposed[model_index])):
+                pairs[candidates.popleft()] = model_index
+
+        paired_model = set(pairs.values())
+        remaining_amounts = [pair for pair in model_amounts if pair[2] not in paired_model]
         model_position = 0
-        # Match sorted amounts within each fee name before falling back to unpaired rows for audit.
+        # Match the remaining amounts within tolerance before pairing the rest for audit.
         for amount, _, source_index in source_amounts:
-            while model_position < len(model_amounts):
-                candidate, _, model_index = model_amounts[model_position]
+            if source_index in pairs:
+                continue
+            while model_position < len(remaining_amounts):
+                candidate, _, model_index = remaining_amounts[model_position]
                 if candidate > amount + _LINE_TOLERANCE:
                     break
                 model_position += 1
                 if candidate >= amount - _LINE_TOLERANCE:
-                    grounded[model_index] = _ground_charge(
-                        proposed[model_index], observed[source_index]
-                    )
-                    paired_source.add(source_index)
+                    pairs[source_index] = model_index
                     paired_model.add(model_index)
                     break
-        remainder_source = [index for index in source_indexes if index not in paired_source]
+        matched_amounts = len(pairs)
+        remainder_source = [index for index in source_indexes if index not in pairs]
         remainder_model = [index for index in model_indexes if index not in paired_model]
-        for source_index, model_index in zip(remainder_source, remainder_model, strict=False):
-            grounded[model_index] = _ground_charge(proposed[model_index], observed[source_index])
-        missing_source_audit = any(
-            observed[index].raw_invalid_fields or observed[index].raw_parse_issues
+        pairs.update(zip(remainder_source, remainder_model, strict=False))
+        for source_index, model_index in pairs.items():
+            grounded[model_index] = _ground_charge(
+                proposed[model_index], observed[source_index], corroborating_rows, document_type
+            )
+        unpaired_audited_rows = [
+            observed[index]
             for index in remainder_source[len(remainder_model) :]
-        )
+            if observed[index].raw_invalid_fields or observed[index].raw_parse_issues
+        ]
+        grounded.extend(unpaired_audited_rows)
         if (
-            len(paired_source) != len(source_amounts)
-            or (source_amounts and len(model_indexes) > len(source_indexes))
-            or missing_source_audit
+            matched_amounts != len(source_amounts)
+            or len(model_indexes) > len(source_indexes)
+            or unpaired_audited_rows
         ):
             issues.append(
                 ValidationAlert.from_code(
@@ -527,7 +706,12 @@ def _ground_model_extraction(
 ) -> RawExtractionEnvelope:
     """Check model proposals against independent billing evidence from the source."""
     data = extraction.extraction
-    updates, issues = _ground_parties(data, rules.extraction, doc, profiles)
+    printed = rules.extraction
+    independent = _independent_source_extractions(doc, rules)
+    updates, issues = _ground_parties(data, printed, doc, profiles)
+    _ground_printed_fields(
+        data, printed, ("reference_no", "document_date", "document_type"), updates, issues
+    )
     has_source_summary = _has_billing_summary(rules) or rules.tax_amount is not None
     for field, code in (
         ("subtotal_amount", AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH),
@@ -535,7 +719,7 @@ def _ground_model_extraction(
         ("total_amount", AlertCode.AMOUNT_TOTAL_MISMATCH),
         ("total_currency", AlertCode.INVALID_OR_MISSING_CURRENCY),
     ):
-        observed = getattr(rules.extraction, field)
+        observed = getattr(printed, field)
         proposed = getattr(data, field)
         if observed is None:
             if rules.raw_invalid_fields.get(field) == "$" or (
@@ -554,18 +738,25 @@ def _ground_model_extraction(
                 )
             )
         updates[field] = observed
-    for currency, total in rules.totals_by_currency.items():
-        proposed = extraction.totals_by_currency.get(currency)
-        if proposed is not None and proposed != total:
-            issues.append(
-                ValidationAlert.from_code(
-                    AlertCode.AMOUNT_TOTAL_MISMATCH,
-                    "模型报告的分币种总额与原文不符",
-                    field=f"reported_totals_by_currency.{currency}",
-                    expected=str(total),
-                    actual=str(proposed),
+    source_summaries = {}
+    for field, code in (
+        ("subtotals_by_currency", AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH),
+        ("taxes_by_currency", AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH),
+        ("totals_by_currency", AlertCode.AMOUNT_TOTAL_MISMATCH),
+    ):
+        source_summaries[field] = observed = getattr(rules, field)
+        proposed = getattr(extraction, field)
+        for currency, amount in observed.items():
+            if currency in proposed and proposed[currency] != amount:
+                issues.append(
+                    ValidationAlert.from_code(
+                        code,
+                        "模型报告的分币种汇总值与原文不符",
+                        field=f"reported_{field}.{currency}",
+                        expected=str(amount),
+                        actual=str(proposed[currency]),
+                    )
                 )
-            )
     clauses = [
         clause.model_copy(update={"text": sanitize_for_llm(clause.text)})
         for clause in data.excluded_clauses
@@ -583,6 +774,7 @@ def _ground_model_extraction(
         ],
         rules,
         dictionary,
+        independent,
     )
     printed_refs, model_refs = rules.extraction.shipment_refs, data.shipment_refs
     printed_mbls = {ref.value for ref in printed_refs.mbl_nos}
@@ -603,6 +795,9 @@ def _ground_model_extraction(
             ),
         }
     )
+    corroborated = _preserve_invalid_fields(
+        rules.raw_invalid_fields, data, printed, independent, updates
+    )
     grounded = data.model_copy(
         update={
             **updates,
@@ -611,19 +806,20 @@ def _ground_model_extraction(
             "shipment_refs": refs,
         }
     )
-    audit = _source_audit(extraction, rules, grounded)
+    audit = _source_audit(extraction, rules, grounded, corroborated)
     audit["raw_parse_issues"].extend([*issues, *line_issues])
-    if not rules.totals_by_currency:
-        audit["explicit_fields"].discard("totals_by_currency")
+    for field, amounts in source_summaries.items():
+        if not amounts:
+            audit["explicit_fields"].discard(field)
     return extraction.model_copy(
         update={
             **audit,
+            **source_summaries,
             "extraction": grounded,
             "charges": charges,
             "has_explicit_total": rules.has_explicit_total
             or grounded.total_amount is not None
             or "total_amount" in audit["raw_invalid_fields"],
-            "totals_by_currency": rules.totals_by_currency,
             # Metadata-only eligibility is decided locally, before making a model call.
             "metadata_only": False,
         }
@@ -642,6 +838,7 @@ def _has_billing_summary(envelope: RawExtractionEnvelope | None) -> bool:
             envelope.has_explicit_total
             or envelope.total_amount is not None
             or envelope.subtotal_amount is not None
+            or bool(envelope.subtotals_by_currency)
             or bool(envelope.totals_by_currency)
         )
     )
@@ -762,20 +959,31 @@ class _BillingNodes:
         budget = state["budget"]
         if not budget.remaining:
             return _ModelAttempt(failure=_BUDGET_EXHAUSTED)
-        # Reuse the reservation for the first POST and charge each SDK retry separately.
         async with state["limiter"]:
             if not await budget.try_acquire():
                 return _ModelAttempt(failure=_BUDGET_EXHAUSTED)
             try:
-                with llm_request_budget(
-                    budget.try_acquire_sync, budget.try_acquire, initial_slots=1
-                ):
-                    if self.use_sync_client:
-                        response = await anyio.to_thread.run_sync(
-                            client.invoke_structured, messages, RawDocumentExtraction
-                        )
+                while True:
+                    try:
+                        # The first POST uses the reservation. SDK retries acquire their own slots.
+                        with llm_request_budget(
+                            budget.try_acquire_sync, budget.try_acquire, initial_slots=1
+                        ):
+                            if self.use_sync_client:
+                                response = await anyio.to_thread.run_sync(
+                                    client.invoke_structured, messages, RawDocumentExtraction
+                                )
+                            else:
+                                response = await client.ainvoke_structured(
+                                    messages, RawDocumentExtraction
+                                )
+                    except LlmGatewayError as exc:
+                        if isinstance(exc, LlmBudgetExhaustedError) or not exc.retryable:
+                            raise
+                        if not await budget.try_acquire():
+                            raise LlmBudgetExhaustedError(_BUDGET_EXHAUSTED) from exc
                     else:
-                        response = await client.ainvoke_structured(messages, RawDocumentExtraction)
+                        break
                 envelope = parse_llm_raw_extraction(response.raw_text, response.parsed)
                 envelope = _ground_model_extraction(
                     envelope,
@@ -963,6 +1171,7 @@ class _BillingNodes:
             source = state["rule_extractions"].get(doc.doc_id)
             enriched_bundle = bundle
             rows = []
+            assembly_failed = False
             try:
                 if envelope is not None and not envelope.metadata_only and envelope.charges:
                     enriched, field_uses = apply_sibling_context(
@@ -1001,8 +1210,7 @@ class _BillingNodes:
             except Exception as exc:
                 failures[doc.doc_id] = f"文档账单记录组装失败（{type(exc).__name__}）"
                 enriched_bundle = bundle
-            else:
-                independent_bundles.append(bundle)
+                assembly_failed = True
             if (
                 not rows
                 and doc.status is DocumentStatus.PARSED
@@ -1014,13 +1222,43 @@ class _BillingNodes:
                     if prior_failure
                     else _NO_CHARGE_DETAILS
                 )
-            records.extend(rows)
             enriched_bundles.append(enriched_bundle)
-        matched = match_and_inherit_batch(
-            records, state.get("existing_bills", ()), state.get("profiles", ())
-        )
+            if assembly_failed:
+                continue
+            if rows:
+                try:
+                    matched = match_and_inherit_batch(
+                        rows, state.get("existing_bills", ()), state.get("profiles", ())
+                    )
+                except Exception as exc:
+                    failures[doc.doc_id] = f"文档历史账单匹配失败（{type(exc).__name__}）"
+                    continue
+                try:
+                    checked = [validate_record(row) for row in matched]
+                except Exception as exc:
+                    failures[doc.doc_id] = f"文档费用行校验失败（{type(exc).__name__}）"
+                    continue
+                records.extend(checked)
+            independent_bundles.append(bundle)
+        verified = validate_batch(records, independent_bundles)
+        # Deduplication can remove a reference-bearing copy from a mail package.
+        package_refs_by_record = {
+            row.id: row.package_sibling_refs for row in records if row.package_sibling_refs
+        }
+        source_doc_ids = {bundle.document.doc_id for bundle in independent_bundles}
+        for index, row in enumerate(verified):
+            retained_ids = {ref.source_doc_id for ref in row.package_sibling_refs}
+            missing_refs = [
+                ref
+                for ref in package_refs_by_record.get(row.id, ())
+                if ref.source_doc_id in source_doc_ids and ref.source_doc_id not in retained_ids
+            ]
+            if missing_refs:
+                verified[index] = row.model_copy(
+                    update={"package_sibling_refs": [*row.package_sibling_refs, *missing_refs]}
+                )
         return {
-            "records": validate_batch(matched, independent_bundles),
+            "records": verified,
             "bundles": enriched_bundles,
             "failures": failures,
         }

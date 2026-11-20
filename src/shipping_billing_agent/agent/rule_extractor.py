@@ -29,6 +29,10 @@ from shipping_billing_agent.domain import (
     parse_llm_raw_extraction,
 )
 from shipping_billing_agent.domain.currency import ACTIVE_ISO4217_CODES
+from shipping_billing_agent.domain.entity_resolver import (
+    CREDIT_DOCUMENT_PATTERN,
+    is_credit_document_type,
+)
 from shipping_billing_agent.domain.models import DocumentStatus, SourceKind, sanitize_source_path
 from shipping_billing_agent.gateways.text_sanitizer import sanitize_for_llm
 
@@ -56,12 +60,18 @@ _BOX_LABEL = re.compile(
 )
 _LABELED_BOX = re.compile(r"\b(?=[A-Z0-9]{0,10}[A-Z])(?=[A-Z0-9]{0,10}[0-9])[A-Z0-9]{11}\b", re.I)
 _COMPANY = re.compile(
-    r"^.+?\b(?:CO[., ]+LTD|INCORPORATED|CORPORATION|LIMITED|LTD|INC|LLC|GMBH)\b[.,]?",
+    r"^.+?\b(?:CO[., ]+LTD|INCORPORATED|CORPORATION|LIMITED|LTD|INC|LLC|GMBH)\b[.,]?"
+    r"(?:\s*\([^()]*\))*",
     re.I,
 )
 _BILL_TITLE = re.compile(
-    r"^(DEBIT\s*(?:NOTE|INVOICE)|CREDIT\s*NOTE|(?:TAX\s+)?INVOICE|GENERAL\s+NOTICE)\b",
+    rf"^(?:{CREDIT_DOCUMENT_PATTERN.pattern}|DEBIT\s*(?:NOTE|INVOICE)|"
+    r"(?:TAX\s+|CREDIT\s+CARD\s+)?INVOICE|LETTER\s+OF\s+CREDIT|GENERAL\s+NOTICE)"
+    r"(?=\s|[:#=]|$)",
     re.I,
+)
+_TITLE_REFERENCE = re.compile(
+    rf"^\s*(?:(?:number|no\.?|id)(?=\W|$)\s*)?[:#=]?\s*({_REF})(?=\s|$)", re.I
 )
 _BL_FILE = re.compile(r"(?:^|[\W_])([MH]BL)(?:[\W_]|$)", re.I)
 _FEE = re.compile(
@@ -91,13 +101,25 @@ _SUMMARY = re.compile(
     r"(?=\W|$)\s*[:=]?\s*(?P<rest>.*)$",
     re.I,
 )
+_SUMMARY_CURRENCY_PREFIX = re.compile(
+    rf"^(?:\(\s*({_CURRENCY_SLOT})\s*\)\s*[:=]?|({_CURRENCY_SLOT})\s*[:=])\s*", re.I
+)
+_TRANSPORT_TOTAL = re.compile(
+    r"^(?:say\b|[a-z]+(?:[ -][a-z]+)*\s+\(\d+\)|(?:no\.?\s+of\s+|number\s+of\s+)?"
+    r"(?:containers?|packages?|cartons?|pieces|pallets?|gross weight|net weight|measurement)\b)",
+    re.I,
+)
 _MONEY = re.compile(
     rf"(?:(?P<prefix>{_CURRENCY_SLOT})\s*)?(?P<amount>{_NUMBER})"
     rf"(?:\s*(?P<suffix>{_CURRENCY_SLOT})(?!\w))?",
     re.I,
 )
 _SUMMARY_DUE_TO = re.compile(rf"^(?P<party>.+?)\s+(?=(?:{_CURRENCY}\s+)?{_NUMBER}(?:\s|$))", re.I)
-_SUMMARY_FIELDS = ("subtotal_amount", "tax_amount", "total_amount")
+_SUMMARY_MAPS = {
+    "subtotal_amount": "subtotals_by_currency",
+    "tax_amount": "taxes_by_currency",
+    "total_amount": "totals_by_currency",
+}
 _PAYMENT_INSTRUCTION = re.compile(
     r"^(?P<payer>.+?)\s+(?:pays?|to pay)\s+(?P<payee>[^:]+):\s*"
     r"(?P<charge>.+)$",
@@ -330,33 +352,38 @@ def _record_summary(text: str, evidence: _Evidence) -> bool:
     if not match:
         return False
     label, rest = match["label"].casefold(), match["rest"]
-    if rest.upper().startswith("TO "):
-        due_to = _SUMMARY_DUE_TO.match(rest[3:])
-        if not due_to:
-            return True
-        evidence.fields.setdefault("payee_hint", due_to["party"].strip())
-        rest = rest[3 + due_to.end() :]
-    stated_currency = re.search(
-        rf"\b(?:currency|curr|cur)\s*:?\s*({_CURRENCY_SLOT})(?!\w)", rest, re.I
-    )
-    if stated_currency:
-        rest = rest[: stated_currency.start()].rstrip()
-    # "TOTAL THREE (3)" on a B/L is a package count.
-    money = _MONEY.match(rest)
-    if money is None or (money.end() < len(rest) and rest[money.end()].isalnum()):
-        return True
-    amount, currency = money["amount"], money["prefix"] or money["suffix"]
-    tail = rest[money.end() :].strip()
-    if stated_currency:
-        currency = stated_currency[1]
-    elif tail and not re.fullmatch(_NUMBER, tail, re.I):
+    if label == "total" and _TRANSPORT_TOTAL.match(rest):
         return True
     field_name = "total_amount"
     if label.startswith(("sub", "小")):
         field_name = "subtotal_amount"
     elif "tax" in label or label.startswith("税"):
         field_name = "tax_amount"
-    evidence.summaries.append((field_name, amount, currency))
+    if rest.upper().startswith("TO "):
+        if due_to := _SUMMARY_DUE_TO.match(rest[3:]):
+            evidence.fields.setdefault("payee_hint", due_to["party"].strip())
+            rest = rest[3 + due_to.end() :]
+        elif label == "balance due":
+            return True
+    stated_currency = re.search(
+        rf"\b(?:currency|curr|cur)\s*:?\s*({_CURRENCY_SLOT})(?!\w)", rest, re.I
+    )
+    if stated_currency:
+        rest = rest[: stated_currency.start()].rstrip()
+    currency = stated_currency[1] if stated_currency else None
+    if prefix := _SUMMARY_CURRENCY_PREFIX.match(rest):
+        currency = currency or prefix[1] or prefix[2]
+        rest = rest[prefix.end() :]
+    money = _MONEY.match(rest)
+    if money:
+        currency = currency or money["prefix"] or money["suffix"]
+        tail = rest[money.end() :]
+        if not tail.strip() or (tail[0].isspace() and re.fullmatch(_NUMBER, tail.strip(), re.I)):
+            evidence.summaries.append((field_name, money["amount"], currency))
+            return True
+    # A tax title or registration label without a money token is not a tax amount.
+    if field_name != "tax_amount" or money or currency:
+        evidence.summaries.append((field_name, rest, currency))
     return True
 
 
@@ -390,42 +417,47 @@ def _summary_values(evidence: _Evidence, dollar_currency: str | None) -> None:
         return normalize_currency(_currency_token(token))[0] or token.upper()
 
     default = scope(evidence.fields.get("total_currency"))
-    total_scopes = {
-        scope(token) for field, _, token in evidence.summaries if token and field == "total_amount"
-    }
-    if not default and len(total_scopes) == 1:
-        default = next(iter(total_scopes))
+    scoped_summaries = [(field, value, scope(token)) for field, value, token in evidence.summaries]
+    scopes = {currency for _, _, currency in scoped_summaries if currency is not None}
+    separate_currencies = len(scopes) > 1
+    if not default and len(scopes) == 1:
+        default = next(iter(scopes))
 
     by_field = defaultdict(dict)
-    for field_name, value, token in evidence.summaries:
-        currency = scope(token) or default
+    for field_name, value, currency in scoped_summaries:
+        currency = currency or default
         previous = by_field[field_name].setdefault(currency, value)
         try:
             equal = parse_decimal_strict(previous) == parse_decimal_strict(value)
         except ValueError:
             equal = previous == value
         if not equal:
-            label = f"{field_name}.{currency}" if currency and len(total_scopes) > 1 else field_name
+            label = f"{field_name}.{currency}" if currency and separate_currencies else field_name
             _flag_conflicting_value(evidence, label, previous, value)
 
     totals = by_field.get("total_amount", {})
-    separate_totals = {
-        currency: total for currency, total in totals.items() if currency is not None
-    }
-    currency_totals = len(separate_totals) > 1
-    if currency_totals:
-        evidence.fields["totals_by_currency"] = separate_totals
     scalar_scope = default if default in totals else next(iter(totals), default)
     for field_name, amounts in by_field.items():
-        if field_name == "total_amount" and currency_totals:
+        if separate_currencies:
+            evidence.fields[_SUMMARY_MAPS[field_name]] = {
+                currency: amount for currency, amount in amounts.items() if currency is not None
+            }
             if None in amounts:
                 evidence.fields[field_name] = amounts[None]
+                evidence.issues.append(
+                    ValidationAlert.from_code(
+                        AlertCode.MULTI_CURRENCY_TOTAL_AMBIGUITY,
+                        "源单有多种汇总币种，此项汇总未标明币种",
+                        field=field_name,
+                        actual=str(amounts[None]),
+                    )
+                )
             continue
         if totals and field_name != "total_amount" and scalar_scope not in amounts:
             continue
         currency = scalar_scope if scalar_scope in amounts else next(iter(amounts))
         evidence.fields[field_name] = amounts[currency]
-        if not currency_totals and currency:
+        if currency:
             evidence.fields.setdefault("total_currency", currency)
 
 
@@ -455,16 +487,19 @@ def _party(lines: Sequence[_Line], label: str) -> str | None:
 def _collect_text_headers(
     doc: ParsedDocument, lines: Sequence[_Line], evidence: _Evidence
 ) -> str | None:
-    title = next(
-        (_BILL_TITLE.match(line.text) for line in lines if _BILL_TITLE.match(line.text)), None
-    )
+    title = next((match for line in lines if (match := _BILL_TITLE.match(line.text))), None)
     if title:
-        evidence.fields.setdefault(
-            "document_type", title[0].upper().replace("DEBITINVOICE", "DEBIT INVOICE")
-        )
+        title_type = " ".join(title[0].upper().split())
+        title_type = re.sub(r"^DEBIT\s*(NOTE|INVOICE)$", r"DEBIT \1", title_type)
+        evidence.fields.setdefault("document_type", title_type)
     for field_name, label in _REFERENCE_LABELS.items():
         if value := _value_after(lines, label, _REF):
             evidence.fields.setdefault(field_name, value.upper())
+    if title and (
+        is_credit_document_type(title_type) or "INVOICE" in title_type or title_type == "DEBIT NOTE"
+    ):
+        if reference := _TITLE_REFERENCE.match(title.string[title.end() :]):
+            evidence.fields.setdefault("reference_no", reference[1].upper())
     date = _value_after(
         lines,
         r"(?:invoice|document|issue|D/C|D/N|C/N|debit note|credit note)?\s*date|general notice",
@@ -482,6 +517,12 @@ def _collect_text_headers(
         value = _party(lines, label)
         if value:
             evidence.fields.setdefault(field_name, value)
+    # Unqualified From/To labels can also identify ports on shipping invoices.
+    for field_name, label in (("issuer", r"from\s*:"), ("recipient", r"to\s*:")):
+        if field_name not in evidence.fields and (
+            value := _value_after(lines, label, _COMPANY.pattern)
+        ):
+            evidence.fields[field_name] = value
     if title:
         leading_companies = []
         for line in lines[:18]:
@@ -637,7 +678,7 @@ def _charge_from_columns(
     }
 
 
-def _collect_tables(doc: ParsedDocument, evidence: _Evidence) -> None:
+def _collect_tables(doc: ParsedDocument, evidence: _Evidence, *, include_charges: bool) -> None:
     row_number = 0
     for table in doc.tables:
         columns: dict[str, int] = {}
@@ -673,9 +714,13 @@ def _collect_tables(doc: ParsedDocument, evidence: _Evidence) -> None:
             if _SUMMARY.match(name):
                 amount = fields.get("amount") or fields.get("debit") or fields.get("credit")
                 currency = fields.get("currency", "")
-                _record_summary(f"{name} {currency} {amount or ''}", evidence)
+                _record_summary(f"{name} {amount or ''} {currency}".strip(), evidence)
                 continue
-            if not name or not (fields.keys() & {"amount", "debit", "credit", "payment_term"}):
+            if (
+                not include_charges
+                or not name
+                or not fields.keys() & {"amount", "debit", "credit", "payment_term"}
+            ):
                 continue
             source = f"{table.source or '[Table]'} [Row {row_index + 1}] {joined}"
             evidence.charges.append(_charge_from_columns(fields, source, row_number, page))
@@ -732,7 +777,7 @@ def _collect_ocr(doc: ParsedDocument, evidence: _Evidence) -> None:
         item_currency = item_fields.get("total_currency")
         if isinstance(item_currency, str):
             evidence.currencies.add(item_currency)
-        for field_name in _SUMMARY_FIELDS:
+        for field_name in _SUMMARY_MAPS:
             value = item_fields.pop(field_name, None)
             if value is None:
                 continue
@@ -982,16 +1027,16 @@ def _extract_local(doc: ParsedDocument) -> RawExtractionEnvelope:
     is_transport = _collect_transport(doc, lines, evidence, bool(title))
     skipped = _capture_clauses(lines, evidence)
     is_office = doc.source_kind in (SourceKind.EXCEL, SourceKind.WORD)
-    if not evidence.charges and is_office:
-        _collect_tables(doc, evidence)
+    if is_office:
+        _collect_tables(doc, evidence, include_charges=not evidence.charges)
     if not evidence.charges:
         _collect_text_charges(doc, lines, evidence, skipped)
     else:
         for line in lines:
             if line.number not in skipped:
                 _record_summary(line.text, evidence)
-    if not evidence.charges and doc.tables and not is_office:
-        _collect_tables(doc, evidence)
+    if not is_office:
+        _collect_tables(doc, evidence, include_charges=not evidence.charges)
 
     summary_tokens = [token for _, _, token in evidence.summaries]
     tokens = (
@@ -1025,13 +1070,13 @@ def _extract_local(doc: ParsedDocument) -> RawExtractionEnvelope:
         evidence.fields["total_currency"] = dollar_currency
     elif isinstance(document_currency, str):
         evidence.fields["total_currency"] = _currency_token(document_currency)
-    totals = evidence.fields.get("totals_by_currency")
-    dollar_summary_field = "total_currency"
-    if isinstance(totals, dict):
-        # Keep an ambiguous symbol in the audit instead of feeding it back into inference.
-        if "$" in totals:
-            totals.pop("$")
-            dollar_summary_field = "totals_by_currency.$"
+    dollar_summary_fields = []
+    for field_name in _SUMMARY_MAPS.values():
+        amounts = evidence.fields.get(field_name)
+        if isinstance(amounts, dict) and "$" in amounts:
+            # Keep an ambiguous symbol in the audit instead of feeding it back into inference.
+            amounts.pop("$")
+            dollar_summary_fields.append(f"{field_name}.$")
     dollar_rows = []
     for index, charge in enumerate(evidence.charges if not metadata_only else ()):
         currency = charge.get("currency")
@@ -1055,13 +1100,17 @@ def _extract_local(doc: ParsedDocument) -> RawExtractionEnvelope:
                 "shipment_refs": refs.model_dump(),
                 "excluded_clauses": [clause.model_dump() for clause in evidence.clauses],
                 "charges": [] if metadata_only else evidence.charges,
+                "has_explicit_total": any(
+                    field != "tax_amount" for field, _, _ in evidence.summaries
+                ),
                 "metadata_only": metadata_only,
             }
         )
     )
     result.raw_parse_issues.extend(evidence.issues)
     if dollar_summary:
-        _annotate_dollar(result, dollar_summary_field, dollar_currency, dollar_reason)
+        for field_name in dollar_summary_fields or ("total_currency",):
+            _annotate_dollar(result, field_name, dollar_currency, dollar_reason)
     for index in dollar_rows:
         _annotate_dollar(result.charges[index], "currency", dollar_currency, dollar_reason)
     return result
@@ -1161,6 +1210,8 @@ def _envelope_currencies(envelope: RawExtractionEnvelope) -> set[str]:
         currency
         for currency in (
             envelope.total_currency,
+            *envelope.subtotals_by_currency,
+            *envelope.taxes_by_currency,
             *envelope.totals_by_currency,
             *(row.charge.currency for row in envelope.charges),
         )

@@ -333,6 +333,33 @@ async def test_unparseable_model_result_can_recover_and_retry_failure_keeps_rows
     assert failed.failed_document_alerts[0].affected_record_ids == [row.id]
 
 
+@pytest.mark.parametrize("budget", [2, 3])
+def test_self_correction_retries_transient_gateway_error_within_batch_budget(budget: int) -> None:
+    client = FakeStructuredLlmClient(
+        [
+            _response("90.00"),
+            LlmGatewayError("temporarily unavailable", retryable=True),
+            _response("100.00"),
+        ]
+    )
+    doc = _document("invoice")
+    result = run_billing_pipeline(
+        [doc], _ENTITY, llm_client=client, limits=ResourceLimits(max_llm_calls_per_batch=budget)
+    )
+    (row,) = result.records
+    assert result.llm_calls_used == len(client.messages) == budget
+    assert row.retry_count == 1
+    if budget == 2:
+        assert result.failed_doc_ids == [doc.doc_id]
+        assert row.review_status is ReviewStatus.NEEDS_REVIEW
+        assert row.amount == Decimal("90.00")
+    else:
+        assert not result.failed_doc_ids
+        assert row.review_status is ReviewStatus.AUTO_READY
+        assert row.amount == Decimal("100.00")
+        assert client.messages[1] == client.messages[2]
+
+
 @pytest.mark.asyncio
 async def test_wide_decimal_and_explicit_illegal_currency_survive_gateway_parsing_error() -> None:
     raw_text = (
@@ -452,6 +479,46 @@ def test_office_summary_bank_rows_and_debit_credit_columns() -> None:
         Decimal("2.00"),
         Decimal("23.90"),
     )
+
+
+@pytest.mark.parametrize("direction", [None, "UNKNOWN", "CREDIT"])
+def test_grounding_fills_explicit_debit_and_blocks_opposite_model_direction(
+    direction: str | None,
+) -> None:
+    doc = _document(
+        "debit-column",
+        f"Invoice No. INV-123\nIssuer: {_ENTITY}\nBill To: {_CUSTOMER}",
+        source_kind="EXCEL",
+        tables=[
+            ParsedTable(
+                rows=[["Description", "Debit", "Currency"], ["Handling Charge", "30.00", "USD"]]
+            )
+        ],
+    )
+    response = _response(
+        "30.00",
+        total=None,
+        total_currency=None,
+        charges=[
+            {
+                "raw_charge_name": "Handling Charge",
+                "amount": "30.00",
+                "currency": "USD",
+                "debit_credit": direction,
+            }
+        ],
+    )
+    result = run_billing_pipeline([doc], _ENTITY, llm_client=FakeStructuredLlmClient([response]))
+    (row,) = result.records
+    assert row.debit_credit == "DEBIT" and row.amount == Decimal("30.00")
+    if direction == "CREDIT":
+        assert row.review_status is ReviewStatus.NEEDS_REVIEW
+        assert any(
+            alert.field == "debit_credit" and alert.severity is AlertSeverity.BLOCKER
+            for alert in row.validation_alerts
+        )
+    else:
+        assert row.review_status is ReviewStatus.AUTO_READY
 
 
 def test_rule_only_uses_every_structured_ocr_item_and_preserves_invalid_values() -> None:
@@ -681,7 +748,16 @@ def test_container_labels_pass_ocr_candidates_to_iso_validator(label: str) -> No
 
 
 @pytest.mark.parametrize(
-    "summary", ["Total USD 0.00", "Subtotal 30.00 USD", "Total USD 30.00\nTotal EUR 40.00"]
+    "summary",
+    [
+        "Total USD 0.00",
+        "Subtotal 30.00 USD",
+        "Total USD 30.00\nTotal EUR 40.00",
+        "Total (USD): 100.00",
+        "Total USD: 100.00",
+        "Total USD:",
+        "Subtotal (EUR): 1.310.40",
+    ],
 )
 def test_summary_without_charges_fails_at_document_level(summary: str) -> None:
     missing = _document("no-lines", f"Invoice INV-EMPTY\nIssuer: {_ENTITY}\n{summary}")
@@ -692,6 +768,56 @@ def test_summary_without_charges_fails_at_document_level(summary: str) -> None:
     (failure,) = result.failed_document_alerts
     assert failure.reason == "文档包含账单总额声明但未提取到有效费用明细"
     assert failure.affected_record_ids == []
+    extraction = result.documents[0].extraction
+    assert extraction.has_explicit_total
+    if summary.endswith(":") or "1.310.40" in summary:
+        assert any(
+            issue.code is AlertCode.OCR_NUMERIC_CONFUSION for issue in extraction.raw_parse_issues
+        )
+
+
+@pytest.mark.parametrize(
+    ("label", "field"),
+    [
+        ("Issuer", "issuer"),
+        ("Bill To", "recipient"),
+        ("Payee", "payee_hint"),
+        ("Payer", "payer_hint"),
+        ("From", "issuer"),
+        ("To", "recipient"),
+    ],
+)
+def test_labeled_company_names_keep_the_complete_branch_suffix(label: str, field: str) -> None:
+    company = "NEPTUNE SHIPPING LIMITED (LAX)"
+    doc = _document("labeled-company", f"Invoice No. INV-123\n{label}: {company}")
+    assert getattr(extract_document_by_rules(doc).extraction, field) == company
+
+
+@pytest.mark.parametrize(
+    ("title", "reference", "amount"),
+    [
+        ("Credit Memo CM-123", "CM-123", "-30"),
+        ("C/N CN-123", "CN-123", "-30"),
+        ("贷项通知 CN-123", "CN-123", "-30"),
+        ("Credit Note CN-123", "CN-123", "-30"),
+        ("Credit Card Invoice INV-123", "INV-123", "30"),
+        ("Letter of Credit", "INV-123", "30"),
+    ],
+)
+def test_rule_only_uses_the_printed_title_and_reference(
+    title: str, reference: str, amount: str
+) -> None:
+    reference_line = "\nReference No. INV-123" if title == "Letter of Credit" else ""
+    doc = _document(
+        "document-title",
+        f"{title}{reference_line}\nIssuer: {_ENTITY}\nBill To: {_CUSTOMER}\n"
+        "Handling Charge 30.00 USD\nTotal USD 30.00",
+    )
+    result = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only")
+    (row,) = result.records
+    assert result.llm_calls_used == 0 and not result.failed_doc_ids
+    assert (row.reference_no, row.amount) == (reference, Decimal(amount))
+    assert row.review_status is ReviewStatus.AUTO_READY
 
 
 def test_source_evidence_and_summary_are_safe_before_batch_validation(monkeypatch) -> None:
@@ -709,6 +835,10 @@ def test_source_evidence_and_summary_are_safe_before_batch_validation(monkeypatc
             assert "signed-value" not in record.source_evidence.model_dump_json()
             assert record.source_doc_totals.source_doc_id == record.source_doc_id
             assert record.source_doc_totals.total_amount == Decimal("100.00")
+            if record.source_doc_id == attachment.doc_id:
+                assert [ref.source_doc_id for ref in record.package_sibling_refs] == [
+                    attachment.doc_id
+                ]
         return real_validate(records, bundles)
 
     monkeypatch.setattr(billing_graph, "validate_batch", inspect_evidence)
@@ -748,7 +878,39 @@ def test_grounding_accepts_reordered_same_name_rows_at_decimal_tolerance() -> No
     assert all(row.review_status is ReviewStatus.AUTO_READY for row in result.records)
 
 
-def test_grounding_keeps_explicit_invalid_audit_until_the_model_supplies_valid_values() -> None:
+def test_grounding_pairs_reordered_equal_amounts_using_the_printed_payment_terms() -> None:
+    doc = _document(
+        "same-amount",
+        f"Invoice No. INV-123\nIssuer: {_ENTITY}\nBill To: {_CUSTOMER}\n"
+        "Handling Fee 30.00 USD (PP)\nHandling Charge 30.00 USD (CC)\nTotal USD 60.00",
+    )
+    response = _response(
+        "30.00",
+        total="60.00",
+        charges=[
+            {
+                "raw_charge_name": "Handling Fee",
+                "amount": "30.00",
+                "currency": "USD",
+                "payment_term": "CC",
+            },
+            {"raw_charge_name": "Handling Charge", "amount": "30.00", "currency": "USD"},
+        ],
+    )
+    result = run_billing_pipeline([doc], _ENTITY, llm_client=FakeStructuredLlmClient([response]))
+    assert [(row.payment_term, row.source_evidence.line_number) for row in result.records] == [
+        (PaymentTerm.CC, 5),
+        (PaymentTerm.PP, 4),
+    ]
+    assert all(row.review_status is ReviewStatus.AUTO_READY for row in result.records)
+
+
+@pytest.mark.parametrize(
+    ("amount", "currency", "date"), [("50000", "EUR", "2026-02-28"), ("12", "CAD", "2026-01-15")]
+)
+def test_grounding_preserves_invalid_source_tokens_after_model_self_correction(
+    amount: str, currency: str, date: str
+) -> None:
     document = _document(
         "unreadable",
         f"Invoice No. INV-123\nIssuer: {_ENTITY}\nDate: 2026-02-30\nHandling Charge 1.310.40 ZZZ",
@@ -756,12 +918,61 @@ def test_grounding_keeps_explicit_invalid_audit_until_the_model_supplies_valid_v
     first = _response(
         "unused", total=None, total_currency=None, charges=[{"raw_charge_name": "Handling Charge"}]
     )
-    second = _response("1310.40", total=None, total_currency=None, document_date="2026-02-28")
+    second = _response(
+        amount, currency=currency, total=None, total_currency=None, document_date=date
+    )
     result = run_billing_pipeline(
         [document], _ENTITY, llm_client=FakeStructuredLlmClient([first, second])
     )
     (row,) = result.records
     assert result.llm_calls_used == 2 and not result.failed_doc_ids
+    assert row.amount is row.currency is row.document_date is None
+    assert row.review_status is ReviewStatus.NEEDS_REVIEW and row.retry_count == 1
+    assert row.raw_invalid_fields == {
+        "amount": "1.310.40",
+        "currency": "ZZZ",
+        "document_date": "2026-02-30",
+    }
+    assert row.raw_amount_text == "1.310.40"
+    assert {(issue.field, issue.actual) for issue in row.raw_parse_issues} >= set(
+        row.raw_invalid_fields.items()
+    )
+
+
+def test_grounding_accepts_replacement_corroborated_by_the_same_documents_text_and_table() -> None:
+    document = _document(
+        "corroborated",
+        f"Invoice No. INV-123\nIssuer: {_ENTITY}\nDate: 2026-02-28",
+        tables=[
+            ParsedTable(
+                rows=[["Description", "Currency", "Amount"], ["Handling Charge", "USD", "1310.40"]]
+            )
+        ],
+        ocr_payload=OcrStructuredPayload.model_validate(
+            {
+                "has_charges": True,
+                "has_metadata": True,
+                "items": [
+                    {
+                        "invoiceNumber": "INV-123",
+                        "invoiceDate": "2026-02-30",
+                        "chargeList": [
+                            {"name": "Handling Charge", "amount": "1.310.40", "currency": "ZZZ"}
+                        ],
+                    }
+                ],
+            }
+        ),
+    )
+    rules = extract_document_by_rules(document)
+    assert rules.raw_invalid_fields == {"document_date": "2026-02-30"}
+    assert rules.charges[0].raw_invalid_fields == {"amount": "1.310.40", "currency": "ZZZ"}
+    response = _response("1310.40", total=None, total_currency=None, document_date="2026-02-28")
+    result = run_billing_pipeline(
+        [document], _ENTITY, llm_client=FakeStructuredLlmClient([response])
+    )
+    (row,) = result.records
+    assert result.llm_calls_used == 1 and not result.failed_doc_ids
     assert (row.amount, row.currency, row.document_date) == (
         Decimal("1310.40"),
         "USD",
