@@ -65,8 +65,16 @@ class _Unchanged(Enum):
 
 
 _UNCHANGED = _Unchanged.VALUE
+_ISOLATED_BILLS = "isolated_bills"
 _SHARED_BASELINE_SNAPSHOT = "shared_baseline_snapshot"
+_ENTITY_PROFILE_SNAPSHOT = "entity_profile_snapshot"
+_SYNCED_WITHOUT_SNAPSHOT = "synced_without_snapshot"
 _BASELINE_SYNC_SELECTION = "baseline_sync_selection"
+_BATCH_METADATA_FIELDS = {
+    "batch_existing_bills",
+    _SHARED_BASELINE_SNAPSHOT,
+    _ENTITY_PROFILE_SNAPSHOT,
+}
 _BATCH_UPDATE_FIELDS = {
     "accounting_entity",
     "status",
@@ -76,8 +84,7 @@ _BATCH_UPDATE_FIELDS = {
     "total_files",
     "succeeded_files",
     "failed_files",
-    "batch_existing_bills",
-    _SHARED_BASELINE_SNAPSHOT,
+    *_BATCH_METADATA_FIELDS,
     "failed_document_alerts",
 }
 _BATCH_COUNTS = ("create", "update", "no_change", "pending_review", "rejected")
@@ -228,7 +235,11 @@ class BillingRepository:
             "total_files": total_files,
             "succeeded_files": succeeded_files,
             "failed_files": failed_files,
-            "batch_existing_bills_json": _dump_batch_bills(batch_existing_bills),
+            "batch_existing_bills_json": (
+                dumps_decimal_json(_json_values(_bill_snapshot_values(batch_existing_bills)))
+                if batch_existing_bills is not None
+                else None
+            ),
             "failed_documents_json": _dump_alerts(failed_document_alerts),
             "created_at": timestamp,
             "updated_at": timestamp,
@@ -264,26 +275,21 @@ class BillingRepository:
                     (batch_id,),
                 )
             ]
-            payload = row["batch_existing_bills_json"]
-            batch_bills = loads_decimal_json(payload) if payload is not None else None
+            metadata = _batch_metadata(row)
+            profile = metadata.get(_ENTITY_PROFILE_SNAPSHOT)
             return {
                 **_batch_summary(row),
                 "documents": documents,
                 "records": records,
                 "failed_document_alerts": alerts,
-                "batch_existing_bills": (
-                    [ExistingBillRecord.model_validate(bill) for bill in batch_bills]
-                    if isinstance(batch_bills, list)
-                    else None
+                "batch_existing_bills": _load_bill_snapshot(metadata.get(_ISOLATED_BILLS)),
+                _SHARED_BASELINE_SNAPSHOT: _load_bill_snapshot(
+                    metadata.get(_SHARED_BASELINE_SNAPSHOT)
                 ),
-                _SHARED_BASELINE_SNAPSHOT: (
-                    [
-                        ExistingBillRecord.model_validate(bill)
-                        for bill in batch_bills[_SHARED_BASELINE_SNAPSHOT]
-                    ]
-                    if isinstance(batch_bills, dict)
-                    else None
+                _ENTITY_PROFILE_SNAPSHOT: (
+                    AccountingEntityProfile.model_validate(profile) if profile is not None else None
                 ),
+                _SYNCED_WITHOUT_SNAPSHOT: metadata.get(_SYNCED_WITHOUT_SNAPSHOT) is True,
             }
 
     def list_batches(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -337,16 +343,28 @@ class BillingRepository:
             _check_batch_version(row, expected_version)
             if not changes:
                 return _batch_summary(row)
-            if _SHARED_BASELINE_SNAPSHOT in changes:
-                if "batch_existing_bills" in changes or _uses_isolated_baseline(row):
-                    raise ValueError("A shared snapshot requires a shared-baseline batch")
-                changes["batch_existing_bills_json"] = _dump_batch_bills(
-                    changes.pop(_SHARED_BASELINE_SNAPSHOT), shared=True
-                )
-            if "batch_existing_bills" in changes:
-                changes["batch_existing_bills_json"] = _dump_batch_bills(
-                    changes.pop("batch_existing_bills")
-                )
+            if changes.keys() & _BATCH_METADATA_FIELDS:
+                metadata = _batch_metadata(row)
+                if _SHARED_BASELINE_SNAPSHOT in changes:
+                    if (
+                        "batch_existing_bills" in changes
+                        or metadata.get(_ISOLATED_BILLS) is not None
+                    ):
+                        raise ValueError("A shared snapshot requires a shared-baseline batch")
+                    metadata[_SHARED_BASELINE_SNAPSHOT] = _bill_snapshot_values(
+                        changes.pop(_SHARED_BASELINE_SNAPSHOT)
+                    )
+                if "batch_existing_bills" in changes:
+                    metadata[_ISOLATED_BILLS] = _bill_snapshot_values(
+                        changes.pop("batch_existing_bills")
+                    )
+                    metadata.pop(_SHARED_BASELINE_SNAPSHOT, None)
+                if _ENTITY_PROFILE_SNAPSHOT in changes:
+                    profile = changes.pop(_ENTITY_PROFILE_SNAPSHOT)
+                    metadata[_ENTITY_PROFILE_SNAPSHOT] = (
+                        profile.model_dump() if profile is not None else None
+                    )
+                changes["batch_existing_bills_json"] = dumps_decimal_json(_json_values(metadata))
             if "failed_document_alerts" in changes:
                 changes["failed_documents_json"] = _dump_alerts(
                     changes.pop("failed_document_alerts")
@@ -474,8 +492,16 @@ class BillingRepository:
         with self._transaction(write=True) as connection:
             batch = _require_batch(connection, batch_id)
             profiles = _entity_profiles(connection)
+            uses_isolated_baseline = _uses_isolated_baseline(batch)
             return [
-                _store_billing_record(connection, batch, record, profiles) for record in records
+                _store_billing_record(
+                    connection,
+                    batch_id,
+                    record,
+                    profiles,
+                    uses_isolated_baseline=uses_isolated_baseline,
+                )
+                for record in records
             ]
 
     def upsert_billing_record(
@@ -488,7 +514,12 @@ class BillingRepository:
         with self._transaction(write=True) as connection:
             batch = _require_batch(connection, batch_id)
             return _store_billing_record(
-                connection, batch, record, _entity_profiles(connection), expected_updated_at
+                connection,
+                batch_id,
+                record,
+                _entity_profiles(connection),
+                expected_updated_at,
+                uses_isolated_baseline=_uses_isolated_baseline(batch),
             )
 
     def get_billing_record(self, batch_id: str, record_id: str) -> ProcessedBillingRecord | None:
@@ -759,7 +790,8 @@ class BillingRepository:
             batch = _require_batch(connection, batch_id)
             _check_batch_version(batch, expected_version)
             profiles = _entity_profiles(connection)
-            uses_isolated_baseline = _uses_isolated_baseline(batch)
+            metadata = _batch_metadata(batch)
+            uses_isolated_baseline = metadata.get(_ISOLATED_BILLS) is not None
             records = connection.execute(
                 """SELECT * FROM billing_records
                    WHERE batch_id = ? AND operation IN ('CREATE', 'UPDATE')
@@ -814,6 +846,20 @@ class BillingRepository:
                     (batch_id, record.id),
                 )
                 counts["updated" if previous is not None else "created"] += 1
+            if (
+                not uses_isolated_baseline
+                and metadata.get(_SHARED_BASELINE_SNAPSHOT) is None
+                and metadata.get(_SYNCED_WITHOUT_SNAPSHOT) is not True
+            ):
+                # Receipts can be deleted with shared bills. Keep the sync history on the batch.
+                metadata.update({_SHARED_BASELINE_SNAPSHOT: None, _SYNCED_WITHOUT_SNAPSHOT: True})
+                _update(
+                    connection,
+                    "batches",
+                    {"batch_existing_bills_json": dumps_decimal_json(_json_values(metadata))},
+                    "id = ?",
+                    (batch_id,),
+                )
         return counts
 
     sync_baseline = sync_batch_to_baseline
@@ -947,19 +993,31 @@ def _check_batch_version(batch: sqlite3.Row, expected: int | None) -> None:
 
 
 def _uses_isolated_baseline(batch: sqlite3.Row) -> bool:
+    return _batch_metadata(batch).get(_ISOLATED_BILLS) is not None
+
+
+def _batch_metadata(batch: sqlite3.Row) -> dict[str, Any]:
     payload = batch["batch_existing_bills_json"]
-    # Isolated baselines use the original JSON array format. Shared snapshots use an object.
-    return payload is not None and payload.lstrip().startswith("[")
+    metadata = loads_decimal_json(payload) if payload is not None else None
+    if isinstance(metadata, list):
+        return {_ISOLATED_BILLS: metadata}
+    if isinstance(metadata, dict):
+        return metadata
+    if metadata is None:
+        return {}
+    raise ValueError("Invalid stored batch metadata")
 
 
-def _dump_batch_bills(
-    bills: Sequence[ExistingBillRecord] | None, *, shared: bool = False
-) -> str | None:
-    if bills is None:
+def _load_bill_snapshot(values: list[dict[str, Any]] | None) -> list[ExistingBillRecord] | None:
+    if values is None:
         return None
-    values = [bill.model_dump(mode="python") for bill in bills]
-    payload = {_SHARED_BASELINE_SNAPSHOT: values} if shared else values
-    return dumps_decimal_json(_json_values(payload))
+    return [ExistingBillRecord.model_validate(bill) for bill in values]
+
+
+def _bill_snapshot_values(
+    bills: Sequence[ExistingBillRecord] | None,
+) -> list[dict[str, Any]] | None:
+    return [bill.model_dump() for bill in bills] if bills is not None else None
 
 
 def _dump_alerts(alerts: Sequence[FailedDocumentAlert]) -> str:
@@ -1093,12 +1151,13 @@ def _billing_record(row: sqlite3.Row) -> ProcessedBillingRecord:
 
 def _store_billing_record(
     connection: sqlite3.Connection,
-    batch: sqlite3.Row,
+    batch_id: str,
     record: ProcessedBillingRecord,
     profiles: Sequence[AccountingEntityProfile],
     expected_updated_at: str | None = None,
+    *,
+    uses_isolated_baseline: bool,
 ) -> ProcessedBillingRecord:
-    batch_id = batch["id"]
     if record.batch_id is not None and record.batch_id != batch_id:
         raise ValueError(f"Record {record.id!r} belongs to a different batch")
     previous = _select_record(connection, batch_id, record.id)
@@ -1119,7 +1178,7 @@ def _store_billing_record(
 
     sql_match_id = record.matched_existing_bill_id
     if sql_match_id is not None and (
-        _uses_isolated_baseline(batch)
+        uses_isolated_baseline
         or _select_existing_bill(
             connection, sql_match_id, record.accounting_entity, profiles=profiles
         ) is None
@@ -1222,17 +1281,30 @@ def _entity_profiles(connection: sqlite3.Connection) -> list[AccountingEntityPro
 def configured_entity_profile(
     name: str, profiles: Sequence[AccountingEntityProfile]
 ) -> AccountingEntityProfile | None:
-    """Resolve an explicit name or alias while retaining branch suffixes."""
+    """Resolve an exact name or alias before considering unique normalized matches."""
+    name = name.strip()
+    canonical_matches = [profile for profile in profiles if profile.canonical_name.strip() == name]
+    if canonical_matches:
+        return canonical_matches[0] if len(canonical_matches) == 1 else None
+    alias_matches = [
+        profile for profile in profiles if any(alias.strip() == name for alias in profile.aliases)
+    ]
+    if alias_matches:
+        return alias_matches[0] if len(alias_matches) == 1 else None
+
     normalized = normalize_party_name(name)
     if not normalized:
         return None
-    aliases = []
+    match = None
     for profile in profiles:
-        if normalize_party_name(profile.canonical_name) == normalized:
-            return profile
-        if any(normalize_party_name(alias) == normalized for alias in profile.aliases):
-            aliases.append(profile)
-    return aliases[0] if len(aliases) == 1 else None
+        if any(
+            normalize_party_name(candidate) == normalized
+            for candidate in (profile.canonical_name, *profile.aliases)
+        ):
+            if match is not None:
+                return None
+            match = profile
+    return match
 
 
 def _bill_entity_matches(

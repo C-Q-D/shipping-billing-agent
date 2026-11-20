@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
@@ -20,6 +20,7 @@ from ..domain.models import (
     AlertCode,
     AlertSeverity,
     BatchStatus,
+    ChargeDictionaryItem,
     DocumentExtractionBundle,
     DocumentStatus,
     ExtractionChannel,
@@ -49,6 +50,7 @@ from .batch_service import (
     Upload,
     _batch_detail,
     _batch_outcome,
+    _batch_scope_changes,
     _BatchScope,
     _document_bundle,
     _entity_name,
@@ -56,7 +58,6 @@ from .batch_service import (
     _ocr_mode,
     _require_batch,
     _root_documents,
-    _shared_baseline_changes,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -172,6 +173,25 @@ _REVIEW_BASIS_FIELDS = (
     "field_diffs",
     "is_credit",
 )
+_EXTRACTED_REVIEW_FIELDS = (set(_REVIEW_BASIS_FIELDS) - {
+    "matched_existing_bill_id",
+    "matched_bill_ref",
+    "field_diffs",
+}) | {"raw_explicit_amount", "raw_invalid_fields"}
+
+
+def _extracted_review_basis(
+    record: ProcessedBillingRecord,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    source = record.model_dump(include=_EXTRACTED_REVIEW_FIELDS)
+    original = record.inherited_fields | record.source_values_before_overrides
+    source.update({field: original[field] for field in source.keys() & original.keys()})
+    totals = record.source_doc_totals
+    return source, totals.model_dump(exclude={"source_doc_id"}) if totals is not None else None
+
+
+def _is_reextraction_warning(alert: ValidationAlert) -> bool:
+    return alert.code is AlertCode.OCR_SUSPICIOUS_FLAG and alert.field == "extraction_snapshot"
 
 
 def _require_editable(batch: Mapping[str, Any], expected_version: int | None) -> None:
@@ -286,7 +306,28 @@ def _restore_decisions(
                     else ReviewStatus.AUTO_READY
                 )
             same_source = record.id in same_source_ids
-            if old.review_status is ReviewStatus.REJECTED:
+            if (
+                same_source
+                and old.review_status in _DECISIONS
+                and _extracted_review_basis(old) != _extracted_review_basis(record)
+            ):
+                warning = ValidationAlert.from_code(
+                    AlertCode.OCR_SUSPICIOUS_FLAG,
+                    "同源单据重新提取后复核依据已变化，请重新核对原件",
+                    field="extraction_snapshot",
+                )
+                alerts = [alert for alert in alerts if not _is_reextraction_warning(alert)]
+                alerts.append(warning)
+                # Keep the warning in the extraction evidence so later rechecks require review too.
+                issues = [
+                    issue
+                    for issue in record.raw_parse_issues
+                    if not _is_reextraction_warning(issue)
+                ]
+                record = record.model_copy(update={"raw_parse_issues": [*issues, warning]})
+                operation = OperationType.PENDING_REVIEW
+                review_status = ReviewStatus.NEEDS_REVIEW
+            elif old.review_status is ReviewStatus.REJECTED:
                 same_warnings = set(map(_warning_key, old.validation_alerts)) == set(
                     map(_warning_key, alerts)
                 )
@@ -391,7 +432,7 @@ def _save_review(
     transaction.upsert_billing_records(batch_id, records)
     changes = {"stage_message": batch["stage_message"], **batch_changes}
     if scope is not None:
-        changes.update(_shared_baseline_changes(transaction, batch, scope))
+        changes.update(_batch_scope_changes(batch, scope))
     transaction.update_batch_with_version_check(batch_id, batch["version"], **changes)
     return _require_batch(transaction, batch_id)
 
@@ -569,13 +610,9 @@ def _retain_child_ids(
     return retained
 
 
-def _source_line_key(
-    record: ProcessedBillingRecord, *, same_source: bool
-) -> tuple[str, Decimal] | None:
+def _replacement_line_key(record: ProcessedBillingRecord) -> tuple[str, Decimal] | None:
     source = record.inherited_fields | record.source_values_before_overrides
     charge = source.get("charge_item", record.charge_item)
-    if same_source:
-        charge = source.get("raw_charge_name", record.raw_charge_name) or charge
     amount = source.get("amount", record.amount)
     if charge is None or amount is None:
         return None
@@ -583,39 +620,83 @@ def _source_line_key(
     return charge, amount.copy_abs().copy_negate() if record.is_credit else amount
 
 
+def _source_lines_by_charge(
+    records: Sequence[ProcessedBillingRecord],
+    origins: Mapping[str, str],
+    dictionary: Sequence[ChargeDictionaryItem],
+) -> dict[tuple[str, str], list[ProcessedBillingRecord]]:
+    groups = defaultdict(list)
+    for record in records:
+        if (origin := origins.get(record.source_doc_id)) is None:
+            continue
+        source = record.inherited_fields | record.source_values_before_overrides
+        raw_charge = source.get("raw_charge_name", record.raw_charge_name)
+        charge, _ = normalize_charge_item(
+            raw_charge or source.get("charge_item", record.charge_item), dictionary
+        )
+        if charge:
+            groups[origin, charge.casefold()].append(record)
+    return groups
+
+
+def _same_source_line_matches(
+    previous: Sequence[ProcessedBillingRecord],
+    extracted: Sequence[ProcessedBillingRecord],
+    same_sources: Mapping[str, str],
+    dictionary: Sequence[ChargeDictionaryItem],
+) -> dict[str, ProcessedBillingRecord]:
+    old_groups = _source_lines_by_charge(
+        previous, {origin: origin for origin in same_sources.values()}, dictionary
+    )
+    new_groups = _source_lines_by_charge(extracted, same_sources, dictionary)
+    matches = {}
+    for key, new_lines in new_groups.items():
+        old_lines = old_groups.get(key, [])
+        if len(old_lines) == len(new_lines) == 1:
+            matches[new_lines[0].id] = old_lines[0]
+            continue
+        old_by_index = defaultdict(list)
+        for line in old_lines:
+            old_by_index[line.source_line_index].append(line)
+        new_index_counts = Counter(line.source_line_index for line in new_lines)
+        for line in new_lines:
+            index = line.source_line_index
+            if len(old_by_index[index]) == new_index_counts[index] == 1:
+                matches[line.id] = old_by_index[index][0]
+    return matches
+
+
 def _carry_line_edits(
     previous: Sequence[ProcessedBillingRecord],
     extracted: Sequence[ProcessedBillingRecord],
     same_sources: Mapping[str, str],
     documents: Mapping[str, DocumentExtractionBundle],
+    dictionary: Sequence[ChargeDictionaryItem],
 ) -> tuple[list[ProcessedBillingRecord], dict[str, str]]:
     # Reserve lines from surviving content before matching edits to changed files.
     destinations = {origin: doc_id for doc_id, origin in same_sources.items()}
+    same_source_matches = _same_source_line_matches(previous, extracted, same_sources, dictionary)
     old_by_key = defaultdict(list)
     new_by_key = defaultdict(list)
-    old_by_line = {}
     for row in previous:
-        origin = row.source_doc_id if row.source_doc_id in destinations else None
-        key = _source_line_key(row, same_source=origin is not None)
-        old_by_key[origin, key].append(row)
-        old_by_line[row.source_doc_id, row.source_line_index] = row
+        if row.source_doc_id not in destinations:
+            old_by_key[_replacement_line_key(row)].append(row)
     for row in extracted:
-        origin = same_sources.get(row.source_doc_id)
-        key = _source_line_key(row, same_source=origin is not None)
-        new_by_key[origin, key].append(row)
+        if row.source_doc_id not in same_sources:
+            new_by_key[_replacement_line_key(row)].append(row)
 
     carried = []
     ids = {}
     used = set()
     for row in extracted:
-        origin = same_sources.get(row.source_doc_id)
-        key = _source_line_key(row, same_source=origin is not None)
-        old = old_by_line.get((origin, row.source_line_index))
-        if old is None or key != _source_line_key(old, same_source=True):
-            candidates = old_by_key[origin, key]
+        same_source = row.source_doc_id in same_sources
+        old = same_source_matches.get(row.id)
+        if not same_source:
+            key = _replacement_line_key(row)
+            candidates = old_by_key[key]
             old = (
                 candidates[0]
-                if key is not None and len(candidates) == len(new_by_key[origin, key]) == 1
+                if key is not None and len(candidates) == len(new_by_key[key]) == 1
                 else None
             )
         changes = {"id": uuid4().hex}
@@ -628,6 +709,11 @@ def _carry_line_edits(
                 human_overrides=old.human_overrides,
                 human_review_history=old.human_review_history,
             )
+            if same_source:
+                changes["raw_parse_issues"] = [
+                    *row.raw_parse_issues,
+                    *(issue for issue in old.raw_parse_issues if _is_reextraction_warning(issue)),
+                ]
         repaired = row.model_copy(update=changes)
         carried.append(repaired)
         ids[row.id] = repaired.id
@@ -1214,16 +1300,14 @@ class ReviewService:
             for record in [*replacement_lines, *restored_lines]
             if record.source_doc_id not in duplicate_targets
         ]
-        carried, ids = _carry_line_edits(old_lines, fresh_lines, same_sources, fresh_documents)
+        carried, ids = _carry_line_edits(
+            old_lines, fresh_lines, same_sources, fresh_documents, scope.charge_dictionary
+        )
         prior_source_ids = set(same_sources.values())
         prior_lines = [record for record in old_lines if record.source_doc_id in prior_source_ids]
-        promoted_sources = {
-            origin for fresh_id, origin in same_sources.items() if fresh_id in restoring
-        }
         carried_ids = {record.id for record in carried}
         if any(
-            record.source_doc_id in promoted_sources
-            and record.id not in carried_ids
+            record.id not in carried_ids
             and (record.review_status in _DECISIONS or record.human_review_history)
             for record in prior_lines
         ):
@@ -1291,7 +1375,7 @@ class ReviewService:
                     same_source_ids=same_source_ids,
                 )
                 outcome = _batch_outcome([bundle.document for bundle in merged], checked, failures)
-                outcome.update(_shared_baseline_changes(transaction, current, scope))
+                outcome.update(_batch_scope_changes(current, scope))
                 transaction.upsert_source_documents(batch_id, result.documents, stored_paths=stored)
                 transaction.upsert_billing_records(batch_id, checked)
                 live_ids = {record.id for record in checked}

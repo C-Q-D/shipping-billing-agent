@@ -21,7 +21,6 @@ from ..agent.graph import BillingGraphInput, _BillingNodes, _BillingState, _pack
 from ..config.limits import ResourceLimits
 from ..config.settings import AppSettings, get_settings
 from ..domain.currency import is_valid_iso4217
-from ..domain.entity_resolver import normalize_party_name
 from ..domain.models import (
     AccountingEntityProfile,
     AlertSeverity,
@@ -61,7 +60,7 @@ from ..parsers.dispatcher import (
 from ..parsers.filename_sanitizer import detect_source_kind, sanitize_filename
 from ..storage import BillingRepository, DatabaseManager, ResourceNotFoundError
 from ..storage.db import BatchWorkerLease, document_root_ids
-from ..storage.repositories import _bill_entity_matches
+from ..storage.repositories import _bill_entity_matches, configured_entity_profile
 
 Upload = tuple[str, bytes | BinaryIO]
 SourceChannel = Literal["WEB", "CLI"]
@@ -122,6 +121,7 @@ class _StaleBatchWorker(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class _BatchScope:
     profiles: list[AccountingEntityProfile]
+    entity_profile: AccountingEntityProfile | None
     baseline: list[ExistingBillRecord]
     existing_bills: list[ExistingBillRecord]
     charge_dictionary: list[ChargeDictionaryItem]
@@ -185,19 +185,24 @@ def _load_batch_scope(
         AccountingEntityProfile.model_validate(profile)
         for profile in repository.list_accounting_entities()
     ]
-    if accounting_entity_profile is not None:
-        canonical = normalize_party_name(accounting_entity_profile.canonical_name)
+    profile_snapshot = accounting_entity_profile
+    if profile_snapshot is None and entity.strip() == batch["accounting_entity"].strip():
+        profile_snapshot = batch.get("entity_profile_snapshot")
+    if profile_snapshot is not None:
+        # Replace the saved profile's current entry without merging punctuation variants.
+        canonical = profile_snapshot.canonical_name.strip()
         profiles = [
             profile
             for profile in profiles
-            if normalize_party_name(profile.canonical_name) != canonical
+            if profile.canonical_name.strip() != canonical
         ]
-        profiles.append(accounting_entity_profile)
+        profiles.append(profile_snapshot)
     bills = batch["batch_existing_bills"]
     if bills is None:
         bills = repository.list_existing_bills() if shared_baseline is None else shared_baseline
     return _BatchScope(
         profiles=profiles,
+        entity_profile=configured_entity_profile(entity, profiles),
         baseline=bills,
         existing_bills=[
             bill for bill in bills if _bill_entity_matches(bill.accounting_entity, entity, profiles)
@@ -209,15 +214,11 @@ def _load_batch_scope(
     )
 
 
-def _shared_baseline_changes(
-    repository: BillingRepository, batch: Mapping[str, Any], scope: _BatchScope
-) -> dict[str, list[ExistingBillRecord]]:
-    # The shared ledger can contain this batch's own results after the first sync.
-    if batch["batch_existing_bills"] is None and not repository.has_baseline_sync_items(
-        batch["id"]
-    ):
-        return {"shared_baseline_snapshot": scope.baseline}
-    return {}
+def _batch_scope_changes(batch: Mapping[str, Any], scope: _BatchScope) -> dict[str, Any]:
+    changes: dict[str, Any] = {"entity_profile_snapshot": scope.entity_profile}
+    if batch["batch_existing_bills"] is None:
+        changes["shared_baseline_snapshot"] = scope.baseline
+    return changes
 
 
 def _document_bundle(row: Mapping[str, Any]) -> DocumentExtractionBundle:
@@ -313,6 +314,8 @@ def _batch_detail(batch: Mapping[str, Any]) -> dict[str, Any]:
                 "failed_document_alerts",
                 "batch_existing_bills",
                 "shared_baseline_snapshot",
+                "entity_profile_snapshot",
+                "synced_without_snapshot",
             }
         },
         "documents": documents,
@@ -924,7 +927,7 @@ class BatchService:
                     result.failed_document_alerts,
                 )
                 with self._worker_transaction(lease, version) as transaction:
-                    outcome.update(_shared_baseline_changes(transaction, batch, scope))
+                    outcome.update(_batch_scope_changes(batch, scope))
                     transaction.upsert_source_documents(batch_id, result.documents)
                     transaction.upsert_billing_records(batch_id, result.records)
                     transaction.update_batch_with_version_check(batch_id, version, **outcome)

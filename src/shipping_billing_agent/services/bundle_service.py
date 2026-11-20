@@ -41,7 +41,6 @@ from ..domain.serializer import _json_values
 from ..gateways.url_guard import HTTP_URL_PATTERN
 from ..storage import BillingRepository, ResourceNotFoundError
 from ..storage.db import utc_timestamp
-from ..storage.repositories import configured_entity_profile
 from .batch_service import (
     ServiceValidationError,
     SourceChannel,
@@ -175,7 +174,9 @@ def export_review_bundle(repository: BillingRepository, batch_id: str) -> dict[s
             )
         bills = batch["batch_existing_bills"]
         snapshot = batch["shared_baseline_snapshot"]
-        if bills is None and snapshot is None and transaction.has_baseline_sync_items(batch_id):
+        if bills is None and snapshot is None and (
+            batch["synced_without_snapshot"] or transaction.has_baseline_sync_items(batch_id)
+        ):
             raise ServiceValidationError(
                 "MISSING_BASELINE_SNAPSHOT",
                 "该历史共享库批次缺少同步前基线快照，已同步基线后无法无损导出复核包",
@@ -186,7 +187,7 @@ def export_review_bundle(repository: BillingRepository, batch_id: str) -> dict[s
         )
         if bills is None:
             bills = scope.existing_bills
-        profile = configured_entity_profile(batch["accounting_entity"], scope.profiles)
+        profile = scope.entity_profile
         profile_snapshot = (
             {"accounting_entity_profile": profile.model_dump(include={"canonical_name", "aliases"})}
             if profile is not None
@@ -445,7 +446,7 @@ def _import_bundle(
         batch_id = batch["id"]
         scope = _load_batch_scope(
             transaction,
-            {"batch_existing_bills": bills},
+            {**batch, "batch_existing_bills": bills},
             bundle.accounting_entity,
             accounting_entity_profile=bundle.accounting_entity_profile,
         )
@@ -481,7 +482,9 @@ def _import_bundle(
                     after=_remap_audit_snapshot(entry.after, batch_id, doc_ids, record_ids),
                 )
         outcome = _batch_outcome([item.document for item in documents], checked, failures)
-        transaction.update_batch_with_version_check(batch_id, batch["version"], **outcome)
+        transaction.update_batch_with_version_check(
+            batch_id, batch["version"], entity_profile_snapshot=scope.entity_profile, **outcome
+        )
         return _batch_detail(_require_batch(transaction, batch_id))
 
 

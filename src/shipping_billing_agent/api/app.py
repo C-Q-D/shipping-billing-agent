@@ -64,10 +64,15 @@ def _register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(OptimisticLockError)
     async def stale_resource(_request: Request, exc: OptimisticLockError) -> DecimalJsonResponse:
+        message = (
+            "该记录此前已同步到其他历史账单，请先核对共享历史基准后再处理改绑"
+            if exc.code == "BASELINE_SYNC_TARGET_CONFLICT"
+            else "资源已被更新，请刷新后重试"
+        )
         return error_response(
             409,
             exc.code,
-            "资源已被更新，请刷新后重试",
+            message,
             details={
                 "resource_id": exc.resource_id,
                 "expected": exc.expected,

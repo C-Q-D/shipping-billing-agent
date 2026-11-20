@@ -59,6 +59,10 @@ from shipping_billing_agent.storage import (
     OptimisticLockError,
     ResourceNotFoundError,
 )
+from shipping_billing_agent.storage.repositories import (
+    _uses_isolated_baseline,
+    configured_entity_profile,
+)
 
 _ENTITY = "NEPTUNE SHIPPING LIMITED"
 _ENTITY_ALIAS = "NEPTUNE SHIPPING LIMITED (LAX)"
@@ -235,7 +239,7 @@ def test_unversioned_contract_upgrades_without_losing_existing_rows(tmp_path: Pa
     assert [row["id"] for row in repository.list_charge_dictionary()] == ["custom"]
     assert repository.sync_baseline("batch") == {"created": 1, "updated": 0, "skipped": 0}
     reopened = BillingRepository(DatabaseManager(path))
-    assert reopened.get_batch("batch") == batch
+    assert reopened.get_batch("batch") == {**batch, "synced_without_snapshot": True}
     assert reopened.sync_baseline("batch") == {"created": 0, "updated": 0, "skipped": 1}
 
 
@@ -939,6 +943,42 @@ def test_shared_bill_import_and_clear_do_not_touch_batch_snapshot(
     assert repository.get_batch(batch_id)["batch_existing_bills"] == [isolated]
 
 
+@pytest.mark.parametrize("mode", ["shared", "isolated", "isolated-empty"])
+def test_batch_metadata_preserves_legacy_baseline_mode_and_exact_values(
+    repository: BillingRepository, mode: str
+) -> None:
+    bill = _bill("ledger", amount=_LARGE_AMOUNT)
+    isolated = {"shared": None, "isolated": [bill], "isolated-empty": []}[mode]
+    batch = repository.create_batch(_ENTITY, batch_existing_bills=isolated)
+    batch_id = batch["id"]
+    assert repository.get_batch(batch_id)["batch_existing_bills"] == isolated
+    with repository.db.connect() as connection:
+        row = connection.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+        assert _uses_isolated_baseline(row) is (isolated is not None)
+
+    profile = AccountingEntityProfile(canonical_name=_ENTITY, aliases=[_ENTITY_ALIAS])
+    changes = {"shared_baseline_snapshot": [bill]} if isolated is None else {}
+    updated = repository.update_batch_with_version_check(
+        batch_id, batch["version"], entity_profile_snapshot=profile, **changes
+    )
+    new_profile = profile.model_copy(update={"aliases": ["New Passport Alias"]})
+    repository.update_batch_with_version_check(
+        batch_id, updated["version"], entity_profile_snapshot=new_profile
+    )
+
+    reopened = BillingRepository(DatabaseManager(repository.db.path))
+    saved = reopened.get_batch(batch_id)
+    assert saved["batch_existing_bills"] == isolated
+    assert saved["shared_baseline_snapshot"] == changes.get("shared_baseline_snapshot")
+    assert saved["entity_profile_snapshot"] == new_profile
+    assert saved["synced_without_snapshot"] is False
+    with reopened.db.connect() as connection:
+        row = connection.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+        envelope = loads_decimal_json(row["batch_existing_bills_json"])
+        assert envelope["entity_profile_snapshot"] == new_profile.model_dump()
+        assert _uses_isolated_baseline(row) is (isolated is not None)
+
+
 def test_shared_bill_scopes_treat_aliases_as_equivalent(repository: BillingRepository) -> None:
     opposite_branch = _bill("other-branch", accounting_entity=f"{_ENTITY} (SFO)")
     unconfigured = _bill("unconfigured", accounting_entity="Example Co. (HQ)")
@@ -975,6 +1015,37 @@ def test_shared_bill_scopes_treat_aliases_as_equivalent(repository: BillingRepos
     assert repository.clear_existing_bills(_ENTITY_ALIAS) == 1
     remaining = repository.list_existing_bills()
     assert {bill.id for bill in remaining} == {"other-branch", "unconfigured"}
+
+
+def test_configured_same_stem_names_require_a_unique_profile(repository: BillingRepository) -> None:
+    plus = AccountingEntityProfile(
+        canonical_name="Harbor+Orchid Logistics",
+        aliases=["Harbor East", "Legacy Harbor", "East+Office"],
+    )
+    dash = AccountingEntityProfile(
+        canonical_name="Harbor-Orchid Logistics",
+        aliases=["Harbor West", " Legacy Harbor ", plus.canonical_name, "East-Office"],
+    )
+    for profile in (plus, dash):
+        repository.create_accounting_entity(profile)
+
+    for profiles in ([plus, dash], [dash, plus]):
+        assert configured_entity_profile(f" {plus.canonical_name} ", profiles) is plus
+        assert configured_entity_profile(dash.canonical_name, profiles) is dash
+        assert configured_entity_profile(" Harbor West ", profiles) is dash
+        assert configured_entity_profile("East+Office", profiles) is plus
+        assert configured_entity_profile("HARBOR EAST", profiles) is plus
+        assert configured_entity_profile("Legacy Harbor", profiles) is None
+        assert configured_entity_profile("East Office", profiles) is None
+        assert configured_entity_profile("Harbor Orchid Logistics", profiles) is None
+
+    east = repository.create_existing_bill(_bill("east", accounting_entity=plus.canonical_name))
+    west = repository.create_existing_bill(_bill("west", accounting_entity=dash.canonical_name))
+    assert repository.list_existing_bills(plus.canonical_name) == [east]
+    assert repository.list_existing_bills(dash.canonical_name) == [west]
+    assert repository.clear_existing_bills("Harbor Orchid Logistics") == 0
+    assert repository.clear_existing_bills("Harbor East") == 1
+    assert repository.list_existing_bills() == [west]
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,7 @@ from PIL import Image
 from shipping_billing_agent.config.limits import ResourceLimits
 from shipping_billing_agent.config.settings import AppSettings
 from shipping_billing_agent.domain.models import (
+    AccountingEntityProfile,
     AlertCode,
     BatchStage,
     BatchStatus,
@@ -509,14 +510,21 @@ def test_concurrent_patches_admit_only_one_writer_and_preserve_other_batch(make_
 
 def test_switch_entity_discards_old_decisions_and_selects_new_scoped_bill(make_service):
     service = make_service()
+    repository = service.repository
+    target_profile = AccountingEntityProfile(canonical_name=CUSTOMER, aliases=["Targeting Ledger"])
+    target = next(
+        row for row in repository.list_accounting_entities() if row["canonical_name"] == CUSTOMER
+    )
+    repository.update_accounting_entity(target["id"], target_profile)
     payload = dumps_decimal_json(
         [
             _bill("neptune").model_dump(),
-            _bill("targeting", entity=CUSTOMER).model_dump(),
+            _bill("targeting", entity="Targeting Ledger").model_dump(),
         ]
     )
     batch = _create(service, existing_bills_json=payload)
     batch_id = batch["id"]
+    assert repository.get_batch(batch_id)["entity_profile_snapshot"].canonical_name == ENTITY
     (record,) = batch["records"]
     review = ReviewService(service)
     review.patch_record(batch_id, record["id"], {"matched_existing_bill_id": "neptune"})
@@ -532,6 +540,7 @@ def test_switch_entity_discards_old_decisions_and_selects_new_scoped_bill(make_s
     assert switched["financial_attributes"] == {"accounting_entity": CUSTOMER, "posting_type": "AP"}
     assert switched["review_status"] != "APPROVED"
     assert "matched_existing_bill_id" not in switched["human_overrides"]
+    assert repository.get_batch(batch_id)["entity_profile_snapshot"] == target_profile
 
 
 def test_reapply_dictionary_restores_only_valid_approvals_and_keeps_overrides(make_service):
@@ -896,6 +905,96 @@ def test_replacement_moves_the_reviewed_line_to_the_surviving_copy(make_service,
     assert repository.list_review_audit_logs(batch_id) == logs
     new_line = next(row for row in after["records"] if row["source_doc_id"] == owner)
     assert new_line["human_overrides"] == {}
+
+
+@pytest.mark.parametrize("action", ["approve", "reject", "patch"])
+def test_same_source_retry_with_unaligned_reviewed_line_keeps_old_results(make_service, action):
+    ocr = FixtureOcr(results={b"same": _invoice("INV-801", "80")})
+    service = make_service(ocr=ocr)
+    repository = service.repository
+    review = ReviewService(service)
+    batch = _create(service, ("first.png", b"same"), ("second.png", b"same"))
+    batch_id = batch["id"]
+    (row,) = batch["records"]
+    doc_id = row["source_doc_id"]
+    review.patch_record(batch_id, row["id"], {"payment_term": "PP"})
+    if action == "approve":
+        review.approve_record(batch_id, row["id"], "已核对原件")
+    elif action == "reject":
+        review.reject_record(batch_id, row["id"], "该行已作废")
+    before = repository.list_billing_records(batch_id)
+    document_before = repository.get_document(batch_id, doc_id)
+    logs = repository.list_review_audit_logs(batch_id)
+
+    ocr.results[b"same"] = _invoice("INV-801", "81", charge="Storage Fee")
+    retried = review.retry_or_replace_document(batch_id, doc_id)
+
+    (failure,) = retried["failed_documents"]
+    assert failure["doc_id"] == doc_id and "未能对齐" in failure["error_message"]
+    assert repository.list_billing_records(batch_id) == before
+    assert repository.get_document(batch_id, doc_id) == document_before
+    assert repository.list_review_audit_logs(batch_id) == logs
+
+
+@pytest.mark.parametrize(
+    ("new_lines", "expected_index"),
+    [
+        ("Storage Fee 5 USD\nHandling Fee 81 USD", 1),
+        ("Handling Fee 81 USD\nHandling Charge 5 USD", 0),
+    ],
+    ids=["unique-charge-moved", "repeated-charge-at-same-position"],
+)
+def test_same_source_retry_aligns_normalized_charges(make_service, new_lines, expected_index):
+    ocr = FixtureOcr(results={b"same": _invoice("INV-801", "80")})
+    service = make_service(ocr=ocr)
+    repository = service.repository
+    review = ReviewService(service)
+    batch = _create(service, ("invoice.png", b"same"))
+    batch_id = batch["id"]
+    (row,) = batch["records"]
+    approved = review.approve_record(batch_id, row["id"], "已核对原件")
+    assert approved["records"][0]["review_status"] == "APPROVED"
+    logs = repository.list_review_audit_logs(batch_id)
+
+    ocr.results[b"same"] = _invoice("INV-801", "81", total="86").replace(
+        "Handling Charge 81 USD", new_lines
+    )
+    retried = review.retry_or_replace_document(batch_id, row["source_doc_id"])
+
+    assert retried["failed_documents"] == []
+    assert len(retried["records"]) == 2
+    handling = next(line for line in retried["records"] if line["id"] == row["id"])
+    assert handling["source_line_index"] == expected_index
+    assert handling["charge_details"]["charge_item"] == "Handling Charge"
+    assert handling["charge_details"]["amount"] == Decimal(81)
+    assert handling["review_status"] == "NEEDS_REVIEW"
+    assert repository.list_review_audit_logs(batch_id) == logs
+
+
+def test_same_source_retry_requires_review_when_an_override_masks_amount_change(make_service):
+    ocr = FixtureOcr(results={b"same": _invoice("INV-801", "80")})
+    service = make_service(ocr=ocr)
+    repository = service.repository
+    review = ReviewService(service)
+    batch = _create(service, ("invoice.png", b"same"))
+    batch_id = batch["id"]
+    (row,) = batch["records"]
+    record_id = row["id"]
+    review.patch_record(batch_id, record_id, {"amount": 80})
+    review.approve_record(batch_id, record_id, "已核对原件")
+    before = repository.get_billing_record(batch_id, record_id)
+    logs = repository.list_review_audit_logs(batch_id)
+
+    ocr.results[b"same"] = _invoice("INV-801", "81", total="80")
+    review.retry_or_replace_document(batch_id, row["source_doc_id"])
+    after = repository.get_billing_record(batch_id, record_id)
+
+    assert (before.raw_explicit_amount, after.raw_explicit_amount) == (80, 81)
+    assert before.amount == after.amount == 80
+    assert before.human_overrides == after.human_overrides == {"amount": 80}
+    assert after.review_status == "NEEDS_REVIEW"
+    assert repository.list_review_audit_logs(batch_id) == logs
+    assert review.reapply_dictionary(batch_id)["records"][0]["review_status"] == "NEEDS_REVIEW"
 
 
 def test_replacement_cannot_overwrite_an_edit_that_commits_during_ocr(make_service):

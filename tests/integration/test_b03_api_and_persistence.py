@@ -111,6 +111,12 @@ def _body(response: httpx.Response, status: int = 200) -> Any:
     return json.loads(response.content, parse_float=Decimal)
 
 
+def _import_bundle(client: TestClient, bundle: dict[str, Any]) -> dict[str, Any]:
+    return _body(
+        client.post(f"{BATCHES}/import-review-bundle", content=dumps_decimal_json(bundle)), 201
+    )
+
+
 def _open_repository(path: Path) -> BillingRepository:
     return BillingRepository(DatabaseManager(path))
 
@@ -646,6 +652,70 @@ def test_replacing_invoice_keeps_the_rejected_record_and_audit(
     assert trail["human_review_history"][-1]["reason"] == reason
 
 
+@pytest.mark.parametrize("reupload", [False, True], ids=["retry-original", "same-byte-upload"])
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+def test_same_byte_ocr_change_keeps_audit_and_requires_review_before_official_download(
+    client: TestClient,
+    settings: AppSettings,
+    monkeypatch: pytest.MonkeyPatch,
+    reupload: bool,
+    decision: str,
+) -> None:
+    content = b"Original invoice image"
+    ocr_amount = 80
+
+    def recognize(_ocr: RapidOcrFallback, data: bytes, _filename: str) -> tuple[str, float]:
+        assert data == content
+        return (
+            f"Invoice No. INV-801\nDate: 2026-10-01\nIssuer: {NEPTUNE}\nBill To: {TARGETING}\n"
+            f"Handling Charge {ocr_amount} USD\nTotal USD {ocr_amount}",
+            0.99,
+        )
+
+    monkeypatch.setattr(RapidOcrFallback, "recognize_image_bytes", recognize)
+    batch = _body(_upload(client, ("original.png", content), ("copy.png", content)), 201)
+    batch_id = batch["id"]
+    path = f"{BATCHES}/{batch_id}"
+    (row,) = batch["records"]
+    record_path = _record_url(path, row)
+    assert row["charge_details"]["amount"] == 80
+    _body(client.patch(record_path, json={"payment_term": "PP"}))
+    reviewed = _body(client.post(f"{record_path}/{decision}", json={"reason": "已核对原件"}))
+    assert reviewed["records"][0]["review_status"] == (
+        "APPROVED" if decision == "approve" else "REJECTED"
+    )
+    download = f"{path}/export/download"
+    expected_count = 1 if decision == "approve" else 0
+    assert len(_body(client.get(download, params={"mode": "official"}))) == expected_count
+
+    repository = _open_repository(settings.sqlite_db_path)
+    before = repository.get_billing_record(batch_id, row["id"])
+    logs = repository.list_review_audit_logs(batch_id)
+    assert [log["action"] for log in logs] == ["PATCH_RECORD", decision.upper()]
+    ocr_amount = 81
+    retry_path = f"{path}/documents/{row['source_doc_id']}/retry"
+    files = {"file": ("reuploaded.png", content)} if reupload else None
+    retried = _body(client.post(retry_path, files=files))
+
+    (updated,) = retried["records"]
+    assert retried["failed_documents"] == []
+    assert updated["id"] == row["id"] and updated["created_at"] == row["created_at"]
+    assert updated["charge_details"]["amount"] == 81
+    assert updated["review_status"] == "NEEDS_REVIEW"
+    after = repository.get_billing_record(batch_id, row["id"])
+    assert after.human_overrides == before.human_overrides
+    assert after.human_review_history == before.human_review_history
+    assert repository.list_review_audit_logs(batch_id) == logs
+    assert _body(client.get(download, params={"mode": "official"})) == []
+    reapplied = _body(client.post(f"{path}/reapply-dictionary"))
+    assert reapplied["records"][0]["review_status"] == "NEEDS_REVIEW"
+    assert _body(client.get(download, params={"mode": "official"})) == []
+    reapproved = _body(client.post(f"{record_path}/approve", json={"reason": "确认新识别金额"}))
+    assert reapproved["records"][0]["review_status"] == "APPROVED"
+    (official,) = _body(client.get(download, params={"mode": "official"}))
+    assert official["charge_details"]["amount"] == 81
+
+
 def test_six_mixed_records_export_exactly_three_five_and_six_with_decimal_bytes(
     settings: AppSettings, client: TestClient, billing_schema: Draft202012Validator
 ) -> None:
@@ -747,6 +817,36 @@ def _ledger_bill(bill_id: str, reference: str, *, entity: str = NEPTUNE) -> dict
     }
 
 
+@pytest.mark.parametrize("side", ["plus", "dash"])
+def test_api_scopes_configured_punctuation_variants_to_each_entity(client: TestClient, side: str):
+    names = {"plus": "Harbor+Orchid Logistics", "dash": "Harbor-Orchid Logistics"}
+    for key, name in names.items():
+        _body(
+            client.post(
+                f"{API}/entities", json={"canonical_name": name, "aliases": [f"Alias {key}"]}
+            ),
+            201,
+        )
+    bills = [_ledger_bill(key, f"INV-{key}", entity=name) for key, name in names.items()]
+    _body(client.post(f"{BILLS}/import", json={"bills": bills}))
+
+    for key, name in names.items():
+        (found,) = _body(client.get(BILLS, params={"accounting_entity": name}))
+        assert found["id"] == key
+    ambiguous = _body(client.get(BILLS, params={"accounting_entity": "Harbor Orchid Logistics"}))
+    assert ambiguous == []
+
+    response = client.delete(
+        BILLS,
+        params={"accounting_entity": names[side]},
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+    assert response.status_code == 204, response.text
+    assert _body(client.get(BILLS, params={"accounting_entity": names[side]})) == []
+    (remaining,) = _body(client.get(BILLS))
+    assert remaining["id"] == next(key for key in names if key != side)
+
+
 def test_third_baseline_sync_updates_the_original_bill_and_preserves_both_receipts(
     settings: AppSettings, client: TestClient
 ) -> None:
@@ -842,6 +942,7 @@ def test_sync_conflicts_when_a_reviewed_record_is_rebound_to_another_bill(
 
     error = _body(client.post(f"{path}/sync-baseline"), 409)
     assert error["code"] == "BASELINE_SYNC_TARGET_CONFLICT"
+    assert error["message"] == "该记录此前已同步到其他历史账单，请先核对共享历史基准后再处理改绑"
     assert error["details"] == {
         "resource_id": record["id"],
         "expected": first["id"],
@@ -873,8 +974,13 @@ def test_shared_review_bundle_after_sync_keeps_the_evaluated_baseline(
     operation = "UPDATE" if shared_match else "CREATE"
     assert (row["operation"], row["review_status"]) == (operation, "AUTO_READY")
     assert row["matched_existing_bill_id"] == ("old-bill" if shared_match else None)
-    assert "shared_baseline_snapshot" not in batch
-    assert "shared_baseline_snapshot" not in _body(client.get(BATCHES))[0]
+    metadata_fields = {
+        "shared_baseline_snapshot",
+        "entity_profile_snapshot",
+        "synced_without_snapshot",
+    }
+    assert not metadata_fields & batch.keys()
+    assert not metadata_fields & _body(client.get(BATCHES))[0].keys()
     repository = _open_repository(settings.sqlite_db_path)
     with repository.db.connect() as connection:
         (match_id,) = connection.execute(
@@ -930,10 +1036,11 @@ def test_review_bundle_keeps_the_baseline_and_profile_used_for_approval(
 ) -> None:
     reference = "INV-813"
     entity = ledger_entity = issuer = NEPTUNE
+    profile = None
     if custom_profile:
         entity, ledger_entity = "Harbor Orchid Logistics", "North Coast Ledger"
         issuer = "Orchid USA"
-        _body(
+        profile = _body(
             client.post(
                 f"{API}/entities",
                 json={"canonical_name": entity, "aliases": [issuer, ledger_entity]},
@@ -961,6 +1068,13 @@ def test_review_bundle_keeps_the_baseline_and_profile_used_for_approval(
     batch_id = batch["id"]
     snapshot = source.get_batch(batch_id)["shared_baseline_snapshot"]
     assert [(bill.id, bill.amount) for bill in snapshot] == [(ledger["id"], 80)]
+    if profile is not None:
+        updated_profile = _body(
+            client.put(
+                f"{API}/entities/{profile['id']}", json={"canonical_name": entity, "aliases": []}
+            )
+        )
+        assert updated_profile["aliases"] == []
     bundle = export_review_bundle(source, batch_id)
     (frozen,) = bundle["existing_bills_snapshot"]
     assert (frozen["id"], frozen["amount"], frozen["accounting_entity"]) == (
@@ -978,10 +1092,7 @@ def test_review_bundle_keeps_the_baseline_and_profile_used_for_approval(
     target_settings = AppSettings(app_data_dir=target, sqlite_db_path=target / "billing.sqlite")
     with TestClient(create_app(settings=target_settings)) as importer:
         profiles = _body(importer.get(f"{API}/entities"))
-        imported = _body(
-            importer.post(f"{BATCHES}/import-review-bundle", content=dumps_decimal_json(bundle)),
-            201,
-        )
+        imported = _import_bundle(importer, bundle)
         (restored,) = imported["records"]
         assert (
             restored["operation"],
@@ -990,9 +1101,83 @@ def test_review_bundle_keeps_the_baseline_and_profile_used_for_approval(
         ) == ("UPDATE", ledger["id"], "APPROVED")
         assert _body(importer.get(BILLS)) == []
         assert _body(importer.get(f"{API}/entities")) == profiles
+        if custom_profile:
+            imported_id = imported["id"]
+            reapplied = _body(importer.post(f"{BATCHES}/{imported_id}/reapply-dictionary"))
+            (row,) = reapplied["records"]
+            assert (row["operation"], row["matched_existing_bill_id"], row["review_status"]) == (
+                "UPDATE",
+                ledger["id"],
+                "APPROVED",
+            )
+            target_repository = _open_repository(target_settings.sqlite_db_path)
+            second_bundle = export_review_bundle(target_repository, imported_id)
+            assert second_bundle["accounting_entity_profile"] == bundle["accounting_entity_profile"]
+            assert second_bundle["existing_bills_snapshot"] == bundle["existing_bills_snapshot"]
+            assert _body(importer.get(f"{API}/entities")) == profiles
+
+    if custom_profile:
+        third = tmp_path / "portable-third"
+        third_settings = AppSettings(app_data_dir=third, sqlite_db_path=third / "billing.sqlite")
+        with TestClient(create_app(settings=third_settings)) as importer:
+            profiles = _body(importer.get(f"{API}/entities"))
+            imported = _import_bundle(importer, second_bundle)
+            (row,) = imported["records"]
+            assert (row["operation"], row["matched_existing_bill_id"], row["review_status"]) == (
+                "UPDATE",
+                ledger["id"],
+                "APPROVED",
+            )
+            assert _body(importer.get(f"{API}/entities")) == profiles
+            assert _body(importer.get(BILLS)) == []
 
     _body(client.post(f"{path}/reapply-dictionary"))
-    assert source.get_batch(batch_id)["shared_baseline_snapshot"] == snapshot
+    refreshed = source.get_batch(batch_id)["shared_baseline_snapshot"]
+    assert [bill.model_dump() for bill in refreshed] == _body(client.get(BILLS))
+
+
+def test_bundle_after_sync_and_reapproval_keeps_the_new_evaluated_baseline(
+    client: TestClient, settings: AppSettings, tmp_path: Path
+) -> None:
+    batch = _body(_upload(client, _invoice("INV-814")), 201)
+    batch_id = batch["id"]
+    path = f"{BATCHES}/{batch_id}"
+    (row,) = batch["records"]
+    repository = _open_repository(settings.sqlite_db_path)
+    assert repository.get_batch(batch_id)["shared_baseline_snapshot"] == []
+
+    assert _body(client.post(f"{path}/sync-baseline"))["created_count"] == 1
+    (ledger,) = _body(client.get(BILLS))
+    assert ledger["amount"] == 100
+    assert repository.get_batch(batch_id)["shared_baseline_snapshot"] == []
+    record_path = _record_url(path, row)
+    _body(client.patch(record_path, json={"amount": 120}))
+    _body(
+        client.patch(
+            f"{path}/documents/{row['source_doc_id']}",
+            json={"total_amount": 120, "total_currency": "USD"},
+        )
+    )
+    approved = _body(client.post(f"{record_path}/approve", json={"reason": "核对更正后的金额"}))
+    (updated,) = approved["records"]
+    assert (
+        updated["operation"], updated["matched_existing_bill_id"], updated["review_status"]
+    ) == ("UPDATE", ledger["id"], "APPROVED")
+    assert _body(client.post(f"{path}/sync-baseline"))["updated_count"] == 1
+    assert _body(client.get(BILLS))[0]["amount"] == 120
+
+    bundle = export_review_bundle(repository, batch_id)
+    assert bundle["existing_bills_snapshot"] == [ledger]
+    target = tmp_path / "reevaluated-bundle"
+    target_settings = AppSettings(app_data_dir=target, sqlite_db_path=target / "billing.sqlite")
+    with TestClient(create_app(settings=target_settings)) as importer:
+        imported = _import_bundle(importer, bundle)
+        (restored,) = imported["records"]
+        assert (
+            restored["operation"], restored["matched_existing_bill_id"], restored["review_status"]
+        ) == ("UPDATE", ledger["id"], "APPROVED")
+        assert restored["charge_details"]["amount"] == 120
+        assert _body(importer.get(BILLS)) == []
 
 
 def test_export_rejects_legacy_synced_batch_without_a_baseline_snapshot(
@@ -1017,6 +1202,63 @@ def test_export_rejects_legacy_synced_batch_without_a_baseline_snapshot(
     assert error.value.message == (
         "该历史共享库批次缺少同步前基线快照，已同步基线后无法无损导出复核包"
     )
+
+
+@pytest.mark.parametrize("has_profile", [False, True], ids=["legacy-null", "profile-only"])
+def test_legacy_sync_without_snapshot_stays_unexportable_after_clearing_ledger(
+    client: TestClient, settings: AppSettings, has_profile: bool
+) -> None:
+    reference = "INV-815"
+    _body(client.post(f"{BILLS}/import", json={"bills": [_ledger_bill("old-ledger", reference)]}))
+    batch = _body(_upload(client, _invoice(reference)), 201)
+    batch_id = batch["id"]
+    path = f"{BATCHES}/{batch_id}"
+    (row,) = batch["records"]
+    approved = _body(client.post(f"{_record_url(path, row)}/approve", json={"reason": "已核对"}))
+    (approved_row,) = approved["records"]
+    assert (approved_row["matched_existing_bill_id"], approved_row["review_status"]) == (
+        "old-ledger", "APPROVED"
+    )
+    repository = _open_repository(settings.sqlite_db_path)
+    profile_snapshot = repository.get_batch(batch_id)["entity_profile_snapshot"]
+    assert profile_snapshot.canonical_name == NEPTUNE
+    payload = (
+        dumps_decimal_json({"entity_profile_snapshot": profile_snapshot.model_dump()})
+        if has_profile
+        else None
+    )
+    with repository.db.connect() as connection:
+        connection.execute(
+            "UPDATE batches SET batch_existing_bills_json = ? WHERE id = ?", (payload, batch_id)
+        )
+    assert _body(client.post(f"{path}/sync-baseline"))["updated_count"] == 1
+    assert len(_sync_receipts(repository, batch_id)) == 1
+    with pytest.raises(ServiceValidationError) as before_clear:
+        export_review_bundle(repository, batch_id)
+    assert (before_clear.value.status_code, before_clear.value.code) == (
+        409, "MISSING_BASELINE_SNAPSHOT"
+    )
+
+    cleared = client.delete(
+        BILLS, params={"accounting_entity": NEPTUNE}, headers={"Origin": "http://127.0.0.1:5173"}
+    )
+    assert cleared.status_code == 204, cleared.text
+    assert _sync_receipts(repository, batch_id) == []
+    replacement = _ledger_bill("replacement-ledger", reference) | {"amount": 45}
+    _body(client.post(f"{BILLS}/import", json={"bills": [replacement]}))
+    (ledger,) = _body(client.get(BILLS))
+    assert (ledger["id"], ledger["amount"]) == ("replacement-ledger", 45)
+
+    reopened = _open_repository(settings.sqlite_db_path)
+    legacy = reopened.get_batch(batch_id)
+    assert legacy["batch_existing_bills"] is None and legacy["shared_baseline_snapshot"] is None
+    with pytest.raises(ServiceValidationError) as after_clear:
+        export_review_bundle(reopened, batch_id)
+    assert (after_clear.value.status_code, after_clear.value.code) == (
+        409, "MISSING_BASELINE_SNAPSHOT"
+    )
+    assert legacy["synced_without_snapshot"] is True
+    assert legacy["entity_profile_snapshot"] == (profile_snapshot if has_profile else None)
 
 
 def test_overlapping_switch_with_stale_version_cannot_overwrite_a_committed_patch(
@@ -1056,6 +1298,7 @@ def test_overlapping_switch_with_stale_version_cannot_overwrite_a_committed_patc
             patch_finished.set()
         conflict = _body(switch.result(timeout=WAIT_SECONDS), 409)
         assert conflict["code"] == "BATCH_CONFLICT"
+        assert conflict["message"] == "资源已被更新，请刷新后重试"
         assert conflict["details"] == {
             "resource_id": batch["id"],
             "expected": version,
