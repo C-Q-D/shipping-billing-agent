@@ -2,8 +2,8 @@
 schema_version: 1
 mode: tracked
 docs_root: docs/workflow
-current_node: "b02-t09"
-next_action: "执行 B02 r2 返工 T08~T09 并派发 B02 r3 复审"
+current_node: "b02-review"
+next_action: "执行 B02 r3 独立复审并收口归档，同时定稿 B03/B04 开启工作树并行"
 check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contracts.py && uv run pytest tests/unit -q && npm --prefix frontend run typecheck"
 ---
 
