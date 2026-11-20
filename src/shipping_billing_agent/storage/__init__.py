@@ -1,1 +1,6 @@
-"""SQLite persistence, upload sandbox, ReviewBundleV1 I/O, and redacting logging filter."""
+"""Public entry points for the SQLite billing repository."""
+
+from .db import DatabaseManager
+from .repositories import BillingRepository, OptimisticLockError, ResourceNotFoundError
+
+__all__ = ["BillingRepository", "DatabaseManager", "OptimisticLockError", "ResourceNotFoundError"]
