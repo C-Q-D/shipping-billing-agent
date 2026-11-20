@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -15,9 +15,17 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, 
 
 from ..domain.charge_normalizer import normalize_charge_item, normalize_payment_term
 from ..domain.currency import is_valid_iso4217, normalize_currency
-from ..domain.entity_resolver import TRANSPORT_FIELDS, entity_matches, recalculate_for_entity
+from ..domain.entity_resolver import (
+    PARTY_FIELDS,
+    TRANSPORT_FIELDS,
+    _name_with_punctuation,
+    entity_matches,
+    recalculate_for_entity,
+    resolve_party_profile,
+)
 from ..domain.matcher import match_and_inherit_batch
 from ..domain.models import (
+    AccountingEntityProfile,
     AlertCode,
     AlertSeverity,
     BatchStatus,
@@ -63,6 +71,7 @@ from .batch_service import (
 
 _LOGGER = logging.getLogger(__name__)
 _DECISIONS = {ReviewStatus.APPROVED, ReviewStatus.REJECTED}
+_ENTITY_BLOCK_CODES = {AlertCode.ENTITY_NOT_MATCHED, "ENTITY_AMBIGUOUS"}
 _TOTAL_MAPS = {
     "subtotal_amount": "subtotals_by_currency",
     "tax_amount": "taxes_by_currency",
@@ -297,6 +306,107 @@ def _for_revalidation(record: ProcessedBillingRecord) -> ProcessedBillingRecord:
     )
 
 
+def _entity_blockers(record: ProcessedBillingRecord) -> list[ValidationAlert]:
+    if record.posting_type is not None:
+        return []
+    return [
+        alert
+        for alert in record.validation_alerts
+        if alert.code in _ENTITY_BLOCK_CODES and alert.severity is not AlertSeverity.RESOLVED
+    ]
+
+
+def _source_party_names(record: ProcessedBillingRecord) -> dict[str, str]:
+    names = {}
+    for field in PARTY_FIELDS:
+        text = record.source_values_before_overrides.get(field, getattr(record, field))
+        names[field] = _name_with_punctuation(text) if isinstance(text, str) else ""
+    return names
+
+
+def _retain_entity_block(
+    record: ProcessedBillingRecord, old: ProcessedBillingRecord, scope: _BatchScope
+) -> ProcessedBillingRecord:
+    if (
+        old.accounting_entity.strip() != record.accounting_entity.strip()
+        or "posting_type" in record.human_overrides
+        or not (blockers := _entity_blockers(old))
+    ):
+        return record
+
+    source_names = _source_party_names(record)
+    if source_names != _source_party_names(old):
+        return record
+    exact_names = {_name_with_punctuation(record.accounting_entity)}
+    if profile := scope.entity_profile:
+        exact_names.update(map(_name_with_punctuation, (profile.canonical_name, *profile.aliases)))
+    if exact_names.intersection(source_names.values()):
+        return record
+
+    # A new database can resolve the same printed name fuzzily once a sibling is absent.
+    # Keep the original evidence until the source or its exact identity changes.
+    original_alerts = {_warning_key(alert): alert for alert in blockers}
+    return record.model_copy(
+        update={
+            "posting_type": None,
+            "operation": OperationType.PENDING_REVIEW,
+            "review_status": ReviewStatus.NEEDS_REVIEW,
+            "validation_alerts": [
+                alert
+                for alert in record.validation_alerts
+                if _warning_key(alert) not in original_alerts
+            ] + list(original_alerts.values()),
+        }
+    )
+
+
+def _scope_with_current_entity_aliases(
+    repository: BillingRepository,
+    scope: _BatchScope,
+    previous: Sequence[ProcessedBillingRecord],
+) -> _BatchScope:
+    profile = scope.entity_profile
+    if profile is None:
+        return scope
+    blocked_names = {
+        name
+        for record in previous
+        if _entity_blockers(record)
+        for name in _source_party_names(record).values()
+        if name
+    }
+    frozen_names = set(map(_name_with_punctuation, (profile.canonical_name, *profile.aliases)))
+    eligible_names = blocked_names - frozen_names
+    if not eligible_names:
+        return scope
+    current_profiles = [
+        AccountingEntityProfile.model_validate(row) for row in repository.list_accounting_entities()
+    ]
+    current = resolve_party_profile(profile.canonical_name, current_profiles)
+    if current is None or (
+        _name_with_punctuation(current.canonical_name)
+        != _name_with_punctuation(profile.canonical_name)
+    ):
+        return scope
+    owned_aliases = [
+        alias
+        for alias in current.aliases
+        if _name_with_punctuation(alias) in eligible_names
+        and resolve_party_profile(alias, current_profiles) is current
+    ]
+    if not owned_aliases:
+        return scope
+
+    # Use only exact aliases for the blocked source names during repair. Keep the saved
+    # baseline and historical profile for export and subsequent approvals.
+    updated = profile.model_copy(update={"aliases": [*profile.aliases, *owned_aliases]})
+    return replace(
+        scope,
+        entity_profile=updated,
+        profiles=[updated if entry is profile else entry for entry in scope.profiles],
+    )
+
+
 def _restore_decisions(
     verified: Sequence[ProcessedBillingRecord],
     previous: Sequence[ProcessedBillingRecord],
@@ -309,6 +419,10 @@ def _restore_decisions(
     old_by_id = {record.id: record for record in previous}
     restored = []
     for record in verified:
+        old = old_by_id.get(record.id)
+        same_source = record.id in same_source_ids
+        if old is not None and same_source:
+            record = _retain_entity_block(record, old, scope)
         if record.id in ambiguous_source_ids:
             restored.append(
                 _require_reextraction_review(
@@ -316,7 +430,6 @@ def _restore_decisions(
                 )
             )
             continue
-        old = old_by_id.get(record.id)
         if old is not None and entity_matches(
             old.accounting_entity, record.accounting_entity, scope.profiles
         ):
@@ -339,7 +452,6 @@ def _restore_decisions(
                     if same_basis and old.review_status is ReviewStatus.APPROVED
                     else ReviewStatus.AUTO_READY
                 )
-            same_source = record.id in same_source_ids
             # A uniquely identified rejected fee stays rejected when other fees change the total.
             include_totals = not (
                 old.review_status is ReviewStatus.REJECTED and record.id in content_matched_ids
@@ -929,6 +1041,15 @@ class ReviewService:
                 reason,
                 fields,
             )
+            if "posting_type" in fields and (blockers := _entity_blockers(before)):
+                # Revalidate a deliberate ledger edit against the current printed parties.
+                edited = edited.model_copy(
+                    update={
+                        "validation_alerts": [
+                            alert for alert in edited.validation_alerts if alert not in blockers
+                        ],
+                    }
+                )
             records = _recheck(
                 _replace_row(batch["records"], edited),
                 [_document_bundle(row) for row in batch["documents"]],
@@ -1336,7 +1457,7 @@ class ReviewService:
         result = self.batch_service._run_pipeline(
             [*package, *parsed],
             batch["accounting_entity"],
-            scope,
+            _scope_with_current_entity_aliases(self.repository, scope, old_lines),
             batch_id,
             targets=targets | restoring.keys(),
         )
@@ -1461,11 +1582,17 @@ class ReviewService:
                 current = _require_batch(transaction, batch_id)
                 _require_editable(current, batch["version"])
                 scope = _load_batch_scope(transaction, current, current["accounting_entity"])
+                previous_lines = [*candidates, *prior_lines]
+                repair_scope = _scope_with_current_entity_aliases(
+                    transaction,
+                    scope,
+                    [record for record in previous_lines if record.id in same_source_ids],
+                )
                 checked = _recheck(
                     [*candidates, *carried],
                     merged,
-                    scope,
-                    [*candidates, *prior_lines],
+                    repair_scope,
+                    previous_lines,
                     same_source_ids=same_source_ids,
                     content_matched_ids={ids[line_id] for line_id in alignment.content_ids},
                     ambiguous_source_ids={ids[line_id] for line_id in alignment.ambiguous_ids},

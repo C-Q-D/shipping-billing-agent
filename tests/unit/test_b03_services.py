@@ -25,13 +25,19 @@ from shipping_billing_agent.domain.models import (
     ChargeDictionaryItem,
     ExistingBillRecord,
     OcrStructuredPayload,
+    OperationType,
     ParsedDocument,
+    PostingType,
+    ProcessedBillingRecord,
+    ReviewStatus,
     ValidationAlert,
     dumps_decimal_json,
     loads_decimal_json,
 )
 from shipping_billing_agent.domain.serializer import serialize_records
 from shipping_billing_agent.services import BatchService, ReviewService, ServiceValidationError
+from shipping_billing_agent.services.batch_service import _BatchScope
+from shipping_billing_agent.services.review_service import _restore_decisions
 from shipping_billing_agent.storage import BillingRepository, DatabaseManager, OptimisticLockError
 from shipping_billing_agent.storage.repositories import ResourceNotFoundError
 
@@ -111,6 +117,51 @@ def _bill(bill_id: str, *, entity: str = ENTITY, amount: str = "100.00") -> Exis
         currency="USD",
         posting_type="AR",
     )
+
+
+@pytest.mark.parametrize(
+    ("printed_issuer", "retains_block"),
+    [("  HARBOR－ORCHID Logistics  ", True), ("Harbor+Orchid Logistics", False)],
+)
+def test_same_source_entity_block_uses_printed_parties_under_overrides(
+    printed_issuer: str, retains_block: bool
+) -> None:
+    target = "Harbor+Orchid Logistics"
+    profile = AccountingEntityProfile(canonical_name=target)
+    scope = _BatchScope(
+        profiles=[profile], entity_profile=profile, existing_bills=[], charge_dictionary=[]
+    )
+    blocker = ValidationAlert.from_code(AlertCode.ENTITY_NOT_MATCHED, "原批主体不匹配")
+    old = ProcessedBillingRecord(
+        id="fee",
+        source_doc_id="original",
+        accounting_entity=target,
+        issuer=target,
+        human_overrides={"issuer": target},
+        source_values_before_overrides={"issuer": "Harbor-Orchid Logistics"},
+        validation_alerts=[blocker, blocker.model_copy()],
+    )
+    recalculated = old.model_copy(
+        update={
+            "operation": OperationType.CREATE,
+            "review_status": ReviewStatus.AUTO_READY,
+            "posting_type": PostingType.AR,
+            "source_values_before_overrides": {"issuer": printed_issuer},
+            "validation_alerts": [],
+        }
+    )
+
+    (restored,), _ = _restore_decisions([recalculated], [old], scope, same_source_ids={old.id})
+
+    if retains_block:
+        assert (restored.operation, restored.review_status, restored.posting_type) == (
+            OperationType.PENDING_REVIEW,
+            ReviewStatus.NEEDS_REVIEW,
+            None,
+        )
+        assert restored.validation_alerts == [blocker]
+    else:
+        assert restored == recalculated
 
 
 def _logo_png() -> bytes:

@@ -41,7 +41,7 @@ from ..domain.serializer import _json_values
 from ..gateways.url_guard import HTTP_URL_PATTERN
 from ..storage import BillingRepository, ResourceNotFoundError
 from ..storage.db import utc_timestamp
-from ..storage.repositories import _bill_entity_matches
+from ..storage.repositories import _bill_entity_matches, configured_entity_profile
 from .batch_service import (
     ServiceValidationError,
     SourceChannel,
@@ -51,7 +51,7 @@ from .batch_service import (
     _load_batch_scope,
     _require_batch,
 )
-from .review_service import _recheck
+from .review_service import _entity_blockers, _recheck
 
 _BUNDLE_VERSION = "1.0"
 _TOTAL_FIELDS = {"subtotal_amount", "tax_amount", "total_amount", "total_currency"}
@@ -179,39 +179,83 @@ def _scope_legacy_baseline(
     batch: Mapping[str, Any],
     snapshot: Sequence[ExistingBillRecord],
     profile: AccountingEntityProfile | None,
-    current_profiles: Sequence[AccountingEntityProfile] | None,
+    db_entity_rows: Sequence[Mapping[str, Any]],
 ) -> list[ExistingBillRecord]:
     entity = batch["accounting_entity"].strip()
+    has_frozen_profile = batch["has_entity_profile_snapshot"]
     profiles = [profile] if profile is not None else []
     profile_names = (
         set(map(_name_with_punctuation, (profile.canonical_name, *profile.aliases)))
         if profile is not None
         else set()
     )
-    if current_profiles is not None and _name_with_punctuation(entity) not in profile_names:
+    if not has_frozen_profile and _name_with_punctuation(entity) not in profile_names:
         profile_names.clear()
 
-    def belongs_to_batch(name: str) -> bool:
+    target_canonicals = {entity}
+    if profile is not None:
+        target_canonicals.add(profile.canonical_name.strip())
+    batch_start, batch_end = batch["created_at"], batch["updated_at"]
+    previously_owned: set[str] = set()
+    uncertain_ownership: set[str] = set()
+    for row in db_entity_rows:
+        if row["canonical_name"].strip() in target_canonicals:
+            continue
+        canonical = _name_with_punctuation(row["canonical_name"])
+        aliases = set(map(_name_with_punctuation, row["aliases"]))
+        if row["created_at"] <= batch_start:
+            previously_owned.add(canonical)
+            # Alias changes have no individual timestamps in legacy databases.
+            if row["updated_at"] <= batch_start:
+                previously_owned.update(aliases)
+            else:
+                uncertain_ownership.update(aliases)
+        elif row["created_at"] <= batch_end or not has_frozen_profile:
+            # A current profile alone cannot prove that a later claimant was the only change.
+            uncertain_ownership.update({canonical, *aliases})
+        elif row["updated_at"] <= batch_end:
+            uncertain_ownership.update(aliases)
+
+    def belongs_to_batch(name: str) -> bool | None:
         if name.strip() == entity:
             return True
         # A legacy snapshot held the full table. A punctuation-insensitive match alone
         # cannot prove which ledger owned one of its rows.
-        return (
-            _name_with_punctuation(name) in profile_names
-            and _bill_entity_matches(name, entity, profiles)
-            and (current_profiles is None or _bill_entity_matches(name, entity, current_profiles))
-        )
+        key = _name_with_punctuation(name)
+        if key not in profile_names or not _bill_entity_matches(name, entity, profiles):
+            return False
+        if key in previously_owned:
+            return False
+        return None if key in uncertain_ownership else True
 
-    bills = [bill for bill in snapshot if belongs_to_batch(bill.accounting_entity)]
+    bills = []
+    uncertain_bill_ids = set()
+    for bill in snapshot:
+        belongs = belongs_to_batch(bill.accounting_entity)
+        if belongs is None:
+            uncertain_bill_ids.add(bill.id)
+        elif belongs:
+            bills.append(bill)
     bill_ids = {bill.id for bill in bills}
-    unproven_scope = current_profiles is not None and snapshot and not (profile_names or bills)
-    if unproven_scope or any(
+    records = batch["records"]
+    if uncertain_bill_ids and any(
+        record.matched_existing_bill_id in uncertain_bill_ids
+        or any(candidate.id in uncertain_bill_ids for candidate in record.candidate_bills)
+        for record in records
+    ):
+        raise ServiceValidationError(
+            "MISSING_BASELINE_SNAPSHOT",
+            "无法确认该历史共享库批次所引用账单的主体归属，无法无损导出复核包",
+            status_code=409,
+        )
+    unproven_scope = not has_frozen_profile and snapshot and not (profile_names or bills)
+    if uncertain_bill_ids or unproven_scope or any(
         not belongs_to_batch(record.accounting_entity)
         or (
             record.matched_existing_bill_id is not None
             and record.matched_existing_bill_id not in bill_ids
         )
-        for record in batch["records"]
+        for record in records
     ):
         _require_snapshot_if_synced(repository, batch)
     return bills
@@ -227,24 +271,25 @@ def export_review_bundle(repository: BillingRepository, batch_id: str) -> dict[s
             )
         bills = batch["batch_existing_bills"]
         snapshot = batch["shared_baseline_snapshot"]
-        missing_baseline = bills is None and snapshot is None
-        if missing_baseline:
-            _require_snapshot_if_synced(transaction, batch)
+        legacy_snapshot = None if batch["shared_baseline_scoped"] else snapshot
         profile = batch["entity_profile_snapshot"]
-        current_profiles = None
-        if missing_baseline or not batch["has_entity_profile_snapshot"]:
+        if bills is None and snapshot is None:
+            _require_snapshot_if_synced(transaction, batch)
             scope = _load_batch_scope(transaction, batch, batch["accounting_entity"])
-            if missing_baseline:
-                bills = scope.existing_bills
+            bills = scope.existing_bills
             if not batch["has_entity_profile_snapshot"]:
                 profile = scope.entity_profile
-                current_profiles = scope.profiles
+        elif legacy_snapshot is not None or not batch["has_entity_profile_snapshot"]:
+            db_entity_rows = transaction.list_accounting_entities()
+            db_profiles = [AccountingEntityProfile.model_validate(row) for row in db_entity_rows]
+            if not batch["has_entity_profile_snapshot"]:
+                profile = configured_entity_profile(batch["accounting_entity"], db_profiles)
+            if legacy_snapshot is not None:
+                snapshot = _scope_legacy_baseline(
+                    transaction, batch, legacy_snapshot, profile, db_entity_rows
+                )
         if bills is None:
-            bills = (
-                snapshot
-                if batch["shared_baseline_scoped"]
-                else _scope_legacy_baseline(transaction, batch, snapshot, profile, current_profiles)
-            )
+            bills = snapshot
         audit_by_record = defaultdict(list)
         for entry in transaction.list_review_audit_logs(batch_id):
             audit_by_record[entry["record_id"]].append(entry)
@@ -522,7 +567,13 @@ def _import_bundle(
             for record in records
         ]
         transaction.upsert_source_documents(batch_id, documents)
-        checked = _recheck(prior, documents, scope, prior)
+        checked = _recheck(
+            prior,
+            documents,
+            scope,
+            prior,
+            same_source_ids={record.id for record in prior if _entity_blockers(record)},
+        )
         if {record.id for record in checked} != set(record_ids.values()):
             raise ValueError("复核包中的重复来源会导致部分复核记录被合并")
         transaction.upsert_billing_records(batch_id, checked)
