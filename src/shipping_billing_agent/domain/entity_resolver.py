@@ -106,56 +106,99 @@ def normalize_party_name(name: str | None) -> str:
     return " ".join((stem, *(f"({branch})" for branch in branches))).strip()
 
 
-def _resolve_party_key(
-    name: _PartyKey, configured_names: dict[_PartyKey, set[_PartyKey]]
-) -> tuple[_PartyKey | None, bool]:
-    if name in configured_names:
-        return name, True
-    exact_aliases = {key for key, aliases in configured_names.items() if name in aliases}
-    if exact_aliases:
-        return (next(iter(exact_aliases)), True) if len(exact_aliases) == 1 else (None, False)
+@dataclass(frozen=True, slots=True)
+class _PartyMatch:
+    profile_index: int | None = None
+    matched_name: bool = False
+    ambiguous: bool = False
 
-    stem, branches = name
-    by_stem = {
-        key: {entry[1] for entry in {key, *aliases} if entry[0] == stem}
-        for key, aliases in configured_names.items()
-    }
-    candidates = {key: suffixes for key, suffixes in by_stem.items() if suffixes}
-    if len(candidates) > 1:
-        return (name if branches else None), False
-    if candidates:
-        key, suffixes = next(iter(candidates.items()))
-        if not branches or not suffixes - {()}:
-            return key, False
-    return name, False
+
+def _name_with_punctuation(name: str) -> str:
+    return " ".join(normalize("NFKC", name).casefold().split())
+
+
+def _resolve_party_key(name: str, profiles: Sequence[AccountingEntityProfile]) -> _PartyMatch:
+    name = name.strip()
+    if not name or not profiles:
+        return _PartyMatch()
+
+    names = [
+        tuple(text.strip() for text in (profile.canonical_name, *profile.aliases))
+        for profile in profiles
+    ]
+    matches = [index for index, entries in enumerate(names) if name == entries[0]]
+    if not matches:
+        matches = [index for index, entries in enumerate(names) if name in entries[1:]]
+    if not matches:
+        normalized = _name_with_punctuation(name)
+        matches = [
+            index
+            for index, entries in enumerate(names)
+            if any(_name_with_punctuation(entry) == normalized for entry in entries)
+        ]
+    if matches:
+        if len(matches) == 1:
+            return _PartyMatch(matches[0], matched_name=True)
+        return _PartyMatch(ambiguous=True)
+
+    stem, branches = _party_key(name)
+    if not stem:
+        return _PartyMatch()
+    by_stem = {}
+    for index, entries in enumerate(names):
+        suffixes = {suffix for entry_stem, suffix in map(_party_key, entries) if entry_stem == stem}
+        if suffixes:
+            by_stem[index] = suffixes
+    matches = [index for index, suffixes in by_stem.items() if branches in suffixes]
+    if matches:
+        if len(matches) == 1:
+            return _PartyMatch(matches[0], matched_name=True)
+        return _PartyMatch(ambiguous=True)
+    if len(by_stem) == 1:
+        index, suffixes = next(iter(by_stem.items()))
+        if not branches or suffixes == {()}:
+            return _PartyMatch(index)
+    return _PartyMatch(ambiguous=not branches and len(by_stem) > 1)
+
+
+def resolve_party_profile(
+    name: str, profiles: Sequence[AccountingEntityProfile]
+) -> AccountingEntityProfile | None:
+    index = _resolve_party_key(name, profiles).profile_index
+    return profiles[index] if index is not None else None
 
 
 def entity_matches(
     party_name: str | None,
     target_entity: str,
     profiles: Sequence[AccountingEntityProfile] = (),
+    *,
+    allow_unconfigured_fallback: bool = True,
 ) -> bool:
-    party = _party_key(party_name)
-    target = _party_key(target_entity)
-    if not party[0] or not target[0]:
+    if not party_name or not party_name.strip() or not target_entity.strip():
         return False
-    if not profiles:
-        return party == target or (party[0] == target[0] and not (party[1] and target[1]))
+    party_match = _resolve_party_key(party_name, profiles)
+    target_match = _resolve_party_key(target_entity, profiles)
+    if party_match.ambiguous or target_match.ambiguous:
+        return False
+    if party_match.profile_index != target_match.profile_index:
+        return False
+    if party_match.matched_name and target_match.matched_name:
+        return True
+    if party_match.profile_index is None and not allow_unconfigured_fallback:
+        return party_name.strip() == target_entity.strip()
 
-    configured_names: dict[_PartyKey, set[_PartyKey]] = {}
-    for profile in profiles:
-        configured_names.setdefault(_party_key(profile.canonical_name), set()).update(
-            _party_key(alias) for alias in profile.aliases
+    party_stem, party_branch = _party_key(party_name)
+    target_stem, target_branch = _party_key(target_entity)
+    if party_match.profile_index is None:
+        return bool(party_stem and party_stem == target_stem) and (
+            party_branch == target_branch or not (party_branch and target_branch)
         )
-    party_key, exact_party = _resolve_party_key(party, configured_names)
-    target_key, exact_target = _resolve_party_key(target, configured_names)
-    conflicting_branches = (
-        party[0] == target[0] and party[1] and target[1] and party[1] != target[1]
-    )
-    return (
-        party_key is not None
-        and party_key == target_key
-        and (not conflicting_branches or exact_party and exact_target)
+    return not (
+        party_stem == target_stem
+        and party_branch
+        and target_branch
+        and party_branch != target_branch
     )
 
 

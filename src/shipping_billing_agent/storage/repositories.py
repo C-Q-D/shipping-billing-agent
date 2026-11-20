@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from ..domain.entity_resolver import normalize_party_name
+from ..domain.entity_resolver import entity_matches, resolve_party_profile
 from ..domain.models import (
     AccountingEntityProfile,
     BatchStage,
@@ -175,11 +175,12 @@ class BillingRepository:
     ) -> None:
         self.db = db
         self._connection = _connection
+        self._backfilled_legacy_sync = False
 
     @contextmanager
-    def transaction(self) -> Iterator[BillingRepository]:
-        """Group a batch version check and subsequent writes in the same transaction."""
-        with self._transaction(write=True) as connection:
+    def transaction(self, *, write: bool = True) -> Iterator[BillingRepository]:
+        """Group repository operations in the same SQLite snapshot."""
+        with self._transaction(write=write) as connection:
             yield BillingRepository(self.db, _connection=connection)
 
     @contextmanager
@@ -187,7 +188,12 @@ class BillingRepository:
         connection = self._connection
         if connection is None:
             with self.db.transaction(write=write) as connection:
+                backfill = write and not self._backfilled_legacy_sync
+                if backfill:
+                    _mark_synced_batches_without_snapshot(connection)
                 yield connection
+            if backfill:
+                self._backfilled_legacy_sync = True
         elif not write:
             yield connection
         else:
@@ -289,6 +295,7 @@ class BillingRepository:
                 _ENTITY_PROFILE_SNAPSHOT: (
                     AccountingEntityProfile.model_validate(profile) if profile is not None else None
                 ),
+                "has_entity_profile_snapshot": _ENTITY_PROFILE_SNAPSHOT in metadata,
                 _SYNCED_WITHOUT_SNAPSHOT: metadata.get(_SYNCED_WITHOUT_SNAPSHOT) is True,
             }
 
@@ -726,16 +733,19 @@ class BillingRepository:
         with self._transaction(write=True) as connection:
             if _select_existing_bill(connection, bill_id, accounting_entity) is None:
                 return False
+            _mark_synced_batches_without_snapshot(connection, [bill_id])
             deleted = connection.execute("DELETE FROM existing_bills WHERE id = ?", (bill_id,))
             return bool(deleted.rowcount)
 
     def clear_existing_bills(self, accounting_entity: str | None = None) -> int:
         with self._transaction(write=True) as connection:
             if accounting_entity is None:
+                _mark_synced_batches_without_snapshot(connection)
                 return connection.execute("DELETE FROM existing_bills").rowcount
-            bills = list(_existing_bill_rows(connection, accounting_entity))
+            bill_ids = [row["id"] for row in _existing_bill_rows(connection, accounting_entity)]
+            _mark_synced_batches_without_snapshot(connection, bill_ids)
             return connection.executemany(
-                "DELETE FROM existing_bills WHERE id = ?", [(row["id"],) for row in bills]
+                "DELETE FROM existing_bills WHERE id = ?", [(bill_id,) for bill_id in bill_ids]
             ).rowcount
 
     def import_existing_bills(
@@ -766,10 +776,14 @@ class BillingRepository:
                     raise ValueError(f"Existing bill {bill.id!r} belongs to another entity")
                 _store_existing_bill(connection, bill, previous=previous)
             if replace_existing:
-                old_bills = list(_existing_bill_rows(connection, accounting_entity))
+                old_ids = [
+                    row["id"] for row in _existing_bill_rows(connection, accounting_entity)
+                    if row["id"] not in new_ids
+                ]
+                _mark_synced_batches_without_snapshot(connection, old_ids)
                 connection.executemany(
                     "DELETE FROM existing_bills WHERE id = ?",
-                    ((row["id"],) for row in old_bills if row["id"] not in new_ids),
+                    [(bill_id,) for bill_id in old_ids],
                 )
             total = connection.execute("SELECT COUNT(*) FROM existing_bills").fetchone()[0]
             return {"imported_count": len(bills), "total_count": total}
@@ -846,20 +860,7 @@ class BillingRepository:
                     (batch_id, record.id),
                 )
                 counts["updated" if previous is not None else "created"] += 1
-            if (
-                not uses_isolated_baseline
-                and metadata.get(_SHARED_BASELINE_SNAPSHOT) is None
-                and metadata.get(_SYNCED_WITHOUT_SNAPSHOT) is not True
-            ):
-                # Receipts can be deleted with shared bills. Keep the sync history on the batch.
-                metadata.update({_SHARED_BASELINE_SNAPSHOT: None, _SYNCED_WITHOUT_SNAPSHOT: True})
-                _update(
-                    connection,
-                    "batches",
-                    {"batch_existing_bills_json": dumps_decimal_json(_json_values(metadata))},
-                    "id = ?",
-                    (batch_id,),
-                )
+            _mark_batch_synced_without_snapshot(connection, batch_id, metadata)
         return counts
 
     sync_baseline = sync_batch_to_baseline
@@ -1006,6 +1007,48 @@ def _batch_metadata(batch: sqlite3.Row) -> dict[str, Any]:
     if metadata is None:
         return {}
     raise ValueError("Invalid stored batch metadata")
+
+
+def _mark_batch_synced_without_snapshot(
+    connection: sqlite3.Connection, batch_id: str, metadata: dict[str, Any]
+) -> None:
+    if (
+        metadata.get(_ISOLATED_BILLS) is not None
+        or metadata.get(_SHARED_BASELINE_SNAPSHOT) is not None
+        or metadata.get(_SYNCED_WITHOUT_SNAPSHOT) is True
+    ):
+        return
+    metadata.update({_SHARED_BASELINE_SNAPSHOT: None, _SYNCED_WITHOUT_SNAPSHOT: True})
+    _update(
+        connection,
+        "batches",
+        {"batch_existing_bills_json": dumps_decimal_json(_json_values(metadata))},
+        "id = ?",
+        (batch_id,),
+    )
+
+
+def _mark_synced_batches_without_snapshot(
+    connection: sqlite3.Connection, bill_ids: Sequence[str] | None = None
+) -> None:
+    """Preserve legacy sync evidence before any shared bill cascades remove its receipts."""
+    query = """SELECT id, batch_existing_bills_json FROM batches WHERE id IN (
+                   SELECT batch_id FROM baseline_sync_items"""
+    if bill_ids is None:
+        groups = (None,)
+    else:
+        limit = connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+        groups = (bill_ids[start : start + limit] for start in range(0, len(bill_ids), limit))
+    for ids in groups:
+        if ids is None:
+            batches = connection.execute(query + ")").fetchall()
+        else:
+            placeholders = ", ".join("?" for _ in ids)
+            batches = connection.execute(
+                f"{query} WHERE existing_bill_id IN ({placeholders}))", ids
+            ).fetchall()
+        for batch in batches:
+            _mark_batch_synced_without_snapshot(connection, batch["id"], _batch_metadata(batch))
 
 
 def _load_bill_snapshot(values: list[dict[str, Any]] | None) -> list[ExistingBillRecord] | None:
@@ -1282,38 +1325,13 @@ def configured_entity_profile(
     name: str, profiles: Sequence[AccountingEntityProfile]
 ) -> AccountingEntityProfile | None:
     """Resolve an exact name or alias before considering unique normalized matches."""
-    name = name.strip()
-    canonical_matches = [profile for profile in profiles if profile.canonical_name.strip() == name]
-    if canonical_matches:
-        return canonical_matches[0] if len(canonical_matches) == 1 else None
-    alias_matches = [
-        profile for profile in profiles if any(alias.strip() == name for alias in profile.aliases)
-    ]
-    if alias_matches:
-        return alias_matches[0] if len(alias_matches) == 1 else None
-
-    normalized = normalize_party_name(name)
-    if not normalized:
-        return None
-    match = None
-    for profile in profiles:
-        if any(
-            normalize_party_name(candidate) == normalized
-            for candidate in (profile.canonical_name, *profile.aliases)
-        ):
-            if match is not None:
-                return None
-            match = profile
-    return match
+    return resolve_party_profile(name, profiles)
 
 
 def _bill_entity_matches(
     name: str, entity: str, profiles: Sequence[AccountingEntityProfile]
 ) -> bool:
-    if name.strip() == entity.strip():
-        return True
-    profile = configured_entity_profile(entity, profiles)
-    return profile is not None and configured_entity_profile(name, profiles) is profile
+    return entity_matches(name, entity, profiles, allow_unconfigured_fallback=False)
 
 
 def _existing_bill_rows(

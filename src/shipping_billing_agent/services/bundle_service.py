@@ -166,7 +166,7 @@ def _has_ocr_flag(document: ParsedDocument) -> bool:
 
 def export_review_bundle(repository: BillingRepository, batch_id: str) -> dict[str, Any]:
     """Capture a consistent snapshot of a completed batch and its audit history."""
-    with repository.transaction() as transaction:
+    with repository.transaction(write=False) as transaction:
         batch = _require_batch(transaction, batch_id)
         if batch["status"] == BatchStatus.PROCESSING:
             raise ServiceValidationError(
@@ -182,17 +182,15 @@ def export_review_bundle(repository: BillingRepository, batch_id: str) -> dict[s
                 "该历史共享库批次缺少同步前基线快照，已同步基线后无法无损导出复核包",
                 status_code=409,
             )
-        scope = _load_batch_scope(
-            transaction, batch, batch["accounting_entity"], shared_baseline=snapshot
-        )
         if bills is None:
-            bills = scope.existing_bills
-        profile = scope.entity_profile
-        profile_snapshot = (
-            {"accounting_entity_profile": profile.model_dump(include={"canonical_name", "aliases"})}
-            if profile is not None
-            else {}
-        )
+            bills = snapshot
+        profile = batch["entity_profile_snapshot"]
+        if bills is None or not batch["has_entity_profile_snapshot"]:
+            scope = _load_batch_scope(transaction, batch, batch["accounting_entity"])
+            if bills is None:
+                bills = scope.existing_bills
+            if not batch["has_entity_profile_snapshot"]:
+                profile = scope.entity_profile
         audit_by_record = defaultdict(list)
         for entry in transaction.list_review_audit_logs(batch_id):
             audit_by_record[entry["record_id"]].append(entry)
@@ -220,7 +218,11 @@ def export_review_bundle(repository: BillingRepository, batch_id: str) -> dict[s
                 "exported_at": utc_timestamp(),
                 "short_code": batch["short_code"],
                 "accounting_entity": batch["accounting_entity"],
-                **profile_snapshot,
+                "accounting_entity_profile": (
+                    profile.model_dump(include={"canonical_name", "aliases"})
+                    if profile is not None
+                    else None
+                ),
                 "ocr_mode": batch["ocr_mode"],
                 "existing_bills_snapshot": [bill.model_dump() for bill in bills],
                 "documents": documents,
@@ -446,9 +448,15 @@ def _import_bundle(
         batch_id = batch["id"]
         scope = _load_batch_scope(
             transaction,
-            {**batch, "batch_existing_bills": bills},
+            {
+                **batch,
+                "batch_existing_bills": bills,
+                "entity_profile_snapshot": bundle.accounting_entity_profile,
+                "has_entity_profile_snapshot": (
+                    "accounting_entity_profile" in bundle.model_fields_set
+                ),
+            },
             bundle.accounting_entity,
-            accounting_entity_profile=bundle.accounting_entity_profile,
         )
         if any(
             not entity_matches(record.accounting_entity, bundle.accounting_entity, scope.profiles)

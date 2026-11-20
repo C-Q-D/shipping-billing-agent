@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -12,7 +13,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, ValidationError
 
-from ..domain.charge_normalizer import normalize_charge_item
+from ..domain.charge_normalizer import normalize_charge_item, normalize_payment_term
 from ..domain.currency import is_valid_iso4217, normalize_currency
 from ..domain.entity_resolver import TRANSPORT_FIELDS, entity_matches, recalculate_for_entity
 from ..domain.matcher import match_and_inherit_batch
@@ -177,21 +178,45 @@ _EXTRACTED_REVIEW_FIELDS = (set(_REVIEW_BASIS_FIELDS) - {
     "matched_existing_bill_id",
     "matched_bill_ref",
     "field_diffs",
-}) | {"raw_explicit_amount", "raw_invalid_fields"}
+}) | {"debit_credit", "raw_explicit_amount", "raw_invalid_fields"}
 
 
 def _extracted_review_basis(
     record: ProcessedBillingRecord,
+    *,
+    include_totals: bool,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     source = record.model_dump(include=_EXTRACTED_REVIEW_FIELDS)
     original = record.inherited_fields | record.source_values_before_overrides
     source.update({field: original[field] for field in source.keys() & original.keys()})
-    totals = record.source_doc_totals
+    totals = record.source_doc_totals if include_totals else None
     return source, totals.model_dump(exclude={"source_doc_id"}) if totals is not None else None
 
 
 def _is_reextraction_warning(alert: ValidationAlert) -> bool:
     return alert.code is AlertCode.OCR_SUSPICIOUS_FLAG and alert.field == "extraction_snapshot"
+
+
+def _require_reextraction_review(
+    record: ProcessedBillingRecord, reason: str
+) -> ProcessedBillingRecord:
+    warning = ValidationAlert.from_code(
+        AlertCode.OCR_SUSPICIOUS_FLAG, reason, field="extraction_snapshot"
+    )
+    return record.model_copy(
+        update={
+            "operation": OperationType.PENDING_REVIEW,
+            "review_status": ReviewStatus.NEEDS_REVIEW,
+            "reject_reason": None,
+            "validation_alerts": [
+                alert for alert in record.validation_alerts if not _is_reextraction_warning(alert)
+            ] + [warning],
+            # Revalidation reads the warning from source evidence until it is reviewed.
+            "raw_parse_issues": [
+                issue for issue in record.raw_parse_issues if not _is_reextraction_warning(issue)
+            ] + [warning],
+        }
+    )
 
 
 def _require_editable(batch: Mapping[str, Any], expected_version: int | None) -> None:
@@ -278,10 +303,19 @@ def _restore_decisions(
     scope: _BatchScope,
     *,
     same_source_ids: Collection[str] = (),
+    content_matched_ids: Collection[str] = (),
+    ambiguous_source_ids: Collection[str] = (),
 ) -> tuple[list[ProcessedBillingRecord], int]:
     old_by_id = {record.id: record for record in previous}
     restored = []
     for record in verified:
+        if record.id in ambiguous_source_ids:
+            restored.append(
+                _require_reextraction_review(
+                    record, "同源单据重新提取后无法唯一对应已复核费用行，请重新核对原件"
+                )
+            )
+            continue
         old = old_by_id.get(record.id)
         if old is not None and entity_matches(
             old.accounting_entity, record.accounting_entity, scope.profiles
@@ -306,28 +340,24 @@ def _restore_decisions(
                     else ReviewStatus.AUTO_READY
                 )
             same_source = record.id in same_source_ids
+            # A uniquely identified rejected fee stays rejected when other fees change the total.
+            include_totals = not (
+                old.review_status is ReviewStatus.REJECTED and record.id in content_matched_ids
+            )
             if (
                 same_source
                 and old.review_status in _DECISIONS
-                and _extracted_review_basis(old) != _extracted_review_basis(record)
+                and _extracted_review_basis(old, include_totals=include_totals)
+                != _extracted_review_basis(record, include_totals=include_totals)
             ):
-                warning = ValidationAlert.from_code(
-                    AlertCode.OCR_SUSPICIOUS_FLAG,
-                    "同源单据重新提取后复核依据已变化，请重新核对原件",
-                    field="extraction_snapshot",
+                restored.append(
+                    _require_reextraction_review(
+                        record.model_copy(update={"validation_alerts": alerts}),
+                        "同源单据重新提取后复核依据已变化，请重新核对原件",
+                    )
                 )
-                alerts = [alert for alert in alerts if not _is_reextraction_warning(alert)]
-                alerts.append(warning)
-                # Keep the warning in the extraction evidence so later rechecks require review too.
-                issues = [
-                    issue
-                    for issue in record.raw_parse_issues
-                    if not _is_reextraction_warning(issue)
-                ]
-                record = record.model_copy(update={"raw_parse_issues": [*issues, warning]})
-                operation = OperationType.PENDING_REVIEW
-                review_status = ReviewStatus.NEEDS_REVIEW
-            elif old.review_status is ReviewStatus.REJECTED:
+                continue
+            if old.review_status is ReviewStatus.REJECTED:
                 same_warnings = set(map(_warning_key, old.validation_alerts)) == set(
                     map(_warning_key, alerts)
                 )
@@ -365,6 +395,8 @@ def _recheck(
     *,
     reapply_dictionary: bool = False,
     same_source_ids: Collection[str] = (),
+    content_matched_ids: Collection[str] = (),
+    ambiguous_source_ids: Collection[str] = (),
 ) -> list[ProcessedBillingRecord]:
     prepared = match_and_inherit_batch(
         [_for_revalidation(record) for record in records],
@@ -373,7 +405,14 @@ def _recheck(
         scope.charge_dictionary if reapply_dictionary else None,
     )
     checked = validate_batch(prepared, bundles)
-    return _restore_decisions(checked, previous, scope, same_source_ids=same_source_ids)[0]
+    return _restore_decisions(
+        checked,
+        previous,
+        scope,
+        same_source_ids=same_source_ids,
+        content_matched_ids=content_matched_ids,
+        ambiguous_source_ids=ambiguous_source_ids,
+    )[0]
 
 
 def _with_action(
@@ -639,31 +678,87 @@ def _source_lines_by_charge(
     return groups
 
 
+def _source_line_signature(record: ProcessedBillingRecord) -> tuple[str | Decimal | None, ...]:
+    source = record.inherited_fields | record.source_values_before_overrides
+    numbers = [
+        source.get(name, getattr(record, name)) for name in ("amount", "unit_price", "quantity")
+    ]
+    return (
+        normalize_currency(source.get("currency", record.currency))[0],
+        *(parse_decimal_strict(value) if value is not None else None for value in numbers),
+        normalize_payment_term(source.get("payment_term", record.payment_term)),
+        source.get("debit_credit", record.debit_credit),
+    )
+
+
+@dataclass(slots=True)
+class _SourceLineAlignment:
+    matches: dict[str, ProcessedBillingRecord]
+    content_ids: set[str]
+    ambiguous_ids: set[str]
+
+
 def _same_source_line_matches(
     previous: Sequence[ProcessedBillingRecord],
     extracted: Sequence[ProcessedBillingRecord],
     same_sources: Mapping[str, str],
     dictionary: Sequence[ChargeDictionaryItem],
-) -> dict[str, ProcessedBillingRecord]:
+) -> _SourceLineAlignment:
     old_groups = _source_lines_by_charge(
         previous, {origin: origin for origin in same_sources.values()}, dictionary
     )
     new_groups = _source_lines_by_charge(extracted, same_sources, dictionary)
-    matches = {}
+    alignment = _SourceLineAlignment(matches={}, content_ids=set(), ambiguous_ids=set())
     for key, new_lines in new_groups.items():
         old_lines = old_groups.get(key, [])
-        if len(old_lines) == len(new_lines) == 1:
-            matches[new_lines[0].id] = old_lines[0]
+        if not old_lines:
             continue
-        old_by_index = defaultdict(list)
+        if len(old_lines) == len(new_lines) == 1:
+            alignment.matches[new_lines[0].id] = old_lines[0]
+            continue
+
+        old_by_signature = defaultdict(list)
         for line in old_lines:
-            old_by_index[line.source_line_index].append(line)
-        new_index_counts = Counter(line.source_line_index for line in new_lines)
+            old_by_signature[_source_line_signature(line)].append(line)
+        new_signatures = {line.id: _source_line_signature(line) for line in new_lines}
+        signature_counts = Counter(new_signatures.values())
+        paired_old_ids = set()
+        remaining_new = []
         for line in new_lines:
+            signature = new_signatures[line.id]
+            candidates = old_by_signature[signature]
+            if len(candidates) == signature_counts[signature] == 1:
+                alignment.matches[line.id] = candidates[0]
+                alignment.content_ids.add(line.id)
+                paired_old_ids.add(candidates[0].id)
+            else:
+                remaining_new.append(line)
+
+        remaining_old = [line for line in old_lines if line.id not in paired_old_ids]
+        if not remaining_new or not remaining_old:
+            continue
+        if len(remaining_old) == len(remaining_new) == 1:
+            alignment.matches[remaining_new[0].id] = remaining_old[0]
+            continue
+
+        if any(
+            line.review_status in _DECISIONS
+            or line.human_review_history
+            or line.human_overrides
+            or any(map(_is_reextraction_warning, line.raw_parse_issues))
+            for line in remaining_old
+        ):
+            alignment.ambiguous_ids.update(line.id for line in remaining_new)
+
+        old_by_index = defaultdict(list)
+        for line in remaining_old:
+            old_by_index[line.source_line_index].append(line)
+        new_index_counts = Counter(line.source_line_index for line in remaining_new)
+        for line in remaining_new:
             index = line.source_line_index
             if len(old_by_index[index]) == new_index_counts[index] == 1:
-                matches[line.id] = old_by_index[index][0]
-    return matches
+                alignment.matches[line.id] = old_by_index[index][0]
+    return alignment
 
 
 def _carry_line_edits(
@@ -671,11 +766,10 @@ def _carry_line_edits(
     extracted: Sequence[ProcessedBillingRecord],
     same_sources: Mapping[str, str],
     documents: Mapping[str, DocumentExtractionBundle],
-    dictionary: Sequence[ChargeDictionaryItem],
+    alignment: _SourceLineAlignment,
 ) -> tuple[list[ProcessedBillingRecord], dict[str, str]]:
     # Reserve lines from surviving content before matching edits to changed files.
     destinations = {origin: doc_id for doc_id, origin in same_sources.items()}
-    same_source_matches = _same_source_line_matches(previous, extracted, same_sources, dictionary)
     old_by_key = defaultdict(list)
     new_by_key = defaultdict(list)
     for row in previous:
@@ -690,7 +784,7 @@ def _carry_line_edits(
     used = set()
     for row in extracted:
         same_source = row.source_doc_id in same_sources
-        old = same_source_matches.get(row.id)
+        old = alignment.matches.get(row.id)
         if not same_source:
             key = _replacement_line_key(row)
             candidates = old_by_key[key]
@@ -706,9 +800,10 @@ def _carry_line_edits(
                 id=old.id,
                 created_at=old.created_at,
                 updated_at=old.updated_at,
-                human_overrides=old.human_overrides,
                 human_review_history=old.human_review_history,
             )
+            if row.id not in alignment.ambiguous_ids:
+                changes["human_overrides"] = old.human_overrides
             if same_source:
                 changes["raw_parse_issues"] = [
                     *row.raw_parse_issues,
@@ -1300,8 +1395,11 @@ class ReviewService:
             for record in [*replacement_lines, *restored_lines]
             if record.source_doc_id not in duplicate_targets
         ]
+        alignment = _same_source_line_matches(
+            old_lines, fresh_lines, same_sources, scope.charge_dictionary
+        )
         carried, ids = _carry_line_edits(
-            old_lines, fresh_lines, same_sources, fresh_documents, scope.charge_dictionary
+            old_lines, fresh_lines, same_sources, fresh_documents, alignment
         )
         prior_source_ids = set(same_sources.values())
         prior_lines = [record for record in old_lines if record.source_doc_id in prior_source_ids]
@@ -1373,6 +1471,8 @@ class ReviewService:
                     scope,
                     [*candidates, *prior_lines],
                     same_source_ids=same_source_ids,
+                    content_matched_ids={ids[line_id] for line_id in alignment.content_ids},
+                    ambiguous_source_ids={ids[line_id] for line_id in alignment.ambiguous_ids},
                 )
                 outcome = _batch_outcome([bundle.document for bundle in merged], checked, failures)
                 outcome.update(_batch_scope_changes(current, scope))

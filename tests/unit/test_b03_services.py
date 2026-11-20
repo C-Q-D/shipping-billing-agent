@@ -30,6 +30,7 @@ from shipping_billing_agent.domain.models import (
     dumps_decimal_json,
     loads_decimal_json,
 )
+from shipping_billing_agent.domain.serializer import serialize_records
 from shipping_billing_agent.services import BatchService, ReviewService, ServiceValidationError
 from shipping_billing_agent.storage import BillingRepository, DatabaseManager, OptimisticLockError
 from shipping_billing_agent.storage.repositories import ResourceNotFoundError
@@ -45,6 +46,11 @@ def _invoice(reference="INV-123", amount="100.00", total=None, charge="Handling 
         f"Invoice No. {reference}\nDate: 2026-10-01\nIssuer: {ENTITY}\nBill To: {CUSTOMER}\n"
         f"{charge} {amount} USD\nTotal USD {printed_total}"
     )
+
+
+def _invoice_with_fees(*amounts: int) -> str:
+    fees = "\n".join(f"Handling Charge {amount} USD" for amount in amounts)
+    return _invoice("INV-801", "0", total=str(sum(amounts))).replace("Handling Charge 0 USD", fees)
 
 
 class FixtureOcr:
@@ -995,6 +1001,108 @@ def test_same_source_retry_requires_review_when_an_override_masks_amount_change(
     assert after.review_status == "NEEDS_REVIEW"
     assert repository.list_review_audit_logs(batch_id) == logs
     assert review.reapply_dictionary(batch_id)["records"][0]["review_status"] == "NEEDS_REVIEW"
+
+
+def test_same_source_retry_aligns_the_one_remaining_fee_after_matching_content(make_service):
+    ocr = FixtureOcr(results={b"same": _invoice_with_fees(80, 5)})
+    service = make_service(ocr=ocr)
+    repository = service.repository
+    review = ReviewService(service)
+    batch = _create(service, ("invoice.png", b"same"))
+    batch_id = batch["id"]
+    rejected, unchanged = batch["records"]
+    review.patch_record(batch_id, rejected["id"], {"payment_term": "PP"})
+    review.reject_record(batch_id, rejected["id"], "该笔费用作废")
+    logs = repository.list_review_audit_logs(batch_id)
+
+    ocr.results[b"same"] = _invoice_with_fees(5, 81)
+    retried = review.retry_or_replace_document(batch_id, rejected["source_doc_id"])
+
+    assert retried["failed_documents"] == []
+    first, second = retried["records"]
+    assert (first["id"], first["charge_details"]["amount"], first["review_status"]) == (
+        unchanged["id"], 5, "AUTO_READY"
+    )
+    assert (second["id"], second["created_at"], second["charge_details"]["amount"]) == (
+        rejected["id"], rejected["created_at"], 81
+    )
+    assert (second["operation"], second["review_status"]) == ("PENDING_REVIEW", "NEEDS_REVIEW")
+    saved = repository.get_billing_record(batch_id, rejected["id"])
+    assert saved.human_overrides == {"payment_term": "PP"}
+    assert [action.action for action in saved.human_review_history] == ["PATCH_RECORD", "REJECT"]
+    assert any(
+        alert.code == AlertCode.OCR_SUSPICIOUS_FLAG and alert.field == "extraction_snapshot"
+        for alert in saved.raw_parse_issues
+    )
+    assert repository.list_review_audit_logs(batch_id) == logs
+    (official,) = serialize_records(repository.list_billing_records(batch_id), "official")
+    assert official["charge_details"]["amount"] == 5
+
+
+@pytest.mark.parametrize(
+    ("old_fees", "new_fees"),
+    [((80, 5), (81, 6, 7)), ((80, 80), (80, 80, 5))],
+    ids=["no-unique-content", "identical-fees"],
+)
+def test_same_source_retry_holds_all_ambiguous_fees_for_review(make_service, old_fees, new_fees):
+    ocr = FixtureOcr(results={b"same": _invoice_with_fees(*old_fees)})
+    service = make_service(ocr=ocr)
+    repository = service.repository
+    review = ReviewService(service)
+    batch = _create(service, ("invoice.png", b"same"))
+    batch_id = batch["id"]
+    reviewed, other = batch["records"]
+    review.patch_record(batch_id, reviewed["id"], {"payment_term": "PP"})
+    review.reject_record(batch_id, reviewed["id"], "该笔费用作废")
+    logs = repository.list_review_audit_logs(batch_id)
+
+    ocr.results[b"same"] = _invoice_with_fees(*new_fees)
+    retried = review.retry_or_replace_document(batch_id, reviewed["source_doc_id"])
+
+    assert retried["failed_documents"] == []
+    rows = repository.list_billing_records(batch_id)
+    assert [row.amount for row in rows] == list(new_fees)
+    assert [row.id for row in rows[:2]] == [reviewed["id"], other["id"]]
+    assert rows[2].id not in {reviewed["id"], other["id"]}
+    assert [action.action for action in rows[0].human_review_history] == ["PATCH_RECORD", "REJECT"]
+    assert rows[0].human_overrides == {}
+    assert repository.list_review_audit_logs(batch_id) == logs
+    for row in rows:
+        assert (row.operation, row.review_status, row.reject_reason) == (
+            "PENDING_REVIEW", "NEEDS_REVIEW", None
+        )
+        (warning,) = [
+            alert for alert in row.raw_parse_issues if alert.field == "extraction_snapshot"
+        ]
+        assert warning.code == AlertCode.OCR_SUSPICIOUS_FLAG
+        assert warning in row.validation_alerts
+    assert {row["review_status"] for row in review.reapply_dictionary(batch_id)["records"]} == {
+        "NEEDS_REVIEW"
+    }
+    assert serialize_records(repository.list_billing_records(batch_id), "official") == []
+
+
+def test_same_source_retry_preserves_audit_when_neither_reviewed_fee_can_be_aligned(make_service):
+    ocr = FixtureOcr(results={b"same": _invoice_with_fees(80, 5)})
+    service = make_service(ocr=ocr)
+    repository = service.repository
+    review = ReviewService(service)
+    batch = _create(service, ("invoice.png", b"same"))
+    batch_id = batch["id"]
+    for row in batch["records"]:
+        review.reject_record(batch_id, row["id"], "该笔费用作废")
+    before = repository.list_billing_records(batch_id)
+    logs = repository.list_review_audit_logs(batch_id)
+
+    ocr.results[b"same"] = _invoice_with_fees(81, 6).replace(
+        "Handling Charge 81 USD\nHandling Charge 6 USD", "Storage Fee 81 USD\nFreight Charge 6 USD"
+    )
+    retried = review.retry_or_replace_document(batch_id, before[0].source_doc_id)
+
+    (failure,) = retried["failed_documents"]
+    assert "未能对齐" in failure["error_message"]
+    assert repository.list_billing_records(batch_id) == before
+    assert repository.list_review_audit_logs(batch_id) == logs
 
 
 def test_replacement_cannot_overwrite_an_edit_that_commits_during_ocr(make_service):

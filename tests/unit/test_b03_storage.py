@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from shipping_billing_agent.domain.entity_resolver import recalculate_for_entity
+from shipping_billing_agent.domain.entity_resolver import entity_matches, recalculate_for_entity
 from shipping_billing_agent.domain.models import (
     AccountingEntityProfile,
     AlertCode,
@@ -979,6 +979,96 @@ def test_batch_metadata_preserves_legacy_baseline_mode_and_exact_values(
         assert _uses_isolated_baseline(row) is (isolated is not None)
 
 
+def _batch_with_sync_receipt(
+    repository: BillingRepository, entity: str, *, mode: str = "legacy"
+) -> tuple[str, str]:
+    batch = repository.create_batch(
+        entity,
+        status=BatchStatus.COMPLETED,
+        stage=BatchStage.COMPLETED,
+        batch_existing_bills=[] if mode == "isolated" else None,
+    )
+    batch_id = batch["id"]
+    if mode == "frozen":
+        repository.update_batch_with_version_check(
+            batch_id, batch["version"], shared_baseline_snapshot=[]
+        )
+    doc_id = f"doc-{batch_id}"
+    repository.upsert_source_documents(batch_id, [_document(doc_id)])
+    repository.upsert_billing_record(
+        batch_id, _record(f"record-{batch_id}", source_doc_id=doc_id, accounting_entity=entity)
+    )
+    assert repository.sync_baseline(batch_id)["created"] == 1
+    (receipt,) = _sync_items(repository, batch_id)
+    if mode == "legacy":
+        profile = AccountingEntityProfile(canonical_name=entity)
+        with repository.db.connect() as connection:
+            connection.execute(
+                "UPDATE batches SET batch_existing_bills_json = ? WHERE id = ?",
+                (dumps_decimal_json({"entity_profile_snapshot": profile.model_dump()}), batch_id),
+            )
+    return batch_id, receipt["existing_bill_id"]
+
+
+@pytest.mark.parametrize("operation", ["single", "scoped-clear", "global-clear", "replace"])
+def test_ledger_deletion_preserves_legacy_sync_evidence_only_for_deleted_bills(
+    repository: BillingRepository, operation: str
+) -> None:
+    batch_id, bill_id = _batch_with_sync_receipt(repository, _ENTITY)
+    other_batch, other_bill = _batch_with_sync_receipt(repository, _OTHER_ENTITY)
+    before = repository.get_batch(batch_id)
+    assert before["synced_without_snapshot"] is False
+    assert repository.get_batch(other_batch)["synced_without_snapshot"] is False
+
+    if operation == "single":
+        assert repository.delete_existing_bill(bill_id, accounting_entity=_ENTITY_ALIAS)
+    elif operation == "scoped-clear":
+        assert repository.clear_existing_bills(_ENTITY_ALIAS) == 1
+    elif operation == "global-clear":
+        assert repository.clear_existing_bills() == 2
+    else:
+        assert repository.import_existing_bills(
+            [_bill("replacement")], replace_existing=True, accounting_entity=_ENTITY_ALIAS
+        ) == {"imported_count": 1, "total_count": 2}
+
+    assert _sync_items(repository, batch_id) == []
+    assert repository.get_existing_bill(bill_id) is None
+    after = repository.get_batch(batch_id)
+    assert after["synced_without_snapshot"] is True
+    assert after["shared_baseline_snapshot"] is None
+    assert after["entity_profile_snapshot"] == before["entity_profile_snapshot"]
+    assert after["version"] == before["version"]
+    all_cleared = operation == "global-clear"
+    assert (repository.get_existing_bill(other_bill) is None) is all_cleared
+    assert repository.get_batch(other_batch)["synced_without_snapshot"] is all_cleared
+
+
+def test_legacy_sync_backfill_uses_first_committed_write_and_skips_frozen_batches(
+    repository: BillingRepository,
+) -> None:
+    legacy, _ = _batch_with_sync_receipt(repository, _ENTITY)
+    frozen, _ = _batch_with_sync_receipt(repository, _ENTITY, mode="frozen")
+    isolated, _ = _batch_with_sync_receipt(repository, _ENTITY, mode="isolated")
+    unsynced = _completed_batch(repository)["id"]
+    reopened = BillingRepository(DatabaseManager(repository.db.path))
+    assert reopened.get_batch(legacy)["synced_without_snapshot"] is False
+
+    with pytest.raises(RuntimeError, match="rollback"):
+        with reopened.transaction() as transaction:
+            assert transaction.get_batch(legacy)["synced_without_snapshot"] is True
+            raise RuntimeError("rollback")
+    assert reopened.get_batch(legacy)["synced_without_snapshot"] is False
+
+    reopened.create_existing_bill(_bill("new-ledger"))
+    assert reopened.get_batch(legacy)["synced_without_snapshot"] is True
+    assert reopened.get_batch(frozen)["shared_baseline_snapshot"] == []
+    assert reopened.get_batch(isolated)["batch_existing_bills"] == []
+    for batch_id in (frozen, isolated, unsynced):
+        assert reopened.get_batch(batch_id)["synced_without_snapshot"] is False
+    for batch_id in (legacy, frozen, isolated):
+        assert len(_sync_items(reopened, batch_id)) == 1
+
+
 def test_shared_bill_scopes_treat_aliases_as_equivalent(repository: BillingRepository) -> None:
     opposite_branch = _bill("other-branch", accounting_entity=f"{_ENTITY} (SFO)")
     unconfigured = _bill("unconfigured", accounting_entity="Example Co. (HQ)")
@@ -1035,14 +1125,25 @@ def test_configured_same_stem_names_require_a_unique_profile(repository: Billing
         assert configured_entity_profile(" Harbor West ", profiles) is dash
         assert configured_entity_profile("East+Office", profiles) is plus
         assert configured_entity_profile("HARBOR EAST", profiles) is plus
+        assert configured_entity_profile("  ＥＡＳＴ＋ＯＦＦＩＣＥ ", profiles) is plus
+        assert configured_entity_profile("harbor－orchid　 LOGISTICS", profiles) is dash
         assert configured_entity_profile("Legacy Harbor", profiles) is None
         assert configured_entity_profile("East Office", profiles) is None
         assert configured_entity_profile("Harbor Orchid Logistics", profiles) is None
+        assert configured_entity_profile("HARBOR+ORCHID LOGISTICS", profiles) is None
+        assert entity_matches("east＋office", plus.canonical_name, profiles)
+        assert entity_matches("harbor－orchid　 LOGISTICS", "Harbor West", profiles)
+        assert not entity_matches(plus.canonical_name, dash.canonical_name, profiles)
+        assert not entity_matches("Harbor West", plus.canonical_name, profiles)
+        assert not entity_matches("Legacy Harbor", "Legacy Harbor", profiles)
+        assert not entity_matches("Harbor Orchid Logistics", plus.canonical_name, profiles)
+    assert entity_matches(plus.canonical_name, dash.canonical_name)
 
     east = repository.create_existing_bill(_bill("east", accounting_entity=plus.canonical_name))
     west = repository.create_existing_bill(_bill("west", accounting_entity=dash.canonical_name))
     assert repository.list_existing_bills(plus.canonical_name) == [east]
     assert repository.list_existing_bills(dash.canonical_name) == [west]
+    assert repository.list_existing_bills("ｅａｓｔ－ｏｆｆｉｃｅ") == [west]
     assert repository.clear_existing_bills("Harbor Orchid Logistics") == 0
     assert repository.clear_existing_bills("Harbor East") == 1
     assert repository.list_existing_bills() == [west]

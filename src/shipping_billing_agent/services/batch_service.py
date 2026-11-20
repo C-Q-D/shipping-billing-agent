@@ -122,7 +122,6 @@ class _StaleBatchWorker(RuntimeError):
 class _BatchScope:
     profiles: list[AccountingEntityProfile]
     entity_profile: AccountingEntityProfile | None
-    baseline: list[ExistingBillRecord]
     existing_bills: list[ExistingBillRecord]
     charge_dictionary: list[ChargeDictionaryItem]
 
@@ -177,33 +176,28 @@ def _load_batch_scope(
     repository: BillingRepository,
     batch: Mapping[str, Any],
     entity: str,
-    *,
-    shared_baseline: list[ExistingBillRecord] | None = None,
-    accounting_entity_profile: AccountingEntityProfile | None = None,
 ) -> _BatchScope:
-    profiles = [
-        AccountingEntityProfile.model_validate(profile)
-        for profile in repository.list_accounting_entities()
-    ]
-    profile_snapshot = accounting_entity_profile
-    if profile_snapshot is None and entity.strip() == batch["accounting_entity"].strip():
-        profile_snapshot = batch.get("entity_profile_snapshot")
-    if profile_snapshot is not None:
-        # Replace the saved profile's current entry without merging punctuation variants.
-        canonical = profile_snapshot.canonical_name.strip()
-        profiles = [
-            profile
-            for profile in profiles
-            if profile.canonical_name.strip() != canonical
-        ]
-        profiles.append(profile_snapshot)
     bills = batch["batch_existing_bills"]
+    same_entity = entity.strip() == batch["accounting_entity"].strip()
+    profile_snapshot = batch.get("entity_profile_snapshot") if same_entity else None
+    if bills is not None and same_entity and batch.get("has_entity_profile_snapshot"):
+        profiles = [profile_snapshot] if profile_snapshot is not None else []
+    else:
+        profiles = [
+            AccountingEntityProfile.model_validate(profile)
+            for profile in repository.list_accounting_entities()
+        ]
+        if profile_snapshot is not None:
+            canonical = profile_snapshot.canonical_name.strip()
+            profiles = [
+                profile for profile in profiles if profile.canonical_name.strip() != canonical
+            ]
+            profiles.append(profile_snapshot)
     if bills is None:
-        bills = repository.list_existing_bills() if shared_baseline is None else shared_baseline
+        bills = repository.list_existing_bills()
     return _BatchScope(
         profiles=profiles,
         entity_profile=configured_entity_profile(entity, profiles),
-        baseline=bills,
         existing_bills=[
             bill for bill in bills if _bill_entity_matches(bill.accounting_entity, entity, profiles)
         ],
@@ -217,7 +211,7 @@ def _load_batch_scope(
 def _batch_scope_changes(batch: Mapping[str, Any], scope: _BatchScope) -> dict[str, Any]:
     changes: dict[str, Any] = {"entity_profile_snapshot": scope.entity_profile}
     if batch["batch_existing_bills"] is None:
-        changes["shared_baseline_snapshot"] = scope.baseline
+        changes["shared_baseline_snapshot"] = scope.existing_bills
     return changes
 
 
@@ -315,6 +309,7 @@ def _batch_detail(batch: Mapping[str, Any]) -> dict[str, Any]:
                 "batch_existing_bills",
                 "shared_baseline_snapshot",
                 "entity_profile_snapshot",
+                "has_entity_profile_snapshot",
                 "synced_without_snapshot",
             }
         },
