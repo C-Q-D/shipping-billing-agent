@@ -2,8 +2,8 @@
 schema_version: 1
 mode: tracked
 docs_root: docs/workflow
-current_node: "wave9-b03-final-closure"
-next_action: "B01/B02/B04 均已完成终审，推进 B03 T11(A1跨库补传与A4建批前分公司历史范围) -> B03 r7 定向闭环后合入主干并启动全栈联调"
+current_node: "wave10-b03-a4-closure"
+next_action: "B03 进行最后 1 项 A4 旧快照移除别名修复（T12 -> r8），完成后立即合入主干并进入全栈实跑联调"
 check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contracts.py && uv run pytest tests/unit -q && npm --prefix frontend run typecheck"
 ---
 
@@ -41,7 +41,7 @@ check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contract
 | :--- | :--- | :--- | :---: | :--- | :---: |
 | B01 | `docs/workflow/features/B01-多格式解析与OCR网关` | 多格式文档解包、Excel/Word/EML/PDF解析、SSRF防护与OCR/LLM网关适配 | B00 | PRD F-01/F-02, arch §1.4/§2, schema.sql source_documents | `已完成` |
 | B02 | `docs/workflow/features/B02-智能抽取匹配与校验门禁` | 航运账单LangGraph编排、AR/AP与贷项判定、四级匹配继承、确定性校验与1轮自修复 | B01 | PRD F-02~F-05, billing-output.schema.json | `已完成` |
-| B03 | `docs/workflow/features/B03-持久层API与CLI复核包` | SQLite 8表仓储、批处理分阶段服务、FastAPI全路由与Origin防护、Typer CLI与复核包互通 | B02 | PRD F-06/F-07, schema.sql 全表, openapi.yaml 全路由 | `待验收(r7)` |
+| B03 | `docs/workflow/features/B03-持久层API与CLI复核包` | SQLite 8表仓储、批处理分阶段服务、FastAPI全路由与Origin防护、Typer CLI与复核包互通 | B02 | PRD F-06/F-07, schema.sql 全表, openapi.yaml 全路由 | `开发中(T12)` |
 | B04 | `docs/workflow/features/B04-财务复核工作台前端` | Lumno B2三栏/移动双视口React工作台、全字段复核、三口径导出与评测看板 | B00, B03 | PRD F-06, prototypes/workbench/README.md, openapi.yaml | `已完成` |
 | B05 | `docs/workflow/features/B05-Harness评测与交付文档` | >=10组真值与对抗样本Harness评测套件、Harness与深度思考报告、README与交付ZIP打包验收 | B03 | PRD F-07, 题面 §8.8/§8.9, eval_runs | `开发中(T02-T03)` |
 
