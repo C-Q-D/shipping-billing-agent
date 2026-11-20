@@ -19,6 +19,16 @@ import {
 } from "./decimalJson.ts";
 import { createDevStubTransport } from "./devStubTransport.ts";
 import {
+  NO_EVAL_RESULT_LABEL,
+  buildEvalRunViewModel,
+  buildReviewBundleV1,
+  formatEvalMetricValue,
+  parseExistingBillsImportInput,
+  validateAccountingEntityInput,
+  validateChargeDictionaryInput,
+  validateReviewBundleInput,
+} from "./managementHelpers.ts";
+import {
   acceptPollResult,
   buildDocTotalsDiffPatch,
   buildRecordDiffPatch,
@@ -787,6 +797,394 @@ export async function runDecimalJsonTests(): Promise<void> {
 
   results.push(
     "PASS 12: sync-baseline 3-cycle repeatable sync (created -> idempotent skipped -> edit/approve -> updated)"
+  );
+
+  // 13. Master data CRUD (no entity delete), dictionary CRUD + batch-scoped reapply, & lossless existing bills import/clear
+  const initEntities = await client.listAccountingEntities();
+  const entValidation = validateAccountingEntityInput(
+    {
+      canonicalName: "PACIFIC HORIZON LOGISTICS LTD.",
+      aliasesText: "PHL, Pacific Horizon, 太平洋地平线",
+      isDefault: true,
+    },
+    initEntities
+  );
+  assertEqual(entValidation.valid, true, "valid new entity passes validation");
+  if (!entValidation.valid) throw new Error("unreachable");
+  const createdEnt = await client.createAccountingEntity(entValidation.payload);
+  assertEqual(createdEnt.is_default, true, "new entity marked default");
+  const entitiesAfterCreate = await client.listAccountingEntities();
+  assertEqual(
+    entitiesAfterCreate.find((e) => e.id === "ent-neptune")?.is_default,
+    false,
+    "previous default entity toggled off when new default set"
+  );
+
+  const entEditCheck = validateAccountingEntityInput(
+    {
+      canonicalName: "PACIFIC HORIZON LOGISTICS LTD.",
+      aliasesText: "PHL, Pacific Horizon Updated",
+      isDefault: false,
+    },
+    entitiesAfterCreate,
+    createdEnt.id
+  );
+  assertEqual(entEditCheck.valid, true, "entity edit allows same canonical name on self");
+  if (!entEditCheck.valid) throw new Error("unreachable");
+  const updatedEnt = await client.updateAccountingEntity(
+    createdEnt.id,
+    entEditCheck.payload
+  );
+  assertEqual(
+    updatedEnt.aliases.join("|"),
+    "PHL|Pacific Horizon Updated",
+    "entity aliases updated cleanly"
+  );
+  assertTrue(
+    !("deleteAccountingEntity" in client),
+    "BillingApiClient must not expose deleteAccountingEntity"
+  );
+  const entityDeleteResp = await stubTransport(
+    "http://127.0.0.1/api/v1/entities/ent-neptune",
+    { method: "DELETE" }
+  );
+  assertEqual(
+    entityDeleteResp.status,
+    404,
+    "DELETE /api/v1/entities/:id is strictly absent (404)"
+  );
+
+  // Dictionary add/edit/delete (builtin protected) & batch-scoped reapply
+  const dictCheck = validateChargeDictionaryInput(
+    "HIGH PRECISION TEST FEE",
+    "Mega Precision Charge",
+    "general"
+  );
+  assertEqual(dictCheck.valid, true, "dictionary input valid");
+  if (!dictCheck.valid) throw new Error("unreachable");
+  const customDictEntry = await client.upsertChargeDictionaryEntry(
+    dictCheck.payload
+  );
+  assertEqual(customDictEntry.is_builtin, false, "created dictionary entry is custom");
+
+  const builtinDelErr = await assertRejectsAsync(
+    client.deleteChargeDictionaryEntry("dict-1"),
+    "delete builtin dictionary entry"
+  );
+  assertTrue(
+    builtinDelErr instanceof ApiClientError && builtinDelErr.status === 400,
+    "deleting builtin dictionary entry returns 400"
+  );
+
+  // Create two independent batches A and B; lock rec-eml-hc in batch A, reapply only batch A
+  const batchAQueued = await client.createDemoBatch({
+    accounting_entity: "NEPTUNE SHIPPING LIMITED",
+    ocr_mode: "REMOTE_ONLY",
+    wait: false,
+  });
+  let batchA = await client.getBatchDetail(batchAQueued.id);
+  while (batchA.stage !== "COMPLETED") {
+    batchA = await client.getBatchDetail(batchAQueued.id);
+  }
+  const batchBQueued = await client.createDemoBatch({
+    accounting_entity: "NEPTUNE SHIPPING LIMITED",
+    ocr_mode: "REMOTE_ONLY",
+    wait: false,
+  });
+  let batchB = await client.getBatchDetail(batchBQueued.id);
+  while (batchB.stage !== "COMPLETED") {
+    batchB = await client.getBatchDetail(batchBQueued.id);
+  }
+
+  // Lock rec-eml-hc charge_item manually in batch A and add H/C custom mapping
+  await client.patchBillingRecord(batchA.id, "rec-eml-hc", {
+    charge_item: "Manual Locked Handling",
+  });
+  const hcCustom = await client.upsertChargeDictionaryEntry({
+    raw_alias: "H/C",
+    standard_name: "Overridden H/C Name",
+    category: "origin_dest",
+  });
+
+  const reappliedA = await client.reapplyBatchChargeDictionary(batchA.id);
+  const recAUnlocked = reappliedA.records.find(
+    (r) => r.id === "rec-precision-blocker"
+  )!;
+  const recALocked = reappliedA.records.find((r) => r.id === "rec-eml-hc")!;
+  assertEqual(
+    recAUnlocked.charge_details.charge_item,
+    "Mega Precision Charge",
+    "reapply updates unlocked record in target batch A"
+  );
+  assertEqual(
+    readDecimalString(recAUnlocked.charge_details, "amount"),
+    "9007199254740991.01",
+    "reapply preserves 9007199254740991.01 lossless"
+  );
+  assertEqual(
+    recALocked.charge_details.charge_item,
+    "Manual Locked Handling",
+    "reapply preserves human-locked charge_item"
+  );
+
+  const batchBAfter = await client.getBatchDetail(batchB.id);
+  assertEqual(
+    batchBAfter.records.find((r) => r.id === "rec-precision-blocker")!.charge_details
+      .charge_item,
+    "Handling Charge",
+    "reapply on batch A must NOT touch batch B"
+  );
+
+  await client.deleteChargeDictionaryEntry(hcCustom.id);
+  const dictAfterDel = await client.listChargeDictionary();
+  assertTrue(
+    !dictAfterDel.some((d) => d.id === hcCustom.id),
+    "custom dictionary entry deleted via DELETE"
+  );
+
+  // Existing bills JSON + CSV lossless import and entity-scoped clear
+  const jsonBillsCheck = parseExistingBillsImportInput(
+    '[{"reference_no":"IMP-MEGA-01","charge_item":"Ocean Freight","amount":9007199254740991.01,"unit_price":0.0025,"currency":"USD","posting_type":"AP","accounting_entity":"ALL AMERICA FORWARDING, INC."}]'
+  );
+  assertEqual(jsonBillsCheck.valid, true, "JSON existing bills import valid");
+  if (!jsonBillsCheck.valid) throw new Error("unreachable");
+  await client.importExistingBills({
+    default_accounting_entity: "ALL AMERICA FORWARDING, INC.",
+    replace_existing: false,
+    bills: jsonBillsCheck.bills,
+  });
+
+  const csvBillsCheck = parseExistingBillsImportInput(
+    'reference_no,charge_item,amount,unit_price,currency,posting_type\n"CSV-001","Handling Charge",125.50,0.0025,USD,AR',
+    {
+      filename: "bills.csv",
+      defaultAccountingEntity: "ALL AMERICA FORWARDING, INC.",
+    }
+  );
+  assertEqual(csvBillsCheck.valid, true, "CSV existing bills import valid");
+  if (!csvBillsCheck.valid) throw new Error("unreachable");
+  await client.importExistingBills({
+    default_accounting_entity: "ALL AMERICA FORWARDING, INC.",
+    replace_existing: false,
+    bills: csvBillsCheck.bills,
+  });
+
+  const aafBills = await client.listExistingBills("ALL AMERICA FORWARDING, INC.");
+  const megaImportedBill = aafBills.find((b) => b.reference_no === "IMP-MEGA-01")!;
+  assertEqual(
+    readDecimalString(megaImportedBill, "amount"),
+    "9007199254740991.01",
+    "imported existing bill retains 9007199254740991.01"
+  );
+  assertEqual(
+    readDecimalString(megaImportedBill, "unit_price"),
+    "0.0025",
+    "imported existing bill retains 0.0025"
+  );
+
+  await client.clearExistingBills("ALL AMERICA FORWARDING, INC.");
+  assertEqual(
+    (await client.listExistingBills("ALL AMERICA FORWARDING, INC.")).length,
+    0,
+    "entity-scoped clear removes target entity shared bills"
+  );
+  assertTrue(
+    (await client.listExistingBills("NEPTUNE SHIPPING LIMITED")).length >= 3,
+    "entity-scoped clear preserves other entity shared bills"
+  );
+  results.push(
+    "PASS 13: Entity add/edit (no delete), dictionary CRUD, batch-scoped reapply & lossless baseline import/clear"
+  );
+
+  // 14. Harness Eval Dashboard: empty state, UNVERIFIED/FAILED/null -> "无结果" (NEVER 0%), COMPLETED metrics & fractions
+  const initialRuns = await client.listEvalRuns();
+  assertEqual(initialRuns.length, 0, "initial eval runs list is empty");
+
+  const unverifiedRun = await client.triggerEvalRun({
+    run_mode: "LIVE_LLM",
+    k_trials: 3,
+  });
+  assertEqual(unverifiedRun.status, "UNVERIFIED", "LIVE_LLM stub returns UNVERIFIED");
+  const unverifiedVm = buildEvalRunViewModel(unverifiedRun);
+  assertEqual(unverifiedVm.trialsText, "0 / 3", "UNVERIFIED reports actual 0 / 3 trials");
+  assertTrue(
+    unverifiedVm.truthMetrics.every(
+      (m) => m.displayText === NO_EVAL_RESULT_LABEL && m.isUnavailable
+    ),
+    "all truth metrics on UNVERIFIED render 无结果 rather than 0%"
+  );
+  assertTrue(
+    unverifiedVm.stabilityMetrics.every(
+      (m) => m.displayText === NO_EVAL_RESULT_LABEL && m.isUnavailable
+    ),
+    "all pass@k/pass^k metrics on UNVERIFIED render 无结果 rather than 0%"
+  );
+
+  const failedRun = await client.triggerEvalRun({
+    run_mode: "LIVE_E2E",
+    k_trials: 3,
+  });
+  assertEqual(failedRun.status, "FAILED", "LIVE_E2E stub returns FAILED");
+  const failedVm = buildEvalRunViewModel(failedRun);
+  assertEqual(failedVm.trialsText, "1 / 3", "FAILED reports actual 1 / 3 trials");
+  assertTrue(
+    failedVm.truthMetrics.every((m) => m.displayText === NO_EVAL_RESULT_LABEL) &&
+      failedVm.stabilityMetrics.every((m) => m.displayText === NO_EVAL_RESULT_LABEL),
+    "FAILED metrics strictly display 无结果"
+  );
+
+  // Direct guard assertions: even if 0 passed to UNVERIFIED/FAILED, or null to COMPLETED -> strictly "无结果"
+  assertEqual(
+    formatEvalMetricValue({ status: "UNVERIFIED" }, 0).displayText,
+    "无结果",
+    "UNVERIFIED never renders 0 as 0%"
+  );
+  assertEqual(
+    formatEvalMetricValue({ status: "FAILED" }, 0).displayText,
+    "无结果",
+    "FAILED never renders 0 as 0%"
+  );
+  assertEqual(
+    formatEvalMetricValue({ status: "COMPLETED" }, null).displayText,
+    "无结果",
+    "COMPLETED with null metric renders 无结果"
+  );
+
+  const offlineRun = await client.triggerEvalRun({
+    run_mode: "OFFLINE_DETERMINISTIC",
+    k_trials: 3,
+  });
+  assertEqual(offlineRun.status, "COMPLETED", "OFFLINE_DETERMINISTIC returns COMPLETED");
+  const offlineVm = buildEvalRunViewModel(offlineRun);
+  const schemaMetric = offlineVm.truthMetrics.find(
+    (m) => m.key === "schema_valid_rate"
+  )!;
+  const exactMetric = offlineVm.truthMetrics.find(
+    (m) => m.key === "field_exact_match"
+  )!;
+  const fpMetric = offlineVm.truthMetrics.find(
+    (m) => m.key === "false_positive_rate"
+  )!;
+  const passAtKMetric = offlineVm.stabilityMetrics.find(
+    (m) => m.key === "pass_at_k"
+  )!;
+  assertEqual(schemaMetric.displayText, "100.0%", "COMPLETED schema_valid_rate formats 100.0%");
+  assertEqual(schemaMetric.fractionText, "12 / 12", "COMPLETED schema_valid_rate shows 12 / 12");
+  assertEqual(exactMetric.displayText, "97.92%", "COMPLETED field_exact_match formats 97.92%");
+  assertEqual(exactMetric.fractionText, "47 / 48", "COMPLETED field_exact_match shows 47 / 48");
+  assertEqual(fpMetric.displayText, "0.0%", "COMPLETED legitimate 0 false positive rate formats 0.0%");
+  assertEqual(passAtKMetric.displayText, "100.0%", "COMPLETED pass@3 formats 100.0%");
+  assertEqual(passAtKMetric.fractionText, "12 / 12", "COMPLETED pass@3 shows 12 / 12");
+  results.push(
+    "PASS 14: Harness eval formatting (UNVERIFIED/FAILED/null -> 无结果, COMPLETED percentages & fractions)"
+  );
+
+  // 15. ReviewBundleV1 ("1.0") export -> import round-trip preserving 9007199254740991.01 / 0.0025, review history & XSS plain text
+  const invalidBundleCheck = validateReviewBundleInput(
+    '{"bundle_version":"2.0","accounting_entity":"NEPTUNE","documents":[],"records":[]}'
+  );
+  assertEqual(invalidBundleCheck.valid, false, "unsupported bundle_version 2.0 rejected");
+
+  const bundleSourceQueued = await client.createDemoBatch({
+    accounting_entity: "NEPTUNE SHIPPING LIMITED",
+    ocr_mode: "REMOTE_ONLY",
+    wait: false,
+  });
+  let bundleSource = await client.getBatchDetail(bundleSourceQueued.id);
+  while (bundleSource.stage !== "COMPLETED") {
+    bundleSource = await client.getBatchDetail(bundleSourceQueued.id);
+  }
+  await client.retryOrReplaceDocument(bundleSource.id, "doc-fail-zero", {
+    ocr_mode: "REMOTE_WITH_LOCAL_FALLBACK",
+  });
+  bundleSource = await client.approveBillingRecord(
+    bundleSource.id,
+    "rec-soft-warning",
+    "复核包互通测试批准原因"
+  );
+  const sourceAuditExport = await client.exportBatchJson(bundleSource.id, "audit");
+  const sourceBillsSnapshot = await client.listExistingBills(
+    bundleSource.accounting_entity
+  );
+
+  const builtBundle = buildReviewBundleV1(
+    bundleSource,
+    sourceBillsSnapshot,
+    sourceAuditExport
+  );
+  assertEqual(builtBundle.bundle_version, "1.0", 'bundle_version strictly "1.0"');
+  const serializedBundle = stringifyLosslessJson(builtBundle);
+  assertTrue(
+    serializedBundle.includes('"bundle_version":"1.0"') &&
+      serializedBundle.includes("9007199254740991.01") &&
+      serializedBundle.includes("0.0025"),
+    "serialized ReviewBundleV1 keeps bundle_version 1.0 and lossless decimals"
+  );
+
+  const validatedImport = validateReviewBundleInput(serializedBundle);
+  assertEqual(validatedImport.valid, true, "serialized bundle passes pre-import check");
+  if (!validatedImport.valid) throw new Error("unreachable");
+
+  // Import into a brand new client instance to prove zero shared in-memory state
+  const targetClient = new BillingApiClient({
+    transport: createDevStubTransport(),
+  });
+  const importedBatch = await targetClient.importReviewBundle(
+    validatedImport.bundle
+  );
+  const importedMega = importedBatch.records.find(
+    (r) => r.id === "rec-precision-blocker"
+  )!;
+  assertEqual(
+    readDecimalString(importedMega.charge_details, "amount"),
+    "9007199254740991.01",
+    "imported ReviewBundleV1 preserves 9007199254740991.01"
+  );
+  assertEqual(
+    readDecimalString(importedMega.charge_details, "unit_price"),
+    "0.0025",
+    "imported ReviewBundleV1 preserves 0.0025"
+  );
+  assertEqual(
+    importedMega.source_evidence?.snippet,
+    "<script>alert('xss')</script><img src=x onerror=alert(1)> RAW_AMOUNT: 9007199254740991.01 USD | RATE: 0.0025",
+    "XSS snippet preserved verbatim as plain text string"
+  );
+  const importedAudit = await targetClient.exportBatchJson(
+    importedBatch.id,
+    "audit"
+  );
+  const importedSoftAudit = importedAudit.records.find(
+    (r) => r.audit_trail.record_id === "rec-soft-warning"
+  )!;
+  const importedHistory = importedSoftAudit.audit_trail
+    .human_review_history as Array<{ action?: string; reason?: string }>;
+  assertTrue(
+    Array.isArray(importedHistory) &&
+      importedHistory.some(
+        (h) =>
+          h.action === "APPROVED" && h.reason === "复核包互通测试批准原因"
+      ),
+    "imported ReviewBundleV1 restores human_review_history cleanly"
+  );
+  const importedFailDocAudit = importedAudit.records.find(
+    (r) => r.audit_trail.source_doc_id === "doc-eml-1"
+  );
+  assertTrue(
+    importedFailDocAudit !== undefined,
+    "imported audit export intact"
+  );
+  const importedDocFailRecord = importedBatch.documents.find(
+    (d) => d.id === "doc-fail-zero"
+  )!;
+  assertEqual(
+    importedDocFailRecord.status,
+    "METADATA_ONLY",
+    "imported bundle preserves retried document status"
+  );
+
+  results.push(
+    "PASS 15: ReviewBundleV1 (1.0) export->import round-trip, 9007199254740991.01/0.0025, review history & XSS plain text"
   );
 
   for (const line of results) {

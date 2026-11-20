@@ -195,7 +195,8 @@ export function LumnoSelect({
     const trigger = triggerRef.current;
     if (!trigger) return;
     const rect = trigger.getBoundingClientRect();
-    const minMenuWidth = Math.max(rect.width, 228);
+    const maxMenuWidth = Math.max(180, window.innerWidth - 16);
+    const minMenuWidth = Math.min(maxMenuWidth, Math.max(rect.width, 228));
     const left = Math.max(
       8,
       Math.min(rect.left, window.innerWidth - minMenuWidth - 8)
@@ -517,12 +518,18 @@ export function LumnoTooltip({ content, children }: LumnoTooltipProps) {
     const el = hostRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
+    const maxW = Math.min(320, Math.max(180, window.innerWidth - 24));
     const left = Math.max(
       12,
-      Math.min(rect.left + rect.width / 2 - 140, window.innerWidth - 340)
+      Math.min(
+        rect.left + rect.width / 2 - maxW / 2,
+        window.innerWidth - maxW - 12
+      )
     );
     const top =
-      rect.bottom + 84 < window.innerHeight ? rect.bottom + 10 : Math.max(12, rect.top - 72);
+      rect.bottom + 84 < window.innerHeight
+        ? rect.bottom + 10
+        : Math.max(12, rect.top - 72);
     setPos({ top, left });
   }, []);
 
@@ -626,8 +633,17 @@ export function LumnoPopconfirm({
     const anchor = anchorElRef.current;
     if (!anchor) return;
     const rect = anchor.getBoundingClientRect();
-    const right = Math.max(12, window.innerWidth - rect.right);
-    const top = Math.min(window.innerHeight - 190, rect.bottom + 6);
+    const panelWidth = Math.min(320, Math.max(200, window.innerWidth - 24));
+    const maxRight = Math.max(12, window.innerWidth - panelWidth - 12);
+    const right = Math.min(
+      maxRight,
+      Math.max(12, window.innerWidth - rect.right)
+    );
+    const estHeight = 220;
+    const top =
+      rect.bottom + estHeight + 12 <= window.innerHeight
+        ? rect.bottom + 6
+        : Math.max(12, rect.top - estHeight - 6);
     setPos({ top, right });
   }, []);
 

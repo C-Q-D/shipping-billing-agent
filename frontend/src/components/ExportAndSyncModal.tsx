@@ -28,6 +28,7 @@ export interface ExportAndSyncModalProps {
   lastSyncResult: SyncResultRecord | null;
   onClose: () => void;
   onSyncBaseline: () => Promise<void>;
+  onOpenBundleExport?: () => void;
   onNotify: (message: string, tone?: "info" | "error") => void;
 }
 
@@ -48,6 +49,7 @@ export function ExportAndSyncModal({
   lastSyncResult,
   onClose,
   onSyncBaseline,
+  onOpenBundleExport,
   onNotify,
 }: ExportAndSyncModalProps) {
   const [activeMode, setActiveMode] = useState<ExportMode>("official");
@@ -176,6 +178,19 @@ export function ExportAndSyncModal({
           >
             同步至基准库 (sync-baseline)
           </LumnoButton>
+          {onOpenBundleExport ? (
+            <LumnoButton
+              variant="secondary"
+              icon="ri-share-forward-line"
+              disabled={!batch}
+              onClick={() => {
+                onClose();
+                onOpenBundleExport();
+              }}
+            >
+              导出复核包 (v1.0)
+            </LumnoButton>
+          ) : null}
           <LumnoButton
             variant="secondary"
             icon="ri-file-copy-line"

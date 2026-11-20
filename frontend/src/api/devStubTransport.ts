@@ -14,6 +14,7 @@ import {
   isCreditDocumentType,
   makeWarningKey,
 } from "./reviewState.ts";
+import { normalizeChargeAliasKey } from "./managementHelpers.ts";
 import type { WarningWaiverItem } from "./client.ts";
 import type { components } from "./schema";
 
@@ -1325,6 +1326,7 @@ export function createDevStubTransport(): FetchLike {
   const batches = new Map<string, BatchDetail>([
     [initialBatch.id, initialBatch],
   ]);
+  const batchSnapshots = new Map<string, ExistingBill[]>();
   const pollSteps = new Map<string, number>([[initialBatch.id, STAGE_SEQUENCE.length]]);
   const auditMetas = new Map<string, BatchAuditMeta>([
     [initialBatch.id, createBatchAuditMeta()],
@@ -1368,13 +1370,44 @@ export function createDevStubTransport(): FetchLike {
       const payload = parseLosslessJson<AccountingEntityUpsert>(
         String(init?.body ?? "{}")
       );
+      const canonical = String(payload.canonical_name ?? "").trim();
+      if (!canonical || canonical.length > 120) {
+        return errorJsonResponse(
+          { code: "INVALID_ENTITY_NAME", message: "记账主体名称须为 1–120 个字符" },
+          400
+        );
+      }
+      if (
+        entities.some(
+          (e) => e.canonical_name.trim().toLowerCase() === canonical.toLowerCase()
+        )
+      ) {
+        return errorJsonResponse(
+          { code: "DUPLICATE_ENTITY", message: `记账主体「${canonical}」已存在` },
+          400
+        );
+      }
+      const cleanAliases = Array.from(
+        new Set(
+          (payload.aliases ?? [])
+            .map((a) => String(a).trim())
+            .filter((a) => a.length > 0)
+        )
+      );
+      const makeDefault = Boolean(payload.is_default);
+      if (makeDefault) {
+        for (const ent of entities) {
+          ent.is_default = false;
+        }
+      }
+      const ts = nextStubTimestamp();
       const created: AccountingEntity = {
         id: `ent-${entitySeq++}`,
-        canonical_name: payload.canonical_name,
-        aliases: payload.aliases ?? [],
-        is_default: Boolean(payload.is_default),
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        canonical_name: canonical,
+        aliases: cleanAliases,
+        is_default: makeDefault,
+        created_at: ts,
+        updated_at: ts,
       };
       entities.push(created);
       return jsonResponse(created, 201);
@@ -1392,10 +1425,42 @@ export function createDevStubTransport(): FetchLike {
       const payload = parseLosslessJson<AccountingEntityUpsert>(
         String(init?.body ?? "{}")
       );
-      target.canonical_name = payload.canonical_name;
-      target.aliases = payload.aliases ?? [];
-      target.is_default = Boolean(payload.is_default);
-      target.updated_at = new Date().toISOString();
+      const canonical = String(payload.canonical_name ?? "").trim();
+      if (!canonical || canonical.length > 120) {
+        return errorJsonResponse(
+          { code: "INVALID_ENTITY_NAME", message: "记账主体名称须为 1–120 个字符" },
+          400
+        );
+      }
+      if (
+        entities.some(
+          (e) =>
+            e.id !== target.id &&
+            e.canonical_name.trim().toLowerCase() === canonical.toLowerCase()
+        )
+      ) {
+        return errorJsonResponse(
+          { code: "DUPLICATE_ENTITY", message: `记账主体「${canonical}」已存在` },
+          400
+        );
+      }
+      const cleanAliases = Array.from(
+        new Set(
+          (payload.aliases ?? [])
+            .map((a) => String(a).trim())
+            .filter((a) => a.length > 0)
+        )
+      );
+      const makeDefault = Boolean(payload.is_default);
+      if (makeDefault) {
+        for (const ent of entities) {
+          ent.is_default = false;
+        }
+      }
+      target.canonical_name = canonical;
+      target.aliases = cleanAliases;
+      target.is_default = makeDefault;
+      target.updated_at = nextStubTimestamp();
       return jsonResponse(target);
     }
 
@@ -1407,13 +1472,35 @@ export function createDevStubTransport(): FetchLike {
       const payload = parseLosslessJson<ChargeDictionaryCreate>(
         String(init?.body ?? "{}")
       );
+      const rawAlias = String(payload.raw_alias ?? "").trim();
+      const standardName = String(payload.standard_name ?? "").trim();
+      const category = String(payload.category ?? "general").trim() || "general";
+      if (!rawAlias || !standardName) {
+        return errorJsonResponse(
+          {
+            code: "INVALID_DICTIONARY_ENTRY",
+            message: "原始费用别名与标准费用名称均不能为空",
+          },
+          400
+        );
+      }
+      const aliasKey = normalizeChargeAliasKey(rawAlias);
+      const existingCustom = dictionary.find(
+        (d) => !d.is_builtin && normalizeChargeAliasKey(d.raw_alias) === aliasKey
+      );
+      if (existingCustom) {
+        existingCustom.raw_alias = rawAlias;
+        existingCustom.standard_name = standardName;
+        existingCustom.category = category;
+        return jsonResponse(existingCustom, 201);
+      }
       const entry: ChargeDictionaryEntry = {
         id: `dict-${dictSeq++}`,
-        raw_alias: payload.raw_alias,
-        standard_name: payload.standard_name,
-        category: payload.category ?? "general",
+        raw_alias: rawAlias,
+        standard_name: standardName,
+        category,
         is_builtin: false,
-        created_at: new Date().toISOString(),
+        created_at: nextStubTimestamp(),
       };
       dictionary.push(entry);
       return jsonResponse(entry, 201);
@@ -1426,6 +1513,15 @@ export function createDevStubTransport(): FetchLike {
         return errorJsonResponse(
           { code: "NOT_FOUND", message: "词典条目不存在" },
           404
+        );
+      }
+      if (dictionary[idx].is_builtin) {
+        return errorJsonResponse(
+          {
+            code: "BUILTIN_DICTIONARY_IMMUTABLE",
+            message: "系统内置标准费用词典不可删除，可通过新增自定义映射覆盖别名",
+          },
+          400
         );
       }
       dictionary.splice(idx, 1);
@@ -1452,29 +1548,77 @@ export function createDevStubTransport(): FetchLike {
       const payload = parseLosslessJson<ExistingBillImportRequest>(
         String(init?.body ?? "{}")
       );
+      if (!Array.isArray(payload.bills)) {
+        return errorJsonResponse(
+          { code: "INVALID_BILLS_PAYLOAD", message: "bills 字段必须为数组" },
+          400
+        );
+      }
       if (payload.replace_existing) {
-        existingBills = [];
+        if (payload.default_accounting_entity?.trim()) {
+          const targetEnt = payload.default_accounting_entity.trim();
+          existingBills = existingBills.filter(
+            (b) => b.accounting_entity !== targetEnt
+          );
+        } else {
+          existingBills = [];
+        }
       }
       let imported = 0;
       for (const item of payload.bills) {
+        const amtStr = readDecimalString(item, "amount");
+        if (amtStr === null) {
+          return errorJsonResponse(
+            {
+              code: "INVALID_BILL_AMOUNT",
+              message: "导入的历史账单缺少合法十进制金额 (amount)",
+            },
+            400
+          );
+        }
+        const qtyStr = readDecimalString(item, "quantity");
+        const unitStr = readDecimalString(item, "unit_price");
         existingBills.push({
           id: `bill-imp-${existingBills.length + 1}`,
-          accounting_entity:
-            String(
-              item.accounting_entity ??
-                payload.default_accounting_entity ??
-                "NEPTUNE SHIPPING LIMITED"
-            ),
-          charge_item: String(item.charge_item ?? "Handling Charge"),
-          amount:
-            typeof item.amount === "number"
-              ? item.amount
-              : toSchemaDecimal("0.00"),
-          currency: String(item.currency ?? "USD"),
-          posting_type: item.posting_type === "AR" ? "AR" : "AP",
+          external_bill_key:
+            typeof item.external_bill_key === "string"
+              ? item.external_bill_key
+              : null,
+          accounting_entity: String(
+            item.accounting_entity ??
+              payload.default_accounting_entity ??
+              "NEPTUNE SHIPPING LIMITED"
+          ),
+          document_type:
+            typeof item.document_type === "string" ? item.document_type : null,
           reference_no:
             typeof item.reference_no === "string" ? item.reference_no : null,
-          version: 1,
+          document_date:
+            typeof item.document_date === "string" ? item.document_date : null,
+          issuer: typeof item.issuer === "string" ? item.issuer : null,
+          recipient: typeof item.recipient === "string" ? item.recipient : null,
+          mbl_no: typeof item.mbl_no === "string" ? item.mbl_no : null,
+          hbl_no: typeof item.hbl_no === "string" ? item.hbl_no : null,
+          booking_no:
+            typeof item.booking_no === "string" ? item.booking_no : null,
+          container_nos: Array.isArray(item.container_nos)
+            ? item.container_nos.map((c) => String(c))
+            : [],
+          charge_item: String(item.charge_item ?? "Handling Charge"),
+          raw_charge_name:
+            typeof item.raw_charge_name === "string"
+              ? item.raw_charge_name
+              : null,
+          quantity: qtyStr !== null ? toSchemaDecimal(qtyStr) : null,
+          unit_price: unitStr !== null ? toSchemaDecimal(unitStr) : null,
+          amount: toSchemaDecimal(amtStr),
+          currency: String(item.currency ?? "USD"),
+          payment_term:
+            item.payment_term === "PP" || item.payment_term === "CC"
+              ? item.payment_term
+              : null,
+          posting_type: item.posting_type === "AR" ? "AR" : "AP",
+          version: typeof item.version === "number" ? item.version : 1,
         });
         imported++;
       }
@@ -1524,6 +1668,7 @@ export function createDevStubTransport(): FetchLike {
       const wait = parsedUrl.searchParams.get("wait") !== "false";
       let accountingEntity = "NEPTUNE SHIPPING LIMITED";
       let ocrMode: BatchSummary["ocr_mode"] = "REMOTE_ONLY";
+      let batchSnapshotBills: ExistingBill[] = [];
       if (init?.body instanceof FormData) {
         const entityField = init.body.get("accounting_entity");
         if (typeof entityField === "string" && entityField.trim()) {
@@ -1535,6 +1680,17 @@ export function createDevStubTransport(): FetchLike {
           ocrField === "REMOTE_WITH_LOCAL_FALLBACK"
         ) {
           ocrMode = ocrField;
+        }
+        const billsField = init.body.get("existing_bills_json");
+        if (typeof billsField === "string" && billsField.trim()) {
+          try {
+            const parsedSnap = parseLosslessJson<unknown>(billsField);
+            if (Array.isArray(parsedSnap)) {
+              batchSnapshotBills = parsedSnap as ExistingBill[];
+            }
+          } catch {
+            // ignore malformed optional snapshot in stub
+          }
         }
       }
       batchSeq++;
@@ -1551,6 +1707,7 @@ export function createDevStubTransport(): FetchLike {
           : "批次已入队，准备解包投递单据...",
       });
       batches.set(id, detail);
+      batchSnapshots.set(id, batchSnapshotBills);
       pollSteps.set(id, wait ? STAGE_SEQUENCE.length : 0);
       if (wait) {
         return jsonResponse(detail, 201);
@@ -1565,46 +1722,103 @@ export function createDevStubTransport(): FetchLike {
       const bundle = parseLosslessJson<ReviewBundleV1>(
         String(init?.body ?? "{}")
       );
-      if (bundle.bundle_version !== "1.0") {
+      if (
+        !bundle ||
+        bundle.bundle_version !== "1.0" ||
+        typeof bundle.accounting_entity !== "string" ||
+        !bundle.accounting_entity.trim() ||
+        !Array.isArray(bundle.documents) ||
+        !Array.isArray(bundle.records)
+      ) {
         return errorJsonResponse(
           {
             code: "INVALID_BUNDLE_VERSION",
-            message: "仅支持 bundle_version 为 1.0 的复核包",
+            message: '仅支持符合 ReviewBundleV1 契约且 bundle_version 为 "1.0" 的复核包',
           },
           400
         );
       }
       batchSeq++;
       const id = `batch-bundle-0${batchSeq}`;
+      const clonedDocs = parseLosslessJson<SourceDocumentSummary[]>(
+        stringifyLosslessJson(bundle.documents)
+      );
+      const clonedRecs = parseLosslessJson<BillingRecordDetail[]>(
+        stringifyLosslessJson(bundle.records)
+      ).map((rec) => ({
+        ...rec,
+        charge_details: preserveChargeDetailsDecimals(rec.charge_details),
+      }));
+      const meta = createBatchAuditMeta();
+      for (const rec of clonedRecs) {
+        if (Object.keys(rec.human_overrides ?? {}).length > 0) {
+          meta.recordEdited.add(rec.id);
+        }
+        const snap = rec.source_evidence?.audit_snapshot as
+          | {
+              human_review_history?: unknown;
+              retry_count?: unknown;
+              llm_calls_used?: unknown;
+            }
+          | undefined;
+        if (snap && typeof snap === "object") {
+          if (typeof snap.llm_calls_used === "number") {
+            meta.llmCallsUsed = snap.llm_calls_used;
+          }
+          if (typeof snap.retry_count === "number" && snap.retry_count > 0) {
+            meta.docRetryCount.set(rec.source_doc_id, snap.retry_count);
+          }
+          if (Array.isArray(snap.human_review_history)) {
+            const items: HumanReviewHistoryItem[] =
+              snap.human_review_history.map((entry) => {
+                const e = (entry ?? {}) as Record<string, unknown>;
+                return {
+                  action: String(e.action ?? "UPDATED"),
+                  operator: String(e.operator ?? "财务复核员"),
+                  timestamp: String(e.timestamp ?? ""),
+                  reason: typeof e.reason === "string" ? e.reason : undefined,
+                };
+              });
+            meta.recordHistory.set(rec.id, items);
+          }
+        }
+      }
+      const failedDocs = clonedDocs
+        .filter((d) => d.status === "FAILED")
+        .map((d) => ({
+          doc_id: d.id,
+          filename: d.sanitized_filename,
+          error_message: d.error_message ?? "文件解析失败",
+          affected_record_ids: d.affected_record_ids ?? [],
+        }));
+      const ts = nextStubTimestamp();
       const detail: BatchDetail = {
         id,
         short_code: bundle.short_code ?? `CLI-1120-0${batchSeq}`,
         accounting_entity: bundle.accounting_entity,
         source_channel: "CLI",
-        status: "COMPLETED",
+        status: failedDocs.length > 0 ? "PARTIAL_ERROR" : "COMPLETED",
         stage: "COMPLETED",
-        stage_message: "已从 CLI 复核包接手还原工作现场",
+        stage_message: "已从 ReviewBundleV1 (v1.0) 复核包接手还原工作现场",
         ocr_mode: bundle.ocr_mode ?? "REMOTE_ONLY",
-        total_files: bundle.documents.length,
-        succeeded_files: bundle.documents.filter((d) => d.status !== "FAILED")
-          .length,
-        failed_files: bundle.documents.filter((d) => d.status === "FAILED")
-          .length,
-        counts: computeCounts(bundle.records),
-        documents: bundle.documents,
-        failed_documents: bundle.documents
-          .filter((d) => d.status === "FAILED")
-          .map((d) => ({
-            doc_id: d.id,
-            filename: d.sanitized_filename,
-            error_message: d.error_message ?? "文件解析失败",
-            affected_record_ids: d.affected_record_ids ?? [],
-          })),
-        records: bundle.records,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        total_files: clonedDocs.length,
+        succeeded_files: clonedDocs.filter((d) => d.status !== "FAILED").length,
+        failed_files: failedDocs.length,
+        counts: computeCounts(clonedRecs),
+        documents: clonedDocs,
+        failed_documents: failedDocs,
+        records: clonedRecs,
+        created_at: ts,
+        updated_at: ts,
       };
       batches.set(id, detail);
+      batchSnapshots.set(
+        id,
+        parseLosslessJson<ExistingBill[]>(
+          stringifyLosslessJson(bundle.existing_bills_snapshot ?? [])
+        )
+      );
+      auditMetas.set(id, meta);
       pollSteps.set(id, STAGE_SEQUENCE.length);
       return jsonResponse(detail, 201);
     }
@@ -1689,7 +1903,63 @@ export function createDevStubTransport(): FetchLike {
           404
         );
       }
-      return jsonResponse(batch);
+      const next = cloneBatchDetail(batch);
+      const meta = getAuditMeta(next.id);
+      const ts = nextStubTimestamp();
+      const aliasLookup = new Map<string, ChargeDictionaryEntry>();
+      // Builtin entries first, custom entries override with higher precedence
+      for (const entry of dictionary) {
+        if (entry.is_builtin) {
+          aliasLookup.set(normalizeChargeAliasKey(entry.raw_alias), entry);
+        }
+      }
+      for (const entry of dictionary) {
+        if (!entry.is_builtin) {
+          aliasLookup.set(normalizeChargeAliasKey(entry.raw_alias), entry);
+        }
+      }
+
+      const touchedDocs = new Set<string>();
+      for (const rec of next.records) {
+        rec.charge_details = preserveChargeDetailsDecimals(rec.charge_details);
+        if (rec.review_status === "REJECTED") {
+          continue;
+        }
+        const overrides = rec.human_overrides ?? {};
+        if (
+          Object.prototype.hasOwnProperty.call(overrides, "charge_item") ||
+          Boolean((overrides as Record<string, unknown>).manual)
+        ) {
+          continue;
+        }
+        const rawSource =
+          rec.charge_details.raw_charge_name ??
+          rec.charge_details.charge_item ??
+          "";
+        const key = normalizeChargeAliasKey(rawSource);
+        if (!key) continue;
+        const matched = aliasLookup.get(key);
+        if (matched && matched.standard_name !== rec.charge_details.charge_item) {
+          const prevName = rec.charge_details.charge_item ?? "未命名";
+          rec.charge_details.charge_item = matched.standard_name;
+          rec.updated_at = ts;
+          touchedDocs.add(rec.source_doc_id);
+          appendRecordHistory(meta, rec.id, {
+            action: "DICTIONARY_REAPPLIED",
+            operator: "系统词典重算",
+            timestamp: ts,
+            reason: `按最新词典仅重算当前批标准费名：${prevName} → ${matched.standard_name}`,
+          });
+        }
+      }
+
+      for (const docId of touchedDocs) {
+        reconcileDocRecords(next, docId, meta);
+      }
+      next.counts = computeCounts(next.records);
+      next.updated_at = ts;
+      batches.set(next.id, next);
+      return jsonResponse(next);
     }
 
     const retryDocMatch =
@@ -2455,45 +2725,105 @@ export function createDevStubTransport(): FetchLike {
         run_mode: EvalRunSummary["run_mode"];
         k_trials?: number;
       }>(String(init?.body ?? "{}"));
-      const run: EvalRunSummary =
-        payload.run_mode === "OFFLINE_DETERMINISTIC"
-          ? {
-              id: `eval-${evalRuns.length + 1}`,
-              run_mode: "OFFLINE_DETERMINISTIC",
-              status: "COMPLETED",
-              error_message: null,
-              model_name: "deterministic-stub",
-              k_trials: 1,
-              actual_trials: 1,
-              total_cases: 10,
-              schema_valid_rate: rawDecimal("1.0") as unknown as number,
-              field_exact_match: rawDecimal("0.98") as unknown as number,
-              ar_ap_accuracy: rawDecimal("1.0") as unknown as number,
-              operation_accuracy: rawDecimal("1.0") as unknown as number,
-              conflict_recall: rawDecimal("1.0") as unknown as number,
-              pass_at_k: null,
-              pass_pow_k: null,
-              created_at: new Date().toISOString(),
-            }
-          : {
-              id: `eval-${evalRuns.length + 1}`,
-              run_mode: payload.run_mode,
-              status: "UNVERIFIED",
-              error_message:
-                "未配置真实 LLM API 密钥（前端独立演示桩不伪造联机分数）",
-              model_name: "deepseek-flash",
-              k_trials: payload.k_trials ?? 3,
-              actual_trials: 0,
-              total_cases: 10,
-              schema_valid_rate: null,
-              field_exact_match: null,
-              ar_ap_accuracy: null,
-              operation_accuracy: null,
-              conflict_recall: null,
-              pass_at_k: null,
-              pass_pow_k: null,
-              created_at: new Date().toISOString(),
-            };
+      const requestedK =
+        typeof payload.k_trials === "number" && Number.isFinite(payload.k_trials)
+          ? Math.max(1, Math.min(10, Math.round(payload.k_trials)))
+          : payload.run_mode === "OFFLINE_DETERMINISTIC"
+            ? 1
+            : 3;
+      const ts = nextStubTimestamp();
+      let run: EvalRunSummary;
+      if (payload.run_mode === "OFFLINE_DETERMINISTIC") {
+        run = {
+          id: `eval-${evalRuns.length + 1}`,
+          run_mode: "OFFLINE_DETERMINISTIC",
+          status: "COMPLETED",
+          error_message: null,
+          model_name: "offline-rules-v1",
+          k_trials: requestedK,
+          actual_trials: requestedK,
+          total_cases: 12,
+          schema_valid_rate: rawDecimal("1.0") as unknown as number,
+          field_exact_match: rawDecimal("0.9792") as unknown as number,
+          ar_ap_accuracy: rawDecimal("1.0") as unknown as number,
+          operation_accuracy: rawDecimal("1.0") as unknown as number,
+          conflict_recall: rawDecimal("1.0") as unknown as number,
+          pass_at_k: rawDecimal("1.0") as unknown as number,
+          pass_pow_k: rawDecimal("1.0") as unknown as number,
+          report: {
+            amount_accuracy: rawDecimal("1.0") as unknown as number,
+            currency_accuracy: rawDecimal("1.0") as unknown as number,
+            false_positive_rate: rawDecimal("0.0") as unknown as number,
+            metric_counts: {
+              schema_valid_rate: { passed: 12, total: 12 },
+              field_exact_match: { passed: 47, total: 48 },
+              ar_ap_accuracy: { passed: 12, total: 12 },
+              operation_accuracy: { passed: 12, total: 12 },
+              conflict_recall: { passed: 6, total: 6 },
+              amount_accuracy: { passed: 24, total: 24 },
+              currency_accuracy: { passed: 24, total: 24 },
+              false_positive_rate: { passed: 0, total: 12 },
+              pass_at_k: { passed: 12, total: 12 },
+              pass_pow_k: { passed: 12, total: 12 },
+            },
+            notes:
+              "12 组真值与对抗用例全量离线确定性回归完成（含 4 份真实原题与 8 组边界对抗）",
+          },
+          created_at: ts,
+        };
+      } else if (payload.run_mode === "LIVE_E2E") {
+        run = {
+          id: `eval-${evalRuns.length + 1}`,
+          run_mode: "LIVE_E2E",
+          status: "FAILED",
+          error_message:
+            "第 2 轮远端 OCR 网关连接中断（本地二进制样本缺少公网中转 URL），评测中止，未生成有效汇总指标",
+          model_name: "deepseek-chat + remote-ocr",
+          k_trials: requestedK,
+          actual_trials: 1,
+          total_cases: 12,
+          schema_valid_rate: null,
+          field_exact_match: null,
+          ar_ap_accuracy: null,
+          operation_accuracy: null,
+          conflict_recall: null,
+          pass_at_k: null,
+          pass_pow_k: null,
+          report: {
+            amount_accuracy: null,
+            currency_accuracy: null,
+            false_positive_rate: null,
+            failed_trial: 2,
+          },
+          created_at: ts,
+        };
+      } else {
+        run = {
+          id: `eval-${evalRuns.length + 1}`,
+          run_mode: "LIVE_LLM",
+          status: "UNVERIFIED",
+          error_message:
+            "未配置真实 DEEPSEEK_API_KEY 密钥（前端独立演示桩拒绝使用离线替身伪造联机分数）",
+          model_name: "deepseek-chat",
+          k_trials: requestedK,
+          actual_trials: 0,
+          total_cases: 12,
+          schema_valid_rate: null,
+          field_exact_match: null,
+          ar_ap_accuracy: null,
+          operation_accuracy: null,
+          conflict_recall: null,
+          pass_at_k: null,
+          pass_pow_k: null,
+          report: {
+            amount_accuracy: null,
+            currency_accuracy: null,
+            false_positive_rate: null,
+            unverified_reason: "MISSING_DEEPSEEK_API_KEY",
+          },
+          created_at: ts,
+        };
+      }
       evalRuns.unshift(run);
       return jsonResponse(run, 201);
     }

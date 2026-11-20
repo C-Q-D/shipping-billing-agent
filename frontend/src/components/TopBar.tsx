@@ -32,7 +32,9 @@ export interface TopBarProps {
   onConfirmSwitchEntity: (entityName: string) => Promise<void> | void;
   onToggleTheme: () => void;
   onOpenImportBundle: () => void;
+  onOpenExportBundle: () => void;
   onOpenMasterData: () => void;
+  onOpenEvalDashboard: () => void;
   onSyncBaseline: () => void;
   onOpenExport: () => void;
 }
@@ -55,7 +57,9 @@ export function TopBar({
   onConfirmSwitchEntity,
   onToggleTheme,
   onOpenImportBundle,
+  onOpenExportBundle,
   onOpenMasterData,
+  onOpenEvalDashboard,
   onSyncBaseline,
   onOpenExport,
 }: TopBarProps) {
@@ -82,7 +86,9 @@ export function TopBar({
       sublabel:
         ent.aliases.length > 0
           ? `别名：${ent.aliases.join(" / ")}`
-          : "默认记账主体档案",
+          : ent.is_default
+            ? "默认航运记账主体"
+            : "记账主体档案",
     });
   }
   if (selectedEntity && !entityMap.has(selectedEntity)) {
@@ -123,7 +129,11 @@ export function TopBar({
     <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
       <div>
         <strong>服务状态：</strong>
-        {healthError ? healthError : health ? `在线 (${health.status})` : "检测中..."}
+        {healthError
+          ? healthError
+          : health
+            ? `在线 (${health.status})`
+            : "检测中..."}
       </div>
       {health ? (
         <>
@@ -141,7 +151,7 @@ export function TopBar({
         </>
       ) : null}
       {isStubMode ? (
-        <div>当前运行于前端独立演示桩（?mode=stub），用于界面与合同冒烟</div>
+        <div>当前运行于前端独立演示桩（?mode=stub），用于界面与契约联调</div>
       ) : null}
     </div>
   );
@@ -158,7 +168,7 @@ export function TopBar({
           <LumnoTooltip content={healthTooltipContent}>
             <span className="wb-health-badge" tabIndex={0}>
               <span className={`wb-health-dot ${healthDotClass}`} />
-              <span>{healthShortLabel}</span>
+              <span className="wb-health-label">{healthShortLabel}</span>
             </span>
           </LumnoTooltip>
 
@@ -170,7 +180,7 @@ export function TopBar({
               placeholder="暂无批次"
               onChange={onSelectBatch}
               footerAction={{
-                label: "导入 CLI 复核包 (v1.0)...",
+                label: "复核包互通 (v1.0)...",
                 icon: "ri-upload-cloud-2-line",
                 onClick: onOpenImportBundle,
               }}
@@ -197,7 +207,7 @@ export function TopBar({
             className="wb-desktop-only"
             onClick={onOpenImportBundle}
           >
-            导入复核包
+            复核包 v1.0
           </LumnoButton>
 
           <LumnoButton
@@ -207,7 +217,17 @@ export function TopBar({
             className="wb-desktop-only"
             onClick={onOpenMasterData}
           >
-            主数据 / 评测 ({existingBillCount})
+            主数据 ({existingBillCount})
+          </LumnoButton>
+
+          <LumnoButton
+            variant="secondary"
+            compact
+            icon="ri-bar-chart-box-line"
+            className="wb-desktop-only"
+            onClick={onOpenEvalDashboard}
+          >
+            Harness 评测
           </LumnoButton>
 
           <LumnoButton
@@ -316,13 +336,34 @@ export function TopBar({
           </LumnoButton>
           <LumnoButton
             variant="secondary"
+            icon="ri-share-forward-line"
+            disabled={!activeBatch}
+            onClick={() => {
+              setMobileMenuOpen(false);
+              onOpenExportBundle();
+            }}
+          >
+            导出当前批复核包 (v1.0)
+          </LumnoButton>
+          <LumnoButton
+            variant="secondary"
             icon="ri-database-2-line"
             onClick={() => {
               setMobileMenuOpen(false);
               onOpenMasterData();
             }}
           >
-            主数据管理与评测看板 ({existingBillCount})
+            主数据管理与历史库 ({existingBillCount})
+          </LumnoButton>
+          <LumnoButton
+            variant="secondary"
+            icon="ri-bar-chart-box-line"
+            onClick={() => {
+              setMobileMenuOpen(false);
+              onOpenEvalDashboard();
+            }}
+          >
+            Harness 评测看板
           </LumnoButton>
           <LumnoButton
             variant="secondary"

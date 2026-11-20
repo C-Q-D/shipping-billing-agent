@@ -21,7 +21,11 @@ import {
   type ReviewBundleV1,
   type SourceDocumentSummary,
 } from "./api/client.ts";
-import { parseLosslessJson, rawDecimal } from "./api/decimalJson.ts";
+import { rawDecimal, stringifyLosslessJson } from "./api/decimalJson.ts";
+import {
+  buildReviewBundleV1,
+  validateReviewBundleInput,
+} from "./api/managementHelpers.ts";
 import {
   acceptPollResult,
   buildDocTotalsDiffPatch,
@@ -69,6 +73,10 @@ import {
   type MutationErrorBanner,
   type RecordAuditHistoryState,
 } from "./components/ReviewInspector.tsx";
+import {
+  ManagementDrawer,
+  type ManagementDrawerTab,
+} from "./components/ManagementDrawer.tsx";
 import { TopBar } from "./components/TopBar.tsx";
 import { UploadAndFileTree } from "./components/UploadAndFileTree.tsx";
 
@@ -86,7 +94,8 @@ type MobileViewTab = "upload" | "queue" | "detail";
 
 type PendingDraftGuardAction =
   | { kind: "switch_batch"; batchId: string }
-  | { kind: "open_import_bundle" };
+  | { kind: "open_import_bundle" }
+  | { kind: "confirm_import_bundle"; bundle: ReviewBundleV1 };
 
 function isActiveBatchStage(stage: BatchSummary["stage"]): boolean {
   return ACTIVE_STAGES.has(stage);
@@ -202,14 +211,25 @@ export default function App() {
     null
   );
 
-  // Modals
+  // Modals & Management Drawer
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [importModalOpen, setImportModalOpen] = useState(false);
+  const [bundleModalMode, setBundleModalMode] = useState<"import" | "export">(
+    "import"
+  );
   const [bundleJsonText, setBundleJsonText] = useState("");
   const [bundleError, setBundleError] = useState<string | null>(null);
   const [importingBundle, setImportingBundle] = useState(false);
+  const [exportBundleJsonText, setExportBundleJsonText] = useState("");
+  const [exportBundleLoading, setExportBundleLoading] = useState(false);
+  const [exportBundleError, setExportBundleError] = useState<string | null>(
+    null
+  );
 
-  const [masterModalOpen, setMasterModalOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerTab, setDrawerTab] =
+    useState<ManagementDrawerTab>("entities");
+  const [reapplyingDictionary, setReapplyingDictionary] = useState(false);
   const [dictionaryList, setDictionaryList] = useState<
     ChargeDictionaryEntry[]
   >([]);
@@ -980,14 +1000,17 @@ export default function App() {
     }
   };
 
-  const handleOpenMasterData = async () => {
-    setMasterModalOpen(true);
+  const handleOpenManagementDrawer = async (tab: ManagementDrawerTab) => {
+    setDrawerTab(tab);
+    setDrawerOpen(true);
     try {
-      const [dict, runs, bills] = await Promise.all([
+      const [ents, dict, runs, bills] = await Promise.all([
+        api.listAccountingEntities(),
         api.listChargeDictionary(),
         api.listEvalRuns(),
         api.listExistingBills(),
       ]);
+      setEntities(ents);
       setDictionaryList(dict);
       setEvalRuns(runs);
       setExistingBillCount(bills.length);
@@ -999,13 +1022,89 @@ export default function App() {
     }
   };
 
+  const handleReapplyDictionary = async () => {
+    if (!activeBatch) return;
+    setReapplyingDictionary(true);
+    const { nextTracker, ticket } = startMutation(
+      pollTrackerRef.current,
+      activeBatch.id
+    );
+    pollTrackerRef.current = nextTracker;
+    try {
+      const updated = await api.reapplyBatchChargeDictionary(activeBatch.id);
+      const finished = finishMutationSuccess(pollTrackerRef.current, ticket);
+      pollTrackerRef.current = finished.nextTracker;
+      setBatchRevision(finished.nextTracker.batchRevision);
+      if (finished.shouldApply) {
+        applyFreshBatchDetail(updated);
+        setAuditHistoryByKey({});
+        setMutationError(null);
+      }
+      pushToast(
+        `已按最新词典仅重新标准化批次 ${updated.short_code}（已保留人工修订）`
+      );
+    } catch (err) {
+      pollTrackerRef.current = finishMutationError(pollTrackerRef.current);
+      pushToast(
+        err instanceof Error ? err.message : "当前批次重标准化失败",
+        "error"
+      );
+    } finally {
+      setReapplyingDictionary(false);
+    }
+  };
+
   const handleOpenImportBundleClick = () => {
+    setBundleModalMode("import");
+    setBundleError(null);
     if (unsavedDraftCount > 0) {
       setPendingDraftGuard({ kind: "open_import_bundle" });
       return;
     }
     setImportModalOpen(true);
   };
+
+  const handleOpenExportBundleClick = () => {
+    setBundleModalMode("export");
+    setBundleError(null);
+    setImportModalOpen(true);
+  };
+
+  useEffect(() => {
+    if (!importModalOpen || bundleModalMode !== "export" || !activeBatch) {
+      return;
+    }
+    let cancelled = false;
+    setExportBundleLoading(true);
+    setExportBundleError(null);
+    void Promise.all([
+      api.listExistingBills(activeBatch.accounting_entity).catch(() => []),
+      api.exportBatchJson(activeBatch.id, "audit").catch(() => null),
+    ])
+      .then(([billsSnapshot, auditExport]) => {
+        if (cancelled) return;
+        const bundle = buildReviewBundleV1(
+          activeBatch,
+          billsSnapshot,
+          auditExport
+        );
+        setExportBundleJsonText(stringifyLosslessJson(bundle, 2));
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setExportBundleError(
+          err instanceof Error ? err.message : "生成 ReviewBundleV1 复核包失败"
+        );
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setExportBundleLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [importModalOpen, bundleModalMode, activeBatch, batchRevision, api]);
 
   const handleBundleFilePick = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1016,52 +1115,83 @@ export default function App() {
     setBundleError(null);
   };
 
-  const handleImportBundle = async () => {
-    setBundleError(null);
-    if (!bundleJsonText.trim()) {
-      setBundleError("请先粘贴或选择 CLI 生成的 ReviewBundleV1 JSON");
-      return;
-    }
-    let parsed: ReviewBundleV1;
-    try {
-      parsed = parseLosslessJson<ReviewBundleV1>(bundleJsonText);
-    } catch {
-      setBundleError("复核包 JSON 语法无效");
-      return;
-    }
-    if (
-      !parsed ||
-      parsed.bundle_version !== "1.0" ||
-      !Array.isArray(parsed.documents) ||
-      !Array.isArray(parsed.records)
-    ) {
-      setBundleError(
-        '不符合 ReviewBundleV1 契约：必须包含 bundle_version: "1.0"、documents 数组与 records 数组'
-      );
-      return;
-    }
-
+  const executeImportBundle = async (bundle: ReviewBundleV1) => {
     setImportingBundle(true);
+    setBundleError(null);
     try {
-      const imported = await api.importReviewBundle(parsed);
+      const imported = await api.importReviewBundle(bundle);
       pollTrackerRef.current = setTrackerActiveBatch(
         pollTrackerRef.current,
         imported.id
       );
       setBatchRevision(pollTrackerRef.current.batchRevision);
       applyFreshBatchDetail(imported);
+      setAuditHistoryByKey({});
+      setEntityNotice(null);
       await refreshBatchesList().catch(() => undefined);
       setImportModalOpen(false);
       setBundleJsonText("");
       setMutationError(null);
-      pushToast(`已接手 CLI 复核包 ${imported.short_code}`);
+      setMobileTab("queue");
+      pushToast(`已接手 ReviewBundleV1 复核包 ${imported.short_code}`);
     } catch (err) {
-      setBundleError(
-        err instanceof Error ? err.message : "导入复核包失败"
-      );
+      setBundleError(err instanceof Error ? err.message : "导入复核包失败");
     } finally {
       setImportingBundle(false);
     }
+  };
+
+  const handleImportBundle = async () => {
+    const check = validateReviewBundleInput(bundleJsonText);
+    if (!check.valid) {
+      setBundleError(check.error);
+      return;
+    }
+    if (unsavedDraftCount > 0) {
+      setPendingDraftGuard({
+        kind: "confirm_import_bundle",
+        bundle: check.bundle,
+      });
+      return;
+    }
+    await executeImportBundle(check.bundle);
+  };
+
+  const handleCopyExportBundle = async () => {
+    if (!exportBundleJsonText) return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(exportBundleJsonText);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = exportBundleJsonText;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      }
+      pushToast("已复制 ReviewBundleV1 (v1.0) 无损复核包 JSON");
+    } catch {
+      pushToast("复制到剪贴板失败，请手动选中预览内容复制", "error");
+    }
+  };
+
+  const handleDownloadExportBundle = () => {
+    if (!activeBatch || !exportBundleJsonText) return;
+    const blob = new Blob([exportBundleJsonText], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${activeBatch.short_code}.review-bundle.v1.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    pushToast(`已导出 ${activeBatch.short_code}.review-bundle.v1.json`);
   };
 
   const handleOpenManualModal = (defaultDocId?: string) => {
@@ -1196,7 +1326,9 @@ export default function App() {
             setTheme((prev) => (prev === "light" ? "dark" : "light"))
           }
           onOpenImportBundle={handleOpenImportBundleClick}
-          onOpenMasterData={() => void handleOpenMasterData()}
+          onOpenExportBundle={handleOpenExportBundleClick}
+          onOpenMasterData={() => void handleOpenManagementDrawer("entities")}
+          onOpenEvalDashboard={() => void handleOpenManagementDrawer("eval_runs")}
           onSyncBaseline={() => void handleSyncBaseline()}
           onOpenExport={() => setExportModalOpen(true)}
         />
@@ -1373,6 +1505,7 @@ export default function App() {
         lastSyncResult={lastSyncResult}
         onClose={() => setExportModalOpen(false)}
         onSyncBaseline={handleSyncBaseline}
+        onOpenBundleExport={handleOpenExportBundleClick}
         onNotify={pushToast}
       />
 
@@ -1551,7 +1684,10 @@ export default function App() {
                 if (action.kind === "switch_batch") {
                   void executeSelectBatch(action.batchId);
                 } else if (action.kind === "open_import_bundle") {
+                  setBundleModalMode("import");
                   setImportModalOpen(true);
+                } else if (action.kind === "confirm_import_bundle") {
+                  void executeImportBundle(action.bundle);
                 }
               }}
             >
@@ -1566,98 +1702,153 @@ export default function App() {
         </div>
       </LumnoModal>
 
-      {/* Import ReviewBundleV1 Modal */}
+      {/* Bidirectional ReviewBundleV1 ("1.0") Interop Modal */}
       <LumnoModal
         open={importModalOpen}
-        title="导入 CLI 复核包（ReviewBundleV1）"
+        title="复核包互通（ReviewBundleV1 · bundle_version: 1.0）"
         onClose={() => setImportModalOpen(false)}
         footer={
-          <>
-            <LumnoButton
-              variant="secondary"
-              onClick={() => setImportModalOpen(false)}
-            >
-              取消
-            </LumnoButton>
-            <LumnoButton
-              variant="primary"
-              busy={importingBundle}
-              onClick={() => void handleImportBundle()}
-            >
-              导入并接手复核
-            </LumnoButton>
-          </>
+          bundleModalMode === "import" ? (
+            <>
+              <LumnoButton
+                variant="secondary"
+                onClick={() => setImportModalOpen(false)}
+              >
+                取消
+              </LumnoButton>
+              <LumnoButton
+                variant="primary"
+                busy={importingBundle}
+                onClick={() => void handleImportBundle()}
+              >
+                导入并接手复核
+              </LumnoButton>
+            </>
+          ) : (
+            <>
+              <LumnoButton
+                variant="secondary"
+                onClick={() => setImportModalOpen(false)}
+              >
+                关闭
+              </LumnoButton>
+              <LumnoButton
+                variant="secondary"
+                icon="ri-file-copy-line"
+                disabled={!exportBundleJsonText || exportBundleLoading}
+                onClick={() => void handleCopyExportBundle()}
+              >
+                复制复核包 JSON
+              </LumnoButton>
+              <LumnoButton
+                variant="primary"
+                icon="ri-download-2-line"
+                disabled={!activeBatch || !exportBundleJsonText || exportBundleLoading}
+                onClick={handleDownloadExportBundle}
+              >
+                下载复核包 (.json)
+              </LumnoButton>
+            </>
+          )
         }
       >
-        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-          <label className="lumno-btn lumno-pill lumno-btn--secondary lumno-btn--compact">
-            <i className="ri-icon ri-file-code-line" aria-hidden="true" />
-            <span>选择 .json 文件</span>
-            <input
-              type="file"
-              accept=".json,application/json"
-              style={{ display: "none" }}
-              onChange={(e) => void handleBundleFilePick(e)}
-            />
-          </label>
-          <span className="wb-helper-note">
-            须包含 bundle_version: "1.0"、documents 与 records
-          </span>
-        </div>
-        <LumnoTextarea
-          value={bundleJsonText}
-          placeholder='{"bundle_version":"1.0","accounting_entity":"NEPTUNE SHIPPING LIMITED","ocr_mode":"REMOTE_ONLY","documents":[],"records":[]}'
-          aria-label="ReviewBundleV1 JSON 内容"
-          style={{ minHeight: "160px", fontFamily: "var(--lumno-font-mono)" }}
-          onChange={(e) => {
-            setBundleJsonText(e.target.value);
+        <LumnoSegmentedControl<"import" | "export">
+          value={bundleModalMode}
+          ariaLabel="复核包互通操作模式"
+          options={[
+            { value: "import", label: "导入接手复核包" },
+            { value: "export", label: "导出当前批复核包" },
+          ]}
+          onChange={(mode) => {
+            setBundleModalMode(mode);
             setBundleError(null);
           }}
         />
-        {bundleError ? <div className="wb-field-error">{bundleError}</div> : null}
+
+        {bundleModalMode === "import" ? (
+          <>
+            {unsavedDraftCount > 0 ? (
+              <div className="wb-alert-item" data-severity="WARNING">
+                提示：当前批次有 {unsavedDraftCount} 项未保存草稿，提交导入时将再次确认，切换后当前草稿保留在原批次本地缓存中。
+              </div>
+            ) : null}
+            <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+              <label className="lumno-btn lumno-pill lumno-btn--secondary lumno-btn--compact">
+                <i className="ri-icon ri-file-code-line" aria-hidden="true" />
+                <span>选择 .json 文件</span>
+                <input
+                  type="file"
+                  accept=".json,application/json"
+                  style={{ display: "none" }}
+                  onChange={(e) => void handleBundleFilePick(e)}
+                />
+              </label>
+              <span className="wb-helper-note">
+                须包含 bundle_version: "1.0"、accounting_entity、documents 与 records
+              </span>
+            </div>
+            <LumnoTextarea
+              value={bundleJsonText}
+              placeholder='{"bundle_version":"1.0","accounting_entity":"NEPTUNE SHIPPING LIMITED","ocr_mode":"REMOTE_ONLY","documents":[],"records":[]}'
+              aria-label="ReviewBundleV1 JSON 内容"
+              style={{ minHeight: "160px", fontFamily: "var(--lumno-font-mono)" }}
+              onChange={(e) => {
+                setBundleJsonText(e.target.value);
+                setBundleError(null);
+              }}
+            />
+            {bundleError ? <div className="wb-field-error">{bundleError}</div> : null}
+          </>
+        ) : !activeBatch ? (
+          <div className="wb-empty-state">
+            <span>当前尚未选中批次，请先在工作台加载或选择一个批次后再导出 ReviewBundleV1。</span>
+          </div>
+        ) : (
+          <>
+            {unsavedDraftCount > 0 ? (
+              <div className="wb-alert-item" data-severity="WARNING">
+                当前批次尚有 {unsavedDraftCount} 项未保存本地草稿，导出的复核包基于服务端已保存快照与审计历史，建议先保存修订。
+              </div>
+            ) : null}
+            <div className="wb-notice-banner">
+              <span>
+                导出批次 <strong>{activeBatch.short_code}</strong> 的完整 ReviewBundleV1（含 bundle_version: "1.0"、高精度数值、历史快照与人工复核历史），可供 CLI 或另一工作台实例无损接手。
+              </span>
+            </div>
+            {exportBundleLoading ? (
+              <div className="wb-helper-note">正在生成无损 ReviewBundleV1 快照...</div>
+            ) : exportBundleError ? (
+              <div className="wb-field-error">{exportBundleError}</div>
+            ) : (
+              <pre
+                className="wb-evidence-pre wb-tabular"
+                style={{ maxHeight: "240px", overflowY: "auto" }}
+              >
+                {exportBundleJsonText}
+              </pre>
+            )}
+          </>
+        )}
       </LumnoModal>
 
-      {/* Master Data & Eval Overview Modal (full 4-tab drawer finalized in T03) */}
-      <LumnoModal
-        open={masterModalOpen}
-        title="主数据档案与 Harness 评测概览（T03 完善全管理页签）"
-        onClose={() => setMasterModalOpen(false)}
-        footer={
-          <LumnoButton
-            variant="primary"
-            onClick={() => setMasterModalOpen(false)}
-          >
-            完成
-          </LumnoButton>
-        }
-      >
-        <div className="wb-kv-grid">
-          <div className="wb-kv-item">
-            <div className="wb-kv-label">记账主体档案数</div>
-            <div className="wb-kv-value wb-tabular">{entities.length} 家</div>
-          </div>
-          <div className="wb-kv-item">
-            <div className="wb-kv-label">费用标准映射词典</div>
-            <div className="wb-kv-value wb-tabular">
-              {dictionaryList.length} 条
-            </div>
-          </div>
-          <div className="wb-kv-item">
-            <div className="wb-kv-label">全局已有历史账单库</div>
-            <div className="wb-kv-value wb-tabular">
-              {existingBillCount} 条
-            </div>
-          </div>
-          <div className="wb-kv-item">
-            <div className="wb-kv-label">Harness 评测历史</div>
-            <div className="wb-kv-value wb-tabular">
-              {evalRuns.length === 0
-                ? "尚未运行（无伪造分数）"
-                : `${evalRuns.length} 次运行`}
-            </div>
-          </div>
-        </div>
-      </LumnoModal>
+      <ManagementDrawer
+        open={drawerOpen}
+        initialTab={drawerTab}
+        api={api}
+        activeBatch={activeBatch}
+        entities={entities}
+        dictionaryList={dictionaryList}
+        evalRuns={evalRuns}
+        selectedEntity={selectedEntity}
+        reapplyingDictionary={reapplyingDictionary}
+        onClose={() => setDrawerOpen(false)}
+        onEntitiesChanged={setEntities}
+        onDictionaryChanged={setDictionaryList}
+        onExistingBillsCountChanged={setExistingBillCount}
+        onEvalRunsChanged={setEvalRuns}
+        onReapplyDictionary={handleReapplyDictionary}
+        onNotify={pushToast}
+      />
     </>
   );
 }
