@@ -55,7 +55,7 @@ from shipping_billing_agent.domain.entity_resolver import (
     is_credit_document_type,
 )
 from shipping_billing_agent.domain.models import DocumentStatus, SourceKind, sanitize_source_path
-from shipping_billing_agent.domain.validators import _validate_batch
+from shipping_billing_agent.domain.validators import _document_parse_issues, _validate_batch
 from shipping_billing_agent.gateways.llm_client import (
     LlmBudgetExhaustedError,
     LlmGatewayError,
@@ -256,6 +256,7 @@ def _records_for_bundle(
     data = envelope.extraction
     totals = SourceDocTotalsSnapshot.from_extraction(doc.doc_id, envelope)
     package_refs = _package_shipment_refs(doc, state)
+    document_issues = _document_parse_issues(envelope)
     records = []
     for index, entry in enumerate(envelope.charges):
         charge = entry.charge
@@ -277,7 +278,7 @@ def _records_for_bundle(
         )
         batch_id = state.get("batch_id")
         record_prefix = f"{batch_id}:{doc.doc_id}" if batch_id else doc.doc_id
-        raw_issues = [*envelope.raw_parse_issues, *entry.raw_parse_issues]
+        raw_issues = [*document_issues, *entry.raw_parse_issues]
         records.append(
             ProcessedBillingRecord(
                 id=f"{record_prefix}:{index + 1}",
@@ -684,10 +685,11 @@ def _ground_charges(
         return grounded, issues
 
     evidence_by_amount: dict[Decimal, set[tuple[str, frozenset[str]]]] = defaultdict(set)
-    for text, amounts, currencies in _charge_evidence(doc, rules):
-        words = f" {_charge_words(text)} "
-        for amount in amounts:
-            evidence_by_amount[amount].add((words, currencies))
+    rate_currency_conflicts: dict[Decimal, set[tuple[str, frozenset[str]]]] = defaultdict(set)
+    for row in _charge_evidence(doc, rules):
+        words = f" {_charge_words(row.text)} "
+        index = evidence_by_amount if row.is_line_amount else rate_currency_conflicts
+        index[row.amount].add((words, row.currencies))
     # A rule-recognized line cannot also substantiate a second model fee.
     used_rows = {
         f" {_charge_words(_TABLE_ROW.sub('', _SHEET_ROW.sub('', line)))} "
@@ -708,21 +710,35 @@ def _ground_charges(
             if not currencies - {charge.currency}:
                 used_rows.add(words)
                 continue
-            alert = _printed_field_conflict(
-                "currency", " / ".join(sorted(currencies)), charge.currency or "缺失"
-            )
+            row_alerts = [
+                _printed_field_conflict(
+                    "currency", " / ".join(sorted(currencies)), charge.currency or "缺失"
+                )
+            ]
         else:
-            alert = ValidationAlert.from_code(
-                AlertCode.AMOUNT_TOTAL_MISMATCH,
-                "模型另报的费用在源单明细中缺少费用名称和金额的对应证据",
-                field="reported_charge_amount",
-                expected="同一源单中的费用名称和金额",
-                actual=f"{charge.raw_charge_name} {entry.raw_amount_text or '金额缺失'}",
-            )
-        issues.append(alert)
+            row_alerts = [
+                ValidationAlert.from_code(
+                    AlertCode.AMOUNT_TOTAL_MISMATCH,
+                    "模型另报的费用在源单明细中缺少费用名称和金额的对应证据",
+                    field="reported_charge_amount",
+                    expected="同一源单中的费用名称和金额",
+                    actual=f"{charge.raw_charge_name} {entry.raw_amount_text or '金额缺失'}",
+                )
+            ]
+            if index not in non_billing and (
+                rate := _matching_charge_evidence(
+                    charge, rate_currency_conflicts, dictionary, used_rows
+                )
+            ):
+                row_alerts.append(
+                    _printed_field_conflict(
+                        "currency", " / ".join(sorted(rate[1])), charge.currency or "缺失"
+                    )
+                )
+        issues.extend(row_alerts)
         unsupported.add(index)
         grounded[index] = entry.model_copy(
-            update={"raw_parse_issues": [*entry.raw_parse_issues, alert]}
+            update={"raw_parse_issues": [*entry.raw_parse_issues, *row_alerts]}
         )
     if unsupported and not observed and _has_billing_summary(rules):
         grounded = [entry for index, entry in enumerate(grounded) if index not in unsupported]

@@ -191,6 +191,29 @@ def _export(
     return payload, items
 
 
+def _assert_official_charges(
+    validator: Draft202012Validator,
+    records: Sequence[ProcessedBillingRecord],
+    *charges: tuple[str, Decimal | int, str],
+    reference_no: str,
+    operation: OperationType = OperationType.CREATE,
+    matched_id: str | None = None,
+) -> None:
+    _, items = _export(validator, records)
+    assert [
+        (
+            item["operation"],
+            item["audit_trail"]["matched_bill_ref"],
+            item["document_info"]["reference_no"],
+            item["charge_details"]["charge_item"],
+            item["charge_details"]["amount"],
+            item["charge_details"]["currency"],
+        )
+        for item in items
+    ] == [(operation.value, matched_id, reference_no, *charge) for charge in charges]
+    assert [row.matched_existing_bill_id for row in records] == [matched_id] * len(charges)
+
+
 def _assert_total(bundle: DocumentExtractionBundle, amount: Decimal) -> None:
     extraction = bundle.extraction
     assert extraction is not None and extraction.has_explicit_total
@@ -247,14 +270,17 @@ def _invoice_pdf(reference: str, amount: str, *extra_lines: str) -> bytes:
     ("label", "branch", "printed_tail"),
     [
         ("Issuer", " (HK)", ""),
-        ("Issuer", "., (HK)", " Reference: INV-ATLAS-1"),
+        ("Issuer", "., (HK)", " Reference: INV-1"),
         ("Issuer", " Hong Kong Branch", " Date: 2026-10-01"),
-        ("Issuer", "., (HK)", "  Ref: INV-ATLAS-1"),
-        ("From", " - (HK)", "  Ref No.: INV-ATLAS-1"),
+        ("Issuer", "., (HK)", "  Ref: INV-1"),
+        ("From", " - (HK)", "  Ref. No.: INV-1"),
+        ("Issuer", "., (HK)", "  Ref #: INV-1"),
         ("To", " - (HK)", ""),
-        ("To", " / (HK)", "  Ref.: INV-ATLAS-1"),
+        ("To", " / (HK)", "  Ref.: INV-1"),
     ],
-    ids=["parenthesized", "punctuated", "named-branch", "ref", "from", "to", "to-slash"],
+    ids=[
+        "parenthesized", "punctuated", "named-branch", "ref", "ref-no", "ref-hash", "to", "to-slash"
+    ],
 )
 def test_labeled_hong_kong_party_posts_only_to_its_own_ledger(
     dispatcher: DocumentParserDispatcher,
@@ -274,7 +300,7 @@ def test_labeled_hong_kong_party_posts_only_to_its_own_ledger(
         ExistingBillRecord(
             id=f"atlas-{index}",
             accounting_entity=entity,
-            reference_no="INV-ATLAS-1",
+            reference_no="INV-1",
             issuer=entity if is_issuer else VENDOR,
             recipient=CUSTOMER if is_issuer else entity,
             charge_item="Handling Charge",
@@ -285,7 +311,7 @@ def test_labeled_hong_kong_party_posts_only_to_its_own_ledger(
         for index, entity in enumerate(entities)
     ]
     invoice = _pdf(
-        "Invoice No. INV-ATLAS-1",
+        "Invoice" if "INV-1" in printed_tail else "Invoice No. INV-1",
         f"{label}: {printed}{printed_tail}",
         f"Bill To: {CUSTOMER}" if is_issuer else f"Issuer: {VENDOR}",
         "Handling Charge 30.00 USD",
@@ -295,11 +321,16 @@ def test_labeled_hong_kong_party_posts_only_to_its_own_ledger(
         result = run_billing_pipeline(documents, entity, existing_bills=bills, profiles=profiles)
         (row,) = result.records
         assert (row.issuer if is_issuer else row.recipient) == printed
+        assert row.reference_no == "INV-1"
         assert not result.failed_doc_ids
         if entity == hong_kong:
             assert row.matched_existing_bill_id == "atlas-1" and row.posting_type is posting
+            assert row.operation is OperationType.NO_CHANGE
             assert row.review_status is ReviewStatus.AUTO_READY
-            assert len(_export(billing_schema, result.records)[1]) == 1
+            _assert_official_charges(
+                billing_schema, result.records, ("Handling Charge", 30, "USD"),
+                reference_no="INV-1", operation=OperationType.NO_CHANGE, matched_id=bills[1].id,
+            )
         else:
             assert row.posting_type is None
             if entity in entities[:3] and not branch.endswith("Branch"):
@@ -353,12 +384,15 @@ def test_original_image_retains_rated_fee_and_recalculates_approved_records(
     assert [row.review_status for row in recalculated] == [ReviewStatus.AUTO_READY] * 2
 
     for records, posting in ((ar.records, "AR"), (printed_name.records, "AR"), (ap.records, "AP")):
+        _assert_official_charges(
+            billing_schema,
+            records,
+            ("Wharfage Administration Fee", Decimal("5.00"), "USD"),
+            ("Wharfage", Decimal("21.90"), "USD"),
+            reference_no="ORFR1618731",
+        )
         _, items = _export(billing_schema, records)
         assert [item["financial_attributes"]["posting_type"] for item in items] == [posting] * 2
-        assert [item["charge_details"]["amount"] for item in items] == [
-            Decimal("5.00"),
-            Decimal("21.90"),
-        ]
     assert _export(billing_schema, recalculated) == _export(billing_schema, ap.records)
 
 
@@ -435,10 +469,19 @@ def test_original_pdf_two_uses_only_the_stated_payee(
         else:
             _assert_review_blocker(row, AlertCode.ENTITY_NOT_MATCHED)
 
-    _, official = _export(billing_schema, result.records)
     _, full = _export(billing_schema, result.records, "full_standard")
     assert len(full) == 3
-    assert len(official) == (3 if posting is PostingType.AR else 0)
+    if posting is PostingType.AR:
+        _assert_official_charges(
+            billing_schema,
+            result.records,
+            ("Handling Charge", Decimal("65.00"), "USD"),
+            ("Detention Free Time Charge", Decimal("1310.40"), "USD"),
+            ("Handling Charge", Decimal("35.00"), "USD"),
+            reference_no="DC-108478",
+        )
+    else:
+        assert _export(billing_schema, result.records)[1] == []
     assert [item["financial_attributes"]["posting_type"] for item in full] == [posting] * 3
 
 
@@ -1033,11 +1076,14 @@ def test_model_extra_fee_without_detail_evidence_blocks_the_whole_invoice(
     ("fee", "amount", "printed_currency", "note", "model_currency", "echo_note"),
     [
         ("Storage Fee", "50000", "EUR", "is a quotation only", "EUR", False),
-        ("Terminal Handling Fee", "30", "USD", "is already included", "USD", True),
+        ("Terminal Handling Fee", "30", "USD", "is already included", "USD", False),
         ("Terminal Handling Fee", "30", "USD", "is already included", "EUR", False),
+        ("Storage Fee", "30", "USD", "(waived)", "USD", False),
+        ("Storage Fee", "45", "USD", "has already been included", "USD", True),
     ],
-    ids=["quotation", "included-same-currency", "included-other-currency"],
+    ids=["quotation", "included", "included-other-currency", "waived", "already-been-included"],
 )
+@pytest.mark.parametrize("wrapped", [False, True], ids=["inline", "next-line"])
 def test_model_billing_a_non_billable_note_blocks_export(
     dispatcher: DocumentParserDispatcher,
     billing_schema: Draft202012Validator,
@@ -1047,13 +1093,19 @@ def test_model_billing_a_non_billable_note_blocks_export(
     note: str,
     model_currency: str,
     echo_note: bool,
+    wrapped: bool,
 ) -> None:
-    remark = f"{fee} {amount} {printed_currency} {note}"
-    invoice = _pdf("Invoice INV-NOTE-1", f"Issuer: {VENDOR}", "Handling Fee 30 USD (PP)", remark)
+    fee_line = f"{fee} {amount} {printed_currency}"
+    remark = f"{fee_line} {note}"
+    note_lines = (fee_line, note) if wrapped else (remark,)
+    invoice = _pdf(
+        "Invoice INV-NOTE-1", f"Issuer: {VENDOR}", "Handling Fee 30 USD (PP)", *note_lines
+    )
     documents = _parse_files(dispatcher, [("invoice-with-note.pdf", invoice)])
     baseline = run_billing_pipeline(documents, VENDOR)
-    _, (official,) = _export(billing_schema, baseline.records)
-    assert official["charge_details"]["charge_item"] == "Handling Charge"
+    _assert_official_charges(
+        billing_schema, baseline.records, ("Handling Charge", 30, "USD"), reference_no="INV-NOTE-1"
+    )
     assert any(clause.text == remark for clause in baseline.records[0].excluded_clauses)
     model_fee = {"raw_charge_name": fee, "amount": amount, "currency": model_currency}
     if echo_note:
@@ -1097,10 +1149,10 @@ def test_model_added_fee_matches_the_source_line_currency(
     exports: int,
 ) -> None:
     invoice = _pdf(
-        "Invoice INV-SOURCE-CURRENCY",
+        "Invoice INV-SOURCE-CURRENCY-1",
         f"Issuer: {VENDOR}",
         "Handling Fee 10 USD",
-        f"Storage Fee charged at {printed_amount} per container",
+        f"Storage Fee at EUR 2 each (line amount {printed_amount} net).",
     )
     documents = _parse_files(dispatcher, [("source-currency.pdf", invoice)])
     client = _model_reply(
@@ -1112,8 +1164,16 @@ def test_model_added_fee_matches_the_source_line_currency(
 
     result = run_billing_pipeline(documents, VENDOR, llm_client=client)
 
-    assert len(_export(billing_schema, result.records)[1]) == exports
-    if not exports:
+    if exports:
+        _assert_official_charges(
+            billing_schema,
+            result.records,
+            ("Handling Charge", 10, "USD"),
+            ("Storage Charge", 30, "USD"),
+            reference_no="INV-SOURCE-CURRENCY-1",
+        )
+    else:
+        assert _export(billing_schema, result.records)[1] == []
         extraction = result.documents[0].extraction
         assert extraction is not None
         (conflict,) = [a for a in extraction.charges[1].raw_parse_issues if a.field == "currency"]
@@ -1122,6 +1182,89 @@ def test_model_added_fee_matches_the_source_line_currency(
         assert conflict in extraction.raw_parse_issues
         for row in result.records:
             _assert_review_blocker(row, conflict.code)
+
+
+@pytest.mark.parametrize("proposed_amount", [30, 15, 450], ids=["quantity", "rate", "line-total"])
+@pytest.mark.parametrize("label", ["line amount", "line total", "amount:"])
+def test_model_narrative_fee_uses_only_the_printed_line_total(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    proposed_amount: int,
+    label: str,
+) -> None:
+    invoice = _pdf(
+        "Invoice INV-NARRATIVE-1",
+        f"Issuer: {VENDOR}",
+        "Handling Fee 10 USD",
+        f"Storage Fee for 30 containers at USD 15 each ({label} USD 450 net).",
+    )
+    documents = _parse_files(dispatcher, [("narrative.pdf", invoice)])
+    client = _model_reply(
+        charges=[
+            {"raw_charge_name": "Handling Fee", "amount": 10, "currency": "USD"},
+            {"raw_charge_name": "Storage Fee", "amount": proposed_amount, "currency": "USD"},
+        ]
+    )
+
+    result = run_billing_pipeline(documents, VENDOR, llm_client=client)
+
+    if proposed_amount == 450:
+        _assert_official_charges(
+            billing_schema,
+            result.records,
+            ("Handling Charge", 10, "USD"),
+            ("Storage Charge", 450, "USD"),
+            reference_no="INV-NARRATIVE-1",
+        )
+    else:
+        assert len(result.records) == 2
+        for row in result.records:
+            _assert_review_blocker(row, AlertCode.AMOUNT_TOTAL_MISMATCH)
+        assert _export(billing_schema, result.records)[1] == []
+
+
+@pytest.mark.parametrize(
+    ("description", "invalid_currency"),
+    [
+        ("Storage Fee for 30 cntrs", None),
+        ("Storage Fee for 30 PCS", None),
+        ("Storage Fee for 30 kgs", None),
+        ("Storage Fee unit price USD 30", None),
+        ("Storage Fee @ USD 30", None),
+        ("Storage Fee costs USD 30 each", None),
+        ("Storage Fee costs USD 30/container", None),
+        ("Storage Fee charged at USD 30 ZZZ per container", "USD / ZZZ"),
+    ],
+)
+def test_model_narrative_quantity_or_rate_alone_cannot_be_billed(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    description: str,
+    invalid_currency: str | None,
+) -> None:
+    invoice = _pdf(
+        "Invoice INV-RATE-ONLY", f"Issuer: {VENDOR}", "Handling Fee 10 USD", description
+    )
+    documents = _parse_files(dispatcher, [("rate-only.pdf", invoice)])
+    client = _model_reply(
+        charges=[
+            {"raw_charge_name": "Handling Fee", "amount": 10, "currency": "USD"},
+            {"raw_charge_name": "Storage Fee", "amount": 30, "currency": "USD"},
+        ]
+    )
+
+    result = run_billing_pipeline(documents, VENDOR, llm_client=client)
+
+    assert len(result.records) == 2
+    for row in result.records:
+        _assert_review_blocker(row, AlertCode.AMOUNT_TOTAL_MISMATCH)
+        if invalid_currency:
+            _assert_review_blocker(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
+            assert any(
+                (alert.field, alert.expected, alert.actual) == ("currency", invalid_currency, "USD")
+                for alert in row.validation_alerts
+            )
+    assert _export(billing_schema, result.records)[1] == []
 
 
 @pytest.mark.parametrize(
@@ -1599,6 +1742,179 @@ def test_detail_currency_conflict_blocks_the_invoice_even_with_a_valid_total(
         assert _export(billing_schema, result.records)[1] == []
 
 
+@pytest.mark.parametrize(
+    ("detail", "bad_token", "charge_item", "term", "unit_price"),
+    [
+        (("R.O.E.", "Handling Fee", "US$30", "EUR (PP)"), "EUR", "Handling Charge", "PP", None),
+        (("R.O.E.", "Handling Fee", "US$30", "ZZZ (CC)"), "ZZZ", "Handling Charge", "CC", None),
+        (("Handling Fee ZZZ 30 USD",), "ZZZ", "Handling Charge", None, None),
+        (("Wharfage 15 ZZZ 30 USD",), "ZZZ", "Wharfage", None, 15),
+        (("Wharfage 15 USD XXX 30 USD",), "XXX", "Wharfage", None, 15),
+    ],
+    ids=["vertical-eur-pp", "vertical-zzz-cc", "inline-prefix", "rate-code", "amount-prefix"],
+)
+def test_detail_layout_keeps_invalid_or_conflicting_currency_in_its_slot(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    detail: tuple[str, ...],
+    bad_token: str,
+    charge_item: str,
+    term: str | None,
+    unit_price: int | None,
+) -> None:
+    def run(detail: tuple[str, ...]) -> ProcessedBillingRecord:
+        pdf = _pdf("Invoice INV-CURRENCY-1", f"Issuer: {VENDOR}", *detail, "Total (USD): 30")
+        documents = _parse_files(dispatcher, [("currency-layout.pdf", pdf)])
+        result = run_billing_pipeline(documents, VENDOR)
+        assert not result.failed_doc_ids
+        (row,) = result.records
+        assert (row.charge_item, row.amount, row.payment_term, row.unit_price) == (
+            charge_item, Decimal("30"), term, unit_price,
+        )
+        return row
+
+    disputed = run(detail)
+    _assert_review_blocker(disputed, AlertCode.CROSS_DOCUMENT_CONFLICT)
+    assert disputed.currency is None and bad_token in disputed.raw_invalid_fields["currency"]
+    assert _export(billing_schema, [disputed])[1] == []
+
+    valid_detail = tuple(
+        line.replace(f" {bad_token} 30", " 30").replace(f"{bad_token} (", "USD (")
+        for line in detail
+    )
+    ready = run(valid_detail)
+    _assert_official_charges(
+        billing_schema, [ready], (charge_item, 30, "USD"), reference_no="INV-CURRENCY-1"
+    )
+
+
+@pytest.mark.parametrize("labeled_first", [True, False], ids=["labels-first", "ordinary-first"])
+@pytest.mark.parametrize("valid_currency", [True, False], ids=["valid-amount", "invalid-currency"])
+def test_charge_amount_labels_and_ordinary_rows_can_share_an_invoice(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    labeled_first: bool,
+    valid_currency: bool,
+) -> None:
+    reference = "INV-MIXED-FEES-1"
+    labels = ("Charge: Storage Fee", "Amount: USD 45" if valid_currency else "Amount: USD 30 ZZZ")
+    ordinary = ("Handling Fee 30 USD",)
+    details = (*labels, *ordinary) if labeled_first else (*ordinary, *labels)
+    pdf = _pdf(f"Invoice {reference}", f"Issuer: {VENDOR}", *details)
+    result = run_billing_pipeline(_parse_files(dispatcher, [("mixed-fees.pdf", pdf)]), VENDOR)
+
+    if valid_currency:
+        expected = [("Storage Charge", 45, "USD"), ("Handling Charge", 30, "USD")]
+        if not labeled_first:
+            expected.reverse()
+        _assert_official_charges(billing_schema, result.records, *expected, reference_no=reference)
+    else:
+        by_charge = {row.charge_item: row for row in result.records}
+        assert len(result.records) == 2
+        assert by_charge.keys() == {"Handling Charge", "Storage Charge"}
+        assert by_charge["Storage Charge"].raw_invalid_fields["currency"] == "USD / ZZZ"
+        for row in result.records:
+            _assert_review_blocker(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
+        assert _export(billing_schema, result.records)[1] == []
+
+
+def test_multiple_charge_label_blocks_keep_their_own_amount_and_payment_term(
+    dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator
+) -> None:
+    message = EmailMessage()
+    message.set_content(
+        f"Debit Note DN-LABELED-1\nIssuer: {VENDOR}\nBill To: {CUSTOMER}\n"
+        "Charge: Storage Fee\nAmount: USD 45\nChange payment term to CC\n"
+        "Charge: Wharfage\nAmount: USD 20\n"
+        "Handling Fee 30 USD\nCharge: Documentation Fee\nAmount: USD 15\n"
+    )
+    documents = _parse_files(dispatcher, [("labeled-charges.eml", message.as_bytes())])
+    result = run_billing_pipeline(documents, VENDOR)
+
+    assert not result.failed_doc_ids
+    assert [row.payment_term for row in result.records] == [PaymentTerm.CC, None, None, None]
+    _assert_official_charges(
+        billing_schema,
+        result.records,
+        ("Storage Charge", 45, "USD"),
+        ("Wharfage", 20, "USD"),
+        ("Handling Charge", 30, "USD"),
+        ("Documentation Fee", 15, "USD"),
+        reference_no="DN-LABELED-1",
+    )
+
+
+def test_excluded_charge_label_cannot_donate_its_amount_to_another_fee(
+    dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator
+) -> None:
+    reference = "DN-QUOTE-1"
+    pdf = _pdf(
+        f"Debit Note {reference}", f"Issuer: {VENDOR}", "Wharfage 20 USD",
+        "Charge: Storage Fee for quotation only", "Amount: USD 50000",
+        "Charge: Handling Fee", "Change payment term to CC",
+    )
+    historical = ExistingBillRecord(
+        id="prior-handling", accounting_entity=VENDOR, issuer=VENDOR, reference_no=reference,
+        charge_item="Handling Charge", amount=30, currency="USD", posting_type=PostingType.AR,
+        payment_term=PaymentTerm.CC,
+    )
+    documents = _parse_files(dispatcher, [("labeled-quote.pdf", pdf)])
+    result = run_billing_pipeline(documents, VENDOR, existing_bills=[historical])
+
+    wharfage, handling = result.records
+    _assert_official_charges(
+        billing_schema, [wharfage], ("Wharfage", 20, "USD"), reference_no=reference
+    )
+    _assert_official_charges(
+        billing_schema, [handling], ("Handling Charge", 30, "USD"), reference_no=reference,
+        operation=OperationType.NO_CHANGE, matched_id=historical.id,
+    )
+
+
+@pytest.mark.parametrize(
+    "correction", ["USD", "EUR", "ZZZ"], ids=["matches-total", "wrong", "invalid"]
+)
+@pytest.mark.parametrize("legacy_copies", [False, True], ids=["scoped-audit", "legacy-audit"])
+def test_currency_override_dismisses_only_the_corrected_source_conflict(
+    dispatcher: DocumentParserDispatcher,
+    billing_schema: Draft202012Validator,
+    correction: str,
+    legacy_copies: bool,
+) -> None:
+    reference = "INV-EDIT-CURRENCY-1"
+    pdf = _pdf(
+        f"Invoice {reference}", f"Issuer: {VENDOR}",
+        "Handling Fee US$30 EUR", "Storage Fee 15 USD", "Total (USD): 45",
+    )
+    result = run_billing_pipeline(_parse_files(dispatcher, [("edit-currency.pdf", pdf)]), VENDOR)
+    first, second = result.records
+    for row in (first, second):
+        _assert_review_blocker(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
+    assert _export(billing_schema, result.records)[1] == []
+    if legacy_copies:
+        second = second.model_copy(update={"raw_parse_issues": first.raw_parse_issues})
+    edited = [first.model_copy(update={"human_overrides": {"currency": correction}}), second]
+
+    for bundles in (result.documents, ()):
+        revised, reset = recalculate_for_entity(edited, VENDOR, bundles=bundles)
+        assert reset == 0
+        for checked in (validate_batch(edited, bundles), revised):
+            if correction == "USD":
+                _assert_official_charges(
+                    billing_schema, checked, ("Handling Charge", 30, "USD"),
+                    ("Storage Charge", 15, "USD"), reference_no=reference,
+                )
+                assert checked[0].raw_invalid_fields["currency"] == "US$ / EUR"
+            else:
+                blocker = (
+                    AlertCode.MULTI_CURRENCY_TOTAL_AMBIGUITY if correction == "EUR"
+                    else AlertCode.CROSS_DOCUMENT_CONFLICT
+                )
+                for row in checked:
+                    _assert_review_blocker(row, blocker)
+                assert _export(billing_schema, checked)[1] == []
+
+
 def test_pdf_bare_dollar_inferred_from_unambiguous_source_has_a_review_warning(
     dispatcher: DocumentParserDispatcher,
     billing_schema: Draft202012Validator,
@@ -1990,6 +2306,63 @@ async def test_duplicate_hbl_attachment_preserves_package_conflict_in_either_upl
             assert _export(billing_schema, checked)[1] == []
 
 
+def test_shared_fee_hbl_alert_names_both_email_packages_in_either_upload_order(
+    dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator
+) -> None:
+    reference = "INV-SHARED-FEE-1"
+    fee = _invoice_pdf(reference, "30")
+    uploads = []
+    for mail_name, hbl in (("alpha.eml", "HBL-1"), ("bravo.eml", "HBL-2")):
+        email = EmailMessage()
+        email.set_content("Please see the attached fee invoice and house bill of lading.")
+        email.add_attachment(fee, maintype="application", subtype="pdf", filename="fee.pdf")
+        email.add_attachment(
+            _pdf("BILL OF LADING", f"HBL No.: {hbl}"),
+            maintype="application", subtype="pdf", filename="house-bl.pdf",
+        )
+        uploads.append((mail_name, email.as_bytes()))
+
+    conflicts = []
+    for order in (uploads, list(reversed(uploads))):
+        result = run_billing_pipeline(_parse_files(dispatcher, order), VENDOR)
+        assert not result.failed_doc_ids
+        (row,) = result.records
+        assert set(row.source_evidence.source_paths) == {"alpha.eml/fee.pdf", "bravo.eml/fee.pdf"}
+        (conflict,) = [
+            alert
+            for alert in row.validation_alerts
+            if alert.code is AlertCode.MULTI_SOURCE_BL_MISMATCH
+        ]
+        assert (conflict.field, conflict.severity, conflict.actual) == (
+            "hbl_no", AlertSeverity.WARNING, "HBL-1、HBL-2",
+        )
+        assert "alpha.eml（HBL-1）、bravo.eml（HBL-2）" in conflict.message
+        conflicts.append(conflict)
+        assert _export(billing_schema, result.records)[1] == []
+
+        detached = ProcessedBillingRecord.model_validate_json(row.model_dump_json())
+        for bundles in ((), result.documents):
+            recalculated, reset = recalculate_for_entity([detached], VENDOR, bundles=bundles)
+            assert reset == 0
+            for (checked,) in (recalculated, validate_batch(recalculated, bundles)):
+                assert conflict in checked.validation_alerts
+                assert _export(billing_schema, [checked])[1] == []
+            resolved = detached.model_copy(
+                update={
+                    "validation_alerts": [
+                        alert.model_copy(update={"severity": AlertSeverity.RESOLVED})
+                        if alert.severity is AlertSeverity.WARNING else alert
+                        for alert in detached.validation_alerts
+                    ]
+                }
+            )
+            _assert_official_charges(
+                billing_schema, validate_batch([resolved], bundles), ("Handling Charge", 30, "USD"),
+                reference_no=reference,
+            )
+    assert conflicts[0] == conflicts[1]
+
+
 @pytest.mark.parametrize("change", ["hbl", "historical-amount", "removed-history"])
 def test_approval_reset_blocks_consecutive_rechecks_until_a_new_approval(
     dispatcher: DocumentParserDispatcher, billing_schema: Draft202012Validator, change: str
@@ -2012,7 +2385,10 @@ def test_approval_reset_blocks_consecutive_rechecks_until_a_new_approval(
     assert ready.operation is OperationType.UPDATE
     assert ready.review_status is ReviewStatus.AUTO_READY
     approved = ready.model_copy(update={"review_status": ReviewStatus.APPROVED})
-    assert len(_export(billing_schema, [approved])[1]) == 1
+    _assert_official_charges(
+        billing_schema, [approved], ("Handling Charge", 80, "USD"),
+        reference_no="INV-APPROVAL-1", operation=OperationType.UPDATE, matched_id=historical.id,
+    )
 
     bills = [historical]
     if change == "hbl":
@@ -2044,7 +2420,12 @@ def test_approval_reset_blocks_consecutive_rechecks_until_a_new_approval(
     )
     assert approved_again.review_status is ReviewStatus.APPROVED
     assert not approved_again.requires_reapproval
-    assert len(_export(billing_schema, [approved_again])[1]) == 1
+    _assert_official_charges(
+        billing_schema, [approved_again], ("Handling Charge", 80, "USD"),
+        reference_no="INV-APPROVAL-1",
+        operation=OperationType.UPDATE if bills else OperationType.CREATE,
+        matched_id=historical.id if bills else None,
+    )
 
 
 def _parse_mock_ocr(payload: bytes, file_url: str) -> ParsedDocument:
@@ -2068,6 +2449,69 @@ def _parse_mock_ocr(payload: bytes, file_url: str) -> ParsedDocument:
     assert document.status is DocumentStatus.PARSED
     assert document.extraction_channel is ExtractionChannel.PLTPLT_OCR
     return document
+
+
+@pytest.mark.parametrize("field", ["invoiceNumber", "mblNumber", "amount"])
+def test_ocr_confirmation_is_bound_to_the_full_item_after_reextraction(
+    billing_schema: Draft202012Validator, field: str
+) -> None:
+    charge = {"name": "Handling Fee", "amount": 30, "currency": "USD"}
+    item = {
+        "fileType": "Invoice", "invoiceNumber": "INV-1", "mblNumber": "MBL-1",
+        "issuer": VENDOR, "suspicious": True, "chargeList": [charge],
+    }
+    if field == "amount":
+        item["text"] = "Amount unclear"
+
+    def extract(payload_item: dict[str, Any]):
+        payload = json.dumps({"data": {"list": [payload_item]}}).encode()
+        document = _parse_mock_ocr(payload, "https://93.184.216.34/ocr-confirmation.pdf")
+        result = run_billing_pipeline([document], VENDOR)
+        assert not result.failed_doc_ids
+        return result
+
+    initial = extract(item)
+    (row,) = initial.records
+    (warning,) = row.validation_alerts
+    assert warning.code is AlertCode.OCR_SUSPICIOUS_FLAG
+    assert warning.severity is AlertSeverity.WARNING
+    assert json.loads(warning.actual) == {
+        key: value for key, value in item.items() if key != "suspicious"
+    }
+    assert _export(billing_schema, initial.records)[1] == []
+    confirmation = warning.model_copy(update={"severity": AlertSeverity.RESOLVED})
+
+    reordered = dict(reversed(list(item.items())))
+    reordered["chargeList"] = [dict(reversed(list(charge.items())))]
+    equivalent = extract(reordered)
+    (row,) = equivalent.records
+    checked = validate_batch(
+        [row.model_copy(update={"validation_alerts": [confirmation]})], equivalent.documents
+    )
+    assert checked[0].validation_alerts == [confirmation]
+    _assert_official_charges(
+        billing_schema, checked, ("Handling Charge", 30, "USD"), reference_no="INV-1"
+    )
+
+    changed = item.copy()
+    if field == "amount":
+        changed["chargeList"] = [{**charge, "amount": 30000}]
+    else:
+        changed[field] = "INV-99" if field == "invoiceNumber" else "MBL-99"
+    updated = extract(changed)
+    (row,) = updated.records
+    (rechecked,) = validate_batch(
+        [row.model_copy(update={"validation_alerts": [confirmation]})], updated.documents
+    )
+    (new_warning,) = rechecked.validation_alerts
+    assert (new_warning.code, new_warning.severity, new_warning.field) == (
+        AlertCode.OCR_SUSPICIOUS_FLAG, AlertSeverity.WARNING, warning.field,
+    )
+    assert new_warning.actual != warning.actual
+    assert rechecked.reference_no == changed["invoiceNumber"]
+    assert rechecked.amount == changed["chargeList"][0]["amount"]
+    assert {ref.value for ref in rechecked.shipment_refs.mbl_nos} == {changed["mblNumber"]}
+    assert _export(billing_schema, [rechecked])[1] == []
 
 
 def test_real_ocr_transport_parties_cannot_become_billing_parties(

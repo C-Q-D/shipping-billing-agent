@@ -51,6 +51,7 @@ _OVERRIDE_CODES = {
     **dict.fromkeys(_NUMERIC_FIELDS, AlertCode.OCR_NUMERIC_CONFUSION),
 }
 FIELD_FORMAT_ALERT_CODES = {*_OVERRIDE_CODES.values(), AlertCode.LLM_EXTRACTION_FAILED}
+PRINTED_CURRENCY_CONFLICT_MESSAGE = "费用明细行标明了不同的币种"
 TRANSPORT_FIELDS = {
     "mbl_no": "mbl_nos",
     "hbl_no": "hbl_no",
@@ -380,6 +381,10 @@ def _invalid_override(field: str, value: Any) -> ValidationAlert:
     )
 
 
+def _is_currency_conflict(issue: ValidationAlert) -> bool:
+    return issue.code is AlertCode.CROSS_DOCUMENT_CONFLICT and issue.field == "currency"
+
+
 def source_format_alerts(
     record: ProcessedBillingRecord, corrected: set[str]
 ) -> list[ValidationAlert]:
@@ -387,10 +392,13 @@ def source_format_alerts(
     alerts = [
         issue
         for issue in record.raw_parse_issues
-        if issue.code not in FIELD_FORMAT_ALERT_CODES
-        or (
-            issue.field not in corrected
-            and (issue.field not in invalid or issue.actual == invalid[issue.field])
+        if not (_is_currency_conflict(issue) and "currency" in corrected)
+        and (
+            issue.code not in FIELD_FORMAT_ALERT_CODES
+            or (
+                issue.field not in corrected
+                and (issue.field not in invalid or issue.actual == invalid[issue.field])
+            )
         )
     ]
     blocked = {alert.field for alert in alerts}

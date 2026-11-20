@@ -851,17 +851,23 @@ def test_rule_only_uses_the_printed_title_and_reference(
         "估价",
         "estimate only",
         "already included",
+        "has already been included",
         "included in freight",
         "已包含",
         "free of charge",
         "no charge",
         "waived",
+        "( waived )",
         "免收",
         "for reference only",
         "for information only",
+        "for your reference only",
+        "for your information only",
         "仅供参考",
         "non-billable",
         "not payable",
+        "不计费",
+        "無需付款",
     ],
 )
 def test_rules_exclude_non_billing_remarks_from_the_invoice(note: str) -> None:
@@ -873,6 +879,64 @@ def test_rules_exclude_non_billing_remarks_from_the_invoice(note: str) -> None:
     (record,) = result.records
     assert any(clause.text == remark for clause in record.excluded_clauses)
     assert len(serialize_records(result.records, "official")) == 1
+
+
+@pytest.mark.parametrize(
+    "note_lines",
+    ["\n(waived)", "[Page 2]\n(waived)", "Total USD 30\n(waived)",
+     "(Storage Fee 45 USD waived)", "Invoice INV-123 (for your reference only)"],
+    ids=["blank-line", "different-page", "summary", "own-charge", "invoice-title"],
+)
+def test_excluded_note_does_not_skip_an_unrelated_preceding_fee(note_lines: str) -> None:
+    doc = _document(
+        "separate-note",
+        f"[Page 1]\nInvoice INV-123\nIssuer: {_ENTITY}\nHandling Charge 30 USD\n{note_lines}",
+    )
+
+    result = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only")
+
+    (row,) = result.records
+    assert (row.reference_no, row.charge_item, row.amount, row.currency) == (
+        "INV-123", "Handling Charge", Decimal(30), "USD",
+    )
+    assert row.operation is OperationType.CREATE
+    (official,) = serialize_records(result.records, "official")
+    assert official["charge_details"]["amount"] == Decimal(30)
+    assert len(row.excluded_clauses) == 1 and "Handling Charge" not in row.excluded_clauses[0].text
+
+
+def test_wrapped_note_excludes_the_preceding_table_row() -> None:
+    doc = _document(
+        "table-note",
+        f"Invoice INV-1\nIssuer: {_ENTITY}",
+        tables=[
+            ParsedTable(
+                source="[Page 2]",
+                rows=[
+                    ["Description", "Amount", "Currency"],
+                    ["Handling Charge", "30", "USD"],
+                    ["Storage Fee", "50000", "EUR"],
+                    ["is a quotation only", "", ""],
+                ],
+            )
+        ],
+    )
+
+    (row,) = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only").records
+
+    assert (row.charge_item, row.amount, row.currency) == ("Handling Charge", Decimal(30), "USD")
+    (clause,) = row.excluded_clauses
+    assert clause.page == 2 and "50000" in clause.text and "is a quotation only" in clause.text
+
+
+@pytest.mark.parametrize("charge_name", ["THC", "DOC", "HANDLING FEE"])
+def test_fee_abbreviation_before_amount_stays_in_the_charge_name(charge_name: str) -> None:
+    doc = _document("fee-abbreviation", f"Invoice INV-1\nIssuer: {_ENTITY}\n{charge_name} 30 USD")
+
+    (row,) = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only").records
+
+    assert row.raw_charge_name == charge_name and row.currency == "USD"
+    assert row.operation is OperationType.CREATE and not row.raw_invalid_fields
 
 
 @pytest.mark.parametrize(

@@ -1036,7 +1036,8 @@ def test_ocr_suspicion_confirmation_revalidates_against_the_exact_item(edit: str
     bundle = _bundle(
         ocr_payload={
             "items": [
-                {"suspicious": True, "pageNumber": 4, "text": "  fee label is unclear  "},
+                {"suspicious": True, "text": "  fee label is unclear  ", "chargeList": [],
+                 "other": {}, "issuer": ""},
                 {"suspicious": True},
             ],
             "has_charges": True,
@@ -1080,10 +1081,15 @@ def test_ocr_suspicion_confirmation_revalidates_against_the_exact_item(edit: str
             {"locations": {"page": 2, "row": 1}},
             {"locations": {"page": 3, "row": 1}},
         ),
+        (
+            {"pageNumber": 4, "text": "unclear"},
+            {"text": "unclear", "pageNumber": 4},
+            {"text": "unclear", "pageNumber": 5},
+        ),
     ],
-    ids=["other", "charge-list", "extra"],
+    ids=["other", "charge-list", "extra", "text-and-page"],
 )
-def test_ocr_suspicion_without_text_invalidates_confirmation_when_content_changes(
+def test_ocr_suspicion_invalidates_confirmation_when_structured_content_changes(
     original: dict, equivalent: dict, changed: dict
 ) -> None:
     bundles = [
@@ -1651,7 +1657,7 @@ def test_detached_package_reconciles_a_corrected_hbl_using_original_sibling_evid
     assert recalculated.package_sibling_refs == checked.package_sibling_refs
 
 
-def test_each_mail_package_checks_its_own_hbls_when_the_fee_is_shared() -> None:
+def test_shared_fee_checks_for_conflicts_between_mail_packages() -> None:
     digest = sha256(b"shared-fee").hexdigest()
     bundles = [
         bundle
@@ -1675,7 +1681,13 @@ def test_each_mail_package_checks_its_own_hbls_when_the_fee_is_shared() -> None:
     (checked,) = validate_batch(records, bundles)
 
     assert {source.parent_doc_id for source in checked.package_sibling_refs} == {"a", "b"}
-    assert len(serialize_records([checked], "official")) == 1
+    (conflict,) = checked.validation_alerts
+    assert (conflict.code, conflict.field, conflict.actual) == (
+        AlertCode.MULTI_SOURCE_BL_MISMATCH, "hbl_no", "HBL-A、HBL-B",
+    )
+    assert checked.operation is OperationType.PENDING_REVIEW
+    assert serialize_records([checked], "official") == []
     detached = ProcessedBillingRecord.model_validate_json(checked.model_dump_json())
     recalculated, reset = recalculate_for_entity([detached], ENTITY)
-    assert reset == 0 and len(serialize_records(recalculated, "official")) == 1
+    assert reset == 0 and recalculated[0].validation_alerts == [conflict]
+    assert serialize_records(recalculated, "official") == []

@@ -15,6 +15,8 @@ from unicodedata import normalize
 from .charge_normalizer import normalize_charge_item, normalize_document_date
 from .currency import is_valid_iso4217
 from .entity_resolver import (
+    PRINTED_CURRENCY_CONFLICT_MESSAGE,
+    _is_currency_conflict,
     apply_human_overrides,
     has_explicit_parties,
     is_credit_document,
@@ -31,6 +33,7 @@ from .models import (
     PackageShipmentRefs,
     PaymentTerm,
     ProcessedBillingRecord,
+    RawExtractionEnvelope,
     ReviewStatus,
     ShipmentRefs,
     SourceDocTotalsSnapshot,
@@ -70,6 +73,7 @@ _LETTER_VALUES = dict(zip(ascii_uppercase, (n for n in range(10, 39) if n % 11),
 _OCR_LETTERS = {"0": "O", "1": "IL", "2": "Z", "5": "S", "8": "B"}
 _OCR_DIGITS = {letter: digit for digit, letters in _OCR_LETTERS.items() for letter in letters}
 _NO_SUMMARY_REASON = "单据无汇总行，免汇总对账"
+_SHARED_HBL_MESSAGE = "同一费用单据在不同邮件包中对应不同的分提单号，待复核"
 
 
 def compute_iso6346_check_digit(prefix10: str) -> int:
@@ -854,7 +858,8 @@ def _snapshot_package_source(
     doc_records: Sequence[ProcessedBillingRecord],
 ) -> PackageShipmentRefs:
     doc = bundle.document
-    extraction = bundle.extraction or canonical.extraction
+    extraction_bundle = bundle if bundle.extraction is not None else canonical
+    extraction = extraction_bundle.extraction
     own = extraction.extraction.shipment_refs if extraction else ShipmentRefs()
     original_hbls = []
     original_mbls = []
@@ -881,7 +886,12 @@ def _snapshot_package_source(
         )
         original_hbls.append(original.hbl_no)
         original_mbls.extend(original.mbl_nos)
-    hbls = [own.hbl_no] if own.hbl_no else original_hbls
+    # Rechecks can receive enriched bundles whose HBL was borrowed from another member.
+    field_sources = extraction_bundle.document.metadata.get("sibling_field_sources")
+    borrowed_hbl = isinstance(field_sources, list) and any(
+        isinstance(source, dict) and source.get("field") == "hbl_no" for source in field_sources
+    )
+    hbls = [own.hbl_no] if own.hbl_no and not borrowed_hbl else original_hbls
     mbls = None
     if doc.source_kind is not SourceKind.EML_BODY:
         source_path = _document_path(doc.doc_id, bundles)
@@ -905,7 +915,7 @@ def _package_conflicts(
     records: Sequence[ProcessedBillingRecord],
     corrected: Sequence[set[str]],
     indexes_by_doc: dict[str, list[int]],
-) -> tuple[list[ValidationAlert], list[SourceRefValue]]:
+) -> tuple[list[ValidationAlert], list[SourceRefValue], set[str]]:
     mbl_sources = []
     mbl_evidence = {}
     hbl_sources = []
@@ -964,7 +974,41 @@ def _package_conflicts(
                 actual="、".join(hbl_evidence[key] for key in sorted(hbl_evidence)),
             )
         )
-    return alerts, package_mbls
+    return alerts, package_mbls, set(hbl_evidence)
+
+
+def _shared_hbl_alert(
+    hbls_by_parent: dict[str | None, set[str]],
+    bundles: dict[str, DocumentExtractionBundle],
+    prior_alerts: Sequence[ValidationAlert],
+) -> ValidationAlert | None:
+    candidates = list(hbls_by_parent.values())
+    if len(candidates) < 2 or set.intersection(*candidates):
+        return None
+    actual = "、".join(sorted(set.union(*candidates)))
+    sources = [
+        (_document_path(parent, bundles) if parent is not None else "", "、".join(sorted(hbls)))
+        for parent, hbls in hbls_by_parent.items()
+    ]
+    message = _SHARED_HBL_MESSAGE
+    if all(path for path, _ in sources):
+        message += "。邮件来源：" + "、".join(f"{path}（{hbls}）" for path, hbls in sorted(sources))
+    else:
+        # Detached records retain the HBLs and parent IDs, and the alert retains the source names.
+        message = next(
+            (
+                alert.message
+                for alert in prior_alerts
+                if alert.code is AlertCode.MULTI_SOURCE_BL_MISMATCH
+                and alert.field == "hbl_no"
+                and alert.actual == actual
+                and alert.message.startswith(_SHARED_HBL_MESSAGE)
+            ),
+            message,
+        )
+    return ValidationAlert.from_code(
+        AlertCode.MULTI_SOURCE_BL_MISMATCH, message, field="hbl_no", actual=actual
+    )
 
 
 def _merge_package_mbls(
@@ -1017,14 +1061,22 @@ def _merge_package_mbls(
         snapshots = []
         alerts = []
         mbls = []
-        for members in package_snapshots.values():
+        hbls_by_parent = {}
+        for parent, members in package_snapshots.items():
             sources = list(members.values())
-            package_alerts, package_mbls = _package_conflicts(
+            package_alerts, package_mbls, package_hbls = _package_conflicts(
                 sources, records, corrected, indexes_by_doc
             )
             snapshots.extend(sources)
             alerts.extend(package_alerts)
             mbls.extend(package_mbls)
+            if package_hbls:
+                hbls_by_parent[parent] = package_hbls
+        if shared_hbl := _shared_hbl_alert(
+            hbls_by_parent, bundles, records[indexes[0]].validation_alerts
+        ):
+            alerts = [alert for alert in alerts if alert.field != "hbl_no"]
+            alerts.append(shared_hbl)
         if not snapshots:
             continue
         checked_docs.add(doc_id)
@@ -1062,34 +1114,27 @@ def _ocr_suspicion_alerts(payload: OcrStructuredPayload | None) -> list[Validati
         return []
     alerts = []
     for index, item in enumerate(payload.items, 1):
-        extra = item.model_extra or {}
-        if extra.get("suspicious") is not True:
+        dumped = item.model_dump(by_alias=True, exclude_none=True)
+        if dumped.pop("suspicious", None) is not True:
             continue
         field = f"ocr.item_{index}"
-        text = extra.get("text")
-        actual = text.strip() if isinstance(text, str) else ""
-        if not actual:
-            content = {
-                "other": item.other,
-                "chargeList": item.charge_list,
-                "extra": {key: value for key, value in extra.items() if key != "suspicious"},
-            }
-            if isinstance(text, str):
-                content["extra"].pop("text")
-            content = {
-                key: value
-                for key, value in content.items()
-                if value not in (None, "", [], {})
-                and not (isinstance(value, str) and not value.strip())
-            }
-            if content:
-                actual = dumps_decimal_json(_ordered_ocr_content(content))
+        content = {
+            key: value
+            for key, value in dumped.items()
+            if value not in (None, [], {}) and not (isinstance(value, str) and not value.strip())
+        }
+        text = content.get("text")
+        actual = field
+        if len(content) == 1 and isinstance(text, str):
+            actual = text.strip()
+        elif content:
+            actual = dumps_decimal_json(_ordered_ocr_content(content))
         alerts.append(
             ValidationAlert.from_code(
                 AlertCode.OCR_SUSPICIOUS_FLAG,
                 "源单 OCR 标记了可疑内容",
                 field=field,
-                actual=actual or field,
+                actual=actual,
             )
         )
     return alerts
@@ -1098,28 +1143,47 @@ def _ocr_suspicion_alerts(payload: OcrStructuredPayload | None) -> list[Validati
 _PreparedLine = tuple[ProcessedBillingRecord, set[str], list[ValidationAlert]]
 
 
+def _document_parse_issues(extraction: RawExtractionEnvelope) -> list[ValidationAlert]:
+    # A line's currency conflict is also recorded in the extraction audit for model rechecks.
+    line_conflicts = [
+        issue
+        for row in extraction.charges
+        for issue in row.raw_parse_issues
+        if _is_currency_conflict(issue)
+    ]
+    return [issue for issue in extraction.raw_parse_issues if issue not in line_conflicts]
+
+
 def _validate_document(
     doc_id: str, records: Sequence[ProcessedBillingRecord], bundle: DocumentExtractionBundle | None
 ) -> tuple[list[_PreparedLine], set[AlertCode]]:
     extraction = bundle.extraction if bundle is not None else None
+    document_issues = _document_parse_issues(extraction) if extraction is not None else []
+    # Older rows copied every printed line conflict into the document-wide audit.
+    printed_conflicts = [
+        issue
+        for record in records
+        if "currency" in record.raw_invalid_fields
+        for issue in record.raw_parse_issues
+        if _is_currency_conflict(issue) and issue.message == PRINTED_CURRENCY_CONFLICT_MESSAGE
+    ]
     prepared = []
     for record in records:
+        raw_issues = record.raw_parse_issues
+        if printed_conflicts and "currency" not in record.raw_invalid_fields:
+            raw_issues = [issue for issue in raw_issues if issue not in printed_conflicts]
+        updates: dict[str, Any] = {}
+        if raw_issues is not record.raw_parse_issues:
+            updates["raw_parse_issues"] = raw_issues
         if extraction is not None:
             # Route document parse issues through the same per-row override checks.
-            record = record.model_copy(
-                update={
-                    "raw_invalid_fields": extraction.raw_invalid_fields | record.raw_invalid_fields,
-                    "raw_parse_issues": [
-                        *record.raw_parse_issues,
-                        *(
-                            issue
-                            for issue in extraction.raw_parse_issues
-                            if issue not in record.raw_parse_issues
-                        ),
-                    ],
-                }
+            updates["raw_invalid_fields"] = (
+                extraction.raw_invalid_fields | record.raw_invalid_fields
             )
-        prepared.append(_prepare_line(record))
+            updates["raw_parse_issues"] = [
+                *raw_issues, *(issue for issue in document_issues if issue not in raw_issues)
+            ]
+        prepared.append(_prepare_line(record.model_copy(update=updates) if updates else record))
 
     lines = [record for record, _, _ in prepared]
     totals = (
@@ -1138,6 +1202,16 @@ def _validate_document(
     alerts, excess, credit_only = (
         _reconcile_totals(lines, totals) if totals is not None else ([], {}, False)
     )
+    source_currency_conflicts = [
+        issue
+        for line in lines
+        for issue in line.raw_parse_issues
+        if _is_currency_conflict(issue)
+    ]
+    for _, _, line_alerts in prepared:
+        alerts.extend(
+            alert for alert in line_alerts if _is_currency_conflict(alert) and alert not in alerts
+        )
     recalculated = _LINE_ALERT_CODES.copy()
     if totals is not None:
         recalculated.update(_TOTAL_ALERT_CODES)
@@ -1157,7 +1231,16 @@ def _validate_document(
     duplicates = _duplicate_line_alerts(lines, excess, credit_only)
     checked = []
     for index, (record, corrected, line_alerts) in enumerate(prepared):
-        record = record.model_copy(update={"source_doc_totals": totals})
+        record = record.model_copy(
+            update={
+                "source_doc_totals": totals,
+                "validation_alerts": [
+                    alert
+                    for alert in record.validation_alerts
+                    if alert not in source_currency_conflicts
+                ],
+            }
+        )
         if no_summary:
             record = _with_reason(record, _NO_SUMMARY_REASON)
         elif _NO_SUMMARY_REASON in record.ai_reasoning:
