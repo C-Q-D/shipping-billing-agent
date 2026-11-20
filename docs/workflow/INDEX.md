@@ -2,8 +2,8 @@
 schema_version: 1
 mode: tracked
 docs_root: docs/workflow
-current_node: "wave12-b05-t03-and-e2e"
-next_action: "进入 Wave 13：核查并修复 browser_tester 暴露的阻塞项与体验打磨，完成 B05 独立 verifier 验收，并执行两轮 gemini-4-neon-high 面试官评审与纯净 ZIP 交付"
+current_node: "wave13c-all-modules-verified"
+next_action: "进入 Wave 14：执行两轮独立 gemini-4-neon-high 面试官评审与打磨（全项目严审与精简 -> 仓库外空白目录盲盒验 ZIP）并完成最终交卷汇总"
 check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contracts.py && uv run pytest tests/unit -q && npm --prefix frontend run typecheck"
 ---
 
@@ -43,7 +43,7 @@ check_cmd: "uv run ruff check src tests && uv run python scripts/verify_contract
 | B02 | `docs/workflow/features/B02-智能抽取匹配与校验门禁` | 航运账单LangGraph编排、AR/AP与贷项判定、四级匹配继承、确定性校验与1轮自修复 | B01 | PRD F-02~F-05, billing-output.schema.json | `已完成` |
 | B03 | `docs/workflow/features/B03-持久层API与CLI复核包` | SQLite 8表仓储、批处理分阶段服务、FastAPI全路由与Origin防护、Typer CLI与复核包互通 | B02 | PRD F-06/F-07, schema.sql 全表, openapi.yaml 全路由 | `已完成` |
 | B04 | `docs/workflow/features/B04-财务复核工作台前端` | Lumno B2三栏/移动双视口React工作台、全字段复核、三口径导出与评测看板 | B00, B03 | PRD F-06, prototypes/workbench/README.md, openapi.yaml | `已完成` |
-| B05 | `docs/workflow/features/B05-Harness评测与交付文档` | >=10组真值与对抗样本Harness评测套件、Harness与深度思考报告、README与交付ZIP打包验收 | B03 | PRD F-07, 题面 §8.8/§8.9, eval_runs | `待验收(r1)` |
+| B05 | `docs/workflow/features/B05-Harness评测与交付文档` | >=10组真值与对抗样本Harness评测套件、Harness与深度思考报告、README与交付ZIP打包验收 | B03 | PRD F-07, 题面 §8.8/§8.9, eval_runs | `已完成` |
 
 ## 4. 发版与交付归档（releases/）
 | 版本/批次 | 路径（相对项目根） | 交付范围与回滚基线摘要 |
