@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 from unicodedata import normalize
 
@@ -60,8 +61,8 @@ _BOX_LABEL = re.compile(
 )
 _LABELED_BOX = re.compile(r"\b(?=[A-Z0-9]{0,10}[A-Z])(?=[A-Z0-9]{0,10}[0-9])[A-Z0-9]{11}\b", re.I)
 _COMPANY = re.compile(
-    r"^.+?\b(?:CO[., ]+LTD|INCORPORATED|CORPORATION|LIMITED|LTD|INC|LLC|GMBH)\b[.,]?"
-    r"(?:\s*\([^()]*\))*",
+    r"^.+?\b(?:CO[., ]+LTD|INCORPORATED|CORPORATION|LIMITED|LTD|INC|LLC|GMBH)\b[.,]*"
+    r"(?: +(?:[^\W\d_][\w'-]* +)*Branch\b[.,]*)?(?: *\([^()]*\)[.,]*)*",
     re.I,
 )
 _BILL_TITLE = re.compile(
@@ -104,6 +105,33 @@ _SUMMARY = re.compile(
 _SUMMARY_CURRENCY_PREFIX = re.compile(
     rf"^(?:\(\s*({_CURRENCY_SLOT})\s*\)\s*[:=]?|({_CURRENCY_SLOT})\s*[:=])\s*", re.I
 )
+_SUMMARY_STATED_CURRENCY = re.compile(
+    rf"\b(?:currency|curr|cur)\b\s*[:=]?\s*({_CURRENCY_SLOT})(?!\w)", re.I
+)
+_DOLLAR_CURRENCIES = {
+    "USD",
+    "AUD",
+    "CAD",
+    "HKD",
+    "SGD",
+    "NZD",
+    "TWD",
+    "BBD",
+    "BMD",
+    "BND",
+    "BSD",
+    "BZD",
+    "FJD",
+    "GYD",
+    "JMD",
+    "KYD",
+    "LRD",
+    "NAD",
+    "SBD",
+    "SRD",
+    "TTD",
+    "XCD",
+}
 _TRANSPORT_TOTAL = re.compile(
     r"^(?:say\b|[a-z]+(?:[ -][a-z]+)*\s+\(\d+\)|(?:no\.?\s+of\s+|number\s+of\s+)?"
     r"(?:containers?|packages?|cartons?|pieces|pallets?|gross weight|net weight|measurement)\b)",
@@ -112,6 +140,11 @@ _TRANSPORT_TOTAL = re.compile(
 _MONEY = re.compile(
     rf"(?:(?P<prefix>{_CURRENCY_SLOT})\s*)?(?P<amount>{_NUMBER})"
     rf"(?:\s*(?P<suffix>{_CURRENCY_SLOT})(?!\w))?",
+    re.I,
+)
+_DETAIL_MONEY = re.compile(
+    rf"(?<![\w.,/+-])(?:{_CURRENCY}\s*)?"
+    rf"(?P<amount>{_NUMBER}|[-+]?\.[0-9]+)(?:{_CURRENCY})?(?![\w/+-]|[.,][0-9])",
     re.I,
 )
 _SUMMARY_DUE_TO = re.compile(rf"^(?P<party>.+?)\s+(?=(?:{_CURRENCY}\s+)?{_NUMBER}(?:\s|$))", re.I)
@@ -215,6 +248,13 @@ _PARTY_LABELS = {
     "payer_hint": r"payer|paid by",
     "payee_hint": r"payee|paid to|balance due to",
 }
+_PARTY_VALUE_TAIL = re.compile(
+    r"\t+|(?:^|\s+)(?:reference(?:\s+(?:number|no\.?|id|#))?|(?:invoice|debit note|credit note)"
+    r"\s+(?:number|no\.?|id|#)|(?:(?:invoice|document|issue|D/C|D/N|C/N)\s+)?date|currency|"
+    rf"hbl(?: no\.?)?|mbl(?: no\.?)?|booking(?: no\.?)?|{'|'.join(_PARTY_LABELS.values())})"
+    r"\s*[:=]",
+    re.I,
+)
 _TRANSPORT_PARTY_LABELS = {
     "shipper": r"shipper(?:/exporter)?(?:\s+booking number.*|\s+document no.*)?",
     "consignee": r"consignee(?:\([^)]*\))?(?:\s+forwarding agent.*)?",
@@ -347,6 +387,60 @@ def _capture_clauses(lines: Sequence[_Line], evidence: _Evidence) -> set[int]:
     return skipped
 
 
+def _charge_evidence(doc: ParsedDocument) -> Iterator[tuple[str, frozenset[Decimal]]]:
+    def detail_lines(lines: Sequence[_Line]) -> Iterator[str]:
+        skipped = _capture_clauses(lines, _Evidence())
+        for line in lines:
+            if (
+                line.number not in skipped
+                and not _INSTRUCTION.search(line.text)
+                and not any(_SUMMARY.match(cell.strip()) for cell in line.text.split("\t"))
+            ):
+                yield line.text
+
+    def source_rows() -> Iterator[str]:
+        yield from detail_lines(_source_lines(doc))
+        for table in doc.tables:
+            text = "\n".join(
+                "\t".join(" ".join(cell.split()) for cell in row) for row in table.rows
+            )
+            yield from detail_lines(_text_lines(text))
+        if doc.ocr_payload is None:
+            return
+        for item in doc.ocr_payload.items:
+            for text in ((item.model_extra or {}).get("text"), item.other):
+                if isinstance(text, str):
+                    yield from detail_lines(_text_lines(text))
+            for row in item.charge_list:
+                fields = _fields_for_keys(row, _COLUMN_KEYS)
+                name = fields.get("raw_charge_name")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                source = str(row.get("sourceText") or row.get("source_text") or "")
+                name = normalize("NFKC", name).strip()
+                if (
+                    _SUMMARY.match(name)
+                    or any(_SUMMARY.match(line.text) for line in _text_lines(source))
+                    or _non_billing_reason(f"{name} {source}")
+                ):
+                    continue
+                values = [
+                    str(fields[field]) for field in ("amount", "debit", "credit") if field in fields
+                ]
+                yield from detail_lines(_text_lines("\t".join([name, *values])))
+                yield from detail_lines(_text_lines(source))
+
+    for text in source_rows():
+        amounts = set()
+        for match in _DETAIL_MONEY.finditer(text):
+            try:
+                amounts.add(parse_decimal_strict(match["amount"]).copy_abs())
+            except ValueError:
+                continue
+        if amounts:
+            yield text, frozenset(amounts)
+
+
 def _record_summary(text: str, evidence: _Evidence) -> bool:
     match = _SUMMARY.match(text)
     if not match:
@@ -365,18 +459,16 @@ def _record_summary(text: str, evidence: _Evidence) -> bool:
             rest = rest[3 + due_to.end() :]
         elif label == "balance due":
             return True
-    stated_currency = re.search(
-        rf"\b(?:currency|curr|cur)\s*:?\s*({_CURRENCY_SLOT})(?!\w)", rest, re.I
-    )
-    if stated_currency:
-        rest = rest[: stated_currency.start()].rstrip()
-    currency = stated_currency[1] if stated_currency else None
+    tokens = _SUMMARY_STATED_CURRENCY.findall(rest)
+    rest = _SUMMARY_STATED_CURRENCY.sub("", rest).strip()
     if prefix := _SUMMARY_CURRENCY_PREFIX.match(rest):
-        currency = currency or prefix[1] or prefix[2]
+        tokens.append(prefix[1] or prefix[2])
         rest = rest[prefix.end() :]
     money = _MONEY.match(rest)
     if money:
-        currency = currency or money["prefix"] or money["suffix"]
+        tokens.extend(token for token in (money["prefix"], money["suffix"]) if token)
+    currency = _summary_currency(evidence, field_name, tokens)
+    if money:
         tail = rest[money.end() :]
         if not tail.strip() or (tail[0].isspace() and re.fullmatch(_NUMBER, tail.strip(), re.I)):
             evidence.summaries.append((field_name, money["amount"], currency))
@@ -406,6 +498,23 @@ def _flag_conflicting_value(
 def _currency_token(raw: str) -> str:
     token = raw.strip()
     return _PRINTED_CURRENCY_ALIASES.get(token.upper(), token)
+
+
+def _summary_currency(evidence: _Evidence, field_name: str, tokens: Sequence[str]) -> str | None:
+    currencies = list(
+        dict.fromkeys(
+            normalize_currency(_currency_token(token))[0] or token.upper() for token in tokens
+        )
+    )
+    explicit = [currency for currency in currencies if currency != "$"]
+    if not explicit:
+        return currencies[0] if currencies else None
+    first, *conflicts = explicit
+    if "$" in currencies and not conflicts and first not in _DOLLAR_CURRENCIES:
+        conflicts.append("$")
+    for conflict in conflicts:
+        _flag_conflicting_value(evidence, f"{field_name}_currency", first, conflict)
+    return first
 
 
 def _summary_values(evidence: _Evidence, dollar_currency: str | None) -> None:
@@ -480,8 +589,12 @@ def _first_company(text: str) -> str:
 
 
 def _party(lines: Sequence[_Line], label: str) -> str | None:
-    value = _value_after(lines, label, r"[^\d\W][^\n]*")
-    return _first_company(value) if value else None
+    value = _value_after(lines, label, r"\S[^\n]*")
+    if not value:
+        return None
+    if tail := _PARTY_VALUE_TAIL.search(value):
+        return value[: tail.start()].rstrip(" ;") or None
+    return value
 
 
 def _collect_text_headers(
@@ -608,9 +721,9 @@ def _collect_transport(
 
 def _transport_parties(doc: ParsedDocument, lines: Sequence[_Line]) -> list[tuple[str, str]]:
     parties = [
-        (role, name)
+        (role, _first_company(name))
         for role, label in _TRANSPORT_PARTY_LABELS.items()
-        if (name := _party(lines, label))
+        if (name := _value_after(lines, label, r"[^\d\W][^\n]*"))
     ]
     if doc.ocr_payload is not None:
         for item in doc.ocr_payload.items:
@@ -784,7 +897,8 @@ def _collect_ocr(doc: ParsedDocument, evidence: _Evidence) -> None:
             currency = item_currency
             if isinstance(value, str) and (money := _MONEY.fullmatch(value.strip())):
                 value = money["amount"]
-                currency = money["prefix"] or money["suffix"] or currency
+                tokens = [token for token in (money["prefix"], money["suffix"]) if token]
+                currency = _summary_currency(evidence, field_name, tokens) or currency
                 item_currency = item_currency or currency
             evidence.summaries.append((field_name, value, currency))
         notes = _Evidence(fields=item_fields)
@@ -805,6 +919,7 @@ def _collect_ocr(doc: ParsedDocument, evidence: _Evidence) -> None:
         evidence.summaries.extend(
             (name, value, currency or item_currency) for name, value, currency in notes.summaries
         )
+        evidence.issues.extend(notes.issues)
         for name, value in item_fields.items():
             previous = evidence.fields.setdefault(name, value)
             if name == "reference_no":

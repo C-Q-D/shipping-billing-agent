@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from decimal import MAX_EMAX, MIN_EMIN, Decimal, localcontext
 from fractions import Fraction
 from itertools import combinations, product
@@ -25,6 +25,7 @@ from .models import (
     AlertCode,
     AlertSeverity,
     DocumentExtractionBundle,
+    OcrStructuredPayload,
     OperationType,
     PackageShipmentRefs,
     PaymentTerm,
@@ -191,6 +192,10 @@ def _line_arithmetic_alert(
         return None
     historical_fields = record.inherited_fields.keys() - record.human_overrides.keys()
     if historical_fields.intersection(_NUMERIC_FIELDS):
+        return None
+    if "amount" in record.explicit_fields and not {"quantity", "unit_price"}.issubset(
+        record.explicit_fields | record.human_overrides.keys()
+    ):
         return None
 
     if quantity >= 0 and unit_price < 0:
@@ -602,9 +607,14 @@ def _reconcile_totals(
     lines = _decimal_sum(amounts)
     if credit_only:
         lines = lines.copy_abs()
+    tax = totals.tax_amount
+    if subtotal is None and tax is not None and credit_only:
+        tax = tax.copy_abs()
     declared_lines = subtotal if subtotal is not None else total
     if declared_lines is not None and currencies:
         expected_lines = declared_lines.copy_abs() if credit_only else declared_lines
+        if subtotal is None and tax is not None:
+            expected_lines = _decimal_sum((expected_lines, tax.copy_negate()))
         excess_by_currency[next(iter(currencies))] = _decimal_sum(
             (lines, expected_lines.copy_negate())
         )
@@ -625,11 +635,15 @@ def _reconcile_totals(
 
     expected_total = total.copy_abs() if credit_only else total
     if subtotal is not None:
-        calculated = _decimal_sum((subtotal, totals.tax_amount or _ZERO))
+        calculated = _decimal_sum((subtotal, tax or _ZERO))
         if credit_only:
             calculated = calculated.copy_abs()
         code = AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH
         message = "源单小计加税额与总计不符"
+    elif tax is not None:
+        calculated = _decimal_sum((lines, tax))
+        code = AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH
+        message = "明细合计加税额与总计不符"
     else:
         calculated = lines
         code = AlertCode.AMOUNT_TOTAL_MISMATCH
@@ -923,6 +937,7 @@ def _merge_package_mbls(
     corrected: list[set[str]],
     indexes_by_doc: dict[str, list[int]],
     bundles: dict[str, DocumentExtractionBundle],
+    available_doc_ids: set[str] | None,
 ) -> set[str]:
     children: dict[str, list[str]] = defaultdict(list)
     for doc_id, bundle in bundles.items():
@@ -942,10 +957,17 @@ def _merge_package_mbls(
 
     checked_docs = set()
     for doc_id, indexes in indexes_by_doc.items():
-        snapshots = snapshots_by_doc.get(doc_id) or next(
-            (records[i].package_sibling_refs for i in indexes if records[i].package_sibling_refs),
-            [],
-        )
+        snapshots_by_id = {
+            source.source_doc_id: source for source in snapshots_by_doc.get(doc_id, ())
+        }
+        for index in indexes:
+            for source in records[index].package_sibling_refs:
+                source_id = source.source_doc_id
+                if source_id not in bundles and (
+                    available_doc_ids is None or source_id in available_doc_ids
+                ):
+                    snapshots_by_id.setdefault(source_id, source)
+        snapshots = list(snapshots_by_id.values())
         if not snapshots:
             continue
         checked_docs.add(doc_id)
@@ -971,18 +993,37 @@ def _merge_package_mbls(
     return checked_docs
 
 
-def validate_batch(
-    records: Sequence[ProcessedBillingRecord], bundles: Sequence[DocumentExtractionBundle] = ()
-) -> list[ProcessedBillingRecord]:
-    """Apply line, document, and cross-document gates in input record order."""
-    selected, canonical = _merge_duplicate_sources(records, bundles)
-    validated = []
-    alerts_by_line = []
-    corrected_by_line = []
-    indexes_by_doc: dict[str, list[int]] = defaultdict(list)
-    for index, record in enumerate(selected):
-        bundle = canonical.get(record.source_doc_id)
-        extraction = bundle.extraction if bundle is not None else None
+def _ocr_suspicion_alerts(payload: OcrStructuredPayload | None) -> list[ValidationAlert]:
+    if payload is None:
+        return []
+    alerts = []
+    for index, item in enumerate(payload.items, 1):
+        extra = item.model_extra or {}
+        if extra.get("suspicious") is not True:
+            continue
+        field = f"ocr.item_{index}"
+        text = extra.get("text")
+        actual = text.strip() if isinstance(text, str) else ""
+        alerts.append(
+            ValidationAlert.from_code(
+                AlertCode.OCR_SUSPICIOUS_FLAG,
+                "源单 OCR 标记了可疑内容",
+                field=field,
+                actual=actual or field,
+            )
+        )
+    return alerts
+
+
+_PreparedLine = tuple[ProcessedBillingRecord, set[str], list[ValidationAlert]]
+
+
+def _validate_document(
+    doc_id: str, records: Sequence[ProcessedBillingRecord], bundle: DocumentExtractionBundle | None
+) -> tuple[list[_PreparedLine], set[AlertCode]]:
+    extraction = bundle.extraction if bundle is not None else None
+    prepared = []
+    for record in records:
         if extraction is not None:
             # Route document parse issues through the same per-row override checks.
             record = record.model_copy(
@@ -998,84 +1039,126 @@ def validate_batch(
                     ],
                 }
             )
-        prepared, corrected, alerts = _prepare_line(record)
-        validated.append(prepared)
-        corrected_by_line.append(corrected)
-        alerts_by_line.append(alerts)
-        indexes_by_doc[record.source_doc_id].append(index)
+        prepared.append(_prepare_line(record))
 
+    lines = [record for record, _, _ in prepared]
+    totals = (
+        SourceDocTotalsSnapshot.from_extraction(doc_id, extraction)
+        if extraction is not None
+        else next(
+            (
+                line.source_doc_totals
+                for line in lines
+                if line.source_doc_totals is not None
+                and line.source_doc_totals.source_doc_id == doc_id
+            ),
+            None,
+        )
+    )
+    alerts, excess, credit_only = (
+        _reconcile_totals(lines, totals) if totals is not None else ([], {}, False)
+    )
+    recalculated = _LINE_ALERT_CODES.copy()
+    if totals is not None:
+        recalculated.update(_TOTAL_ALERT_CODES)
+    if len(lines) > 1 or bundle is not None:
+        recalculated.add(AlertCode.DUPLICATE_LINE_EXTRACTED)
+    if bundle is not None:
+        recalculated.add(AlertCode.OCR_SUSPICIOUS_FLAG)
+        alerts.extend(_ocr_suspicion_alerts(bundle.document.ocr_payload))
+    no_summary = totals is not None and (
+        totals.subtotal_amount is None
+        and totals.total_amount is None
+        and not totals.subtotals_by_currency
+        and not totals.totals_by_currency
+        and not totals.has_explicit_total
+        and (extraction is None or "subtotal_amount" not in extraction.raw_invalid_fields)
+    )
+    duplicates = _duplicate_line_alerts(lines, excess, credit_only)
+    checked = []
+    for index, (record, corrected, line_alerts) in enumerate(prepared):
+        record = record.model_copy(update={"source_doc_totals": totals})
+        if no_summary:
+            record = _with_reason(record, _NO_SUMMARY_REASON)
+        elif _NO_SUMMARY_REASON in record.ai_reasoning:
+            record = record.model_copy(
+                update={
+                    "ai_reasoning": [
+                        reason for reason in record.ai_reasoning if reason != _NO_SUMMARY_REASON
+                    ]
+                }
+            )
+        checked.append((record, corrected, [*line_alerts, *alerts, *duplicates.get(index, ())]))
+    return checked, recalculated
+
+
+def _validate_batch(
+    records: Sequence[ProcessedBillingRecord],
+    bundles: Sequence[DocumentExtractionBundle],
+    *,
+    on_document_error: Callable[[str, Exception], None] | None = None,
+) -> list[ProcessedBillingRecord]:
+    selected, canonical = _merge_duplicate_sources(records, bundles)
+    input_indexes: dict[str, list[int]] = defaultdict(list)
+    for index, record in enumerate(selected):
+        input_indexes[record.source_doc_id].append(index)
+
+    by_index = {}
     recalculated_by_doc = {}
-    for doc_id, indexes in indexes_by_doc.items():
-        bundle = canonical.get(doc_id)
-        extraction = bundle.extraction if bundle is not None else None
-        lines = [validated[index] for index in indexes]
-        totals = (
-            SourceDocTotalsSnapshot.from_extraction(doc_id, extraction)
-            if extraction is not None
-            else next(
-                (
-                    line.source_doc_totals
-                    for line in lines
-                    if line.source_doc_totals is not None
-                    and line.source_doc_totals.source_doc_id == doc_id
-                ),
-                None,
+    failed_doc_ids = set()
+    for doc_id, indexes in input_indexes.items():
+        try:
+            checked, recalculated = _validate_document(
+                doc_id, [selected[index] for index in indexes], canonical.get(doc_id)
             )
-        )
-        alerts, excess, credit_only = (
-            _reconcile_totals(lines, totals) if totals is not None else ([], {}, False)
-        )
-        recalculated = _LINE_ALERT_CODES.copy()
-        if totals is not None:
-            recalculated.update(_TOTAL_ALERT_CODES)
-        if len(indexes) > 1 or bundle is not None:
-            recalculated.add(AlertCode.DUPLICATE_LINE_EXTRACTED)
-        if len(indexes_by_doc) > 1 or bundles:
-            recalculated.add(AlertCode.CROSS_DOCUMENT_CONFLICT)
-        if bundle is not None:
-            recalculated.add(AlertCode.OCR_SUSPICIOUS_FLAG)
+        except Exception as exc:
+            if on_document_error is None:
+                raise
+            on_document_error(doc_id, exc)
+            failed_doc_ids.add(doc_id)
+            canonical.pop(doc_id, None)
+            continue
+        by_index.update(zip(indexes, checked, strict=True))
         recalculated_by_doc[doc_id] = recalculated
-        no_summary = totals is not None and (
-            totals.subtotal_amount is None
-            and totals.total_amount is None
-            and not totals.subtotals_by_currency
-            and not totals.totals_by_currency
-            and not totals.has_explicit_total
-            and (extraction is None or "subtotal_amount" not in extraction.raw_invalid_fields)
-        )
-        payload = bundle.document.ocr_payload if bundle is not None else None
-        if payload and any(
-            (item.model_extra or {}).get("suspicious") is True for item in payload.items
-        ):
-            alerts.append(
-                ValidationAlert.from_code(AlertCode.OCR_SUSPICIOUS_FLAG, "源单 OCR 标记了可疑内容")
-            )
-        duplicates = _duplicate_line_alerts(lines, excess, credit_only)
-        for offset, index in enumerate(indexes):
-            record = validated[index].model_copy(update={"source_doc_totals": totals})
-            if no_summary:
-                record = _with_reason(record, _NO_SUMMARY_REASON)
-            elif _NO_SUMMARY_REASON in record.ai_reasoning:
-                record = record.model_copy(
-                    update={
-                        "ai_reasoning": [
-                            reason for reason in record.ai_reasoning if reason != _NO_SUMMARY_REASON
-                        ]
-                    }
-                )
-            validated[index] = record
-            alerts_by_line[index].extend([*alerts, *duplicates.get(offset, ())])
+
+    validated = []
+    alerts_by_line = []
+    corrected_by_line = []
+    indexes_by_doc: dict[str, list[int]] = defaultdict(list)
+    for index in range(len(selected)):
+        if index not in by_index:
+            continue
+        record, corrected, alerts = by_index[index]
+        indexes_by_doc[record.source_doc_id].append(len(validated))
+        validated.append(record)
+        alerts_by_line.append(alerts)
+        corrected_by_line.append(corrected)
+    if len(indexes_by_doc) > 1 or bundles:
+        for recalculated in recalculated_by_doc.values():
+            recalculated.add(AlertCode.CROSS_DOCUMENT_CONFLICT)
 
     for index, alerts in _cross_document_alerts(validated).items():
         alerts_by_line[index].extend(alerts)
+    available_doc_ids = (
+        {bundle.document.doc_id for bundle in bundles} - failed_doc_ids
+        if on_document_error is not None
+        else None
+    )
     for doc_id in _merge_package_mbls(
-        validated, alerts_by_line, corrected_by_line, indexes_by_doc, canonical
+        validated, alerts_by_line, corrected_by_line, indexes_by_doc, canonical, available_doc_ids
     ):
         recalculated_by_doc[doc_id].add(AlertCode.MULTI_SOURCE_BL_MISMATCH)
     return [
         _with_alerts(record, alerts, recalculated_by_doc[record.source_doc_id])
         for record, alerts in zip(validated, alerts_by_line, strict=True)
     ]
+
+
+def validate_batch(
+    records: Sequence[ProcessedBillingRecord], bundles: Sequence[DocumentExtractionBundle] = ()
+) -> list[ProcessedBillingRecord]:
+    """Apply line, document, and cross-document gates in input record order."""
+    return _validate_batch(records, bundles)
 
 
 def validate_records(records: Sequence[ProcessedBillingRecord]) -> list[ProcessedBillingRecord]:

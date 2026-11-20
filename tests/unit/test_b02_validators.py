@@ -290,6 +290,37 @@ def test_partial_update_only_multiplies_three_current_or_manually_edited_values(
     ]
 
 
+@pytest.mark.parametrize(
+    ("explicit", "overrides", "has_mismatch"),
+    [
+        ({"amount"}, {}, False),
+        ({"amount", "quantity"}, {}, False),
+        ({"amount", "quantity"}, {"unit_price": "15"}, True),
+        ({"amount", "quantity", "unit_price"}, {}, True),
+        (set(), {}, True),
+    ],
+    ids=["legacy-amount", "legacy-quantity", "manual-rate", "all-explicit", "unannotated"],
+)
+def test_direct_arithmetic_checks_only_current_values_when_amount_is_explicit(
+    explicit: set[str], overrides: dict[str, str], has_mismatch: bool
+) -> None:
+    legacy = _line(
+        amount="35",
+        quantity="2",
+        unit_price="15",
+        explicit_fields=explicit,
+        human_overrides=overrides,
+    )
+    assert not legacy.inherited_fields
+
+    checked = validate_record(legacy)
+
+    if has_mismatch:
+        _assert_review(checked, AlertCode.LINE_ARITHMETIC_MISMATCH)
+    else:
+        assert not checked.validation_alerts and checked.review_status is ReviewStatus.AUTO_READY
+
+
 def test_fully_inherited_arithmetic_does_not_block_payment_term_only_updates() -> None:
     source = _line(reference_no="DN-202609-001", amount=None, payment_term="CC")
     matched = match_record(
@@ -417,6 +448,99 @@ def test_unchanged_recalculation_keeps_manual_decision_under_an_entity_alias(
     assert recalculated.human_review_history == history
     assert recalculated.operation is OperationType.UPDATE
     assert len(serialize_records([recalculated], "official")) == (status is ReviewStatus.APPROVED)
+
+
+@pytest.mark.parametrize("change", ["hbl", "historical-amount"])
+@pytest.mark.parametrize("status", [ReviewStatus.APPROVED, ReviewStatus.REJECTED])
+def test_same_ledger_recalculation_requires_review_when_hbl_or_the_historical_delta_changes(
+    change: str, status: ReviewStatus
+) -> None:
+    source = _line(
+        reference_no="NOTICE-1",
+        issuer=ENTITY,
+        recipient="Buyer",
+        amount="80",
+        shipment_refs={"hbl_no": "HBL-11"},
+    )
+    historical = _bill(issuer=ENTITY, recipient="Buyer", amount="50")
+    previous = validate_record(match_record(source, [historical]))
+    history = [HumanReviewAction(action=status, operator="reviewer", timestamp="2026-11-19")]
+    previous = previous.model_copy(
+        update={
+            "review_status": status,
+            "reject_reason": "checked",
+            "human_review_history": history,
+        }
+    )
+    previous = ProcessedBillingRecord.model_validate_json(previous.model_dump_json())
+    if change == "hbl":
+        previous = previous.model_copy(update={"human_overrides": {"hbl_no": "HBL-99"}})
+    else:
+        historical = historical.model_copy(update={"amount": Decimal("30000")})
+
+    (checked,), reset = recalculate_for_entity([previous], ENTITY, existing_bills=[historical])
+
+    assert checked.matched_existing_bill_id == previous.matched_existing_bill_id == historical.id
+    assert checked.amount == previous.amount and checked.operation is OperationType.UPDATE
+    if change == "hbl":
+        assert checked.shipment_refs.hbl_no == "HBL-99"
+    else:
+        (diff,) = checked.field_diffs
+        assert (diff.field, diff.old_value, diff.new_value, diff.changed) == (
+            "amount",
+            Decimal("30000"),
+            Decimal("80"),
+            True,
+        )
+    assert reset == 1 and checked.review_status is ReviewStatus.NEEDS_REVIEW
+    assert checked.reject_reason is None and checked.human_review_history == history
+    assert serialize_records([checked], "official") == []
+
+
+@pytest.mark.parametrize("status", [ReviewStatus.APPROVED, ReviewStatus.REJECTED])
+def test_recalculation_preserves_review_across_equivalent_refs_and_serialized_diffs(
+    status: ReviewStatus,
+) -> None:
+    refs = {
+        "hbl_no": "HBL-11",
+        "booking_no": "BK-12",
+        "mbl_nos": [{"value": value, "source": "document"} for value in ("MBL-1", "MBL-2")],
+        "container_nos": ["MSCU6639870", "CSQU3054383"],
+    }
+    source = _line(
+        reference_no="NOTICE-1",
+        issuer=ENTITY,
+        recipient="Buyer",
+        amount="80.000",
+        shipment_refs=refs,
+    )
+    historical = _bill(issuer=ENTITY, recipient="Buyer", amount="50.00")
+    (previous,) = validate_batch(match_and_inherit_batch([source], [historical]))
+    assert previous.review_status is ReviewStatus.AUTO_READY
+    history = [HumanReviewAction(action=status, operator="reviewer", timestamp="2026-11-19")]
+    previous = previous.model_copy(
+        update={
+            "review_status": status,
+            "reject_reason": "checked",
+            "human_review_history": history,
+            "human_overrides": {
+                "shipment_refs": {
+                    **refs,
+                    "hbl_no": " ｈｂｌ-１１ ",
+                    "booking_no": " bk-12 ",
+                    "mbl_nos": list(reversed(refs["mbl_nos"])),
+                    "container_nos": list(reversed(refs["container_nos"])),
+                }
+            },
+        }
+    )
+    previous = ProcessedBillingRecord.model_validate_json(previous.model_dump_json())
+    historical = historical.model_copy(update={"amount": Decimal("50")})
+
+    (checked,), reset = recalculate_for_entity([previous], ENTITY, existing_bills=[historical])
+
+    assert reset == 0 and checked.review_status is status
+    assert checked.reject_reason == "checked" and checked.human_review_history == history
 
 
 @pytest.mark.parametrize("change", ["amount", "total_gate"])
@@ -863,6 +987,56 @@ def test_ocr_suspicion_from_payload_item_is_a_warning() -> None:
     assert alert.code is AlertCode.OCR_SUSPICIOUS_FLAG
     assert alert.severity is AlertSeverity.WARNING
     assert result.operation is OperationType.PENDING_REVIEW
+
+
+@pytest.mark.parametrize(
+    "edit", [None, "field", "actual"], ids=["exact", "wrong-field", "wrong-value"]
+)
+def test_ocr_suspicion_confirmation_revalidates_against_the_exact_item(edit: str | None) -> None:
+    bundle = _bundle(
+        ocr_payload={
+            "items": [
+                {"suspicious": True, "pageNumber": 4, "text": "  fee label is unclear  "},
+                {"suspicious": True},
+            ],
+            "has_charges": True,
+            "has_metadata": True,
+        }
+    )
+    (initial,) = validate_batch([_line()], [bundle])
+    with_text, without_text = initial.validation_alerts
+    assert all(alert.code is AlertCode.OCR_SUSPICIOUS_FLAG for alert in initial.validation_alerts)
+    assert with_text.field and without_text.field and with_text.field != without_text.field
+    assert with_text.actual == "fee label is unclear"
+    assert without_text.actual == without_text.field
+    checked = []
+    for alert in (with_text, without_text):
+        update = {"severity": AlertSeverity.RESOLVED}
+        if edit and alert is with_text:
+            update[edit] = "different"
+        checked.append(alert.model_copy(update=update))
+    confirmed = initial.model_copy(update={"validation_alerts": checked})
+
+    (rechecked,) = validate_batch([confirmed], [bundle])
+
+    first, second = rechecked.validation_alerts
+    assert (first.field, first.actual) == (with_text.field, with_text.actual)
+    assert first.severity is (AlertSeverity.WARNING if edit else AlertSeverity.RESOLVED)
+    assert second == checked[1] and second.severity is AlertSeverity.RESOLVED
+    assert len(serialize_records([rechecked], "official")) == (0 if edit else 1)
+
+
+def test_duplicate_amount_excess_uses_the_total_before_tax() -> None:
+    rows = [_line("first", amount="15"), _line("second", amount="15", source_line_index=1)]
+    bundle = _bundle(tax_amount="3", total_amount="18", total_currency="USD")
+
+    checked = validate_batch(rows, [bundle])
+
+    for row in checked:
+        assert _codes(row) == {
+            AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH,
+            AlertCode.DUPLICATE_LINE_EXTRACTED,
+        }
 
 
 @pytest.mark.parametrize(

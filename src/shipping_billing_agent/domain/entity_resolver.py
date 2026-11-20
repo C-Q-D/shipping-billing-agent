@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -408,13 +409,56 @@ def has_explicit_parties(record: ProcessedBillingRecord) -> bool:
     )
 
 
-def _review_basis(record: ProcessedBillingRecord) -> tuple[Any, ...]:
+@dataclass(frozen=True, slots=True)
+class _ReviewBasis:
+    billing_fields: tuple[Any, ...]
+    shipment_refs: tuple[str, str, tuple[str, ...], tuple[str, ...]]
+    operation: OperationType
+    field_diffs: tuple[tuple[Any, ...], ...]
+
+
+def _diff_value(field: str, value: Any) -> tuple[int, Decimal | str]:
+    if field in _NUMERIC_FIELDS and value is not None:
+        try:
+            return 0, parse_decimal_strict(value)
+        except ValueError:
+            pass  # Keep a legacy non-numeric value comparable as stored.
+    return 1, json.dumps(value, sort_keys=True, ensure_ascii=False)
+
+
+def _review_basis(record: ProcessedBillingRecord) -> _ReviewBasis:
+    def ref_key(value: str | None) -> str:
+        return "".join(normalize("NFKC", value or "").upper().split())
+
     unresolved = frozenset(
         (alert.code, alert.severity, alert.field, alert.actual, alert.expected)
         for alert in record.validation_alerts
         if alert.severity is not AlertSeverity.RESOLVED
     )
-    return (*(getattr(record, field) for field in _REVIEW_FIELDS), unresolved)
+    refs = record.shipment_refs
+    shipment_refs = (
+        ref_key(refs.hbl_no),
+        ref_key(refs.booking_no),
+        tuple(sorted({key for ref in refs.mbl_nos if (key := ref_key(ref.value))})),
+        tuple(sorted({key for value in refs.container_nos if (key := ref_key(value))})),
+    )
+    diffs = []
+    for diff in record.field_diffs:
+        values = diff.model_dump(mode="json")
+        diffs.append(
+            (
+                diff.field,
+                _diff_value(diff.field, values["old_value"]),
+                _diff_value(diff.field, values["new_value"]),
+                diff.changed,
+            )
+        )
+    return _ReviewBasis(
+        billing_fields=(*(getattr(record, field) for field in _REVIEW_FIELDS), unresolved),
+        shipment_refs=shipment_refs,
+        operation=record.operation,
+        field_diffs=tuple(sorted(diffs)),
+    )
 
 
 def recalculate_for_entity(
@@ -474,9 +518,9 @@ def recalculate_for_entity(
         previous = reviewed.get(record.id)
         if previous is None:
             continue
-        if entity_matches(previous.accounting_entity, record.accounting_entity, profiles) and (
-            _review_basis(previous) == _review_basis(record)
-        ):
+        same_ledger = entity_matches(previous.accounting_entity, record.accounting_entity, profiles)
+        before, after = _review_basis(previous), _review_basis(record)
+        if same_ledger and before == after:
             updated[index] = record.model_copy(
                 update={
                     "review_status": previous.review_status,
@@ -486,4 +530,15 @@ def recalculate_for_entity(
             )
         else:
             reset_approval_count += 1
+            same_bill = previous.matched_existing_bill_id == record.matched_existing_bill_id
+            changed_action = (before.operation, before.field_diffs) != (
+                after.operation,
+                after.field_diffs,
+            )
+            if same_ledger and (
+                before.shipment_refs != after.shipment_refs or same_bill and changed_action
+            ):
+                updated[index] = record.model_copy(
+                    update={"review_status": ReviewStatus.NEEDS_REVIEW}
+                )
     return updated, reset_approval_count

@@ -19,10 +19,12 @@ from shipping_billing_agent.agent import (
 from shipping_billing_agent.agent import graph as billing_graph
 from shipping_billing_agent.agent.prompts import select_minimal_document_snippet
 from shipping_billing_agent.config.limits import ResourceLimits
+from shipping_billing_agent.domain import serialize_records
 from shipping_billing_agent.domain.models import (
     AccountingEntityProfile,
     AlertCode,
     AlertSeverity,
+    ChargeDictionaryItem,
     DocumentStatus,
     ExistingBillRecord,
     ExtractionChannel,
@@ -794,6 +796,25 @@ def test_labeled_company_names_keep_the_complete_branch_suffix(label: str, field
 
 
 @pytest.mark.parametrize(
+    "company", ["Atlas Shipping Ltd., (HK)", "Atlas Shipping Ltd Hong Kong Branch"]
+)
+@pytest.mark.parametrize(
+    ("label", "field", "tail"),
+    [
+        ("Issuer", "issuer", " Invoice No.: INV-123"),
+        ("Bill To", "recipient", "\tUnrelated column"),
+        ("From", "issuer", " Reference: INV-123"),
+        ("To", "recipient", " Date: 2026-10-01"),
+    ],
+)
+def test_party_label_keeps_branch_and_trims_adjacent_fields(
+    company: str, label: str, field: str, tail: str
+) -> None:
+    doc = _document("branch-with-tail", f"Invoice INV-123\n{label}: {company}{tail}")
+    assert getattr(extract_document_by_rules(doc).extraction, field) == company
+
+
+@pytest.mark.parametrize(
     ("title", "reference", "amount"),
     [
         ("Credit Memo CM-123", "CM-123", "-30"),
@@ -827,11 +848,13 @@ def test_source_evidence_and_summary_are_safe_before_batch_validation(monkeypatc
     attachment = _document(
         "attachment", parent_doc_id=root.doc_id, content_sha256=standalone.content_sha256
     )
-    real_validate = billing_graph.validate_batch
+    real_validate = billing_graph._validate_batch
+    checked_sources = []
 
-    def inspect_evidence(records, bundles):
+    def inspect_evidence(records, bundles, **options):
         assert len(records) == 2
         for record in records:
+            checked_sources.append(record.source_doc_id)
             assert "signed-value" not in record.source_evidence.model_dump_json()
             assert record.source_doc_totals.source_doc_id == record.source_doc_id
             assert record.source_doc_totals.total_amount == Decimal("100.00")
@@ -839,10 +862,11 @@ def test_source_evidence_and_summary_are_safe_before_batch_validation(monkeypatc
                 assert [ref.source_doc_id for ref in record.package_sibling_refs] == [
                     attachment.doc_id
                 ]
-        return real_validate(records, bundles)
+        return real_validate(records, bundles, **options)
 
-    monkeypatch.setattr(billing_graph, "validate_batch", inspect_evidence)
+    monkeypatch.setattr(billing_graph, "_validate_batch", inspect_evidence)
     result = run_billing_pipeline([standalone, attachment, root], _ENTITY)
+    assert checked_sources == [standalone.doc_id, attachment.doc_id]
     (row,) = result.records
     assert set(row.source_evidence.source_paths) == {
         "https://example.invalid/direct.pdf",
@@ -979,3 +1003,82 @@ def test_grounding_accepts_replacement_corroborated_by_the_same_documents_text_a
         "2026-02-28",
     )
     assert row.review_status is ReviewStatus.AUTO_READY and not row.raw_invalid_fields
+
+
+@pytest.mark.parametrize("channel", ["text", "table", "ocr"])
+def test_model_only_fee_is_grounded_in_a_same_document_alias_and_amount(channel: str) -> None:
+    text = f"Credit Note CN-123\nIssuer: {_ENTITY}\nTotal (USD): -1250.00"
+    attributes = {}
+    if channel == "text":
+        text += "\nVGM: USD -1,250.00"
+    elif channel == "table":
+        attributes["tables"] = [ParsedTable(rows=[["VGM", "USD", "-1,250.00"]])]
+    else:
+        attributes["ocr_payload"] = {
+            "has_charges": True,
+            "has_metadata": False,
+            "items": [{"text": "VGM: USD -1,250.00"}],
+        }
+    doc = _document("model-only-fee", text, **attributes)
+    dictionary = [ChargeDictionaryItem(raw_alias="VGM", standard_name="Verified Gross Mass")]
+    assert not extract_document_by_rules(doc).charges
+    response = _response(
+        "unused",
+        reference_no="CN-123",
+        document_type="Credit Note",
+        total="-1250.00",
+        charges=[
+            {"raw_charge_name": "Verified Gross Mass", "amount": "1250.00", "currency": "USD"}
+        ],
+    )
+
+    result = run_billing_pipeline(
+        [doc], _ENTITY, charge_dictionary=dictionary, llm_client=FakeStructuredLlmClient([response])
+    )
+
+    (row,) = result.records
+    assert not result.failed_doc_ids and result.llm_calls_used == 1
+    assert row.amount == Decimal("-1250.00") and row.review_status is ReviewStatus.AUTO_READY
+
+
+@pytest.mark.parametrize(
+    "detail",
+    ["VGM: 1500.00 USD", "VGM: ref INV-500", "VGM: 500.00.00 USD", "VGMS: 500 USD"],
+)
+def test_model_fee_requires_complete_name_and_numeric_tokens(detail: str) -> None:
+    doc = _document(
+        "token-boundaries",
+        f"Invoice INV-123\nIssuer: {_ENTITY}\n{detail}\nTotal USD 500.00",
+    )
+    response = _response(
+        "unused",
+        total="500",
+        charges=[{"raw_charge_name": "VGM", "amount": "500", "currency": "USD"}],
+    )
+    result = run_billing_pipeline(
+        [doc], _ENTITY, llm_client=FakeStructuredLlmClient([response, response])
+    )
+    assert not result.records and result.failed_doc_ids == [doc.doc_id]
+
+
+def test_model_extra_fee_cannot_reuse_a_recognized_fee_as_evidence() -> None:
+    doc = _document(
+        "shared-name-token",
+        f"Invoice INV-123\nIssuer: {_ENTITY}\nTerminal Handling Charge 30 USD",
+    )
+    response = _response(
+        "unused",
+        total=None,
+        charges=[
+            {"raw_charge_name": "Terminal Handling Charge", "amount": "30", "currency": "USD"},
+            {"raw_charge_name": "Handling Fee", "amount": "30", "currency": "EUR"},
+        ],
+    )
+
+    result = run_billing_pipeline(
+        [doc], _ENTITY, llm_client=FakeStructuredLlmClient([response, response])
+    )
+
+    assert len(result.records) == 2
+    assert all(row.operation is OperationType.PENDING_REVIEW for row in result.records)
+    assert serialize_records(result.records, "official") == []

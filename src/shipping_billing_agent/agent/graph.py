@@ -7,6 +7,7 @@ import re
 from collections import defaultdict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from fractions import Fraction
 from functools import partial
 from threading import Lock
@@ -47,11 +48,13 @@ from shipping_billing_agent.domain import (
     validate_batch,
     validate_record,
 )
+from shipping_billing_agent.domain.charge_normalizer import _CHARGE_NAMES
 from shipping_billing_agent.domain.entity_resolver import (
     FIELD_FORMAT_ALERT_CODES,
     is_credit_document_type,
 )
 from shipping_billing_agent.domain.models import DocumentStatus, SourceKind, sanitize_source_path
+from shipping_billing_agent.domain.validators import _validate_batch
 from shipping_billing_agent.gateways.llm_client import (
     LlmBudgetExhaustedError,
     LlmGatewayError,
@@ -66,6 +69,7 @@ from .prompts import (
     format_validation_alerts,
 )
 from .rule_extractor import (
+    _charge_evidence,
     _non_billing_reason,
     apply_sibling_context,
     extract_document_by_rules,
@@ -519,9 +523,41 @@ def _amount_pairs(
     )
 
 
+def _charge_words(text: str) -> str:
+    return " ".join(re.findall(r"[^\W_]+", normalize("NFKC", text).casefold()))
+
+
+def _matching_charge_evidence(
+    charge: RawChargeItem,
+    evidence_by_amount: dict[Decimal, set[str]],
+    dictionary: Sequence[ChargeDictionaryItem],
+    used_rows: set[str],
+) -> str | None:
+    if charge.amount is None or not (evidence := evidence_by_amount.get(charge.amount.copy_abs())):
+        return None
+    name = charge.raw_charge_name
+    standard, _ = normalize_charge_item(name, dictionary)
+    if standard is None:
+        return None
+    names = [name, standard]
+    names.extend(alias for alias, value in _CHARGE_NAMES.items() if value == standard)
+    names.extend(item.raw_alias for item in dictionary if item.standard_name == standard)
+    phrases = {
+        f" {words} "
+        for alias in names
+        if normalize_charge_item(alias, dictionary)[0] == standard
+        and (words := _charge_words(alias))
+    }
+    return min(
+        (text for text in evidence - used_rows if any(phrase in text for phrase in phrases)),
+        default=None,
+    )
+
+
 def _ground_charges(
     proposed: list[RawChargeEnvelope],
     rules: RawExtractionEnvelope,
+    doc: ParsedDocument,
     dictionary: Sequence[ChargeDictionaryItem],
     independent: Sequence[RawExtractionEnvelope],
 ) -> tuple[list[RawChargeEnvelope], list[ValidationAlert]]:
@@ -543,6 +579,7 @@ def _ground_charges(
     observed = rules.charges
     grounded = proposed.copy()
     issues = []
+    paired_proposals = set()
     model_groups = indexes_by_name(proposed)
     source_groups = indexes_by_name(observed)
     independent_groups = [
@@ -596,6 +633,7 @@ def _ground_charges(
         remainder_source = [index for index in source_indexes if index not in pairs]
         remainder_model = [index for index in model_indexes if index not in paired_model]
         pairs.update(zip(remainder_source, remainder_model, strict=False))
+        paired_proposals.update(pairs.values())
         for source_index, model_index in pairs.items():
             grounded[model_index] = _ground_charge(
                 proposed[model_index], observed[source_index], corroborating_rows, document_type
@@ -620,26 +658,42 @@ def _ground_charges(
                     actual=amounts_text(proposed, model_indexes),
                 )
             )
-    summary = rules.subtotal_amount if rules.subtotal_amount is not None else rules.total_amount
-    additional_fees = sorted(model_groups.keys() - source_groups.keys())
-    source_amounts = [row.charge.amount for row in observed]
-    if (
-        summary is not None
-        and source_amounts
-        and additional_fees
-        and all(amount is not None for amount in source_amounts)
-    ):
-        observed_sum = sum(Fraction(amount) for amount in source_amounts if amount is not None)
-        if abs(observed_sum - Fraction(summary)) <= _LINE_TOLERANCE:
-            issues.append(
-                ValidationAlert.from_code(
-                    AlertCode.AMOUNT_TOTAL_MISMATCH,
-                    "原文已识别的费用行与汇总相符，模型另报了无法核对的费用行",
-                    field="reported_charge_amount",
-                    actual="、".join(additional_fees),
-                    expected="、".join(source_groups),
-                )
-            )
+    unpaired = [index for index in range(len(proposed)) if index not in paired_proposals]
+    if not unpaired:
+        return grounded, issues
+
+    evidence_by_amount: dict[Decimal, set[str]] = defaultdict(set)
+    for text, amounts in _charge_evidence(doc):
+        words = f" {_charge_words(text)} "
+        for amount in amounts:
+            evidence_by_amount[amount].add(words)
+    # A rule-recognized line cannot also substantiate a second model fee.
+    used_rows = {
+        f" {_charge_words(_TABLE_ROW.sub('', _SHEET_ROW.sub('', line)))} "
+        for entry in observed
+        for line in (entry.charge.source_text or "").splitlines()
+    }
+    unsupported = set()
+    for index in unpaired:
+        entry = grounded[index]
+        charge = entry.charge
+        if evidence := _matching_charge_evidence(charge, evidence_by_amount, dictionary, used_rows):
+            used_rows.add(evidence)
+            continue
+        alert = ValidationAlert.from_code(
+            AlertCode.AMOUNT_TOTAL_MISMATCH,
+            "模型另报的费用在源单明细中缺少费用名称和金额的对应证据",
+            field="reported_charge_amount",
+            expected="同一源单中的费用名称和金额",
+            actual=f"{charge.raw_charge_name} {entry.raw_amount_text or '金额缺失'}",
+        )
+        issues.append(alert)
+        unsupported.add(index)
+        grounded[index] = entry.model_copy(
+            update={"raw_parse_issues": [*entry.raw_parse_issues, alert]}
+        )
+    if unsupported and not observed and _has_billing_summary(rules):
+        grounded = [entry for index, entry in enumerate(grounded) if index not in unsupported]
     return grounded, issues
 
 
@@ -773,6 +827,7 @@ def _ground_model_extraction(
             )
         ],
         rules,
+        doc,
         dictionary,
         independent,
     )
@@ -1075,7 +1130,11 @@ class _BillingNodes:
             for entry in envelope.charges:
                 raw_issues.extend(entry.raw_parse_issues)
             alerts.extend(
-                issue for issue in raw_issues if issue.code is AlertCode.LLM_EXTRACTION_FAILED
+                issue
+                for issue in raw_issues
+                if issue.code is AlertCode.LLM_EXTRACTION_FAILED
+                or not rows
+                and issue.code in _REPAIRABLE_CHECKS
             )
             if alerts:
                 correction_alerts[doc.doc_id] = alerts
@@ -1223,7 +1282,7 @@ class _BillingNodes:
                     else _NO_CHARGE_DETAILS
                 )
             enriched_bundles.append(enriched_bundle)
-            if assembly_failed:
+            if assembly_failed or (not rows and doc.doc_id in failures):
                 continue
             if rows:
                 try:
@@ -1240,23 +1299,11 @@ class _BillingNodes:
                     continue
                 records.extend(checked)
             independent_bundles.append(bundle)
-        verified = validate_batch(records, independent_bundles)
-        # Deduplication can remove a reference-bearing copy from a mail package.
-        package_refs_by_record = {
-            row.id: row.package_sibling_refs for row in records if row.package_sibling_refs
-        }
-        source_doc_ids = {bundle.document.doc_id for bundle in independent_bundles}
-        for index, row in enumerate(verified):
-            retained_ids = {ref.source_doc_id for ref in row.package_sibling_refs}
-            missing_refs = [
-                ref
-                for ref in package_refs_by_record.get(row.id, ())
-                if ref.source_doc_id in source_doc_ids and ref.source_doc_id not in retained_ids
-            ]
-            if missing_refs:
-                verified[index] = row.model_copy(
-                    update={"package_sibling_refs": [*row.package_sibling_refs, *missing_refs]}
-                )
+
+        def fail_document(doc_id: str, exc: Exception) -> None:
+            failures[doc_id] = f"文档批次复检失败（{type(exc).__name__}）"
+
+        verified = _validate_batch(records, independent_bundles, on_document_error=fail_document)
         return {
             "records": verified,
             "bundles": enriched_bundles,
