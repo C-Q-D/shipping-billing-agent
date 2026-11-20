@@ -392,7 +392,15 @@ def source_format_alerts(
     alerts = [
         issue
         for issue in record.raw_parse_issues
-        if not (_is_currency_conflict(issue) and "currency" in corrected)
+        if not (
+            (_is_currency_conflict(issue) and "currency" in corrected)
+            or (
+                issue.code is AlertCode.CROSS_DOCUMENT_CONFLICT
+                and issue.field == "payment_term"
+                and "payment_term" in corrected
+                and record.payment_term is not None
+            )
+        )
         and (
             issue.code not in FIELD_FORMAT_ALERT_CODES
             or (

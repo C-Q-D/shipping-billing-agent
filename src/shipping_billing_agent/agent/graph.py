@@ -471,6 +471,7 @@ def _ground_charge(
     observed: RawChargeEnvelope,
     independent: Sequence[RawChargeEnvelope],
     document_type: str | None,
+    document_issues: list[ValidationAlert],
 ) -> RawChargeEnvelope:
     printed, model = observed.charge, proposed.charge
     updates = {
@@ -490,6 +491,22 @@ def _ground_charge(
     if bare_dollar or printed.currency or conflicting_currency_tokens:
         updates["currency"] = printed.currency
     issues = []
+    # Check the printed equation even when the proposed amount matched within tolerance.
+    printed_numbers: set[str] = set()
+    for field in ("quantity", "unit_price", "amount"):
+        value = getattr(printed, field)
+        if (
+            value is None
+            or field not in observed.explicit_fields
+            or field in observed.raw_invalid_fields
+            or (field == "amount" and not {"quantity", "unit_price"} <= printed_numbers)
+        ):
+            continue
+        printed_numbers.add(field)
+        updates[field] = value
+        candidate = getattr(model, field)
+        if field != "amount" and candidate is not None and candidate != value:
+            issues.append(_printed_field_conflict(field, str(value), str(candidate)))
     _ground_printed_fields(model, printed, ("payment_term", "debit_credit"), updates, issues)
     if (
         document_type
@@ -502,22 +519,25 @@ def _ground_charge(
     corroborated = _preserve_invalid_fields(
         observed.raw_invalid_fields, model, printed, independent, updates
     )
+    if any(
+        issue.code is AlertCode.CROSS_DOCUMENT_CONFLICT and issue.field == "payment_term"
+        for issue in observed.raw_parse_issues
+    ):
+        updates["payment_term"] = None
+        corroborated.discard("payment_term")
     charge = model.model_copy(update=updates)
     audit = _source_audit(proposed, observed, charge, corroborated)
     audit["raw_parse_issues"].extend(issues)
     if currency_conflict:
-        audit["raw_parse_issues"].append(
-            ValidationAlert.from_code(
-                AlertCode.INVALID_OR_MISSING_CURRENCY,
-                "模型提取的费用行币种与原文不符",
-                field="currency",
-                expected=printed.currency,
-                actual=model.currency,
-            )
-        )
+        conflict = _printed_field_conflict("currency", printed.currency, model.currency)
+        audit["raw_parse_issues"].append(conflict)
+        document_issues.append(conflict)
     for field in ("amount", "unit_price", "quantity"):
         text_field = f"raw_{field}_text"
-        if field in observed.raw_invalid_fields and getattr(charge, field) is None:
+        if field in printed_numbers:
+            audit["raw_invalid_fields"].pop(field, None)
+            audit[text_field] = getattr(observed, text_field)
+        elif field in observed.raw_invalid_fields and getattr(charge, field) is None:
             audit[text_field] = getattr(observed, text_field)
     return proposed.model_copy(update={"charge": charge, **audit})
 
@@ -658,7 +678,8 @@ def _ground_charges(
         paired_proposals.update(pairs.values())
         for source_index, model_index in pairs.items():
             grounded[model_index] = _ground_charge(
-                proposed[model_index], observed[source_index], corroborating_rows, document_type
+                proposed[model_index], observed[source_index], corroborating_rows,
+                document_type, issues,
             )
         unpaired_audited_rows = [
             observed[index]
@@ -1323,6 +1344,14 @@ class _BillingNodes:
                     if prior_failure
                     else _NO_CHARGE_DETAILS
                 )
+            elif not rows and source is not None:
+                for issue in source.raw_parse_issues:
+                    if (
+                        issue.code is AlertCode.LLM_EXTRACTION_FAILED
+                        and issue.field == "excluded_clauses"
+                    ):
+                        failures.setdefault(doc.doc_id, issue.message)
+                        break
             enriched_bundles.append(enriched_bundle)
             if assembly_failed or (not rows and doc.doc_id in failures):
                 continue

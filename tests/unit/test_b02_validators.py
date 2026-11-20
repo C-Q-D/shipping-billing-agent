@@ -186,6 +186,79 @@ def test_line_arithmetic_cent_boundary(amount: str, passes: bool) -> None:
         _assert_review(validated, AlertCode.LINE_ARITHMETIC_MISMATCH)
 
 
+def test_explicit_printed_operands_remain_gated_until_the_amount_is_corrected() -> None:
+    line = _line(
+        amount="45", quantity="2", unit_price="15",
+        explicit_fields={"amount", "quantity", "unit_price"},
+    )
+
+    blocked = validate_record(line)
+    _assert_review(blocked, AlertCode.LINE_ARITHMETIC_MISMATCH)
+    (issue,) = blocked.validation_alerts
+    assert (issue.field, issue.expected, issue.actual) == ("amount", "30", "45")
+    assert serialize_records([blocked], "official") == []
+
+    edited = blocked.model_copy(update={"human_overrides": {"amount": "30.00"}})
+    checked = validate_record(edited)
+    assert checked.amount == Decimal(30) and checked.raw_explicit_amount == Decimal(45)
+    assert checked.validation_alerts == []
+    (official,) = serialize_records([checked], "official")
+    assert official["charge_details"]["amount"] == Decimal(30)
+
+
+@pytest.mark.parametrize("choice", ["PP", "CC", "CASH", None])
+def test_printed_payment_term_conflict_requires_a_valid_override(choice: str | None) -> None:
+    issue = ValidationAlert.from_code(
+        AlertCode.CROSS_DOCUMENT_CONFLICT,
+        "费用明细行标明了相互矛盾的付款条款",
+        field="payment_term",
+        actual="PP / CC",
+    )
+    line = _line(
+        raw_parse_issues=[issue], raw_invalid_fields={"payment_term": "PP / CC"},
+        explicit_fields={"amount", "payment_term"},
+        human_overrides={"payment_term": choice},
+    )
+
+    checked = validate_record(line)
+
+    assert checked.raw_parse_issues == [issue]
+    assert checked.raw_invalid_fields == line.raw_invalid_fields
+    if choice in {"PP", "CC"}:
+        assert checked.payment_term == choice and checked.validation_alerts == []
+        (official,) = serialize_records([checked], "official")
+        assert official["charge_details"]["payment_term"] == choice
+    else:
+        assert checked.payment_term is None and issue in checked.validation_alerts
+        _assert_review(checked, AlertCode.CROSS_DOCUMENT_CONFLICT)
+        assert serialize_records([checked], "official") == []
+
+
+def test_corrected_source_payment_term_still_conflicts_with_a_different_document() -> None:
+    issue = ValidationAlert.from_code(
+        AlertCode.CROSS_DOCUMENT_CONFLICT,
+        "费用明细行标明了相互矛盾的付款条款",
+        field="payment_term",
+        actual="CC / PP",
+    )
+    first = _line(
+        "a", "first", reference_no="INV-15", raw_parse_issues=[issue],
+        raw_invalid_fields={"payment_term": "CC / PP"},
+        explicit_fields={"amount", "payment_term"}, human_overrides={"payment_term": "PP"},
+    )
+    second = _line("b", "second", reference_no="INV-15", payment_term="CC")
+
+    checked = validate_batch([first, second])
+
+    for row, value, other_value in zip(checked, ("PP", "CC"), ("CC", "PP"), strict=True):
+        _assert_review(row, AlertCode.CROSS_DOCUMENT_CONFLICT)
+        (conflict,) = row.validation_alerts
+        assert (conflict.field, conflict.actual, conflict.expected) == (
+            "payment_term", value, other_value,
+        )
+    assert serialize_records(checked, "official") == []
+
+
 @pytest.mark.parametrize(
     ("explicit", "overrides", "check_arithmetic"),
     [

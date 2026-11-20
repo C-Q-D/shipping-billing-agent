@@ -997,12 +997,17 @@ def test_exclusion_can_refer_to_the_preceding_fee(note: str) -> None:
     [
         "\nStorage Fee is not waived",
         "\nThis fee has never been waived",
+        "\nThis fee isn’t currently waived",
+        "\nThese charges aren’t yet waived",
+        "\nThis fee hasn't actually been waived",
+        "\nThis fee won’t be waived",
         "\nThis fee is no longer free of charge",
         "\nThe above fee is not included in freight",
         "\nThis charge is not a quotation\nonly",
         "\nThis charge cannot be a quotation only",
         " (not waived)",
         " is not waived",
+        " (hasn't yet been waived)",
     ],
 )
 def test_negated_non_billing_note_preserves_the_payable_fee(note: str) -> None:
@@ -1050,6 +1055,99 @@ def test_exclusion_does_not_reach_outside_the_labeled_charge(note: str) -> None:
     ]
     (clause,) = extraction.extraction.excluded_clauses
     assert clause.text == note.splitlines()[-1]
+
+
+@pytest.mark.parametrize("note", ["上述两项费用免收", "上述兩筆均不計費", "Both fees are\nwaived"])
+def test_group_waiver_counts_each_labeled_charge_block_once(note: str) -> None:
+    details = "Charge: Handling Fee\nAmount: 30 USD\nPayment Term: PP\nStorage Fee 500 USD"
+    doc = _document("counted-exclusion", f"Invoice INV-1\nIssuer: {_ENTITY}\n{details}\n{note}")
+
+    extraction = extract_document_by_rules(doc)
+
+    assert not extraction.charges and not extraction.raw_parse_issues
+    (clause,) = extraction.extraction.excluded_clauses
+    assert clause.text == " ".join((*details.splitlines(), *note.splitlines()))
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        "",
+        "Handling Fee 30 USD\nStorage Fee 500 USD\n\n",
+        "Handling Fee 30 USD\n[Page 2]\nStorage Fee 500 USD\n",
+        "Handling Fee 30 USD\nStorage Fee 500 USD\nWharfage 20 USD\n",
+    ],
+    ids=["no-fees", "gap-before-note", "page-boundary", "more-than-stated"],
+)
+def test_group_waiver_requires_an_unambiguous_count_on_the_same_page(details: str) -> None:
+    note = "Both fees are waived"
+    doc = _document(
+        "uncertain-exclusion", f"[Page 1]\nInvoice INV-1\nIssuer: {_ENTITY}\n{details}{note}"
+    )
+
+    result = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only")
+
+    extraction = result.documents[0].extraction
+    (issue,) = extraction.raw_parse_issues
+    assert (issue.code, issue.severity, issue.field, issue.actual) == (
+        AlertCode.LLM_EXTRACTION_FAILED, AlertSeverity.BLOCKER, "excluded_clauses", note,
+    )
+    (clause,) = extraction.extraction.excluded_clauses
+    assert clause.text == note and clause.reason == issue.message
+    if details:
+        assert result.records and all(issue in row.validation_alerts for row in result.records)
+    else:
+        (failure,) = result.failed_document_alerts
+        assert failure.doc_id == doc.doc_id and failure.reason == issue.message
+    assert serialize_records(result.records, "official") == []
+
+
+def test_group_waiver_excludes_adjacent_table_fees() -> None:
+    doc = _document(
+        "table-group-waiver",
+        f"Invoice INV-1\nIssuer: {_ENTITY}",
+        tables=[ParsedTable(source="[Page 2]", rows=[
+            ["Description", "Amount", "Currency"],
+            ["Handling Fee", "30", "USD"],
+            ["Storage Fee", "500", "USD"],
+            ["All fees are waived", "", ""],
+        ])],
+    )
+
+    extraction = extract_document_by_rules(doc)
+
+    assert not extraction.charges and not extraction.raw_parse_issues
+    (clause,) = extraction.extraction.excluded_clauses
+    assert clause.page == 2 and "30" in clause.text and "500" in clause.text
+
+
+@pytest.mark.parametrize("separate_remark", [True, False], ids=["ocr-remark", "text-with-ocr"])
+def test_group_waiver_with_unlocated_ocr_charges_requires_review(separate_remark: bool) -> None:
+    note = "Both fees are waived"
+    doc = _document(
+        "ocr-waiver",
+        f"Invoice INV-1\nIssuer: {_ENTITY}\n" + (
+            "" if separate_remark else f"Handling Fee 30 USD\nStorage Fee 500 USD\n{note}"
+        ),
+        ocr_payload={"has_charges": True, "has_metadata": True, "items": [{
+            "chargeList": [
+                {"name": "Handling Fee", "amount": "30", "currency": "USD"},
+                {"name": "Storage Fee", "amount": "500", "currency": "USD"},
+            ],
+            "other": {"Remarks": note} if separate_remark else {},
+        }]},
+    )
+
+    result = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only")
+
+    assert len(result.records) == 2
+    for row in result.records:
+        (issue,) = row.validation_alerts
+        assert (issue.code, issue.severity, issue.field) == (
+            AlertCode.LLM_EXTRACTION_FAILED, AlertSeverity.BLOCKER, "excluded_clauses",
+        )
+        assert note in issue.actual
+    assert serialize_records(result.records, "official") == []
 
 
 @pytest.mark.parametrize("charge_name", ["THC", "DOC", "HANDLING FEE"])
@@ -1138,6 +1236,76 @@ def test_text_row_fallback_keeps_the_marked_rate_currency() -> None:
     assert any(
         alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT and alert.field == "currency"
         for alert in row.validation_alerts
+    )
+    assert serialize_records([row], "official") == []
+
+
+@pytest.mark.parametrize(
+    "detail",
+    ["Wharfage @ USD 15 × 2", "Wharfage @ USD 15* 2", "Storage Fee 2 at USD 15"],
+)
+def test_rate_operands_without_line_totals_are_not_local_charges(detail: str) -> None:
+    doc = _document(
+        "isolated-operand", f"Invoice INV-1\nIssuer: {_ENTITY}\nCurrency: USD\n{detail}"
+    )
+
+    assert extract_document_by_rules(doc).charges == []
+
+
+@pytest.mark.parametrize("multiplier", ["2.0", "3"])
+def test_two_printed_quantities_must_agree_even_if_the_prefix_balances(multiplier: str) -> None:
+    detail = f"Wharfage qty 2 @ USD 15 x {multiplier} line total 30 USD"
+    doc = _document("two-quantities", f"Invoice INV-1\nIssuer: {_ENTITY}\n{detail}")
+
+    (row,) = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only").records
+
+    assert row.quantity == 2 and row.unit_price == 15 and row.amount == 30
+    if multiplier == "3":
+        (issue,) = row.validation_alerts
+        assert (issue.code, issue.severity, issue.field, issue.expected, issue.actual) == (
+            AlertCode.CROSS_DOCUMENT_CONFLICT, AlertSeverity.BLOCKER, "quantity", "2", "3",
+        )
+        assert serialize_records([row], "official") == []
+    else:
+        assert row.validation_alerts == []
+        assert len(serialize_records([row], "official")) == 1
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Storage Fee 30 USD (PP) (PP)",
+        "Storage Fee 30 USD (PREPAID), (P);",
+        "Charge: Storage Fee\nPayment Term: P\nAmount: 30 USD (PP)\nPayment Terms: PREPAID",
+    ],
+    ids=["duplicate", "normalized-aliases", "label-attributes"],
+)
+def test_equal_printed_payment_terms_are_combined(detail: str) -> None:
+    doc = _document("repeated-term", f"Invoice INV-1\nIssuer: {_ENTITY}\n{detail}")
+
+    (row,) = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only").records
+
+    assert row.payment_term is PaymentTerm.PP and "payment_term" in row.explicit_fields
+    assert "payment_term" not in row.raw_invalid_fields and row.validation_alerts == []
+    (official,) = serialize_records([row], "official")
+    assert official["charge_details"]["payment_term"] == "PP"
+
+
+def test_structured_ocr_term_cannot_hide_conflicting_source_terms() -> None:
+    doc = _document(
+        "ocr-payment-conflict", f"Invoice INV-1\nIssuer: {_ENTITY}",
+        ocr_payload={"has_charges": True, "has_metadata": True, "items": [{"chargeList": [{
+            "name": "Storage Fee", "amount": "30", "currency": "USD", "paymentTerm": "CC",
+            "sourceText": "Storage Fee 30 USD (PP) (CC)",
+        }]}]},
+    )
+
+    (row,) = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only").records
+
+    assert row.payment_term is None and row.raw_invalid_fields["payment_term"] == "PP / CC"
+    (issue,) = row.validation_alerts
+    assert (issue.code, issue.severity, issue.field) == (
+        AlertCode.CROSS_DOCUMENT_CONFLICT, AlertSeverity.BLOCKER, "payment_term",
     )
     assert serialize_records([row], "official") == []
 
@@ -1244,6 +1412,42 @@ def test_grounding_pairs_reordered_equal_amounts_using_the_printed_payment_terms
         (PaymentTerm.PP, 4),
     ]
     assert all(row.review_status is ReviewStatus.AUTO_READY for row in result.records)
+
+
+@pytest.mark.parametrize(
+    ("printed_amount", "model_amount", "arithmetic_blocked"),
+    [("30", "30.00", False), ("30.021", "30.02", True)],
+    ids=["decimal-scale-is-equivalent", "matching-tolerance-cannot-hide-source-mismatch"],
+)
+def test_grounded_arithmetic_uses_the_printed_decimals(
+    printed_amount: str, model_amount: str, arithmetic_blocked: bool
+) -> None:
+    doc = _document(
+        "printed-operands",
+        f"Invoice INV-123\nIssuer: {_ENTITY}\nBill To: {_CUSTOMER}\n"
+        f"Wharfage @ 15 USD x 2 line total {printed_amount} USD",
+    )
+    response = _response(model_amount, total=None, charges=[{
+        "raw_charge_name": "Wharfage", "currency": "USD", "amount": model_amount,
+        "quantity": "2.0", "unit_price": "15.00",
+    }])
+
+    client = FakeStructuredLlmClient([response] * 2)
+    result = run_billing_pipeline([doc], _ENTITY, llm_client=client)
+
+    (row,) = result.records
+    assert row.amount == Decimal(printed_amount) and row.raw_amount_text == printed_amount
+    assert (row.raw_quantity_text, row.raw_unit_price_text) == ("2", "15")
+    assert {"amount", "quantity", "unit_price"} <= row.explicit_fields
+    if arithmetic_blocked:
+        (issue,) = row.validation_alerts
+        assert (issue.code, issue.severity, issue.expected, issue.actual) == (
+            AlertCode.LINE_ARITHMETIC_MISMATCH, AlertSeverity.BLOCKER, "30", printed_amount,
+        )
+        assert serialize_records([row], "official") == []
+    else:
+        assert row.validation_alerts == [] and result.llm_calls_used == 1
+        assert len(serialize_records([row], "official")) == 1
 
 
 @pytest.mark.parametrize(
