@@ -695,7 +695,10 @@ def test_recalculation_without_callbacks_validates_credit_under_both_entities() 
         (current,), reset_count = recalculate_for_entity([previous], entity)
         assert reset_count == 1
         assert current.operation is OperationType.CREATE
-        assert current.review_status is ReviewStatus.AUTO_READY
+        assert current.review_status is (
+            ReviewStatus.NEEDS_REVIEW if entity == ZIM else ReviewStatus.AUTO_READY
+        )
+        assert current.requires_reapproval == (entity == ZIM)
         assert current.posting_type is direction
         assert current.is_credit
         assert current.amount == Decimal("-40.00")

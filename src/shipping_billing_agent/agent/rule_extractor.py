@@ -62,7 +62,7 @@ _BOX_LABEL = re.compile(
 _LABELED_BOX = re.compile(r"\b(?=[A-Z0-9]{0,10}[A-Z])(?=[A-Z0-9]{0,10}[0-9])[A-Z0-9]{11}\b", re.I)
 _COMPANY = re.compile(
     r"^.+?\b(?:CO[., ]+LTD|INCORPORATED|CORPORATION|LIMITED|LTD|INC|LLC|GMBH)\b[.,]*"
-    r"(?: +(?:[^\W\d_][\w'-]* +)*Branch\b[.,]*)?(?: *\([^()]*\)[.,]*)*",
+    r"(?: +(?:[^\W\d_][\w'-]* +)*Branch\b[.,]*)?(?:[\s,./-]*\([^()]*\)[.,]*)*",
     re.I,
 )
 _BILL_TITLE = re.compile(
@@ -92,6 +92,12 @@ _CONDITIONAL = re.compile(
     r"^\s*fee of\s+\$|违约|違約|罚金|罰金",
     re.I,
 )
+_NON_BILLING_NOTE = re.compile(
+    r"\b(?:(?:quotation|quote|estimate)\s+only|for\s+quotation|already\s+included|included\s+in|"
+    r"free\s+of\s+charge|no\s+charge|waived|for\s+(?:reference|information)\s+only|"
+    r"non[-\s]billable|not\s+payable)\b|仅供报价|估价|已包含|免收|仅供参考",
+    re.I,
+)
 _BANK_REASON = "银行汇款信息"
 _CONDITIONAL_REASON = "条件收费或违约条款"
 _INSTRUCTION = re.compile(r"\bignore\s+(?:all|previous|prior)\b", re.I)
@@ -108,6 +114,7 @@ _SUMMARY_CURRENCY_PREFIX = re.compile(
 _SUMMARY_STATED_CURRENCY = re.compile(
     rf"\b(?:currency|curr|cur)\b\s*[:=]?\s*({_CURRENCY_SLOT})(?!\w)", re.I
 )
+_INLINE_TOTAL = re.compile(r"\s+(?P<summary>total\s*(?:\([^()]*\)\s*)?[:=].*)$", re.I)
 _DOLLAR_CURRENCIES = {
     "USD",
     "AUD",
@@ -143,10 +150,12 @@ _MONEY = re.compile(
     re.I,
 )
 _DETAIL_MONEY = re.compile(
-    rf"(?<![\w.,/+-])(?:{_CURRENCY}\s*)?"
-    rf"(?P<amount>{_NUMBER}|[-+]?\.[0-9]+)(?:{_CURRENCY})?(?![\w/+-]|[.,][0-9])",
+    rf"(?<![\w.,/+-])(?:(?P<prefix>{_CURRENCY})\s*)?"
+    rf"(?P<amount>{_NUMBER}|[-+]?\.[0-9]+)"
+    rf"(?:\s*(?P<suffix>{_CURRENCY})(?!\w))?(?![\w/+-]|[.,][0-9])",
     re.I,
 )
+_DETAIL_CURRENCY = re.compile(rf"(?<![^\W\d_]){_CURRENCY}(?![^\W\d_])")
 _SUMMARY_DUE_TO = re.compile(rf"^(?P<party>.+?)\s+(?=(?:{_CURRENCY}\s+)?{_NUMBER}(?:\s|$))", re.I)
 _SUMMARY_MAPS = {
     "subtotal_amount": "subtotals_by_currency",
@@ -249,7 +258,8 @@ _PARTY_LABELS = {
     "payee_hint": r"payee|paid to|balance due to",
 }
 _PARTY_VALUE_TAIL = re.compile(
-    r"\t+|(?:^|\s+)(?:reference(?:\s+(?:number|no\.?|id|#))?|(?:invoice|debit note|credit note)"
+    r"\t+|(?:^|\s+)(?:(?:reference|ref\.?)(?:\s+(?:number|no\.?|id|#))?|from|to|"
+    r"(?:invoice|debit note|credit note)"
     r"\s+(?:number|no\.?|id|#)|(?:(?:invoice|document|issue|D/C|D/N|C/N)\s+)?date|currency|"
     rf"hbl(?: no\.?)?|mbl(?: no\.?)?|booking(?: no\.?)?|{'|'.join(_PARTY_LABELS.values())})"
     r"\s*[:=]",
@@ -276,6 +286,9 @@ class _Evidence:
     container_nos: list[str] = field(default_factory=list)
     clauses: list[ExcludedClause] = field(default_factory=list)
     issues: list[ValidationAlert] = field(default_factory=list)
+    charge_currency_conflicts: dict[int, tuple[str, list[ValidationAlert]]] = field(
+        default_factory=dict
+    )
     summaries: list[tuple[str, Any, str | None]] = field(default_factory=list)
     currencies: set[str] = field(default_factory=set)
 
@@ -296,6 +309,27 @@ class _Evidence:
         clause = ExcludedClause(text=sanitize_for_llm(text), reason=reason, page=page)
         if clause not in self.clauses:
             self.clauses.append(clause)
+
+    def add_charge(self, row: dict[str, Any], *currency_tokens: str | None) -> None:
+        tokens = [token for token in currency_tokens if token]
+        if tokens:
+            currency, conflicts = _printed_currency(tokens)
+            row["currency"] = currency if not conflicts else None
+            if conflicts:
+                issues = [
+                    ValidationAlert.from_code(
+                        AlertCode.CROSS_DOCUMENT_CONFLICT,
+                        "费用明细行标明了不同的币种",
+                        field="currency",
+                        expected=currency,
+                        actual=conflict,
+                    )
+                    for conflict in conflicts
+                ]
+                raw = " / ".join(dict.fromkeys(tokens))
+                self.charge_currency_conflicts[len(self.charges)] = (raw, issues)
+                self.issues.extend(issue for issue in issues if issue not in self.issues)
+        self.charges.append(row)
 
 
 def _text_lines(text: str) -> list[_Line]:
@@ -343,6 +377,8 @@ def _non_billing_reason(text: str) -> str | None:
         return "已付金额"
     if re.search(r"\bCARRIER\s+FREE\s+H\s*/?\s*C\b", text, re.I):
         return "承运方免收操作费"
+    if _NON_BILLING_NOTE.search(text):
+        return "报价、已含、免收或其他非记账说明"
     if _CONDITIONAL.search(text):
         return _CONDITIONAL_REASON
     return None
@@ -387,7 +423,9 @@ def _capture_clauses(lines: Sequence[_Line], evidence: _Evidence) -> set[int]:
     return skipped
 
 
-def _charge_evidence(doc: ParsedDocument) -> Iterator[tuple[str, frozenset[Decimal]]]:
+def _charge_evidence(
+    doc: ParsedDocument, rules: RawExtractionEnvelope
+) -> Iterator[tuple[str, frozenset[Decimal], frozenset[str]]]:
     def detail_lines(lines: Sequence[_Line]) -> Iterator[str]:
         skipped = _capture_clauses(lines, _Evidence())
         for line in lines:
@@ -425,20 +463,36 @@ def _charge_evidence(doc: ParsedDocument) -> Iterator[tuple[str, frozenset[Decim
                 ):
                     continue
                 values = [
-                    str(fields[field]) for field in ("amount", "debit", "credit") if field in fields
+                    str(fields[field])
+                    for field in ("amount", "debit", "credit", "currency")
+                    if field in fields
                 ]
                 yield from detail_lines(_text_lines("\t".join([name, *values])))
                 yield from detail_lines(_text_lines(source))
 
+    dollar_currency, _ = normalize_currency(
+        "$",
+        context_currencies=_envelope_currencies(rules),
+        us_shipping_context=bool(_US_CONTEXT.search(doc.raw_text)),
+    )
     for text in source_rows():
         amounts = set()
+        tokens = [match[0] for match in _DETAIL_CURRENCY.finditer(text)]
         for match in _DETAIL_MONEY.finditer(text):
             try:
                 amounts.add(parse_decimal_strict(match["amount"]).copy_abs())
             except ValueError:
                 continue
+            tokens.extend(token for token in (match["prefix"], match["suffix"]) if token)
         if amounts:
-            yield text, frozenset(amounts)
+            currency, conflicts = _printed_currency(tokens)
+            if currency == "$":
+                currency = dollar_currency or currency
+            yield (
+                text,
+                frozenset(amounts),
+                frozenset(token for token in (currency, *conflicts) if token),
+            )
 
 
 def _record_summary(text: str, evidence: _Evidence) -> bool:
@@ -500,7 +554,7 @@ def _currency_token(raw: str) -> str:
     return _PRINTED_CURRENCY_ALIASES.get(token.upper(), token)
 
 
-def _summary_currency(evidence: _Evidence, field_name: str, tokens: Sequence[str]) -> str | None:
+def _printed_currency(tokens: Sequence[str]) -> tuple[str | None, list[str]]:
     currencies = list(
         dict.fromkeys(
             normalize_currency(_currency_token(token))[0] or token.upper() for token in tokens
@@ -508,10 +562,15 @@ def _summary_currency(evidence: _Evidence, field_name: str, tokens: Sequence[str
     )
     explicit = [currency for currency in currencies if currency != "$"]
     if not explicit:
-        return currencies[0] if currencies else None
+        return (currencies[0] if currencies else None), []
     first, *conflicts = explicit
     if "$" in currencies and not conflicts and first not in _DOLLAR_CURRENCIES:
         conflicts.append("$")
+    return first, conflicts
+
+
+def _summary_currency(evidence: _Evidence, field_name: str, tokens: Sequence[str]) -> str | None:
+    first, conflicts = _printed_currency(tokens)
     for conflict in conflicts:
         _flag_conflicting_value(evidence, f"{field_name}_currency", first, conflict)
     return first
@@ -570,7 +629,7 @@ def _summary_values(evidence: _Evidence, dollar_currency: str | None) -> None:
             evidence.fields.setdefault("total_currency", currency)
 
 
-def _value_after(lines: Sequence[_Line], label: str, value: str) -> str | None:
+def _labeled_values(lines: Sequence[_Line], label: str) -> Iterator[str]:
     pattern = re.compile(rf"^\s*(?:{label})(?:(?<=:)|(?=\W|$))\s*[:#=]?\s*(.*)$", re.I)
     for index, line in enumerate(lines):
         if not (match := pattern.match(line.text)):
@@ -578,6 +637,11 @@ def _value_after(lines: Sequence[_Line], label: str, value: str) -> str | None:
         rest = match[1]
         if not rest and index + 1 < len(lines) and lines[index + 1].page == line.page:
             rest = lines[index + 1].text
+        yield rest
+
+
+def _value_after(lines: Sequence[_Line], label: str, value: str) -> str | None:
+    for rest in _labeled_values(lines, label):
         if found := re.match(value, rest, re.I):
             return found[0].strip()
     return None
@@ -588,13 +652,13 @@ def _first_company(text: str) -> str:
     return match[0] if match else text
 
 
-def _party(lines: Sequence[_Line], label: str) -> str | None:
-    value = _value_after(lines, label, r"\S[^\n]*")
-    if not value:
-        return None
-    if tail := _PARTY_VALUE_TAIL.search(value):
-        return value[: tail.start()].rstrip(" ;") or None
-    return value
+def _party(lines: Sequence[_Line], label: str, *, company_only: bool = False) -> str | None:
+    for value in _labeled_values(lines, label):
+        if tail := _PARTY_VALUE_TAIL.search(value):
+            value = value[: tail.start()].rstrip(" ;")
+        if value and (not company_only or _COMPANY.match(value)):
+            return value
+    return None
 
 
 def _collect_text_headers(
@@ -632,9 +696,7 @@ def _collect_text_headers(
             evidence.fields.setdefault(field_name, value)
     # Unqualified From/To labels can also identify ports on shipping invoices.
     for field_name, label in (("issuer", r"from\s*:"), ("recipient", r"to\s*:")):
-        if field_name not in evidence.fields and (
-            value := _value_after(lines, label, _COMPANY.pattern)
-        ):
+        if field_name not in evidence.fields and (value := _party(lines, label, company_only=True)):
             evidence.fields[field_name] = value
     if title:
         leading_companies = []
@@ -970,37 +1032,40 @@ def _split_ocr_rows(lines: Sequence[_Line], evidence: _Evidence, skipped: set[in
     consumed = set()
     for start, stop in zip(starts, [*starts[1:], end], strict=False):
         description = lines[start]
-        detail = lines[start + 1 : stop]
-        numbers = [
-            money
-            for line in detail
+        detail = [
+            line
+            for line in lines[start + 1 : stop]
             if line.page == description.page
             and line.number not in skipped
-            and (money := _MONEY.fullmatch(line.text))
+            and not _SUMMARY.match(line.text)
         ]
+        numbers = [money for line in detail if (money := _MONEY.fullmatch(line.text))]
         if not numbers:
             continue
         currencies = [
             line.text
             for line in detail
-            if re.fullmatch(_CURRENCY, line.text, re.I) and line.text.upper() == line.text
+            if re.fullmatch(_CURRENCY_SLOT, line.text, re.I) and line.text.upper() == line.text
         ]
-        currency = numbers[-1]["prefix"] or numbers[-1]["suffix"] or numbers[0]["suffix"]
+        currencies.extend(
+            token for money in numbers for token in (money["prefix"], money["suffix"]) if token
+        )
         term = next((line.text for line in detail if normalize_payment_term(line.text)), None)
-        evidence.charges.append(
+        evidence.add_charge(
             {
                 "raw_charge_name": description.text,
                 "amount": numbers[-1]["amount"],
                 "unit_price": numbers[0]["amount"] if len(numbers) > 1 else None,
-                "currency": currency
-                or next(iter(currencies), evidence.fields.get("total_currency")),
+                "currency": evidence.fields.get("total_currency"),
                 "payment_term": term,
-                "source_text": "\n".join(line.text for line in lines[start:stop]),
+                "source_text": "\n".join(line.text for line in (description, *detail)),
                 "line_number": description.number,
                 "page": description.page,
-            }
+            },
+            *currencies,
         )
-        consumed.update(line.number for line in lines[start:stop])
+        consumed.add(description.number)
+        consumed.update(line.number for line in detail)
     return consumed
 
 
@@ -1008,7 +1073,6 @@ def _text_charge_fields(row: re.Match[str]) -> dict[str, str | None]:
     return {
         "raw_charge_name": row["name"],
         "amount": row["amount"],
-        "currency": row["prefix"] or row["suffix"],
         "payment_term": row["amount_term"] or (row["term"] or "").strip(" ()") or None,
     }
 
@@ -1034,6 +1098,12 @@ def _collect_text_charges(
         if re.search(r"\b(?:DESCRIPTION|CHARGE)\b.*\bQTY\b.*\bDEBIT\b", text, re.I):
             in_ledger = True
             continue
+        if total := _INLINE_TOTAL.search(text):
+            detail = text[: total.start()]
+            row = _TEXT_ROW.fullmatch(detail)
+            if _RATE_ROW.fullmatch(detail) or (row and _FEE.search(row["name"])):
+                _record_summary(total["summary"], evidence)
+                text = detail
         if amount := re.fullmatch(r"(?:charge\s+)?amount\s*:\s*(.+)", text, re.I):
             labeled_amount, amount_line = amount[1], line
             continue
@@ -1046,7 +1116,11 @@ def _collect_text_charges(
                 fields = _text_charge_fields(row)
                 if _key(row["name"]) == "hc":
                     fields["raw_charge_name"] = "Handling Charge"
-                evidence.charges.append(_charge_from_columns(fields, text, line.number, line.page))
+                evidence.add_charge(
+                    _charge_from_columns(fields, text, line.number, line.page),
+                    row["prefix"],
+                    row["suffix"],
+                )
                 continue
         if waybill := re.match(
             rf"^(?:[A-Z]{{4}}\s+({_REF})\s+)?Waybill\s+({_REF})\s+(.+)$", text, re.I
@@ -1067,17 +1141,24 @@ def _collect_text_charges(
                 "raw_charge_name": rate_row["name"],
                 "unit_price": rate_row["rate"],
                 "amount": rate_row["amount"],
-                "currency": rate_row["currency"] or rate_row["rate_currency"],
                 "payment_term": rate_row["amount_term"]
                 or (rate_row["term"] or "").strip(" ()")
                 or None,
             }
-            evidence.charges.append(_charge_from_columns(fields, line.text, line.number, line.page))
+            evidence.add_charge(
+                _charge_from_columns(fields, line.text, line.number, line.page),
+                rate_row["rate_currency"],
+                rate_row["currency"],
+            )
         elif (row := _TEXT_ROW.fullmatch(text)) and (
             _FEE.search(row["name"]) and not _TRANSPORT_LABEL.search(row["name"])
         ):
             fields = _text_charge_fields(row)
-            evidence.charges.append(_charge_from_columns(fields, line.text, line.number, line.page))
+            evidence.add_charge(
+                _charge_from_columns(fields, line.text, line.number, line.page),
+                row["prefix"],
+                row["suffix"],
+            )
         if change := re.search(
             rf"\bchange\s+(?:the\s+)?payment\s+terms?\s+to\s+({_TERM})\b", text, re.I
         ):
@@ -1093,14 +1174,16 @@ def _collect_text_charges(
             change_charge = text
     if not evidence.charges and (change_term or labeled_amount) and change_charge:
         fields = {"raw_charge_name": change_charge, "payment_term": change_term}
+        currency_tokens = ()
         if amount_line is not None:
             fields["amount"] = labeled_amount
             if money := _MONEY.fullmatch(labeled_amount or ""):
-                fields.update(amount=money["amount"], currency=money["prefix"] or money["suffix"])
+                fields["amount"] = money["amount"]
+                currency_tokens = (money["prefix"], money["suffix"])
             fields.update(
                 source_text=amount_line.text, line_number=amount_line.number, page=amount_line.page
             )
-        evidence.charges.append(fields)
+        evidence.add_charge(fields, *currency_tokens)
 
 
 def _annotate_dollar(
@@ -1195,7 +1278,11 @@ def _extract_local(doc: ParsedDocument) -> RawExtractionEnvelope:
     dollar_rows = []
     for index, charge in enumerate(evidence.charges if not metadata_only else ()):
         currency = charge.get("currency")
-        if currency is None and len(known_currencies) <= 1:
+        if (
+            currency is None
+            and index not in evidence.charge_currency_conflicts
+            and len(known_currencies) <= 1
+        ):
             currency = document_currency
         if currency == "$":
             dollar_rows.append(index)
@@ -1223,6 +1310,12 @@ def _extract_local(doc: ParsedDocument) -> RawExtractionEnvelope:
         )
     )
     result.raw_parse_issues.extend(evidence.issues)
+    if not metadata_only:
+        for index, (raw, issues) in evidence.charge_currency_conflicts.items():
+            row = result.charges[index]
+            row.explicit_fields.add("currency")
+            row.raw_invalid_fields["currency"] = raw
+            row.raw_parse_issues.extend(issues)
     if dollar_summary:
         for field_name in dollar_summary_fields or ("total_currency",):
             _annotate_dollar(result, field_name, dollar_currency, dollar_reason)

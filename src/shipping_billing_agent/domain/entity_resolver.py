@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from functools import partial
 from typing import Any
 from unicodedata import normalize
 
@@ -63,6 +64,7 @@ _REQUIRED_OVERRIDES = {"amount", "currency", "charge_item", "posting_type"}
 _ENTITY_OVERRIDES = {"posting_type", "matched_existing_bill_id", "force_create_new"}
 _REVIEW_FIELDS = (
     "charge_item",
+    "raw_charge_name",
     "quantity",
     "unit_price",
     "amount",
@@ -73,6 +75,8 @@ _REVIEW_FIELDS = (
     "document_date",
     "issuer",
     "recipient",
+    "payer_hint",
+    "payee_hint",
     "posting_type",
     "debit_credit",
     "is_credit",
@@ -80,6 +84,7 @@ _REVIEW_FIELDS = (
     "matched_bill_ref",
     "match_level",
 )
+_HUMAN_DECISIONS = (ReviewStatus.APPROVED, ReviewStatus.REJECTED)
 _PartyKey = tuple[str, tuple[str, ...]]
 
 
@@ -409,6 +414,32 @@ def has_explicit_parties(record: ProcessedBillingRecord) -> bool:
     )
 
 
+def _match_ledger_records(
+    records: list[ProcessedBillingRecord],
+    match: Callable[[list[ProcessedBillingRecord]], list[ProcessedBillingRecord]],
+) -> list[ProcessedBillingRecord]:
+    """Keep explicitly different branches out of the historical bill matcher."""
+    eligible = {}
+    for index, record in enumerate(records):
+        if record.posting_type is not None:
+            eligible[index] = record
+            continue
+        target_stem, target_branch = _party_key(record.accounting_entity)
+        parties = (record.payer_hint, record.payee_hint)
+        if not any(party and party.strip() for party in parties):
+            parties = (record.issuer, record.recipient)
+        if target_stem and any(
+            stem == target_stem and branch != target_branch
+            for stem, branch in map(_party_key, parties)
+        ):
+            continue
+        eligible[index] = record
+    if len(eligible) == len(records):
+        return match(records)
+    matched = dict(zip(eligible, match(list(eligible.values())) if eligible else (), strict=True))
+    return [matched.get(index, record) for index, record in enumerate(records)]
+
+
 @dataclass(frozen=True, slots=True)
 class _ReviewBasis:
     billing_fields: tuple[Any, ...]
@@ -480,15 +511,12 @@ def recalculate_for_entity(
     from .matcher import _prepare_record, match_and_inherit_batch
     from .validators import validate_batch
 
-    reviewed = {
-        record.id: record
-        for record in records
-        if record.review_status in (ReviewStatus.APPROVED, ReviewStatus.REJECTED)
-    }
+    previous_by_id = {record.id: record for record in records}
     updated = []
     for record in records:
+        same_ledger = entity_matches(record.accounting_entity, new_entity, profiles)
         overrides = record.human_overrides
-        if not entity_matches(record.accounting_entity, new_entity, profiles):
+        if not same_ledger:
             overrides = {
                 field: value for field, value in overrides.items() if field not in _ENTITY_OVERRIDES
             }
@@ -497,6 +525,11 @@ def recalculate_for_entity(
                 "accounting_entity": new_entity,
                 "operation": OperationType.PENDING_REVIEW,
                 "review_status": ReviewStatus.NEEDS_REVIEW,
+                "requires_reapproval": (
+                    same_ledger
+                    and record.requires_reapproval
+                    and record.review_status not in _HUMAN_DECISIONS
+                ),
                 "human_overrides": overrides,
                 "ai_reasoning": [],
                 "reject_reason": None,
@@ -504,26 +537,42 @@ def recalculate_for_entity(
         )
         updated.append(_prepare_record(source, profiles, charge_dictionary, recompute_entity=True))
     if matcher_fn is None or matcher_fn is match_and_inherit_batch:
-        updated = match_and_inherit_batch(updated, existing_bills, profiles, charge_dictionary)
+        match = partial(
+            match_and_inherit_batch,
+            existing_bills=existing_bills,
+            profiles=profiles,
+            charge_dictionary=charge_dictionary,
+        )
     else:
         scoped_bills = [
             bill
             for bill in existing_bills
             if entity_matches(bill.accounting_entity, new_entity, profiles)
         ]
-        updated = matcher_fn(updated, scoped_bills)
+
+        def match(rows: list[ProcessedBillingRecord]) -> list[ProcessedBillingRecord]:
+            return matcher_fn(rows, scoped_bills)
+
+    updated = _match_ledger_records(updated, match)
     updated = validate_batch(updated, bundles) if validator_fn is None else validator_fn(updated)
     reset_approval_count = 0
     for index, record in enumerate(updated):
-        previous = reviewed.get(record.id)
+        previous = previous_by_id.get(record.id)
         if previous is None:
             continue
         same_ledger = entity_matches(previous.accounting_entity, record.accounting_entity, profiles)
+        if previous.review_status not in _HUMAN_DECISIONS:
+            if same_ledger and previous.requires_reapproval:
+                updated[index] = record.model_copy(
+                    update={"review_status": ReviewStatus.NEEDS_REVIEW, "requires_reapproval": True}
+                )
+            continue
         before, after = _review_basis(previous), _review_basis(record)
         if same_ledger and before == after:
             updated[index] = record.model_copy(
                 update={
                     "review_status": previous.review_status,
+                    "requires_reapproval": False,
                     "reject_reason": previous.reject_reason,
                     "human_review_history": previous.human_review_history,
                 }
@@ -536,9 +585,15 @@ def recalculate_for_entity(
                 after.field_diffs,
             )
             if same_ledger and (
-                before.shipment_refs != after.shipment_refs or same_bill and changed_action
+                previous.review_status is ReviewStatus.APPROVED
+                or before.shipment_refs != after.shipment_refs
+                or same_bill
+                and changed_action
             ):
                 updated[index] = record.model_copy(
-                    update={"review_status": ReviewStatus.NEEDS_REVIEW}
+                    update={
+                        "review_status": ReviewStatus.NEEDS_REVIEW,
+                        "requires_reapproval": previous.review_status is ReviewStatus.APPROVED,
+                    }
                 )
     return updated, reset_approval_count

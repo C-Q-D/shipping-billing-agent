@@ -135,6 +135,38 @@ def test_line_arithmetic_cent_boundary(amount: str, passes: bool) -> None:
         _assert_review(validated, AlertCode.LINE_ARITHMETIC_MISMATCH)
 
 
+@pytest.mark.parametrize(
+    ("explicit", "overrides", "check_arithmetic"),
+    [
+        ({"payment_term"}, {"amount": "35"}, False),
+        (set(), {"amount": "35"}, True),
+        ({"quantity", "unit_price"}, {"amount": "35"}, True),
+        ({"payment_term"}, {"amount": "35", "quantity": "2", "unit_price": "15"}, True),
+    ],
+    ids=["legacy-partial", "legacy-unannotated", "printed-rate", "edited-all-three"],
+)
+def test_arithmetic_checks_amount_override_against_stated_rate_fields(
+    explicit: set[str], overrides: dict[str, str], check_arithmetic: bool
+) -> None:
+    line = _line(
+        amount="30",
+        quantity="2",
+        unit_price="15",
+        explicit_fields=explicit,
+        human_overrides=overrides,
+    )
+
+    checked = validate_record(line)
+
+    assert checked.amount == Decimal("35")
+    if check_arithmetic:
+        _assert_review(checked, AlertCode.LINE_ARITHMETIC_MISMATCH)
+        assert not serialize_records([checked], "official")
+    else:
+        assert checked.review_status is ReviewStatus.AUTO_READY
+        assert len(serialize_records([checked], "official")) == 1
+
+
 def test_large_decimal_arithmetic_retains_cents_under_low_caller_precision() -> None:
     line = _line(
         amount="123456789012345678901234567890.021",
@@ -423,7 +455,8 @@ def test_same_entity_recalculation_rematches_against_reloaded_history_without_ca
     assert reset == 1
     assert result.matched_existing_bill_id == "updated-baseline"
     assert (result.amount, result.operation) == (Decimal("80"), OperationType.NO_CHANGE)
-    assert result.review_status is ReviewStatus.AUTO_READY and result.validation_alerts == []
+    assert result.review_status is ReviewStatus.NEEDS_REVIEW and result.validation_alerts == []
+    assert result.requires_reapproval and not serialize_records([result], "official")
     assert approved.matched_existing_bill_id == "old" and approved.amount == Decimal("30")
 
 
@@ -437,13 +470,20 @@ def test_unchanged_recalculation_keeps_manual_decision_under_an_entity_alias(
     history = [HumanReviewAction(action=status, operator="reviewer", timestamp="2026-02-28")]
     reason = "duplicate" if status is ReviewStatus.REJECTED else None
     original = validate_record(match_record(source, bills, profiles)).model_copy(
-        update={"review_status": status, "reject_reason": reason, "human_review_history": history}
+        update={
+            "review_status": status,
+            "requires_reapproval": True,
+            "reject_reason": reason,
+            "human_review_history": history,
+        }
     )
 
+    assert not validate_record(original).requires_reapproval
     (recalculated,), reset = recalculate_for_entity([original], "Neptune", profiles, bills)
 
     assert reset == 0
     assert recalculated.review_status is status
+    assert not recalculated.requires_reapproval
     assert recalculated.reject_reason == reason
     assert recalculated.human_review_history == history
     assert recalculated.operation is OperationType.UPDATE
@@ -1026,6 +1066,55 @@ def test_ocr_suspicion_confirmation_revalidates_against_the_exact_item(edit: str
     assert len(serialize_records([rechecked], "official")) == (0 if edit else 1)
 
 
+@pytest.mark.parametrize(
+    ("original", "equivalent", "changed"),
+    [
+        ({"other": "30 or 3O?"}, {"other": "30 or 3O?"}, {"other": "80 or 8O?"}),
+        (
+            {"chargeList": [{"amount": "30", "currency": "USD"}]},
+            {"chargeList": [{"currency": "USD", "amount": "30"}]},
+            {"chargeList": [{"currency": "USD", "amount": "30000"}]},
+        ),
+        (
+            {"locations": {"row": 1, "page": 2}},
+            {"locations": {"page": 2, "row": 1}},
+            {"locations": {"page": 3, "row": 1}},
+        ),
+    ],
+    ids=["other", "charge-list", "extra"],
+)
+def test_ocr_suspicion_without_text_invalidates_confirmation_when_content_changes(
+    original: dict, equivalent: dict, changed: dict
+) -> None:
+    bundles = [
+        _bundle(
+            ocr_payload={
+                "items": [{"suspicious": True, **data}],
+                "has_charges": True,
+                "has_metadata": True,
+            }
+        )
+        for data in (original, equivalent, changed)
+    ]
+    (initial,) = validate_batch([_line()], [bundles[0]])
+    (warning,) = initial.validation_alerts
+    resolved = warning.model_copy(update={"severity": AlertSeverity.RESOLVED})
+    confirmed = initial.model_copy(update={"validation_alerts": [resolved]})
+
+    (rechecked,) = validate_batch([confirmed], [bundles[1]])
+    (current,) = rechecked.validation_alerts
+    assert current.severity is AlertSeverity.RESOLVED and current.actual == warning.actual
+    assert len(serialize_records([rechecked], "official")) == 1
+
+    (rechecked,) = validate_batch([rechecked], [bundles[2]])
+
+    (current,) = rechecked.validation_alerts
+    assert current.code is AlertCode.OCR_SUSPICIOUS_FLAG
+    assert current.severity is AlertSeverity.WARNING
+    assert current.field == warning.field and current.actual != warning.actual
+    assert serialize_records([rechecked], "official") == []
+
+
 def test_duplicate_amount_excess_uses_the_total_before_tax() -> None:
     rows = [_line("first", amount="15"), _line("second", amount="15", source_line_index=1)]
     bundle = _bundle(tax_amount="3", total_amount="18", total_currency="USD")
@@ -1560,3 +1649,33 @@ def test_detached_package_reconciles_a_corrected_hbl_using_original_sibling_evid
     assert recalculated.operation is OperationType.CREATE
     assert recalculated.shipment_refs.hbl_no == "HBL-A"
     assert recalculated.package_sibling_refs == checked.package_sibling_refs
+
+
+def test_each_mail_package_checks_its_own_hbls_when_the_fee_is_shared() -> None:
+    digest = sha256(b"shared-fee").hexdigest()
+    bundles = [
+        bundle
+        for mail in ("a", "b")
+        for bundle in (
+            _bundle(f"fee-{mail}", parent_doc_id=mail, digest=digest),
+            _bundle(f"bl-{mail}", parent_doc_id=mail, shipment_refs={"hbl_no": f"HBL-{mail}"}),
+        )
+    ]
+    records = [
+        _line(
+            mail,
+            f"fee-{mail}",
+            issuer=ENTITY,
+            shipment_refs={"hbl_no": f"HBL-{mail}"},
+            package_sibling_refs=[{"source_doc_id": f"fee-{mail}", "parent_doc_id": mail}],
+        )
+        for mail in ("a", "b")
+    ]
+
+    (checked,) = validate_batch(records, bundles)
+
+    assert {source.parent_doc_id for source in checked.package_sibling_refs} == {"a", "b"}
+    assert len(serialize_records([checked], "official")) == 1
+    detached = ProcessedBillingRecord.model_validate_json(checked.model_dump_json())
+    recalculated, reset = recalculate_for_entity([detached], ENTITY)
+    assert reset == 0 and len(serialize_records(recalculated, "official")) == 1

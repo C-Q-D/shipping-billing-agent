@@ -9,6 +9,7 @@ from decimal import MAX_EMAX, MIN_EMIN, Decimal, localcontext
 from fractions import Fraction
 from itertools import combinations, product
 from string import ascii_uppercase
+from typing import Any
 from unicodedata import normalize
 
 from .charge_normalizer import normalize_charge_item, normalize_document_date
@@ -36,6 +37,7 @@ from .models import (
     SourceKind,
     SourceRefValue,
     ValidationAlert,
+    dumps_decimal_json,
     sanitize_source_path,
 )
 
@@ -156,6 +158,8 @@ def _with_alerts(
         alerts.setdefault((*key, current.expected), current)
 
     operation, status = record.operation, record.review_status
+    decided = status in (ReviewStatus.APPROVED, ReviewStatus.REJECTED)
+    requires_reapproval = record.requires_reapproval and not decided
     if any(
         alert.severity in (AlertSeverity.BLOCKER, AlertSeverity.WARNING)
         for alert in alerts.values()
@@ -167,13 +171,14 @@ def _with_alerts(
                 operation = OperationType.UPDATE if record.field_diffs else OperationType.NO_CHANGE
             else:
                 operation = OperationType.CREATE
-        if status not in (ReviewStatus.APPROVED, ReviewStatus.REJECTED):
-            status = ReviewStatus.AUTO_READY
+        if not decided:
+            status = ReviewStatus.NEEDS_REVIEW if requires_reapproval else ReviewStatus.AUTO_READY
     return record.model_copy(
         update={
             "validation_alerts": list(alerts.values()),
             "operation": operation,
             "review_status": status,
+            "requires_reapproval": requires_reapproval,
         }
     )
 
@@ -193,8 +198,11 @@ def _line_arithmetic_alert(
     historical_fields = record.inherited_fields.keys() - record.human_overrides.keys()
     if historical_fields.intersection(_NUMERIC_FIELDS):
         return None
-    if "amount" in record.explicit_fields and not {"quantity", "unit_price"}.issubset(
-        record.explicit_fields | record.human_overrides.keys()
+    stated_fields = record.explicit_fields | record.human_overrides.keys()
+    if (
+        record.explicit_fields
+        and "amount" in stated_fields
+        and not {"quantity", "unit_price"}.issubset(stated_fields)
     ):
         return None
 
@@ -419,19 +427,21 @@ def _with_reason(record: ProcessedBillingRecord, reason: str) -> ProcessedBillin
 
 def _merge_duplicate_sources(
     records: Sequence[ProcessedBillingRecord], bundles: Sequence[DocumentExtractionBundle]
-) -> tuple[list[ProcessedBillingRecord], dict[str, DocumentExtractionBundle]]:
+) -> tuple[list[ProcessedBillingRecord], dict[str, DocumentExtractionBundle], dict[str, str]]:
     by_id = {bundle.document.doc_id: bundle for bundle in bundles}
     records_by_doc: dict[str, list[ProcessedBillingRecord]] = defaultdict(list)
     for record in records:
         records_by_doc[record.source_doc_id].append(record)
 
     canonical = {}
+    canonical_ids = {}
     merged = {}
     dropped = set()
     for group in _document_groups(bundles):
         primary = group[0]
         primary_id = primary.document.doc_id
         canonical[primary_id] = primary
+        canonical_ids.update((bundle.document.doc_id, primary_id) for bundle in group)
         if len(group) == 1:
             continue
         # If only a copy was extracted successfully, keep its rows under the canonical ID.
@@ -478,7 +488,7 @@ def _merge_duplicate_sources(
             )
             record = _with_reason(record, f"已归并同批重复提交的同源单据：{'、'.join(paths)}")
         result.append(record)
-    return result, canonical
+    return result, canonical, canonical_ids
 
 
 def _signed_amount(record: ProcessedBillingRecord, amount: Decimal) -> Decimal:
@@ -838,29 +848,55 @@ def _cross_document_alerts(
 
 
 def _snapshot_package_source(
-    doc_id: str,
+    bundle: DocumentExtractionBundle,
+    canonical: DocumentExtractionBundle,
     bundles: dict[str, DocumentExtractionBundle],
     doc_records: Sequence[ProcessedBillingRecord],
 ) -> PackageShipmentRefs:
-    bundle = bundles[doc_id]
-    own = bundle.extraction.extraction.shipment_refs if bundle.extraction else ShipmentRefs()
-    originals = [
-        ShipmentRefs.model_validate(record.source_values_before_overrides["shipment_refs"] or {})
-        if "shipment_refs" in record.source_values_before_overrides
-        else _source_refs(record)
-        for record in doc_records
-    ]
-    hbls = [own.hbl_no] if own.hbl_no else [refs.hbl_no for refs in originals]
+    doc = bundle.document
+    extraction = bundle.extraction or canonical.extraction
+    own = extraction.extraction.shipment_refs if extraction else ShipmentRefs()
+    original_hbls = []
+    original_mbls = []
+    for record in doc_records:
+        # The billing row can include BLs borrowed from siblings in its own package.
+        snapshot = next(
+            (
+                source
+                for source in record.package_sibling_refs
+                if source.source_doc_id == record.source_doc_id
+            ),
+            None,
+        )
+        if snapshot is not None:
+            original_hbls.extend(snapshot.hbl_nos)
+            original_mbls.extend(snapshot.mbl_nos or ())
+            continue
+        original = (
+            ShipmentRefs.model_validate(
+                record.source_values_before_overrides["shipment_refs"] or {}
+            )
+            if "shipment_refs" in record.source_values_before_overrides
+            else _source_refs(record)
+        )
+        original_hbls.append(original.hbl_no)
+        original_mbls.extend(original.mbl_nos)
+    hbls = [own.hbl_no] if own.hbl_no else original_hbls
     mbls = None
-    if bundle.document.source_kind is not SourceKind.EML_BODY:
-        source_path = _document_path(doc_id, bundles)
-        original_mbls = [ref for refs in originals for ref in refs.mbl_nos]
+    if doc.source_kind is not SourceKind.EML_BODY:
+        source_path = _document_path(doc.doc_id, bundles)
+        mbls_by_source = {(ref.value, ref.source): ref for ref in (*original_mbls, *own.mbl_nos)}
         mbls = [
             SourceRefValue(value=ref.value, source=sanitize_source_path(ref.source) or source_path)
-            for ref in (*original_mbls, *own.mbl_nos)
+            for ref in mbls_by_source.values()
         ]
+    canonical_id = canonical.document.doc_id
     return PackageShipmentRefs(
-        source_doc_id=doc_id, mbl_nos=mbls, hbl_nos=[hbl for hbl in hbls if hbl]
+        source_doc_id=doc.doc_id,
+        parent_doc_id=doc.parent_doc_id,
+        canonical_doc_id=canonical_id if canonical_id != doc.doc_id else None,
+        mbl_nos=mbls,
+        hbl_nos=list(dict.fromkeys(hbl for hbl in hbls if hbl)),
     )
 
 
@@ -875,7 +911,7 @@ def _package_conflicts(
     hbl_sources = []
     hbl_evidence = {}
     for source in sources:
-        indexes = indexes_by_doc.get(source.source_doc_id, ())
+        indexes = indexes_by_doc.get(source.canonical_doc_id or source.source_doc_id, ())
         edited_hbls = [
             records[index].shipment_refs.hbl_no for index in indexes if "hbl_no" in corrected[index]
         ]
@@ -937,41 +973,61 @@ def _merge_package_mbls(
     corrected: list[set[str]],
     indexes_by_doc: dict[str, list[int]],
     bundles: dict[str, DocumentExtractionBundle],
-    available_doc_ids: set[str] | None,
+    canonical: dict[str, DocumentExtractionBundle],
+    canonical_ids: dict[str, str],
+    *,
+    use_missing_snapshots: bool,
 ) -> set[str]:
-    children: dict[str, list[str]] = defaultdict(list)
-    for doc_id, bundle in bundles.items():
-        if parent_id := bundle.document.parent_doc_id:
-            children[parent_id].append(doc_id)
-
-    snapshots_by_doc = {}
-    for parent_id, child_ids in children.items():
-        snapshots = [
-            _snapshot_package_source(
-                doc_id, bundles, [records[i] for i in indexes_by_doc.get(doc_id, ())]
-            )
-            for doc_id in sorted(child_ids)
-        ]
-        for doc_id in (parent_id, *child_ids):
-            snapshots_by_doc[doc_id] = snapshots
+    packages: dict[str, dict[str, PackageShipmentRefs]] = defaultdict(dict)
+    parents_by_record_doc: dict[str, set[str]] = defaultdict(set)
+    # Build each package from its original members before following duplicate IDs to billing rows.
+    for source_id, bundle in sorted(bundles.items()):
+        parent_id = bundle.document.parent_doc_id
+        canonical_id = canonical_ids[source_id]
+        if not parent_id or canonical_id not in canonical:
+            continue
+        packages[parent_id][source_id] = _snapshot_package_source(
+            bundle,
+            canonical[canonical_id],
+            bundles,
+            [records[index] for index in indexes_by_doc.get(canonical_id, ())],
+        )
+        parents_by_record_doc[canonical_id].add(parent_id)
+        parents_by_record_doc[canonical_ids.get(parent_id, parent_id)].add(parent_id)
 
     checked_docs = set()
     for doc_id, indexes in indexes_by_doc.items():
-        snapshots_by_id = {
-            source.source_doc_id: source for source in snapshots_by_doc.get(doc_id, ())
-        }
-        for index in indexes:
-            for source in records[index].package_sibling_refs:
-                source_id = source.source_doc_id
-                if source_id not in bundles and (
-                    available_doc_ids is None or source_id in available_doc_ids
-                ):
-                    snapshots_by_id.setdefault(source_id, source)
-        snapshots = list(snapshots_by_id.values())
+        saved_sources = (
+            [source for index in indexes for source in records[index].package_sibling_refs]
+            if use_missing_snapshots
+            else []
+        )
+        parents = set(parents_by_record_doc.get(doc_id, ()))
+        for source in saved_sources:
+            live = bundles.get(source.source_doc_id)
+            parent_id = live.document.parent_doc_id if live else source.parent_doc_id
+            if parent_id in packages:
+                parents.add(parent_id)
+        package_snapshots = {parent_id: packages[parent_id].copy() for parent_id in sorted(parents)}
+        default_parent = next(iter(package_snapshots)) if len(package_snapshots) == 1 else None
+        for source in saved_sources:
+            if source.source_doc_id not in bundles:
+                parent_id = source.parent_doc_id or default_parent
+                package_snapshots.setdefault(parent_id, {}).setdefault(source.source_doc_id, source)
+        snapshots = []
+        alerts = []
+        mbls = []
+        for members in package_snapshots.values():
+            sources = list(members.values())
+            package_alerts, package_mbls = _package_conflicts(
+                sources, records, corrected, indexes_by_doc
+            )
+            snapshots.extend(sources)
+            alerts.extend(package_alerts)
+            mbls.extend(package_mbls)
         if not snapshots:
             continue
         checked_docs.add(doc_id)
-        alerts, mbls = _package_conflicts(snapshots, records, corrected, indexes_by_doc)
         for index in indexes:
             alerts_by_line[index].extend(alerts)
             record = records[index]
@@ -993,6 +1049,14 @@ def _merge_package_mbls(
     return checked_docs
 
 
+def _ordered_ocr_content(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _ordered_ocr_content(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return [_ordered_ocr_content(item) for item in value]
+    return value
+
+
 def _ocr_suspicion_alerts(payload: OcrStructuredPayload | None) -> list[ValidationAlert]:
     if payload is None:
         return []
@@ -1004,6 +1068,22 @@ def _ocr_suspicion_alerts(payload: OcrStructuredPayload | None) -> list[Validati
         field = f"ocr.item_{index}"
         text = extra.get("text")
         actual = text.strip() if isinstance(text, str) else ""
+        if not actual:
+            content = {
+                "other": item.other,
+                "chargeList": item.charge_list,
+                "extra": {key: value for key, value in extra.items() if key != "suspicious"},
+            }
+            if isinstance(text, str):
+                content["extra"].pop("text")
+            content = {
+                key: value
+                for key, value in content.items()
+                if value not in (None, "", [], {})
+                and not (isinstance(value, str) and not value.strip())
+            }
+            if content:
+                actual = dumps_decimal_json(_ordered_ocr_content(content))
         alerts.append(
             ValidationAlert.from_code(
                 AlertCode.OCR_SUSPICIOUS_FLAG,
@@ -1098,14 +1178,13 @@ def _validate_batch(
     *,
     on_document_error: Callable[[str, Exception], None] | None = None,
 ) -> list[ProcessedBillingRecord]:
-    selected, canonical = _merge_duplicate_sources(records, bundles)
+    selected, canonical, canonical_ids = _merge_duplicate_sources(records, bundles)
     input_indexes: dict[str, list[int]] = defaultdict(list)
     for index, record in enumerate(selected):
         input_indexes[record.source_doc_id].append(index)
 
     by_index = {}
     recalculated_by_doc = {}
-    failed_doc_ids = set()
     for doc_id, indexes in input_indexes.items():
         try:
             checked, recalculated = _validate_document(
@@ -1115,7 +1194,6 @@ def _validate_batch(
             if on_document_error is None:
                 raise
             on_document_error(doc_id, exc)
-            failed_doc_ids.add(doc_id)
             canonical.pop(doc_id, None)
             continue
         by_index.update(zip(indexes, checked, strict=True))
@@ -1139,13 +1217,15 @@ def _validate_batch(
 
     for index, alerts in _cross_document_alerts(validated).items():
         alerts_by_line[index].extend(alerts)
-    available_doc_ids = (
-        {bundle.document.doc_id for bundle in bundles} - failed_doc_ids
-        if on_document_error is not None
-        else None
-    )
     for doc_id in _merge_package_mbls(
-        validated, alerts_by_line, corrected_by_line, indexes_by_doc, canonical, available_doc_ids
+        validated,
+        alerts_by_line,
+        corrected_by_line,
+        indexes_by_doc,
+        {bundle.document.doc_id: bundle for bundle in bundles},
+        canonical,
+        canonical_ids,
+        use_missing_snapshots=on_document_error is None,
     ):
         recalculated_by_doc[doc_id].add(AlertCode.MULTI_SOURCE_BL_MISMATCH)
     return [

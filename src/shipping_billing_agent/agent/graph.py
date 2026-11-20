@@ -51,6 +51,7 @@ from shipping_billing_agent.domain import (
 from shipping_billing_agent.domain.charge_normalizer import _CHARGE_NAMES
 from shipping_billing_agent.domain.entity_resolver import (
     FIELD_FORMAT_ALERT_CODES,
+    _match_ledger_records,
     is_credit_document_type,
 )
 from shipping_billing_agent.domain.models import DocumentStatus, SourceKind, sanitize_source_path
@@ -235,7 +236,10 @@ def _package_shipment_refs(doc: ParsedDocument, state: _BillingState) -> list[Pa
         hbl = "".join(normalize("NFKC", refs.hbl_no or "").upper().split())
         snapshots.append(
             PackageShipmentRefs(
-                source_doc_id=source.doc_id, mbl_nos=mbls, hbl_nos=[hbl] if hbl else []
+                source_doc_id=source.doc_id,
+                parent_doc_id=source.parent_doc_id,
+                mbl_nos=mbls,
+                hbl_nos=[hbl] if hbl else [],
             )
         )
     return snapshots
@@ -478,7 +482,11 @@ def _ground_charge(
         issue.field == "currency" and issue.actual == "$" for issue in observed.raw_parse_issues
     )
     currency_conflict = printed.currency and model.currency and printed.currency != model.currency
-    if bare_dollar or printed.currency:
+    conflicting_currency_tokens = any(
+        issue.code is AlertCode.CROSS_DOCUMENT_CONFLICT and issue.field == "currency"
+        for issue in observed.raw_parse_issues
+    )
+    if bare_dollar or printed.currency or conflicting_currency_tokens:
         updates["currency"] = printed.currency
     issues = []
     _ground_printed_fields(model, printed, ("payment_term", "debit_credit"), updates, issues)
@@ -529,10 +537,10 @@ def _charge_words(text: str) -> str:
 
 def _matching_charge_evidence(
     charge: RawChargeItem,
-    evidence_by_amount: dict[Decimal, set[str]],
+    evidence_by_amount: dict[Decimal, set[tuple[str, frozenset[str]]]],
     dictionary: Sequence[ChargeDictionaryItem],
     used_rows: set[str],
-) -> str | None:
+) -> tuple[str, frozenset[str]] | None:
     if charge.amount is None or not (evidence := evidence_by_amount.get(charge.amount.copy_abs())):
         return None
     name = charge.raw_charge_name
@@ -549,7 +557,12 @@ def _matching_charge_evidence(
         and (words := _charge_words(alias))
     }
     return min(
-        (text for text in evidence - used_rows if any(phrase in text for phrase in phrases)),
+        (
+            (text, currencies)
+            for text, currencies in evidence
+            if text not in used_rows and any(phrase in text for phrase in phrases)
+        ),
+        key=lambda row: (bool(row[1] - {charge.currency}), row[0], sorted(row[1])),
         default=None,
     )
 
@@ -580,7 +593,15 @@ def _ground_charges(
     grounded = proposed.copy()
     issues = []
     paired_proposals = set()
-    model_groups = indexes_by_name(proposed)
+    non_billing = {
+        index
+        for index, row in enumerate(proposed)
+        if _non_billing_reason(f"{row.charge.raw_charge_name} {row.charge.source_text or ''}")
+    }
+    model_groups = {
+        name: [index for index in indexes if index not in non_billing]
+        for name, indexes in indexes_by_name(proposed).items()
+    }
     source_groups = indexes_by_name(observed)
     independent_groups = [
         (source.charges, indexes_by_name(source.charges)) for source in independent
@@ -662,11 +683,11 @@ def _ground_charges(
     if not unpaired:
         return grounded, issues
 
-    evidence_by_amount: dict[Decimal, set[str]] = defaultdict(set)
-    for text, amounts in _charge_evidence(doc):
+    evidence_by_amount: dict[Decimal, set[tuple[str, frozenset[str]]]] = defaultdict(set)
+    for text, amounts, currencies in _charge_evidence(doc, rules):
         words = f" {_charge_words(text)} "
         for amount in amounts:
-            evidence_by_amount[amount].add(words)
+            evidence_by_amount[amount].add((words, currencies))
     # A rule-recognized line cannot also substantiate a second model fee.
     used_rows = {
         f" {_charge_words(_TABLE_ROW.sub('', _SHEET_ROW.sub('', line)))} "
@@ -677,16 +698,27 @@ def _ground_charges(
     for index in unpaired:
         entry = grounded[index]
         charge = entry.charge
-        if evidence := _matching_charge_evidence(charge, evidence_by_amount, dictionary, used_rows):
-            used_rows.add(evidence)
-            continue
-        alert = ValidationAlert.from_code(
-            AlertCode.AMOUNT_TOTAL_MISMATCH,
-            "模型另报的费用在源单明细中缺少费用名称和金额的对应证据",
-            field="reported_charge_amount",
-            expected="同一源单中的费用名称和金额",
-            actual=f"{charge.raw_charge_name} {entry.raw_amount_text or '金额缺失'}",
+        evidence = (
+            None
+            if index in non_billing
+            else _matching_charge_evidence(charge, evidence_by_amount, dictionary, used_rows)
         )
+        if evidence:
+            words, currencies = evidence
+            if not currencies - {charge.currency}:
+                used_rows.add(words)
+                continue
+            alert = _printed_field_conflict(
+                "currency", " / ".join(sorted(currencies)), charge.currency or "缺失"
+            )
+        else:
+            alert = ValidationAlert.from_code(
+                AlertCode.AMOUNT_TOTAL_MISMATCH,
+                "模型另报的费用在源单明细中缺少费用名称和金额的对应证据",
+                field="reported_charge_amount",
+                expected="同一源单中的费用名称和金额",
+                actual=f"{charge.raw_charge_name} {entry.raw_amount_text or '金额缺失'}",
+            )
         issues.append(alert)
         unsupported.add(index)
         grounded[index] = entry.model_copy(
@@ -819,13 +851,7 @@ def _ground_model_extraction(
         if clause not in clauses:
             clauses.append(clause)
     charges, line_issues = _ground_charges(
-        [
-            row
-            for row in extraction.charges
-            if not _non_billing_reason(
-                f"{row.charge.raw_charge_name} {row.charge.source_text or ''}"
-            )
-        ],
+        extraction.charges,
         rules,
         doc,
         dictionary,
@@ -1286,8 +1312,13 @@ class _BillingNodes:
                 continue
             if rows:
                 try:
-                    matched = match_and_inherit_batch(
-                        rows, state.get("existing_bills", ()), state.get("profiles", ())
+                    matched = _match_ledger_records(
+                        rows,
+                        partial(
+                            match_and_inherit_batch,
+                            existing_bills=state.get("existing_bills", ()),
+                            profiles=state.get("profiles", ()),
+                        ),
                     )
                 except Exception as exc:
                     failures[doc.doc_id] = f"文档历史账单匹配失败（{type(exc).__name__}）"

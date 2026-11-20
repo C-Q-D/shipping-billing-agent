@@ -249,6 +249,8 @@ class ShipmentRefs(BaseModel):
 
 class PackageShipmentRefs(BaseModel):
     source_doc_id: str
+    parent_doc_id: str | None = None
+    canonical_doc_id: str | None = None
     # The mail body can contribute HBL evidence, but only attachments contribute MBLs.
     mbl_nos: list[SourceRefValue] | None = None
     hbl_nos: list[str] = Field(default_factory=list)
@@ -568,6 +570,7 @@ class ProcessedBillingRecord(_RawFieldAudit):
     source_line_index: int = Field(default=0, ge=0)
     operation: OperationType = OperationType.PENDING_REVIEW
     review_status: ReviewStatus = ReviewStatus.NEEDS_REVIEW
+    requires_reapproval: bool = False
     match_level: MatchLevel = MatchLevel.NONE
     matched_existing_bill_id: str | None = None
     matched_bill_ref: str | None = None

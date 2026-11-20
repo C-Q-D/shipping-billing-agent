@@ -841,6 +841,69 @@ def test_rule_only_uses_the_printed_title_and_reference(
     assert row.review_status is ReviewStatus.AUTO_READY
 
 
+@pytest.mark.parametrize(
+    "note",
+    [
+        "quotation only",
+        "quote only",
+        "for quotation",
+        "仅供报价",
+        "估价",
+        "estimate only",
+        "already included",
+        "included in freight",
+        "已包含",
+        "free of charge",
+        "no charge",
+        "waived",
+        "免收",
+        "for reference only",
+        "for information only",
+        "仅供参考",
+        "non-billable",
+        "not payable",
+    ],
+)
+def test_rules_exclude_non_billing_remarks_from_the_invoice(note: str) -> None:
+    remark = f"Storage Fee 50000 EUR {note}"
+    doc = _document("non-billable-remark", f"{_INV_BODY}\n{remark}")
+
+    result = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only")
+
+    (record,) = result.records
+    assert any(clause.text == remark for clause in record.excluded_clauses)
+    assert len(serialize_records(result.records, "official")) == 1
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Wharfage 30 USD 30 EUR (PP)",
+        "Charge: Handling Fee\nAmount: US$30 EUR",
+        "R.O.E.\nHandling Fee\nUSD\n30\nEUR\n30\nPP",
+    ],
+    ids=["rate-row", "labeled-amount", "split-ocr-row"],
+)
+def test_rules_block_currency_disagreement_in_alternate_detail_layouts(detail: str) -> None:
+    doc = _document("conflicting-currencies", f"Invoice INV-1\nIssuer: {_ENTITY}\n{detail}")
+    doc = doc.model_copy(update={"raw_text": f"{doc.raw_text}\nTotal (USD): 30"})
+
+    result = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only")
+
+    (record,) = result.records
+    assert record.source_doc_totals is not None
+    assert record.source_doc_totals.total_amount == Decimal("30")
+    assert record.operation is OperationType.PENDING_REVIEW
+    assert "currency" in record.raw_invalid_fields
+    assert any(
+        alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT
+        and alert.severity is AlertSeverity.BLOCKER
+        and {alert.expected, alert.actual} == {"USD", "EUR"}
+        for alert in record.validation_alerts
+    )
+    assert serialize_records([record], "official") == []
+
+
 def test_source_evidence_and_summary_are_safe_before_batch_validation(monkeypatch) -> None:
     signed = "https://example.invalid/direct.pdf?X-Amz-Signature=signed-value#private"
     root = _document("mail", "", source_kind="EML", public_url=signed.replace("direct", "email"))
