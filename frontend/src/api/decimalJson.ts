@@ -642,3 +642,114 @@ export function stringifyLosslessJson(value: unknown, space?: number): string {
   const result = serializeLosslessValue(value, undefined, indentStep, 0);
   return result ?? "undefined";
 }
+
+interface DecimalParts {
+  sign: 1 | -1;
+  coeff: bigint;
+  scale: number;
+}
+
+function parseDecimalParts(input: string): DecimalParts {
+  const normalized = rawDecimal(input).raw;
+  const match = DECIMAL_INPUT_PATTERN.exec(normalized);
+  if (!match) {
+    throw new DecimalSyntaxError(`非法十进制数值 "${input}"`);
+  }
+  const [, rawSign, intPart, fracPart = "", expPart = ""] = match;
+  const exponent = expPart ? Number.parseInt(expPart.slice(1), 10) : 0;
+  const digits = `${intPart}${fracPart}`;
+  let coeff = BigInt(digits);
+  if (coeff === 0n) {
+    return { sign: 1, coeff: 0n, scale: 0 };
+  }
+  let scale = fracPart.length - exponent;
+  if (scale < 0) {
+    coeff *= 10n ** BigInt(-scale);
+    scale = 0;
+  }
+  return {
+    sign: rawSign === "-" ? -1 : 1,
+    coeff,
+    scale,
+  };
+}
+
+function alignDecimalParts(
+  a: DecimalParts,
+  b: DecimalParts
+): { aVal: bigint; bVal: bigint; scale: number } {
+  const scale = Math.max(a.scale, b.scale);
+  const aScaled =
+    a.coeff * (scale > a.scale ? 10n ** BigInt(scale - a.scale) : 1n);
+  const bScaled =
+    b.coeff * (scale > b.scale ? 10n ** BigInt(scale - b.scale) : 1n);
+  return {
+    aVal: BigInt(a.sign) * aScaled,
+    bVal: BigInt(b.sign) * bScaled,
+    scale,
+  };
+}
+
+function formatBigIntDecimal(value: bigint, scale: number): string {
+  if (value === 0n) {
+    return scale > 0 ? `0.${"0".repeat(scale)}` : "0";
+  }
+  const signPrefix = value < 0n ? "-" : "";
+  const absStr = (value < 0n ? -value : value).toString();
+  if (scale <= 0) {
+    return `${signPrefix}${absStr}`;
+  }
+  if (absStr.length <= scale) {
+    return `${signPrefix}0.${"0".repeat(scale - absStr.length)}${absStr}`;
+  }
+  const splitIdx = absStr.length - scale;
+  return `${signPrefix}${absStr.slice(0, splitIdx)}.${absStr.slice(splitIdx)}`;
+}
+
+export function compareDecimalStrings(a: string, b: string): -1 | 0 | 1 {
+  const { aVal, bVal } = alignDecimalParts(
+    parseDecimalParts(a),
+    parseDecimalParts(b)
+  );
+  if (aVal < bVal) return -1;
+  if (aVal > bVal) return 1;
+  return 0;
+}
+
+export function addDecimalStrings(a: string, b: string): string {
+  const { aVal, bVal, scale } = alignDecimalParts(
+    parseDecimalParts(a),
+    parseDecimalParts(b)
+  );
+  return formatBigIntDecimal(aVal + bVal, scale);
+}
+
+export function subtractDecimalStrings(a: string, b: string): string {
+  const { aVal, bVal, scale } = alignDecimalParts(
+    parseDecimalParts(a),
+    parseDecimalParts(b)
+  );
+  return formatBigIntDecimal(aVal - bVal, scale);
+}
+
+export function multiplyDecimalStrings(a: string, b: string): string {
+  const pa = parseDecimalParts(a);
+  const pb = parseDecimalParts(b);
+  const product = BigInt(pa.sign * pb.sign) * pa.coeff * pb.coeff;
+  const scale = pa.scale + pb.scale;
+  return formatBigIntDecimal(product, scale);
+}
+
+export function isWithinDecimalTolerance(
+  a: string,
+  b: string,
+  tolerance = "0.02"
+): boolean {
+  const { aVal, bVal, scale } = alignDecimalParts(
+    parseDecimalParts(a),
+    parseDecimalParts(b)
+  );
+  const diff = aVal >= bVal ? aVal - bVal : bVal - aVal;
+  const diffFormatted = formatBigIntDecimal(diff, scale);
+  return compareDecimalStrings(diffFormatted, tolerance) <= 0;
+}

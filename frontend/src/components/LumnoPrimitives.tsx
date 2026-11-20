@@ -128,17 +128,23 @@ export function LumnoSwitch({
 }
 
 export function LumnoInput({
+  ref,
   className = "",
   ...rest
-}: InputHTMLAttributes<HTMLInputElement>) {
-  return <input className={`lumno-input ${className}`.trim()} {...rest} />;
+}: InputHTMLAttributes<HTMLInputElement> & { ref?: Ref<HTMLInputElement> }) {
+  return <input ref={ref} className={`lumno-input ${className}`.trim()} {...rest} />;
 }
 
 export function LumnoTextarea({
+  ref,
   className = "",
   ...rest
-}: TextareaHTMLAttributes<HTMLTextAreaElement>) {
-  return <textarea className={`lumno-textarea ${className}`.trim()} {...rest} />;
+}: TextareaHTMLAttributes<HTMLTextAreaElement> & {
+  ref?: Ref<HTMLTextAreaElement>;
+}) {
+  return (
+    <textarea ref={ref} className={`lumno-textarea ${className}`.trim()} {...rest} />
+  );
 }
 
 export interface LumnoSelectOption {

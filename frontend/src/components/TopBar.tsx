@@ -24,6 +24,7 @@ export interface TopBarProps {
   entities: ReadonlyArray<AccountingEntity>;
   selectedEntity: string;
   existingBillCount: number;
+  unsavedDraftCount?: number;
   theme: LumnoTheme;
   syncingBaseline: boolean;
   switchingEntity: boolean;
@@ -46,6 +47,7 @@ export function TopBar({
   entities,
   selectedEntity,
   existingBillCount,
+  unsavedDraftCount = 0,
   theme,
   syncingBaseline,
   switchingEntity,
@@ -289,6 +291,11 @@ export function TopBar({
         >
           切换主体后，系统将按新主体重新计算全部记录的 AR/AP 方向与历史账单匹配，并自动清除原主体下的人工关联及跨主体审批结论。
         </div>
+        {unsavedDraftCount > 0 ? (
+          <div className="wb-field-error" style={{ marginTop: "4px" }}>
+            注意：当前批次仍有 {unsavedDraftCount} 项未保存草稿，切换主体重算后这些未保存修改可能失效，建议先保存或取消切换。
+          </div>
+        ) : null}
       </LumnoModal>
 
       <LumnoModal

@@ -49,6 +49,28 @@ export type OcrMode = BatchSummary["ocr_mode"];
 export type ExportMode = ExportResponse["mode"];
 export type DecimalInput = string | number | RawDecimalLiteral;
 
+export interface WarningWaiverItem {
+  code: string;
+  field?: string | null;
+  actual?: string | null;
+  reason: string;
+}
+
+export interface RecordMutationHeadersOptions {
+  expectedRecordUpdatedAt?: string | null;
+  resolvedWarnings?: ReadonlyArray<WarningWaiverItem>;
+}
+
+export type RecordPatchInput = Omit<
+  RecordPatchRequest,
+  "quantity" | "unit_price" | "amount" | "force_create_new"
+> & {
+  quantity?: DecimalInput | null;
+  unit_price?: DecimalInput | null;
+  amount?: DecimalInput | null;
+  force_create_new?: boolean;
+};
+
 export const MAX_SINGLE_FILE_BYTES = 50 * 1024 * 1024;
 export const MAX_BATCH_ITEMS_COUNT = 50;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -257,15 +279,12 @@ function normalizeDecimalField(
 }
 
 function buildRecordPatchPayload(
-  patch: Omit<RecordPatchRequest, "quantity" | "unit_price" | "amount"> & {
-    quantity?: DecimalInput | null;
-    unit_price?: DecimalInput | null;
-    amount?: DecimalInput | null;
+  patch: RecordPatchInput
+): Partial<RecordPatchRequest> {
+  const payload: Partial<RecordPatchRequest> = {};
+  if (patch.force_create_new !== undefined) {
+    payload.force_create_new = patch.force_create_new;
   }
-): RecordPatchRequest {
-  const payload: RecordPatchRequest = {
-    force_create_new: patch.force_create_new,
-  };
   if (patch.charge_item !== undefined) payload.charge_item = patch.charge_item;
   if (patch.quantity !== undefined) {
     payload.quantity = normalizeDecimalField(patch.quantity);
@@ -305,6 +324,22 @@ function buildRecordPatchPayload(
   }
   if (patch.review_note !== undefined) payload.review_note = patch.review_note;
   return payload;
+}
+
+function buildRecordMutationHeaders(
+  options?: RecordMutationHeadersOptions
+): Record<string, string> | undefined {
+  if (!options) return undefined;
+  const headers: Record<string, string> = {};
+  if (options.expectedRecordUpdatedAt) {
+    headers["X-Record-Updated-At"] = options.expectedRecordUpdatedAt;
+  }
+  if (options.resolvedWarnings && options.resolvedWarnings.length > 0) {
+    headers["X-Resolved-Warnings"] = encodeURIComponent(
+      stringifyLosslessJson(options.resolvedWarnings)
+    );
+  }
+  return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
 export interface CreateBatchInput {
@@ -357,6 +392,7 @@ export class BillingApiClient {
       method?: string;
       jsonBody?: unknown;
       formData?: FormData;
+      headers?: Record<string, string>;
       timeoutMs?: number;
       signal?: AbortSignal;
     } = {}
@@ -383,7 +419,7 @@ export class BillingApiClient {
       options.signal.addEventListener("abort", onExternalAbort, { once: true });
     }
 
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = { ...(options.headers ?? {}) };
     let body: BodyInit | undefined;
     if (options.formData) {
       body = options.formData;
@@ -465,6 +501,7 @@ export class BillingApiClient {
       method?: string;
       jsonBody?: unknown;
       formData?: FormData;
+      headers?: Record<string, string>;
       timeoutMs?: number;
       signal?: AbortSignal;
     } = {}
@@ -754,11 +791,8 @@ export class BillingApiClient {
   patchBillingRecord(
     batchId: string,
     recordId: string,
-    patch: Omit<RecordPatchRequest, "quantity" | "unit_price" | "amount"> & {
-      quantity?: DecimalInput | null;
-      unit_price?: DecimalInput | null;
-      amount?: DecimalInput | null;
-    }
+    patch: RecordPatchInput,
+    options?: RecordMutationHeadersOptions
   ): Promise<BatchDetail> {
     const payload = buildRecordPatchPayload(patch);
     return this.requestJson<BatchDetail>(
@@ -766,6 +800,7 @@ export class BillingApiClient {
       {
         method: "PATCH",
         jsonBody: payload,
+        headers: buildRecordMutationHeaders(options),
       }
     );
   }
@@ -773,13 +808,15 @@ export class BillingApiClient {
   approveBillingRecord(
     batchId: string,
     recordId: string,
-    reason: string
+    reason: string,
+    options?: RecordMutationHeadersOptions
   ): Promise<BatchDetail> {
     return this.requestJson<BatchDetail>(
       `/api/v1/batches/${encodeURIComponent(batchId)}/records/${encodeURIComponent(recordId)}/approve`,
       {
         method: "POST",
         jsonBody: { reason },
+        headers: buildRecordMutationHeaders(options),
       }
     );
   }

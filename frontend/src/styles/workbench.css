@@ -1628,6 +1628,196 @@ body[data-theme="dark"] .wb-doc-node[data-active="true"] {
   gap: 8px;
 }
 
+/* T02 Review Inspector, Form Controls, Soft-Warning Waiver & Export Modal */
+.wb-draft-banner {
+  padding: 8px 10px;
+  border-radius: var(--lumno-radius-md);
+  border: 1px solid var(--wb-warn-border);
+  background: var(--wb-warn-bg);
+  color: var(--wb-warn-text);
+  font-size: var(--lumno-font-size-xs);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.wb-readonly-box {
+  padding: 7px 9px;
+  border-radius: var(--lumno-radius-md);
+  border: 1px dashed var(--lumno-color-divider);
+  background: var(--lumno-color-control-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wb-form-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.wb-form-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.wb-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.wb-form-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wb-form-label {
+  font-size: var(--lumno-font-size-xs);
+  font-weight: 600;
+  color: var(--lumno-color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-form-row-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wb-form-divider {
+  height: 1px;
+  background: var(--lumno-color-border);
+  margin: 2px 0;
+}
+
+.wb-action-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.wb-chip-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.wb-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 9px;
+  border-radius: var(--lumno-radius-md);
+  background: var(--lumno-color-control-bg);
+  border: 1px solid var(--lumno-color-control-border);
+}
+
+.wb-candidate-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: var(--lumno-radius-md);
+  border: 1px solid var(--lumno-color-control-border);
+  background: var(--lumno-color-control-bg);
+  cursor: pointer;
+}
+
+.wb-candidate-option input[type="radio"] {
+  margin-top: 3px;
+  accent-color: #273042;
+}
+
+.wb-waiver-box {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--wb-warn-border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wb-waiver-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--lumno-font-size-xs);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.wb-waiver-toggle input[type="checkbox"] {
+  accent-color: #273042;
+}
+
+.wb-doc-repair-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wb-audit-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 9px;
+  border-radius: var(--lumno-radius-md);
+  background: var(--lumno-color-control-bg);
+  border: 1px solid var(--lumno-color-control-border);
+}
+
+.wb-audit-list {
+  margin: 0;
+  padding-left: 16px;
+  font-size: var(--lumno-font-size-xs);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wb-review-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.wb-approve-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 9px;
+  border-radius: var(--lumno-radius-md);
+  background: var(--lumno-color-control-bg);
+  border: 1px solid var(--lumno-color-control-border);
+}
+
+.wb-field-flash {
+  border-color: var(--lumno-color-focus-ring) !important;
+  background: var(--lumno-color-input-focus-bg) !important;
+}
+
+.wb-export-counts-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
 /* Responsive Breakpoint: Mobile 390x844 (<= 959px) */
 @media (max-width: 959px) {
   .wb-shell {
@@ -1689,7 +1879,10 @@ body[data-theme="dark"] .wb-doc-node[data-active="true"] {
     display: none;
   }
 
-  .wb-kv-grid {
+  .wb-kv-grid,
+  .wb-form-grid-2,
+  .wb-form-grid-3,
+  .wb-export-counts-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 }

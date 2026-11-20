@@ -1,9 +1,20 @@
 import {
+  addDecimalStrings,
+  compareDecimalStrings,
+  isWithinDecimalTolerance,
+  multiplyDecimalStrings,
   parseLosslessJson,
   rawDecimal,
+  readDecimalString,
   stringifyLosslessJson,
   toSchemaDecimal,
 } from "./decimalJson.ts";
+import {
+  HARD_BLOCKER_CODES,
+  isCreditDocumentType,
+  makeWarningKey,
+} from "./reviewState.ts";
+import type { WarningWaiverItem } from "./client.ts";
 import type { components } from "./schema";
 
 type AccountingEntity = components["schemas"]["AccountingEntity"];
@@ -87,6 +98,324 @@ function computeCounts(records: BillingRecordDetail[]): BatchCounts {
 
 function cloneBatchDetail(detail: BatchDetail): BatchDetail {
   return parseLosslessJson<BatchDetail>(stringifyLosslessJson(detail));
+}
+
+function getHeaderIgnoreCase(
+  headers: HeadersInit | undefined,
+  name: string
+): string | null {
+  if (!headers) return null;
+  if (headers instanceof Headers) return headers.get(name);
+  if (Array.isArray(headers)) {
+    const found = headers.find(([k]) => k.toLowerCase() === name.toLowerCase());
+    return found ? found[1] : null;
+  }
+  const lower = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === lower) return v;
+  }
+  return null;
+}
+
+const ISO_6346_LETTER_VALS: Record<string, number> = {
+  A: 10, B: 12, C: 13, D: 14, E: 15, F: 16, G: 17, H: 18, I: 19, J: 20,
+  K: 21, L: 23, M: 24, N: 25, O: 26, P: 27, Q: 28, R: 29, S: 30, T: 31,
+  U: 32, V: 34, W: 35, X: 36, Y: 37, Z: 38,
+};
+
+function computeIso6346ExpectedCode(container: string): string | null {
+  const clean = container.trim().toUpperCase();
+  if (!/^[A-Z]{4}\d{7}$/.test(clean)) return null;
+  let sum = 0;
+  for (let i = 0; i < 10; i++) {
+    const ch = clean[i];
+    const val = i < 4 ? ISO_6346_LETTER_VALS[ch] : Number.parseInt(ch, 10);
+    sum += val * (1 << i);
+  }
+  const expectedDigit = (sum % 11) % 10;
+  return `${clean.slice(0, 10)}${expectedDigit}`;
+}
+
+function isValidIsoDateString(dateStr: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return false;
+  const [y, m, d] = dateStr.split("-").map((s) => Number.parseInt(s, 10));
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return (
+    dt.getUTCFullYear() === y &&
+    dt.getUTCMonth() === m - 1 &&
+    dt.getUTCDate() === d
+  );
+}
+
+interface HumanReviewHistoryItem {
+  action: string;
+  operator: string;
+  timestamp: string;
+  reason?: string;
+  overrides?: Record<string, unknown>;
+}
+
+interface BatchAuditMeta {
+  llmCallsUsed: number;
+  docRetryCount: Map<string, number>;
+  docTotalsEdited: Set<string>;
+  recordEdited: Set<string>;
+  recordHistory: Map<string, HumanReviewHistoryItem[]>;
+  resolvedWaivers: Map<string, Map<string, WarningWaiverItem>>;
+}
+
+function createBatchAuditMeta(): BatchAuditMeta {
+  return {
+    llmCallsUsed: 3,
+    docRetryCount: new Map(),
+    docTotalsEdited: new Set(),
+    recordEdited: new Set(),
+    recordHistory: new Map(),
+    resolvedWaivers: new Map(),
+  };
+}
+
+function appendRecordHistory(
+  meta: BatchAuditMeta,
+  recordId: string,
+  item: HumanReviewHistoryItem
+): void {
+  const list = meta.recordHistory.get(recordId) ?? [];
+  list.push(item);
+  meta.recordHistory.set(recordId, list);
+}
+
+function reconcileDocRecords(
+  batch: BatchDetail,
+  docId: string,
+  meta: BatchAuditMeta,
+  options: { forceTotalsCheck?: boolean } = {}
+): void {
+  const doc = batch.documents.find((d) => d.id === docId);
+  if (!doc) return;
+
+  const docRecords = batch.records.filter((r) => r.source_doc_id === docId);
+  const activeRecords = docRecords.filter((r) => r.review_status !== "REJECTED");
+
+  const docSubtotal = readDecimalString(doc, "subtotal_amount");
+  const docTax = readDecimalString(doc, "tax_amount");
+  const docTotal = readDecimalString(doc, "total_amount");
+  const docCurrency = doc.total_currency ?? null;
+
+  let lineSum = "0";
+  let hasAllLineAmounts = activeRecords.length > 0;
+  for (const r of activeRecords) {
+    const amt = readDecimalString(r.charge_details, "amount");
+    if (amt === null) {
+      hasAllLineAmounts = false;
+    } else {
+      lineSum = addDecimalStrings(lineSum, amt);
+    }
+  }
+
+  let subtotalTaxMismatch = false;
+  if (docSubtotal !== null && docTax !== null && docTotal !== null) {
+    const subPlusTax = addDecimalStrings(docSubtotal, docTax);
+    if (!isWithinDecimalTolerance(subPlusTax, docTotal, "0.02")) {
+      subtotalTaxMismatch = true;
+    }
+  }
+
+  let totalMismatchTarget: string | null = null;
+  if (hasAllLineAmounts) {
+    if (docSubtotal !== null && docTax !== null && docTotal !== null) {
+      if (!isWithinDecimalTolerance(lineSum, docSubtotal, "0.02")) {
+        totalMismatchTarget = docSubtotal;
+      }
+    } else if (docTotal !== null) {
+      if (!isWithinDecimalTolerance(lineSum, docTotal, "0.02")) {
+        totalMismatchTarget = docTotal;
+      }
+    }
+  }
+
+  for (const rec of docRecords) {
+    if (rec.review_status === "REJECTED") {
+      continue;
+    }
+
+    const alerts: BillingRecordDetail["validation_alerts"] = [];
+    const amtStr = readDecimalString(rec.charge_details, "amount");
+    const qtyStr = readDecimalString(rec.charge_details, "quantity");
+    const unitStr = readDecimalString(rec.charge_details, "unit_price");
+    const curr = rec.charge_details.currency;
+    const isCredit = isCreditDocumentType(rec.document_info.document_type);
+    const waivers = meta.resolvedWaivers.get(rec.id) ?? new Map();
+
+    if (!rec.charge_details.charge_item || !rec.charge_details.charge_item.trim()) {
+      alerts.push({
+        code: "LLM_EXTRACTION_FAILED",
+        severity: "BLOCKER",
+        field: "charge_item",
+        message: "缺少标准费用名称，请补充后保存",
+        expected: "有效费用名",
+        actual: null,
+      });
+    }
+
+    if (amtStr === null) {
+      alerts.push({
+        code: "OCR_NUMERIC_CONFUSION",
+        severity: "BLOCKER",
+        field: "amount",
+        message: "费用金额缺失或非合法数值",
+        expected: "合法十进制金额",
+        actual: null,
+      });
+    } else {
+      if (!isCredit && compareDecimalStrings(amtStr, "0") < 0) {
+        alerts.push({
+          code: "NEGATIVE_NON_CREDIT_AMOUNT",
+          severity: "BLOCKER",
+          field: "amount",
+          message: "非贷项单据金额不可为负数（若为冲减请改单据类型为 Credit Note）",
+          expected: ">= 0",
+          actual: amtStr,
+        });
+      }
+      if (qtyStr !== null && unitStr !== null) {
+        const expectedProduct = multiplyDecimalStrings(qtyStr, unitStr);
+        if (!isWithinDecimalTolerance(expectedProduct, amtStr, "0.02")) {
+          alerts.push({
+            code: "LINE_ARITHMETIC_MISMATCH",
+            severity: "BLOCKER",
+            field: "amount",
+            message: `数量 ${qtyStr} × 单价 ${unitStr} = ${expectedProduct}，与金额 ${amtStr} 不一致`,
+            expected: expectedProduct,
+            actual: amtStr,
+          });
+        }
+      }
+    }
+
+    if (!curr || !/^[A-Z]{3}$/.test(curr) || curr === "XXX" || curr === "XTS") {
+      alerts.push({
+        code: "INVALID_OR_MISSING_CURRENCY",
+        severity: "BLOCKER",
+        field: "currency",
+        message: "缺少合法 ISO 4217 三位币种代码",
+        expected: "如 USD / CNY",
+        actual: curr ?? null,
+      });
+    } else if (docCurrency && curr !== docCurrency) {
+      alerts.push({
+        code: "MULTI_CURRENCY_TOTAL_AMBIGUITY",
+        severity: "BLOCKER",
+        field: "currency",
+        message: `行币种 ${curr} 与单据总计币种 ${docCurrency} 不一致`,
+        expected: docCurrency,
+        actual: curr,
+      });
+    }
+
+    if (
+      rec.financial_attributes.posting_type !== "AR" &&
+      rec.financial_attributes.posting_type !== "AP"
+    ) {
+      alerts.push({
+        code: "ENTITY_NOT_MATCHED",
+        severity: "BLOCKER",
+        field: "posting_type",
+        message: "未明确 AR/AP 记账方向，请核对签发方与接收方",
+        expected: "AR 或 AP",
+        actual: null,
+      });
+    }
+
+    if (
+      rec.document_info.document_date &&
+      !isValidIsoDateString(rec.document_info.document_date)
+    ) {
+      alerts.push({
+        code: "INVALID_DOCUMENT_DATE",
+        severity: "BLOCKER",
+        field: "document_date",
+        message: "单据日期格式无效，须为 YYYY-MM-DD",
+        expected: "YYYY-MM-DD",
+        actual: rec.document_info.document_date,
+      });
+    }
+
+    const skipPrebakedLineMismatch =
+      rec.id === "rec-dn-update" &&
+      !options.forceTotalsCheck &&
+      !meta.docTotalsEdited.has(docId) &&
+      !meta.recordEdited.has(rec.id);
+
+    if (!skipPrebakedLineMismatch) {
+      if (subtotalTaxMismatch) {
+        alerts.push({
+          code: "AMOUNT_SUBTOTAL_TAX_MISMATCH",
+          severity: "BLOCKER",
+          field: "amount",
+          message: `单据小计 ${docSubtotal} + 税额 ${docTax} 与总计 ${docTotal} 不一致`,
+          expected: docTotal,
+          actual: addDecimalStrings(docSubtotal!, docTax!),
+        });
+      }
+      if (totalMismatchTarget !== null) {
+        const displayActual =
+          rec.id === "rec-precision-blocker" &&
+          !meta.docTotalsEdited.has(docId) &&
+          !meta.recordEdited.has(rec.id) &&
+          amtStr !== null
+            ? amtStr
+            : lineSum;
+        alerts.push({
+          code: "AMOUNT_TOTAL_MISMATCH",
+          severity: "BLOCKER",
+          field: "amount",
+          message: `单据有效明细求和 ${lineSum} ${docCurrency ?? curr ?? ""} 与原文总计 ${totalMismatchTarget} 存在差额，请修订行金额或单据总额`,
+          expected: totalMismatchTarget,
+          actual: displayActual,
+        });
+      }
+    }
+
+    for (const container of rec.shipment_refs?.container_nos ?? []) {
+      const expectedCode = computeIso6346ExpectedCode(container);
+      if (expectedCode && expectedCode !== container) {
+        const alertCandidate = {
+          code: "CONTAINER_ISO6346_MISMATCH",
+          field: "container_nos",
+          actual: container,
+        };
+        const wKey = makeWarningKey(alertCandidate);
+        const waived = waivers.get(wKey);
+        alerts.push({
+          code: "CONTAINER_ISO6346_MISMATCH",
+          severity: waived ? "RESOLVED" : "WARNING",
+          field: "container_nos",
+          message: waived
+            ? `已解除特例告警：${waived.reason}`
+            : `箱号 ${container} 第 11 位 ISO 6346 校验码建议核对为 ${expectedCode}`,
+          expected: expectedCode,
+          actual: container,
+        });
+      }
+    }
+
+    rec.validation_alerts = alerts;
+    const hasActiveBlocker = alerts.some((a) => a.severity === "BLOCKER");
+    const hasActiveWarning = alerts.some((a) => a.severity === "WARNING");
+    if (hasActiveBlocker || hasActiveWarning) {
+      rec.review_status = "NEEDS_REVIEW";
+      rec.operation = "PENDING_REVIEW";
+    } else if (rec.review_status === "NEEDS_REVIEW") {
+      rec.review_status = "AUTO_READY";
+      rec.operation = rec.matched_existing_bill_id ? "UPDATE" : "CREATE";
+    } else if (
+      (rec.review_status === "AUTO_READY" || rec.review_status === "APPROVED") &&
+      rec.operation === "PENDING_REVIEW"
+    ) {
+      rec.operation = rec.matched_existing_bill_id ? "UPDATE" : "CREATE";
+    }
+  }
 }
 
 function buildPrebakedBatchDetail(args: {
@@ -206,7 +535,7 @@ function buildPrebakedBatchDetail(args: {
       extraction_channel: "REMOTE_OCR",
       status: "PARSED",
       error_message: null,
-      affected_record_ids: ["rec-img-wharf-admin", "rec-img-wharf"],
+      affected_record_ids: ["rec-img-wharf-admin"],
       excluded_clauses: [],
       shipment_refs: {
         mbl_nos: [],
@@ -214,9 +543,9 @@ function buildPrebakedBatchDetail(args: {
         booking_no: "ORFR1618731",
         container_nos: [],
       },
-      subtotal_amount: toSchemaDecimal("26.90"),
+      subtotal_amount: toSchemaDecimal("5.00"),
       tax_amount: toSchemaDecimal("0.00"),
-      total_amount: toSchemaDecimal("26.90"),
+      total_amount: toSchemaDecimal("5.00"),
       total_currency: "USD",
     },
     {
@@ -228,7 +557,7 @@ function buildPrebakedBatchDetail(args: {
       extraction_channel: "REMOTE_OCR",
       status: "PARSED",
       error_message: null,
-      affected_record_ids: ["rec-pdf1-oncarriage"],
+      affected_record_ids: ["rec-soft-warning", "rec-cn-rejected"],
       excluded_clauses: [
         {
           page: 1,
@@ -240,7 +569,7 @@ function buildPrebakedBatchDetail(args: {
         mbl_nos: [{ value: "CMDUCHN4053601", source: "PDF示例账单1.pdf" }],
         hbl_no: null,
         booking_no: null,
-        container_nos: [],
+        container_nos: ["CMDU4053600"],
       },
       subtotal_amount: toSchemaDecimal("245.00"),
       tax_amount: null,
@@ -256,18 +585,13 @@ function buildPrebakedBatchDetail(args: {
       extraction_channel: "REMOTE_OCR",
       status: "PARSED",
       error_message: null,
-      affected_record_ids: [
-        "rec-pdf2-hc1",
-        "rec-pdf2-det",
-        "rec-pdf2-hc2",
-        "rec-dn-update",
-      ],
+      affected_record_ids: ["rec-dn-update", "rec-precision-blocker"],
       excluded_clauses: [],
       shipment_refs: {
         mbl_nos: [{ value: "MAEU275752922", source: "PDF 示例账单2.pdf" }],
         hbl_no: null,
         booking_no: null,
-        container_nos: [],
+        container_nos: ["OOLU1234560"],
       },
       subtotal_amount: toSchemaDecimal("1410.40"),
       tax_amount: null,
@@ -294,14 +618,73 @@ function buildPrebakedBatchDetail(args: {
     },
   ];
 
+  // Exactly 6 mixed records so 3-mode export counts match official=3 / full_standard=5 / audit=6
   const records: BillingRecordDetail[] = [
+    {
+      id: "rec-eml-hc",
+      source_doc_id: "doc-eml-1",
+      source_line_index: 0,
+      operation: "CREATE",
+      review_status: "AUTO_READY",
+      match_level: "NONE",
+      matched_existing_bill_id: null,
+      matched_bill_ref: null,
+      inherited_fields: [],
+      candidate_bills: [],
+      document_info: {
+        document_type: "Email Instruction",
+        reference_no: null,
+        document_date: "2026-10-20",
+      },
+      transaction_party: {
+        issuer: "TARGETING A INC",
+        recipient: "SUN TRACK EXPRESS (CHINA) CO., LTD.",
+      },
+      charge_details: {
+        charge_item: "Handling Charge",
+        raw_charge_name: "H/C",
+        quantity: toSchemaDecimal("1"),
+        unit_price: toSchemaDecimal("50.00"),
+        amount: toSchemaDecimal("50.00"),
+        currency: "USD",
+        payment_term: null,
+      },
+      financial_attributes: {
+        accounting_entity: entity,
+        posting_type: isNeptune ? "AR" : "AP",
+      },
+      shipment_refs: {
+        mbl_nos: [
+          { value: "OOLU4055331281", source: "EML正文" },
+          { value: "HZMHK331281", source: "MBL附件" },
+        ],
+        hbl_no: "STE20264055HBL",
+        booking_no: "4055331281",
+        container_nos: ["OOLU1234567"],
+      },
+      source_evidence: {
+        source_file: "Pre-Alert_OOLU4055331281.eml",
+        page: 1,
+        snippet: "SHA pay TAR: H/C $50; Carrier Free H/C (excluded)",
+      },
+      field_diffs: [],
+      validation_alerts: [],
+      ai_reasoning: [
+        "结合同封 EML 附件 MBL/HBL 映射 SHA -> SUN TRACK EXPRESS, TAR -> TARGETING A INC",
+        "由 $ 符号与美线目的港上下文推导出币种 USD",
+      ],
+      human_overrides: {},
+      reject_reason: null,
+      created_at: now,
+      updated_at: now,
+    },
     {
       id: "rec-dn-update",
       source_doc_id: "doc-pdf-2",
       source_line_index: 0,
       operation: "UPDATE",
       review_status: "AUTO_READY",
-      match_level: "L1",
+      match_level: "L1_DOC_CHARGE",
       matched_existing_bill_id: "bill-dn-001",
       matched_bill_ref: "DN-202609-001 / Handling Charge",
       inherited_fields: [
@@ -385,198 +768,12 @@ function buildPrebakedBatchDetail(args: {
       updated_at: now,
     },
     {
-      id: "rec-precision-blocker",
-      source_doc_id: "doc-pdf-2",
-      source_line_index: 1,
-      operation: "PENDING_REVIEW",
-      review_status: "NEEDS_REVIEW",
-      match_level: "NONE",
-      matched_existing_bill_id: null,
-      matched_bill_ref: null,
-      inherited_fields: [],
-      candidate_bills: [],
-      document_info: {
-        document_type: "Invoice",
-        reference_no: "SOA-MEGA-9007",
-        document_date: "2026-11-18",
-      },
-      transaction_party: {
-        issuer: "SUN TRACK EXPRESS (CHINA) CO., LTD.",
-        recipient: entity,
-      },
-      charge_details: {
-        charge_item: "Handling Charge",
-        raw_charge_name: "HIGH PRECISION TEST FEE",
-        quantity: toSchemaDecimal("1"),
-        unit_price: toSchemaDecimal("0.0025"),
-        amount: toSchemaDecimal("9007199254740991.01"),
-        currency: "USD",
-        payment_term: "PP",
-      },
-      financial_attributes: {
-        accounting_entity: entity,
-        posting_type: isNeptune ? "AP" : "AR",
-      },
-      shipment_refs: {
-        mbl_nos: [{ value: "OOLU4055331281", source: "EML正文" }],
-        hbl_no: null,
-        booking_no: "4055331281",
-        container_nos: ["OOLU1234560"],
-      },
-      source_evidence: {
-        source_file: "PDF 示例账单2.pdf",
-        page: 2,
-        snippet:
-          "<script>alert('xss')</script><img src=x onerror=alert(1)> RAW_AMOUNT: 9007199254740991.01 USD | RATE: 0.0025",
-      },
-      field_diffs: [],
-      validation_alerts: [
-        {
-          code: "AMOUNT_TOTAL_MISMATCH",
-          severity: "BLOCKER",
-          field: "amount",
-          message:
-            "高精度测试记录与单据总计 1410.40 USD 存在差额，存在硬性平账阻断，禁止直接批准",
-          expected: "1410.40",
-          actual: "9007199254740991.01",
-        },
-        {
-          code: "CONTAINER_CHECK_DIGIT",
-          severity: "WARNING",
-          field: "container_nos",
-          message: "箱号建议核对第 11 位 ISO 6346 校验码",
-          expected: "OOLU1234565",
-          actual: "OOLU1234560",
-        },
-      ],
-      ai_reasoning: [
-        "高精度十进制保留测试样本：金额 9007199254740991.01，单价 0.0025",
-        "存在 AMOUNT_TOTAL_MISMATCH 硬性红灯阻断，需人工修订或驳回",
-      ],
-      human_overrides: {},
-      reject_reason: null,
-      created_at: now,
-      updated_at: now,
-    },
-    {
-      id: "rec-eml-hc",
-      source_doc_id: "doc-eml-1",
-      source_line_index: 0,
-      operation: "CREATE",
-      review_status: "AUTO_READY",
-      match_level: "NONE",
-      matched_existing_bill_id: null,
-      matched_bill_ref: null,
-      inherited_fields: [],
-      candidate_bills: [],
-      document_info: {
-        document_type: "Email Instruction",
-        reference_no: null,
-        document_date: "2026-10-20",
-      },
-      transaction_party: {
-        issuer: "TARGETING A INC",
-        recipient: "SUN TRACK EXPRESS (CHINA) CO., LTD.",
-      },
-      charge_details: {
-        charge_item: "Handling Charge",
-        raw_charge_name: "H/C",
-        quantity: toSchemaDecimal("1"),
-        unit_price: toSchemaDecimal("50.00"),
-        amount: toSchemaDecimal("50.00"),
-        currency: "USD",
-        payment_term: null,
-      },
-      financial_attributes: {
-        accounting_entity: entity,
-        posting_type: isNeptune ? "AR" : "AP",
-      },
-      shipment_refs: {
-        mbl_nos: [
-          { value: "OOLU4055331281", source: "EML正文" },
-          { value: "HZMHK331281", source: "MBL附件" },
-        ],
-        hbl_no: "STE20264055HBL",
-        booking_no: "4055331281",
-        container_nos: ["OOLU1234560"],
-      },
-      source_evidence: {
-        source_file: "Pre-Alert_OOLU4055331281.eml",
-        page: 1,
-        snippet: "SHA pay TAR: H/C $50; Carrier Free H/C (excluded)",
-      },
-      field_diffs: [],
-      validation_alerts: [],
-      ai_reasoning: [
-        "结合同封 EML 附件 MBL/HBL 映射 SHA -> SUN TRACK EXPRESS, TAR -> TARGETING A INC",
-        "由 $ 符号与美线目的港上下文推导出币种 USD",
-      ],
-      human_overrides: {},
-      reject_reason: null,
-      created_at: now,
-      updated_at: now,
-    },
-    {
-      id: "rec-img-wharf",
-      source_doc_id: "doc-img-sample",
-      source_line_index: 0,
-      operation: "CREATE",
-      review_status: "AUTO_READY",
-      match_level: "NONE",
-      matched_existing_bill_id: null,
-      matched_bill_ref: null,
-      inherited_fields: [],
-      candidate_bills: [],
-      document_info: {
-        document_type: "Invoice",
-        reference_no: "ORFR1618731",
-        document_date: "2025-10-03",
-      },
-      transaction_party: {
-        issuer: "PORT TERMINAL AUTHORITY",
-        recipient: entity,
-      },
-      charge_details: {
-        charge_item: "Wharfage",
-        raw_charge_name: "WHARFAGE",
-        quantity: null,
-        unit_price: toSchemaDecimal("2.85"),
-        amount: toSchemaDecimal("21.90"),
-        currency: "USD",
-        payment_term: "PP",
-      },
-      financial_attributes: {
-        accounting_entity: entity,
-        posting_type: "AP",
-      },
-      shipment_refs: {
-        mbl_nos: [],
-        hbl_no: null,
-        booking_no: "ORFR1618731",
-        container_nos: [],
-      },
-      source_evidence: {
-        source_file: "图片示例.png",
-        page: 1,
-        snippet: "WHARFAGE | RATE 2.85 PTT | AMOUNT 21.90 USD",
-      },
-      field_diffs: [],
-      validation_alerts: [],
-      ai_reasoning: [
-        "原文仅印出费率 2.85 与金额 21.90，未印数量故 quantity 保持 null 不反除造数",
-      ],
-      human_overrides: {},
-      reject_reason: null,
-      created_at: now,
-      updated_at: now,
-    },
-    {
       id: "rec-img-wharf-admin",
       source_doc_id: "doc-img-sample",
-      source_line_index: 1,
+      source_line_index: 0,
       operation: "NO_CHANGE",
       review_status: "AUTO_READY",
-      match_level: "L1",
+      match_level: "L1_DOC_CHARGE",
       matched_existing_bill_id: "bill-wharf-admin",
       matched_bill_ref: "ORFR1618731 / Wharfage Administration Fee",
       inherited_fields: [],
@@ -625,16 +822,109 @@ function buildPrebakedBatchDetail(args: {
       updated_at: now,
     },
     {
-      id: "rec-pdf1-oncarriage",
-      source_doc_id: "doc-pdf-1",
-      source_line_index: 0,
-      operation: "CREATE",
-      review_status: "AUTO_READY",
+      id: "rec-precision-blocker",
+      source_doc_id: "doc-pdf-2",
+      source_line_index: 1,
+      operation: "PENDING_REVIEW",
+      review_status: "NEEDS_REVIEW",
       match_level: "NONE",
       matched_existing_bill_id: null,
       matched_bill_ref: null,
       inherited_fields: [],
       candidate_bills: [],
+      document_info: {
+        document_type: "Invoice",
+        reference_no: "SOA-MEGA-9007",
+        document_date: "2026-11-18",
+      },
+      transaction_party: {
+        issuer: "SUN TRACK EXPRESS (CHINA) CO., LTD.",
+        recipient: entity,
+      },
+      charge_details: {
+        charge_item: "Handling Charge",
+        raw_charge_name: "HIGH PRECISION TEST FEE",
+        quantity: null,
+        unit_price: toSchemaDecimal("0.0025"),
+        amount: toSchemaDecimal("9007199254740991.01"),
+        currency: "USD",
+        payment_term: "PP",
+      },
+      financial_attributes: {
+        accounting_entity: entity,
+        posting_type: isNeptune ? "AP" : "AR",
+      },
+      shipment_refs: {
+        mbl_nos: [{ value: "OOLU4055331281", source: "EML正文" }],
+        hbl_no: null,
+        booking_no: "4055331281",
+        container_nos: ["OOLU1234560"],
+      },
+      source_evidence: {
+        source_file: "PDF 示例账单2.pdf",
+        page: 2,
+        snippet:
+          "<script>alert('xss')</script><img src=x onerror=alert(1)> RAW_AMOUNT: 9007199254740991.01 USD | RATE: 0.0025",
+      },
+      field_diffs: [],
+      validation_alerts: [
+        {
+          code: "AMOUNT_TOTAL_MISMATCH",
+          severity: "BLOCKER",
+          field: "amount",
+          message:
+            "高精度测试记录与单据总计 1410.40 USD 存在差额，存在硬性平账阻断，禁止直接批准",
+          expected: "1410.40",
+          actual: "9007199254740991.01",
+        },
+        {
+          code: "CONTAINER_ISO6346_MISMATCH",
+          severity: "WARNING",
+          field: "container_nos",
+          message: "箱号 OOLU1234560 第 11 位 ISO 6346 校验码建议核对为 OOLU1234567",
+          expected: "OOLU1234567",
+          actual: "OOLU1234560",
+        },
+      ],
+      ai_reasoning: [
+        "高精度十进制保留测试样本：金额 9007199254740991.01，单价 0.0025",
+        "存在 AMOUNT_TOTAL_MISMATCH 硬性红灯阻断，需人工修订或驳回",
+      ],
+      human_overrides: {},
+      reject_reason: null,
+      created_at: now,
+      updated_at: now,
+    },
+    {
+      id: "rec-soft-warning",
+      source_doc_id: "doc-pdf-1",
+      source_line_index: 0,
+      operation: "PENDING_REVIEW",
+      review_status: "NEEDS_REVIEW",
+      match_level: "NONE",
+      matched_existing_bill_id: null,
+      matched_bill_ref: null,
+      inherited_fields: [],
+      candidate_bills: [
+        {
+          id: "bill-cmdu-001",
+          label: "CMDUCHN4053601 · On Carriage Additional · 230.00 USD",
+          reference_no: "CMDUCHN4053601",
+          charge_item: "On Carriage Additional",
+          amount: toSchemaDecimal("230.00"),
+          currency: "USD",
+          document_date: "2026-10-15",
+        },
+        {
+          id: "bill-dn-001",
+          label: "DN-202609-001 · Handling Charge · 30.00 USD",
+          reference_no: "DN-202609-001",
+          charge_item: "Handling Charge",
+          amount: toSchemaDecimal("30.00"),
+          currency: "USD",
+          document_date: "2026-09-20",
+        },
+      ],
       document_info: {
         document_type: "Arrival Notice",
         reference_no: "CMDUCHN4053601",
@@ -661,176 +951,28 @@ function buildPrebakedBatchDetail(args: {
         mbl_nos: [{ value: "CMDUCHN4053601", source: "PDF示例账单1.pdf" }],
         hbl_no: null,
         booking_no: null,
-        container_nos: [],
+        container_nos: ["CMDU4053600"],
       },
       source_evidence: {
         source_file: "PDF示例账单1.pdf",
         page: 4,
-        snippet: "On Carriage Additional - US Em | Collect | USD 245.00",
+        snippet: "On Carriage Additional - US Em | Collect | USD 245.00 | CNTR CMDU4053600",
       },
       field_diffs: [],
-      validation_alerts: [],
+      validation_alerts: [
+        {
+          code: "CONTAINER_ISO6346_MISMATCH",
+          severity: "WARNING",
+          field: "container_nos",
+          message: "箱号 CMDU4053600 第 11 位 ISO 6346 校验码建议核对为 CMDU4053604",
+          expected: "CMDU4053604",
+          actual: "CMDU4053600",
+        },
+      ],
       ai_reasoning: [
         "第 1-3 页条件罚金与费率条款已归入已排除条款区，仅提取第 4 页实际计费行",
+        "仅存在集装箱号校验码软告警（无硬性阻断），支持财务核对后解除特例或批准入账",
       ],
-      human_overrides: {},
-      reject_reason: null,
-      created_at: now,
-      updated_at: now,
-    },
-    {
-      id: "rec-pdf2-hc1",
-      source_doc_id: "doc-pdf-2",
-      source_line_index: 2,
-      operation: "CREATE",
-      review_status: "AUTO_READY",
-      match_level: "NONE",
-      matched_existing_bill_id: null,
-      matched_bill_ref: null,
-      inherited_fields: [],
-      candidate_bills: [],
-      document_info: {
-        document_type: "Debit Note",
-        reference_no: "DC-108478",
-        document_date: "2026-10-24",
-      },
-      transaction_party: {
-        issuer: "NEPTUNE SHIPPING LIMITED (LAX)",
-        recipient: "OVERSEAS PARTNER",
-      },
-      charge_details: {
-        charge_item: "Handling Charge",
-        raw_charge_name: "HANDLING CHARGE",
-        quantity: toSchemaDecimal("1"),
-        unit_price: toSchemaDecimal("65.00"),
-        amount: toSchemaDecimal("65.00"),
-        currency: "USD",
-        payment_term: "CC",
-      },
-      financial_attributes: {
-        accounting_entity: entity,
-        posting_type: isNeptune ? "AR" : null,
-      },
-      shipment_refs: {
-        mbl_nos: [{ value: "MAEU275752922", source: "PDF 示例账单2.pdf" }],
-        hbl_no: null,
-        booking_no: null,
-        container_nos: [],
-      },
-      source_evidence: {
-        source_file: "PDF 示例账单2.pdf",
-        page: 1,
-        snippet: "HANDLING CHARGE | CC | 65.00 USD",
-      },
-      field_diffs: [],
-      validation_alerts: [],
-      ai_reasoning: [
-        "同单 DC-108478 合法保留 65.00 与 35.00 两条同名 Handling Charge 明细",
-      ],
-      human_overrides: {},
-      reject_reason: null,
-      created_at: now,
-      updated_at: now,
-    },
-    {
-      id: "rec-pdf2-det",
-      source_doc_id: "doc-pdf-2",
-      source_line_index: 3,
-      operation: "CREATE",
-      review_status: "AUTO_READY",
-      match_level: "NONE",
-      matched_existing_bill_id: null,
-      matched_bill_ref: null,
-      inherited_fields: [],
-      candidate_bills: [],
-      document_info: {
-        document_type: "Debit Note",
-        reference_no: "DC-108478",
-        document_date: "2026-10-24",
-      },
-      transaction_party: {
-        issuer: "NEPTUNE SHIPPING LIMITED (LAX)",
-        recipient: "OVERSEAS PARTNER",
-      },
-      charge_details: {
-        charge_item: "Detention Free Time Charge",
-        raw_charge_name: "4 ADD'L DETENTION FREE TIME CHARGE",
-        quantity: toSchemaDecimal("4"),
-        unit_price: toSchemaDecimal("327.60"),
-        amount: toSchemaDecimal("1310.40"),
-        currency: "USD",
-        payment_term: "CC",
-      },
-      financial_attributes: {
-        accounting_entity: entity,
-        posting_type: isNeptune ? "AR" : null,
-      },
-      shipment_refs: {
-        mbl_nos: [{ value: "MAEU275752922", source: "PDF 示例账单2.pdf" }],
-        hbl_no: null,
-        booking_no: null,
-        container_nos: [],
-      },
-      source_evidence: {
-        source_file: "PDF 示例账单2.pdf",
-        page: 1,
-        snippet: "4 ADD'L DETENTION FREE TIME CHARGE | CC | 1310.40 USD",
-      },
-      field_diffs: [],
-      validation_alerts: [],
-      ai_reasoning: ["单据总计 65.00 + 1310.40 + 35.00 = 1410.40 对账通过"],
-      human_overrides: {},
-      reject_reason: null,
-      created_at: now,
-      updated_at: now,
-    },
-    {
-      id: "rec-pdf2-hc2",
-      source_doc_id: "doc-pdf-2",
-      source_line_index: 4,
-      operation: "CREATE",
-      review_status: "AUTO_READY",
-      match_level: "NONE",
-      matched_existing_bill_id: null,
-      matched_bill_ref: null,
-      inherited_fields: [],
-      candidate_bills: [],
-      document_info: {
-        document_type: "Debit Note",
-        reference_no: "DC-108478",
-        document_date: "2026-10-24",
-      },
-      transaction_party: {
-        issuer: "NEPTUNE SHIPPING LIMITED (LAX)",
-        recipient: "OVERSEAS PARTNER",
-      },
-      charge_details: {
-        charge_item: "Handling Charge",
-        raw_charge_name: "HANDLING CHARGE",
-        quantity: toSchemaDecimal("1"),
-        unit_price: toSchemaDecimal("35.00"),
-        amount: toSchemaDecimal("35.00"),
-        currency: "USD",
-        payment_term: "CC",
-      },
-      financial_attributes: {
-        accounting_entity: entity,
-        posting_type: isNeptune ? "AR" : null,
-      },
-      shipment_refs: {
-        mbl_nos: [{ value: "MAEU275752922", source: "PDF 示例账单2.pdf" }],
-        hbl_no: null,
-        booking_no: null,
-        container_nos: [],
-      },
-      source_evidence: {
-        source_file: "PDF 示例账单2.pdf",
-        page: 1,
-        snippet: "HANDLING CHARGE (LINE 2) | CC | 35.00 USD",
-      },
-      field_diffs: [],
-      validation_alerts: [],
-      ai_reasoning: ["同单合法同名第二行 Handling Charge 35.00 独立成条"],
       human_overrides: {},
       reject_reason: null,
       created_at: now,
@@ -950,9 +1092,24 @@ function toBatchSummary(detail: BatchDetail): BatchSummary {
   };
 }
 
+function preserveChargeDetailsDecimals(
+  details: BillingRecordDetail["charge_details"]
+): BillingRecordDetail["charge_details"] {
+  const qtyStr = readDecimalString(details, "quantity");
+  const unitStr = readDecimalString(details, "unit_price");
+  const amtStr = readDecimalString(details, "amount");
+  return {
+    ...details,
+    quantity: qtyStr !== null ? toSchemaDecimal(qtyStr) : null,
+    unit_price: unitStr !== null ? toSchemaDecimal(unitStr) : null,
+    amount: amtStr !== null ? toSchemaDecimal(amtStr) : null,
+  };
+}
+
 function buildExportRecords(
   batch: BatchDetail,
-  mode: ExportResponse["mode"]
+  mode: ExportResponse["mode"],
+  meta?: BatchAuditMeta
 ): ExportResponse {
   let excludedPending = 0;
   let excludedRejected = 0;
@@ -960,8 +1117,8 @@ function buildExportRecords(
 
   for (const rec of batch.records) {
     if (rec.review_status === "REJECTED") {
-      excludedRejected++;
       if (mode !== "audit") {
+        excludedRejected++;
         continue;
       }
     } else if (
@@ -976,7 +1133,7 @@ function buildExportRecords(
       operation: rec.operation,
       document_info: rec.document_info,
       transaction_party: rec.transaction_party,
-      charge_details: rec.charge_details,
+      charge_details: preserveChargeDetailsDecimals(rec.charge_details),
       financial_attributes: rec.financial_attributes,
       audit_trail: {
         ai_reasoning: rec.ai_reasoning,
@@ -985,13 +1142,15 @@ function buildExportRecords(
         ...(mode === "audit"
           ? {
               record_id: rec.id,
+              source_doc_id: rec.source_doc_id,
               review_status: rec.review_status,
               reject_reason: rec.reject_reason ?? null,
               source_evidence: rec.source_evidence ?? {},
               validation_alerts: rec.validation_alerts ?? [],
               human_overrides: rec.human_overrides ?? {},
-              retry_count: 0,
-              human_review_history: [],
+              retry_count: meta?.docRetryCount.get(rec.source_doc_id) ?? 0,
+              llm_calls_used: meta?.llmCallsUsed ?? 3,
+              human_review_history: meta?.recordHistory.get(rec.id) ?? [],
             }
           : {}),
       },
@@ -1012,6 +1171,11 @@ export function createDevStubTransport(): FetchLike {
   let batchSeq = 1;
   let entitySeq = 5;
   let dictSeq = 10;
+  let tsCounter = 0;
+  const nextStubTimestamp = (): string => {
+    tsCounter++;
+    return new Date(Date.UTC(2026, 10, 20, 9, 10, tsCounter)).toISOString();
+  };
 
   const entities: AccountingEntity[] = [
     {
@@ -1122,6 +1286,29 @@ export function createDevStubTransport(): FetchLike {
       posting_type: "AP",
       version: 1,
     },
+    {
+      id: "bill-cmdu-001",
+      external_bill_key: "CMDUCHN4053601#On Carriage Additional",
+      accounting_entity: "NEPTUNE SHIPPING LIMITED",
+      document_type: "Arrival Notice",
+      reference_no: "CMDUCHN4053601",
+      document_date: "2026-10-15",
+      issuer: "CMA CGM (AMERICA) LLC",
+      recipient: "NEPTUNE SHIPPING LIMITED",
+      mbl_no: "CMDUCHN4053601",
+      hbl_no: null,
+      booking_no: null,
+      container_nos: [],
+      charge_item: "On Carriage Additional",
+      raw_charge_name: "On Carriage Additional - US Em",
+      quantity: toSchemaDecimal("1"),
+      unit_price: toSchemaDecimal("230.00"),
+      amount: toSchemaDecimal("230.00"),
+      currency: "USD",
+      payment_term: "CC",
+      posting_type: "AP",
+      version: 1,
+    },
   ];
 
   const evalRuns: EvalRunSummary[] = [];
@@ -1139,6 +1326,21 @@ export function createDevStubTransport(): FetchLike {
     [initialBatch.id, initialBatch],
   ]);
   const pollSteps = new Map<string, number>([[initialBatch.id, STAGE_SEQUENCE.length]]);
+  const auditMetas = new Map<string, BatchAuditMeta>([
+    [initialBatch.id, createBatchAuditMeta()],
+  ]);
+  const getAuditMeta = (batchId: string): BatchAuditMeta => {
+    let meta = auditMetas.get(batchId);
+    if (!meta) {
+      meta = createBatchAuditMeta();
+      auditMetas.set(batchId, meta);
+    }
+    return meta;
+  };
+  const baselineSyncLedger = new Map<
+    string,
+    { existingBillId: string; syncedUpdatedAt: string }
+  >();
 
   return async (input: RequestInfo | URL, init?: RequestInit) => {
     const rawUrl = typeof input === "string" ? input : input.toString();
@@ -1509,15 +1711,46 @@ export function createDevStubTransport(): FetchLike {
           404
         );
       }
+      let retryOcrMode = next.ocr_mode;
+      let hasReplacementFile = false;
+      let hasPublicUrl = false;
+      if (init?.body instanceof FormData) {
+        const modeField = init.body.get("ocr_mode");
+        if (
+          modeField === "REMOTE_ONLY" ||
+          modeField === "REMOTE_WITH_LOCAL_FALLBACK"
+        ) {
+          retryOcrMode = modeField;
+        }
+        if (init.body.get("file")) {
+          hasReplacementFile = true;
+        }
+        const urlField = init.body.get("public_url");
+        if (typeof urlField === "string" && urlField.trim()) {
+          hasPublicUrl = true;
+        }
+      }
+      const meta = getAuditMeta(next.id);
+      meta.docRetryCount.set(docId, (meta.docRetryCount.get(docId) ?? 0) + 1);
+      meta.llmCallsUsed += 1;
+
       targetDoc.status = "METADATA_ONLY";
-      targetDoc.extraction_channel = "LOCAL_FALLBACK";
-      targetDoc.error_message = null;
+      targetDoc.extraction_channel =
+        retryOcrMode === "REMOTE_WITH_LOCAL_FALLBACK" && !hasPublicUrl
+          ? "LOCAL_FALLBACK"
+          : "REMOTE_OCR";
+      targetDoc.error_message = hasReplacementFile
+        ? "已通过替换文件完成重新解析"
+        : hasPublicUrl
+          ? "已通过公网 URL 重试完成解析"
+          : null;
       next.failed_documents = next.failed_documents.filter(
         (f) => f.doc_id !== docId
       );
       next.failed_files = next.failed_documents.length;
       next.succeeded_files = next.total_files - next.failed_files;
       next.status = next.failed_files > 0 ? "PARTIAL_ERROR" : "COMPLETED";
+      next.updated_at = nextStubTimestamp();
       batches.set(next.id, next);
       return jsonResponse(next);
     }
@@ -1543,9 +1776,14 @@ export function createDevStubTransport(): FetchLike {
           404
         );
       }
+      const meta = getAuditMeta(next.id);
+      meta.docRetryCount.set(docId, (meta.docRetryCount.get(docId) ?? 0) + 1);
+      meta.llmCallsUsed += 1;
+
       targetDoc.status = "METADATA_ONLY";
       targetDoc.extraction_channel = "REMOTE_OCR";
       targetDoc.error_message = "已人工强制提取：图片仅含公司徽标，无计费金额";
+      next.updated_at = nextStubTimestamp();
       batches.set(next.id, next);
       return jsonResponse(next);
     }
@@ -1584,6 +1822,24 @@ export function createDevStubTransport(): FetchLike {
       if (payload.total_currency !== undefined) {
         targetDoc.total_currency = payload.total_currency;
       }
+      const meta = getAuditMeta(next.id);
+      meta.docTotalsEdited.add(docId);
+      reconcileDocRecords(next, docId, meta, { forceTotalsCheck: true });
+
+      const ts = nextStubTimestamp();
+      for (const rec of next.records) {
+        if (rec.source_doc_id === docId) {
+          rec.updated_at = ts;
+          appendRecordHistory(meta, rec.id, {
+            action: "DOC_TOTALS_PATCHED",
+            operator: "财务复核员",
+            timestamp: ts,
+            reason: payload.review_note ?? "更新单据总额并重算同单行对账",
+          });
+        }
+      }
+      next.counts = computeCounts(next.records);
+      next.updated_at = ts;
       batches.set(next.id, next);
       return jsonResponse(next);
     }
@@ -1603,8 +1859,11 @@ export function createDevStubTransport(): FetchLike {
         String(init?.body ?? "{}")
       );
       const next = cloneBatchDetail(batch);
+      const ts = nextStubTimestamp();
+      const newId = `rec-manual-${next.records.length + 1}`;
+      const amtStr = readDecimalString(payload, "amount") ?? "0.00";
       next.records.push({
-        id: `rec-manual-${next.records.length + 1}`,
+        id: newId,
         source_doc_id: payload.source_doc_id,
         source_line_index: next.records.length,
         operation: "CREATE",
@@ -1627,8 +1886,8 @@ export function createDevStubTransport(): FetchLike {
           charge_item: payload.charge_item,
           raw_charge_name: payload.raw_charge_name ?? payload.charge_item,
           quantity: toSchemaDecimal("1"),
-          unit_price: payload.amount,
-          amount: payload.amount,
+          unit_price: toSchemaDecimal(amtStr),
+          amount: toSchemaDecimal(amtStr),
           currency: payload.currency,
           payment_term: payload.payment_term ?? null,
         },
@@ -1643,8 +1902,29 @@ export function createDevStubTransport(): FetchLike {
         ai_reasoning: [`财务人工补录：${payload.reason}`],
         human_overrides: { manual: true },
         reject_reason: null,
+        created_at: ts,
+        updated_at: ts,
+      });
+      const targetDoc = next.documents.find(
+        (d) => d.id === payload.source_doc_id
+      );
+      if (targetDoc) {
+        targetDoc.affected_record_ids = [
+          ...(targetDoc.affected_record_ids ?? []),
+          newId,
+        ];
+      }
+      const meta = getAuditMeta(next.id);
+      meta.recordEdited.add(newId);
+      reconcileDocRecords(next, payload.source_doc_id, meta);
+      appendRecordHistory(meta, newId, {
+        action: "MANUAL_CREATED",
+        operator: "财务复核员",
+        timestamp: ts,
+        reason: payload.reason,
       });
       next.counts = computeCounts(next.records);
+      next.updated_at = ts;
       batches.set(next.id, next);
       return jsonResponse(next, 201);
     }
@@ -1671,17 +1951,94 @@ export function createDevStubTransport(): FetchLike {
           404
         );
       }
+
+      const expectedUpdatedAt = getHeaderIgnoreCase(
+        init?.headers,
+        "X-Record-Updated-At"
+      );
+      if (
+        expectedUpdatedAt &&
+        target.updated_at &&
+        expectedUpdatedAt !== target.updated_at
+      ) {
+        return errorJsonResponse(
+          {
+            code: "RECORD_CONFLICT",
+            message: "该记录已被其他操作更新（版本冲突），请刷新最新数据后重试",
+            details: {
+              server_updated_at: target.updated_at,
+              client_updated_at: expectedUpdatedAt,
+            },
+          },
+          409
+        );
+      }
+
+      const meta = getAuditMeta(next.id);
+      const waiversHeader = getHeaderIgnoreCase(
+        init?.headers,
+        "X-Resolved-Warnings"
+      );
+      if (waiversHeader) {
+        const waivers = parseLosslessJson<WarningWaiverItem[]>(
+          decodeURIComponent(waiversHeader)
+        );
+        const recordWaivers =
+          meta.resolvedWaivers.get(recordId) ??
+          new Map<string, WarningWaiverItem>();
+        for (const w of waivers) {
+          const reasonLen = (w.reason ?? "").trim().length;
+          if (reasonLen < 2 || reasonLen > 500) {
+            return errorJsonResponse(
+              {
+                code: "INVALID_REASON_LENGTH",
+                message: "软告警解除说明须为 2–500 个字符",
+              },
+              422
+            );
+          }
+          const matchedAlert = (target.validation_alerts ?? []).find(
+            (a) =>
+              a.code === w.code &&
+              (a.field ?? null) === (w.field ?? null) &&
+              (a.actual ?? null) === (w.actual ?? null)
+          );
+          if (
+            !matchedAlert ||
+            matchedAlert.severity === "BLOCKER" ||
+            HARD_BLOCKER_CODES.has(w.code)
+          ) {
+            return errorJsonResponse(
+              {
+                code: "CANNOT_WAIVE_HARD_BLOCKER",
+                message: "硬性阻断或核心算术/总计门禁告警不可强行解除",
+                details: { code: w.code, field: w.field ?? null },
+              },
+              422
+            );
+          }
+          recordWaivers.set(makeWarningKey(w), w);
+        }
+        meta.resolvedWaivers.set(recordId, recordWaivers);
+      }
+
       if (payload.charge_item !== undefined) {
         target.charge_details.charge_item = payload.charge_item;
       }
       if (payload.quantity !== undefined) {
-        target.charge_details.quantity = payload.quantity;
+        const qStr = readDecimalString(payload, "quantity");
+        target.charge_details.quantity =
+          qStr !== null ? toSchemaDecimal(qStr) : null;
       }
       if (payload.unit_price !== undefined) {
-        target.charge_details.unit_price = payload.unit_price;
+        const uStr = readDecimalString(payload, "unit_price");
+        target.charge_details.unit_price =
+          uStr !== null ? toSchemaDecimal(uStr) : null;
       }
       if (payload.amount !== undefined) {
-        target.charge_details.amount = payload.amount;
+        const aStr = readDecimalString(payload, "amount");
+        target.charge_details.amount =
+          aStr !== null ? toSchemaDecimal(aStr) : null;
       }
       if (payload.currency !== undefined) {
         target.charge_details.currency = payload.currency;
@@ -1707,11 +2064,74 @@ export function createDevStubTransport(): FetchLike {
       if (payload.recipient !== undefined) {
         target.transaction_party.recipient = payload.recipient;
       }
+      if (!target.shipment_refs) {
+        target.shipment_refs = {};
+      }
+      if (payload.mbl_no !== undefined) {
+        target.shipment_refs.mbl_nos = payload.mbl_no
+          ? [{ value: payload.mbl_no, source: "人工修订" }]
+          : [];
+      }
+      if (payload.hbl_no !== undefined) {
+        target.shipment_refs.hbl_no = payload.hbl_no;
+      }
+      if (payload.booking_no !== undefined) {
+        target.shipment_refs.booking_no = payload.booking_no;
+      }
+      if (payload.container_nos !== undefined) {
+        target.shipment_refs.container_nos = payload.container_nos ?? [];
+      }
+      if (payload.force_create_new === true) {
+        target.matched_existing_bill_id = null;
+        target.matched_bill_ref = null;
+        target.match_level = "NONE";
+      } else if (payload.matched_existing_bill_id !== undefined) {
+        target.matched_existing_bill_id = payload.matched_existing_bill_id;
+        if (payload.matched_existing_bill_id) {
+          const matchedBill = existingBills.find(
+            (b) => b.id === payload.matched_existing_bill_id
+          );
+          const candidateBill = target.candidate_bills?.find(
+            (c) => c.id === payload.matched_existing_bill_id
+          );
+          target.matched_bill_ref = matchedBill
+            ? `${matchedBill.reference_no ?? matchedBill.id} / ${matchedBill.charge_item}`
+            : candidateBill
+              ? candidateBill.label
+              : payload.matched_existing_bill_id;
+          target.match_level = "L1_DOC_CHARGE";
+        } else {
+          target.matched_bill_ref = null;
+          target.match_level = "NONE";
+        }
+      }
+
+      const overridePatch = { ...payload } as Record<string, unknown>;
+      delete overridePatch.raw_charge_name;
+      for (const k of ["quantity", "unit_price", "amount"] as const) {
+        if (overridePatch[k] !== undefined) {
+          overridePatch[k] = readDecimalString(payload, k);
+        }
+      }
       target.human_overrides = {
         ...(target.human_overrides ?? {}),
-        ...payload,
+        ...overridePatch,
       };
+
+      meta.recordEdited.add(recordId);
+      reconcileDocRecords(next, target.source_doc_id, meta);
+
+      const ts = nextStubTimestamp();
+      target.updated_at = ts;
+      appendRecordHistory(meta, recordId, {
+        action: "PATCHED",
+        operator: "财务复核员",
+        timestamp: ts,
+        reason: payload.review_note ?? "保存全字段人工修订并重跑门禁",
+        overrides: overridePatch,
+      });
       next.counts = computeCounts(next.records);
+      next.updated_at = ts;
       batches.set(next.id, next);
       return jsonResponse(next);
     }
@@ -1728,6 +2148,19 @@ export function createDevStubTransport(): FetchLike {
           404
         );
       }
+      const payload = parseLosslessJson<{ reason?: string }>(
+        String(init?.body ?? "{}")
+      );
+      const reason = (payload.reason ?? "").trim();
+      if (reason.length < 2 || reason.length > 500) {
+        return errorJsonResponse(
+          {
+            code: "INVALID_REASON_LENGTH",
+            message: "批准理由须为 2–500 个字符",
+          },
+          422
+        );
+      }
       const next = cloneBatchDetail(batch);
       const target = next.records.find((r) => r.id === approveMatch[2]);
       if (!target) {
@@ -1736,6 +2169,24 @@ export function createDevStubTransport(): FetchLike {
           404
         );
       }
+      const expectedUpdatedAt = getHeaderIgnoreCase(
+        init?.headers,
+        "X-Record-Updated-At"
+      );
+      if (
+        expectedUpdatedAt &&
+        target.updated_at &&
+        expectedUpdatedAt !== target.updated_at
+      ) {
+        return errorJsonResponse(
+          {
+            code: "RECORD_CONFLICT",
+            message: "该记录已被其他操作更新（版本冲突），请刷新最新数据后重试",
+          },
+          409
+        );
+      }
+
       const blockers = (target.validation_alerts ?? []).filter(
         (a) => a.severity === "BLOCKER"
       );
@@ -1745,15 +2196,56 @@ export function createDevStubTransport(): FetchLike {
             code: "HARD_BLOCKER_CANNOT_APPROVE",
             message:
               "该记录存在未解决的硬性数值或对账错误，请先修正金额/币种或选择驳回",
-            details: { blocker_codes: blockers.map((b) => b.code) },
+            details: {
+              blocker_codes: blockers.map((b) => b.code),
+              blockers: blockers.map((b) => ({
+                code: b.code,
+                field: b.field ?? null,
+                message: b.message,
+                expected: b.expected ?? null,
+                actual: b.actual ?? null,
+              })),
+            },
             request_id: "stub-422-blocker",
           },
           422
         );
       }
+
+      const meta = getAuditMeta(next.id);
+      const recordWaivers =
+        meta.resolvedWaivers.get(target.id) ??
+        new Map<string, WarningWaiverItem>();
+      target.validation_alerts = (target.validation_alerts ?? []).map((a) => {
+        if (a.severity === "WARNING") {
+          recordWaivers.set(makeWarningKey(a), {
+            code: a.code,
+            field: a.field ?? null,
+            actual: a.actual ?? null,
+            reason,
+          });
+          return {
+            ...a,
+            severity: "RESOLVED",
+            message: `${a.message}（特例批准：${reason}）`,
+          };
+        }
+        return a;
+      });
+      meta.resolvedWaivers.set(target.id, recordWaivers);
+
+      const ts = nextStubTimestamp();
       target.review_status = "APPROVED";
       target.operation = target.matched_existing_bill_id ? "UPDATE" : "CREATE";
+      target.updated_at = ts;
+      appendRecordHistory(meta, target.id, {
+        action: "APPROVED",
+        operator: "财务复核员",
+        timestamp: ts,
+        reason,
+      });
       next.counts = computeCounts(next.records);
+      next.updated_at = ts;
       batches.set(next.id, next);
       return jsonResponse(next);
     }
@@ -1768,9 +2260,19 @@ export function createDevStubTransport(): FetchLike {
           404
         );
       }
-      const payload = parseLosslessJson<{ reason: string }>(
+      const payload = parseLosslessJson<{ reason?: string }>(
         String(init?.body ?? "{}")
       );
+      const reason = (payload.reason ?? "").trim();
+      if (reason.length < 2 || reason.length > 500) {
+        return errorJsonResponse(
+          {
+            code: "INVALID_REASON_LENGTH",
+            message: "驳回理由须为 2–500 个字符",
+          },
+          422
+        );
+      }
       const next = cloneBatchDetail(batch);
       const target = next.records.find((r) => r.id === rejectMatch[2]);
       if (!target) {
@@ -1779,9 +2281,22 @@ export function createDevStubTransport(): FetchLike {
           404
         );
       }
+      const ts = nextStubTimestamp();
       target.review_status = "REJECTED";
-      target.reject_reason = payload.reason;
+      target.reject_reason = reason;
+      target.updated_at = ts;
+
+      const meta = getAuditMeta(next.id);
+      meta.recordEdited.add(target.id);
+      reconcileDocRecords(next, target.source_doc_id, meta);
+      appendRecordHistory(meta, target.id, {
+        action: "REJECTED",
+        operator: "财务复核员",
+        timestamp: ts,
+        reason,
+      });
       next.counts = computeCounts(next.records);
+      next.updated_at = ts;
       batches.set(next.id, next);
       return jsonResponse(next);
     }
@@ -1800,7 +2315,7 @@ export function createDevStubTransport(): FetchLike {
         rawMode === "full_standard" || rawMode === "audit"
           ? rawMode
           : "official";
-      return jsonResponse(buildExportRecords(batch, mode));
+      return jsonResponse(buildExportRecords(batch, mode, getAuditMeta(batch.id)));
     }
 
     const downloadMatch =
@@ -1818,7 +2333,7 @@ export function createDevStubTransport(): FetchLike {
         rawMode === "full_standard" || rawMode === "audit"
           ? rawMode
           : "official";
-      const exported = buildExportRecords(batch, mode);
+      const exported = buildExportRecords(batch, mode, getAuditMeta(batch.id));
       return jsonResponse(exported.records);
     }
 
@@ -1833,10 +2348,100 @@ export function createDevStubTransport(): FetchLike {
           404
         );
       }
+      let createdCount = 0;
+      let updatedCount = 0;
+      let skippedCount = 0;
+      const fallbackTs = batch.updated_at;
+
+      for (const rec of batch.records) {
+        if (
+          (rec.review_status !== "AUTO_READY" &&
+            rec.review_status !== "APPROVED") ||
+          (rec.operation !== "CREATE" && rec.operation !== "UPDATE")
+        ) {
+          continue;
+        }
+        const recUpdatedAt = rec.updated_at ?? fallbackTs;
+        const ledgerKey = `${batch.id}::${rec.id}`;
+        const prevSync = baselineSyncLedger.get(ledgerKey);
+
+        if (prevSync && prevSync.syncedUpdatedAt === recUpdatedAt) {
+          skippedCount++;
+          continue;
+        }
+
+        const targetBillId =
+          prevSync?.existingBillId ?? rec.matched_existing_bill_id ?? null;
+        const existingBill = targetBillId
+          ? existingBills.find((b) => b.id === targetBillId)
+          : undefined;
+        const amtStr = readDecimalString(rec.charge_details, "amount") ?? "0.00";
+        const qtyStr = readDecimalString(rec.charge_details, "quantity");
+        const unitStr = readDecimalString(rec.charge_details, "unit_price");
+
+        if (existingBill) {
+          existingBill.accounting_entity =
+            rec.financial_attributes.accounting_entity;
+          existingBill.document_type = rec.document_info.document_type;
+          existingBill.reference_no = rec.document_info.reference_no;
+          existingBill.document_date = rec.document_info.document_date;
+          existingBill.issuer = rec.transaction_party.issuer;
+          existingBill.recipient = rec.transaction_party.recipient;
+          existingBill.charge_item =
+            rec.charge_details.charge_item ?? existingBill.charge_item;
+          existingBill.quantity =
+            qtyStr !== null ? toSchemaDecimal(qtyStr) : null;
+          existingBill.unit_price =
+            unitStr !== null ? toSchemaDecimal(unitStr) : null;
+          existingBill.amount = toSchemaDecimal(amtStr);
+          existingBill.currency =
+            rec.charge_details.currency ?? existingBill.currency;
+          existingBill.payment_term = rec.charge_details.payment_term;
+          existingBill.posting_type =
+            rec.financial_attributes.posting_type ?? existingBill.posting_type;
+          existingBill.version += 1;
+          baselineSyncLedger.set(ledgerKey, {
+            existingBillId: existingBill.id,
+            syncedUpdatedAt: recUpdatedAt,
+          });
+          updatedCount++;
+        } else {
+          const newBillId = `bill-sync-${existingBills.length + 1}`;
+          existingBills.push({
+            id: newBillId,
+            external_bill_key: `${rec.document_info.reference_no ?? rec.id}#${rec.charge_details.charge_item ?? "Fee"}`,
+            accounting_entity: rec.financial_attributes.accounting_entity,
+            document_type: rec.document_info.document_type,
+            reference_no: rec.document_info.reference_no,
+            document_date: rec.document_info.document_date,
+            issuer: rec.transaction_party.issuer,
+            recipient: rec.transaction_party.recipient,
+            mbl_no: rec.shipment_refs?.mbl_nos?.[0]?.value ?? null,
+            hbl_no: rec.shipment_refs?.hbl_no ?? null,
+            booking_no: rec.shipment_refs?.booking_no ?? null,
+            container_nos: rec.shipment_refs?.container_nos ?? [],
+            charge_item: rec.charge_details.charge_item ?? "Handling Charge",
+            raw_charge_name: rec.charge_details.raw_charge_name ?? null,
+            quantity: qtyStr !== null ? toSchemaDecimal(qtyStr) : null,
+            unit_price: unitStr !== null ? toSchemaDecimal(unitStr) : null,
+            amount: toSchemaDecimal(amtStr),
+            currency: rec.charge_details.currency ?? "USD",
+            payment_term: rec.charge_details.payment_term,
+            posting_type: rec.financial_attributes.posting_type ?? "AP",
+            version: 1,
+          });
+          baselineSyncLedger.set(ledgerKey, {
+            existingBillId: newBillId,
+            syncedUpdatedAt: recUpdatedAt,
+          });
+          createdCount++;
+        }
+      }
+
       const res: SyncBaselineResult = {
-        created_count: batch.counts.create,
-        updated_count: batch.counts.update,
-        skipped_count: batch.counts.no_change,
+        created_count: createdCount,
+        updated_count: updatedCount,
+        skipped_count: skippedCount,
       };
       return jsonResponse(res);
     }

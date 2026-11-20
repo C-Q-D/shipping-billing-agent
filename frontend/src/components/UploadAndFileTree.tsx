@@ -114,6 +114,7 @@ export interface UploadAndFileTreeProps {
   selectedEntity: string;
   activeBatch: BatchDetail | null;
   activeDocFilterId: string | null;
+  dirtyDocIds?: ReadonlySet<string>;
   submittingBatch: boolean;
   submittingDemo: boolean;
   retryingDocId: string | null;
@@ -130,15 +131,16 @@ export interface UploadAndFileTreeProps {
     ocrMode: OcrMode;
   }) => Promise<void>;
   onSelectDocFilter: (docId: string | null) => void;
+  onInspectDoc: (docId: string) => void;
   onForceParseDoc: (docId: string) => void;
   onRetryOrReplaceDoc: (docId: string, file?: File) => void;
-  onOpenDocTotalsHint: (doc: SourceDocumentSummary) => void;
 }
 
 export function UploadAndFileTree({
   selectedEntity,
   activeBatch,
   activeDocFilterId,
+  dirtyDocIds,
   submittingBatch,
   submittingDemo,
   retryingDocId,
@@ -146,9 +148,9 @@ export function UploadAndFileTree({
   onSubmitBatch,
   onSubmitDemo,
   onSelectDocFilter,
+  onInspectDoc,
   onForceParseDoc,
   onRetryOrReplaceDoc,
-  onOpenDocTotalsHint,
 }: UploadAndFileTreeProps) {
   const [stagedFiles, setStagedFiles] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
@@ -596,6 +598,7 @@ export function UploadAndFileTree({
               {orderedDocs.map(({ doc, isChild }) => {
                 const statusMeta = getDocStatusMeta(doc.status);
                 const isSelected = activeDocFilterId === doc.id;
+                const isDocDirty = dirtyDocIds?.has(doc.id) ?? false;
                 const totalStr = formatLosslessAmount(doc, "total_amount", "");
                 return (
                   <div
@@ -606,13 +609,25 @@ export function UploadAndFileTree({
                     data-child={isChild ? "true" : "false"}
                     data-failed={doc.status === "FAILED" ? "true" : "false"}
                     data-active={isSelected ? "true" : "false"}
-                    onClick={() =>
-                      onSelectDocFilter(isSelected ? null : doc.id)
-                    }
+                    onClick={() => {
+                      onSelectDocFilter(isSelected ? null : doc.id);
+                      if (
+                        doc.status === "FAILED" ||
+                        doc.status === "SKIPPED_NOISE"
+                      ) {
+                        onInspectDoc(doc.id);
+                      }
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
                         onSelectDocFilter(isSelected ? null : doc.id);
+                        if (
+                          doc.status === "FAILED" ||
+                          doc.status === "SKIPPED_NOISE"
+                        ) {
+                          onInspectDoc(doc.id);
+                        }
                       }
                     }}
                   >
@@ -627,9 +642,14 @@ export function UploadAndFileTree({
                         />
                         <span>{doc.sanitized_filename}</span>
                       </span>
-                      <span className={`wb-badge wb-badge--${statusMeta.tone}`}>
-                        {statusMeta.label}
-                      </span>
+                      <div style={{ display: "inline-flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
+                        {isDocDirty ? (
+                          <span className="wb-badge wb-badge--warn">未保存</span>
+                        ) : null}
+                        <span className={`wb-badge wb-badge--${statusMeta.tone}`}>
+                          {statusMeta.label}
+                        </span>
+                      </div>
                     </div>
 
                     <div className="wb-doc-meta-row">
@@ -681,16 +701,14 @@ export function UploadAndFileTree({
                           </>
                         ) : null}
 
-                        {doc.status === "PARSED" ? (
-                          <LumnoButton
-                            variant="ghost"
-                            compact
-                            icon="ri-calculator-line"
-                            onClick={() => onOpenDocTotalsHint(doc)}
-                          >
-                            总额概览
-                          </LumnoButton>
-                        ) : null}
+                        <LumnoButton
+                          variant="ghost"
+                          compact
+                          icon="ri-tools-line"
+                          onClick={() => onInspectDoc(doc.id)}
+                        >
+                          {doc.status === "PARSED" ? "总额与修理" : "详情修理"}
+                        </LumnoButton>
                       </div>
                     </div>
 

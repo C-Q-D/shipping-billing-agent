@@ -4,7 +4,7 @@ import type {
   BatchSummary,
   BillingRecordDetail,
 } from "../api/client.ts";
-import { formatLosslessAmount } from "../api/decimalJson.ts";
+import { formatLosslessAmount, readDecimalString } from "../api/decimalJson.ts";
 import { LumnoButton, LumnoSegmentedControl } from "./LumnoPrimitives.tsx";
 
 export type RecordFilterTab =
@@ -63,14 +63,16 @@ export interface BatchQueuePanelProps {
   filterTab: RecordFilterTab;
   activeDocFilterId: string | null;
   selectedRecordId: string | null;
+  dirtyRecordIds?: ReadonlySet<string>;
   retryingDocId: string | null;
   entityNotice: { count: number; message: string } | null;
   onChangeFilterTab: (tab: RecordFilterTab) => void;
   onClearDocFilter: () => void;
   onSelectRecord: (recordId: string) => void;
+  onInspectDoc: (docId: string) => void;
   onRetryOrReplaceDoc: (docId: string, file?: File) => void;
   onDismissEntityNotice: () => void;
-  onOpenManualRecordHint: () => void;
+  onOpenManualRecord: () => void;
 }
 
 export function BatchQueuePanel({
@@ -78,14 +80,16 @@ export function BatchQueuePanel({
   filterTab,
   activeDocFilterId,
   selectedRecordId,
+  dirtyRecordIds,
   retryingDocId,
   entityNotice,
   onChangeFilterTab,
   onClearDocFilter,
   onSelectRecord,
+  onInspectDoc,
   onRetryOrReplaceDoc,
   onDismissEntityNotice,
-  onOpenManualRecordHint,
+  onOpenManualRecord,
 }: BatchQueuePanelProps) {
   const replaceInputRef = useRef<HTMLInputElement | null>(null);
   const replaceDocIdRef = useRef<string | null>(null);
@@ -148,7 +152,7 @@ export function BatchQueuePanel({
               variant="ghost"
               compact
               icon="ri-add-line"
-              onClick={onOpenManualRecordHint}
+              onClick={onOpenManualRecord}
             >
               手工补行
             </LumnoButton>
@@ -295,6 +299,14 @@ export function BatchQueuePanel({
                           </LumnoButton>
                         ) : null}
                         <LumnoButton
+                          variant="ghost"
+                          compact
+                          icon="ri-tools-line"
+                          onClick={() => onInspectDoc(failDoc.doc_id)}
+                        >
+                          详情修理
+                        </LumnoButton>
+                        <LumnoButton
                           variant="secondary"
                           compact
                           icon="ri-refresh-line"
@@ -376,6 +388,7 @@ export function BatchQueuePanel({
               <div className="wb-record-list" role="listbox" aria-label="账单明细列表">
                 {filteredRecords.map((rec) => {
                   const selected = rec.id === selectedRecordId;
+                  const isDirty = dirtyRecordIds?.has(rec.id) ?? false;
                   const opMeta = getOperationBadge(rec);
                   const blockers = (rec.validation_alerts ?? []).filter(
                     (a) => a.severity === "BLOCKER"
@@ -383,6 +396,15 @@ export function BatchQueuePanel({
                   const warnings = (rec.validation_alerts ?? []).filter(
                     (a) => a.severity === "WARNING"
                   ).length;
+                  const rawAmountStr = readDecimalString(
+                    rec.charge_details,
+                    "amount"
+                  );
+                  const isCredit =
+                    (rawAmountStr?.startsWith("-") ?? false) ||
+                    (rec.document_info.document_type ?? "")
+                      .toLowerCase()
+                      .includes("credit");
                   const amountText = formatLosslessAmount(
                     rec.charge_details,
                     "amount"
@@ -410,6 +432,14 @@ export function BatchQueuePanel({
                           {rec.charge_details.raw_charge_name ? (
                             <span className="wb-record-sub">
                               ({rec.charge_details.raw_charge_name})
+                            </span>
+                          ) : null}
+                          {isCredit ? (
+                            <span className="wb-badge wb-badge--info">贷项</span>
+                          ) : null}
+                          {isDirty ? (
+                            <span className="wb-badge wb-badge--warn">
+                              未保存
                             </span>
                           ) : null}
                         </div>
