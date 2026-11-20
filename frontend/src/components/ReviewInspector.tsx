@@ -6,32 +6,33 @@ import {
   useState,
   type ChangeEvent,
 } from "react";
-import type {
-  BatchDetail,
-  BillingRecordDetail,
-  ChargeDictionaryEntry,
-  OcrMode,
-  SourceDocumentSummary,
-  ValidationAlert,
+import {
+  isAllowedUploadFilename,
+  isValidPublicHttpUrl,
+  MAX_SINGLE_FILE_BYTES,
+  type BatchDetail,
+  type BillingRecordDetail,
+  type ChargeDictionaryEntry,
+  type OcrMode,
+  type SourceDocumentSummary,
+  type ValidationAlert,
 } from "../api/client.ts";
 import { formatLosslessAmount, readDecimalString } from "../api/decimalJson.ts";
 import {
   buildDocTotalsDiffPatch,
   buildRecordDiffPatch,
-  canWaiveValidationAlert,
+  countCodePoints,
   extractServerRecordFormValues,
   getEffectiveDocTotalsValues,
   getEffectiveRecordFormValues,
-  getRecordWarningWaivers,
   hasDocTotalsDraft,
   hasRecordDraft,
-  makeWarningKey,
   validateReviewReason,
   type DebitCreditOption,
   type DocTotalsFormValues,
   type DraftStoreState,
+  type MutationErrorBanner,
   type RecordFormValues,
-  type WarningWaiverDraft,
 } from "../api/reviewState.ts";
 import {
   LumnoButton,
@@ -43,25 +44,13 @@ import {
   LumnoTooltip,
 } from "./LumnoPrimitives.tsx";
 
-export interface MutationErrorBanner {
-  title: string;
-  code?: string;
-  message: string;
-  blockers?: Array<{
-    code: string;
-    field?: string | null;
-    message: string;
-    expected?: string | null;
-    actual?: string | null;
-  }>;
-  isConflict?: boolean;
-}
+export type { MutationErrorBanner };
 
 export interface RecordAuditHistoryState {
   loading: boolean;
   error: string | null;
-  llmCallsUsed: number | null;
   retryCount: number | null;
+  extractionChannel: string | null;
   history: Array<{
     action: string;
     operator: string;
@@ -91,8 +80,6 @@ export interface ReviewInspectorProps {
     field: K,
     value: RecordFormValues[K]
   ) => void;
-  onSetWarningWaiver: (recordId: string, waiver: WarningWaiverDraft) => void;
-  onRemoveWarningWaiver: (recordId: string, warningKey: string) => void;
   onResetRecordDraft: (recordId: string) => void;
   onSaveRecordPatch: (record: BillingRecordDetail) => Promise<void>;
   onApproveRecord: (
@@ -167,9 +154,10 @@ function getFieldProvenance(
   ) {
     return "override";
   }
+  const inheritedFields = record.inherited_fields ?? [];
   if (
-    record.inherited_fields.includes(fieldKey) ||
-    (fieldKey === "mbl_no" && record.inherited_fields.includes("mbl_nos"))
+    inheritedFields.includes(fieldKey) ||
+    (fieldKey === "mbl_no" && inheritedFields.includes("mbl_nos"))
   ) {
     return "inherited";
   }
@@ -201,8 +189,6 @@ export function ReviewInspector({
   onRefreshBatch,
   onClearInspectedDoc,
   onUpdateRecordField,
-  onSetWarningWaiver,
-  onRemoveWarningWaiver,
   onResetRecordDraft,
   onSaveRecordPatch,
   onApproveRecord,
@@ -237,6 +223,11 @@ export function ReviewInspector({
   const [auditExpanded, setAuditExpanded] = useState(false);
   const [retryOcrMode, setRetryOcrMode] = useState<OcrMode>("REMOTE_ONLY");
   const [retryPublicUrl, setRetryPublicUrl] = useState("");
+  const [stagedRetryFile, setStagedRetryFile] = useState<{
+    docId: string;
+    file: File;
+  } | null>(null);
+  const [retrySourceError, setRetrySourceError] = useState<string | null>(null);
 
   useLayoutEffect(() => {
     scrollPaneRef.current?.scrollTo({ top: 0, behavior: "auto" });
@@ -254,20 +245,38 @@ export function ReviewInspector({
   useEffect(() => {
     setDocValidationErrors({});
     setRetryPublicUrl("");
+    setStagedRetryFile(null);
+    setRetrySourceError(null);
+  }, [batch?.id, inspectedDocId, selectedRecord?.source_doc_id]);
+
+  useEffect(() => {
     if (batch) {
       setRetryOcrMode(batch.ocr_mode);
     }
-  }, [batch?.id, inspectedDocId, selectedRecord?.source_doc_id, batch]);
+  }, [batch?.id]);
+
+  const activeRecordDirty =
+    batch && selectedRecord
+      ? hasRecordDraft(draftStore, batch.id, selectedRecord.id)
+      : false;
+
+  useEffect(() => {
+    if (activeRecordDirty) {
+      setApprovePanelOpen(false);
+      setApproveReasonError(null);
+    }
+  }, [activeRecordDirty]);
 
   const inspectedDoc = useMemo(() => {
     if (!batch || !inspectedDocId) return null;
-    return batch.documents.find((d) => d.id === inspectedDocId) ?? null;
+    return (batch.documents ?? []).find((d) => d.id === inspectedDocId) ?? null;
   }, [batch, inspectedDocId]);
 
   const recordSourceDoc = useMemo(() => {
     if (!batch || !selectedRecord) return null;
     return (
-      batch.documents.find((d) => d.id === selectedRecord.source_doc_id) ?? null
+      (batch.documents ?? []).find((d) => d.id === selectedRecord.source_doc_id) ??
+      null
     );
   }, [batch, selectedRecord]);
 
@@ -344,7 +353,7 @@ export function ReviewInspector({
     if (!diff.valid) {
       setRecordValidationErrors(diff.fieldErrors);
       const firstErrField = Object.keys(diff.fieldErrors)[0];
-      if (firstErrField && !firstErrField.startsWith("waive:")) {
+      if (firstErrField) {
         focusField(firstErrField);
       }
       return;
@@ -354,7 +363,11 @@ export function ReviewInspector({
   };
 
   const handleConfirmApproveClick = async () => {
-    if (!selectedRecord) return;
+    if (!batch || !selectedRecord) return;
+    if (hasRecordDraft(draftStore, batch.id, selectedRecord.id)) {
+      setApproveReasonError("请先保存当前未保存修改，或放弃草稿后再执行批准/驳回");
+      return;
+    }
     const err = validateReviewReason(approveReason);
     if (err) {
       setApproveReasonError(err);
@@ -382,12 +395,49 @@ export function ReviewInspector({
     e.target.value = "";
     const docId = replaceTargetDocIdRef.current;
     replaceTargetDocIdRef.current = null;
-    if (docId && file) {
-      void onRetryDoc(docId, {
-        ocrMode: retryOcrMode,
-        publicUrl: retryPublicUrl.trim() || undefined,
-        file,
-      });
+    if (!docId || !file) return;
+    if (!isAllowedUploadFilename(file.name)) {
+      setRetrySourceError(
+        "不支持的替换文件格式（仅支持 .eml/.pdf/.jpg/.jpeg/.png/.tif/.tiff/.xls/.xlsx/.doc/.docx）"
+      );
+      return;
+    }
+    if (file.size <= 0) {
+      setRetrySourceError("替换文件大小为 0 字节，无法上传");
+      return;
+    }
+    if (file.size > MAX_SINGLE_FILE_BYTES) {
+      setRetrySourceError("替换文件超过 50 MiB 单文件上限");
+      return;
+    }
+    // A8: Mutually exclusive — selecting a replacement file clears public URL
+    setRetryPublicUrl("");
+    setRetrySourceError(null);
+    setStagedRetryFile({ docId, file });
+  };
+
+  const handleSubmitDocRetry = async (docId: string) => {
+    const activeFile =
+      stagedRetryFile && stagedRetryFile.docId === docId
+        ? stagedRetryFile.file
+        : undefined;
+    const trimmedUrl = retryPublicUrl.trim();
+    if (activeFile && trimmedUrl) {
+      setRetrySourceError("替换文件与公网 URL 互斥，请仅保留其中一项");
+      return;
+    }
+    if (trimmedUrl && !isValidPublicHttpUrl(trimmedUrl)) {
+      setRetrySourceError("公网 URL 格式无效，须以 http:// 或 https:// 开头");
+      return;
+    }
+    setRetrySourceError(null);
+    await onRetryDoc(docId, {
+      ocrMode: retryOcrMode,
+      publicUrl: activeFile ? undefined : trimmedUrl || undefined,
+      file: activeFile,
+    });
+    if (activeFile) {
+      setStagedRetryFile(null);
     }
   };
 
@@ -454,7 +504,7 @@ export function ReviewInspector({
 
         <div className="wb-doc-repair-controls">
           <div className="wb-field-label">
-            <span>重试 / 强扫 OCR 通道切换</span>
+            <span>重试 / 替换来源（替换文件与公网 URL 严格互斥）</span>
           </div>
           <div className="wb-form-row-wrap">
             <LumnoSegmentedControl
@@ -468,11 +518,41 @@ export function ReviewInspector({
             />
             <LumnoInput
               value={retryPublicUrl}
-              placeholder="可选：补充公网 PDF/图片 URL 后重试"
+              placeholder="可选：填写公网 URL 重试（输入 URL 将清空待传替换文件）"
               aria-label="补充公网 URL 重试"
-              onChange={(e) => setRetryPublicUrl(e.target.value)}
+              onChange={(e) => {
+                const nextUrl = e.target.value;
+                setRetryPublicUrl(nextUrl);
+                setRetrySourceError(null);
+                if (nextUrl.trim() && stagedRetryFile?.docId === doc.id) {
+                  setStagedRetryFile(null);
+                }
+              }}
             />
           </div>
+          {stagedRetryFile && stagedRetryFile.docId === doc.id ? (
+            <div className="wb-staged-item">
+              <div className="wb-staged-row">
+                <span className="wb-staged-name" title={stagedRetryFile.file.name}>
+                  待替换文件：{stagedRetryFile.file.name}
+                </span>
+                <LumnoButton
+                  variant="ghost"
+                  compact
+                  icon="ri-close-line"
+                  onClick={() => {
+                    setStagedRetryFile(null);
+                    setRetrySourceError(null);
+                  }}
+                >
+                  取消替换
+                </LumnoButton>
+              </div>
+            </div>
+          ) : null}
+          {retrySourceError ? (
+            <div className="wb-field-error">{retrySourceError}</div>
+          ) : null}
           <div className="wb-action-row">
             {doc.status === "SKIPPED_NOISE" ? (
               <LumnoButton
@@ -492,14 +572,13 @@ export function ReviewInspector({
               icon="ri-refresh-line"
               busy={isRetrying}
               disabled={isForcing}
-              onClick={() =>
-                void onRetryDoc(doc.id, {
-                  ocrMode: retryOcrMode,
-                  publicUrl: retryPublicUrl.trim() || undefined,
-                })
-              }
+              onClick={() => void handleSubmitDocRetry(doc.id)}
             >
-              按所选通道重试
+              {stagedRetryFile && stagedRetryFile.docId === doc.id
+                ? "上传替换文件并重算"
+                : retryPublicUrl.trim()
+                  ? "使用公网 URL 重试"
+                  : "按所选通道原地重试"}
             </LumnoButton>
             <LumnoButton
               variant="ghost"
@@ -511,7 +590,7 @@ export function ReviewInspector({
                 replaceFileInputRef.current?.click();
               }}
             >
-              上传替换文件
+              选择替换文件
             </LumnoButton>
             <LumnoButton
               variant="ghost"
@@ -678,9 +757,6 @@ export function ReviewInspector({
   const formValues = selectedRecord
     ? getEffectiveRecordFormValues(selectedRecord, draftStore, batch.id)
     : null;
-  const waiversMap = selectedRecord
-    ? getRecordWarningWaivers(draftStore, batch.id, selectedRecord.id)
-    : {};
   const diffPreview = selectedRecord
     ? buildRecordDiffPatch(selectedRecord, draftStore, batch.id)
     : null;
@@ -765,10 +841,22 @@ export function ReviewInspector({
               <ul style={{ margin: "4px 0 0", paddingLeft: "18px", fontSize: "12px" }}>
                 {mutationError.blockers.map((b, i) => (
                   <li key={`${b.code}-${i}`}>
-                    [{b.code}] {b.message}
-                    {b.expected || b.actual
-                      ? `（期望 ${b.expected ?? "—"} / 实际 ${b.actual ?? "—"}）`
-                      : ""}
+                    <span>
+                      [{b.code}]{b.field ? ` (${b.field})` : ""} {b.message}
+                      {b.expected || b.actual
+                        ? `（期望 ${b.expected ?? "—"} / 实际 ${b.actual ?? "—"}）`
+                        : ""}
+                    </span>
+                    {b.field ? (
+                      <LumnoButton
+                        variant="ghost"
+                        compact
+                        onClick={() => focusField(b.field!)}
+                        style={{ marginLeft: "6px" }}
+                      >
+                        定位字段
+                      </LumnoButton>
+                    ) : null}
                   </li>
                 ))}
               </ul>
@@ -876,130 +964,80 @@ export function ReviewInspector({
               ) : null}
             </div>
 
-            {/* Validation Alerts & Per-Item Soft Warning Waiver */}
+            {/* Validation Alerts */}
             {(selectedRecord.validation_alerts?.length ?? 0) > 0 ? (
-              <div className="wb-section-box" aria-label="校验门禁告警与软告警解除">
+              <div className="wb-section-box" aria-label="校验门禁告警">
                 <div className="wb-field-label">
                   <span>校验门禁告警</span>
                   <span className="wb-tabular">
                     {selectedRecord.validation_alerts?.length} 项
                   </span>
                 </div>
-                {selectedRecord.validation_alerts?.map((alert, idx) => {
-                  const wKey = makeWarningKey(alert);
-                  const activeWaiver = waiversMap[wKey];
-                  const waivable = canWaiveValidationAlert(alert);
-                  const waiveErr = recordValidationErrors[`waive:${wKey}`];
-
-                  return (
+                {(selectedRecord.validation_alerts ?? []).map((alert, idx) => (
+                  <div
+                    key={`${alert.code}-${alert.field ?? ""}-${idx}`}
+                    className="wb-alert-item"
+                    data-severity={alert.severity}
+                  >
                     <div
-                      key={`${wKey}-${idx}`}
-                      className="wb-alert-item"
-                      data-severity={alert.severity}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: "6px",
+                        flexWrap: "wrap",
+                      }}
                     >
-                      <div
-                        style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "center",
-                          gap: "6px",
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <strong style={{ fontSize: "12px" }}>
-                          [{alert.severity}] {alert.code}
-                          {alert.field ? ` · ${alert.field}` : ""}
-                        </strong>
-                        <div style={{ display: "inline-flex", gap: "4px" }}>
-                          {alert.field ? (
-                            <LumnoButton
-                              variant="ghost"
-                              compact
-                              onClick={() => focusField(alert.field!)}
-                            >
-                              定位字段
-                            </LumnoButton>
-                          ) : null}
-                          {alert.severity !== "RESOLVED" &&
-                          alert.field &&
-                          alert.expected ? (
-                            <LumnoButton
-                              variant="ghost"
-                              compact
-                              onClick={() => applySuggestedAlertValue(alert)}
-                            >
-                              采用建议值
-                            </LumnoButton>
-                          ) : null}
-                        </div>
+                      <strong style={{ fontSize: "12px" }}>
+                        [{alert.severity}] {alert.code}
+                        {alert.field ? ` · ${alert.field}` : ""}
+                      </strong>
+                      <div style={{ display: "inline-flex", gap: "4px" }}>
+                        {alert.field ? (
+                          <LumnoButton
+                            variant="ghost"
+                            compact
+                            onClick={() => focusField(alert.field!)}
+                          >
+                            定位字段
+                          </LumnoButton>
+                        ) : null}
+                        {alert.severity !== "RESOLVED" &&
+                        alert.field &&
+                        alert.expected ? (
+                          <LumnoButton
+                            variant="ghost"
+                            compact
+                            onClick={() => applySuggestedAlertValue(alert)}
+                          >
+                            采用建议值
+                          </LumnoButton>
+                        ) : null}
                       </div>
-
-                      <div>{alert.message}</div>
-
-                      {alert.expected || alert.actual ? (
-                        <div className="wb-mono wb-tabular" style={{ fontSize: "11px" }}>
-                          期望: {alert.expected ?? "—"} | 实际:{" "}
-                          {alert.actual ?? "—"}
-                        </div>
-                      ) : null}
-
-                      {alert.severity === "BLOCKER" ? (
-                        <div style={{ fontSize: "11px", opacity: 0.9 }}>
-                          硬性阻断严禁强行解除，请修订对应字段、修正单据总额或选择驳回。
-                        </div>
-                      ) : null}
-
-                      {waivable ? (
-                        <div className="wb-waiver-box">
-                          <label className="wb-waiver-toggle">
-                            <input
-                              type="checkbox"
-                              checked={Boolean(activeWaiver)}
-                              onChange={(e) => {
-                                if (e.target.checked) {
-                                  onSetWarningWaiver(selectedRecord.id, {
-                                    code: alert.code,
-                                    field: alert.field ?? null,
-                                    actual: alert.actual ?? null,
-                                    reason: activeWaiver?.reason ?? "",
-                                  });
-                                } else {
-                                  onRemoveWarningWaiver(selectedRecord.id, wKey);
-                                }
-                              }}
-                            />
-                            <span>
-                              解除此软告警（提交精确 (code, field, actual) 与说明）
-                            </span>
-                          </label>
-                          {activeWaiver ? (
-                            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                              <LumnoInput
-                                value={activeWaiver.reason}
-                                placeholder="输入解除软告警的核对理由（2–500 字符）"
-                                aria-label={`解除 ${alert.code} 软告警理由`}
-                                onChange={(e) =>
-                                  onSetWarningWaiver(selectedRecord.id, {
-                                    ...activeWaiver,
-                                    reason: e.target.value,
-                                  })
-                                }
-                              />
-                              {waiveErr ? (
-                                <span className="wb-field-error">{waiveErr}</span>
-                              ) : (
-                                <span className="wb-helper-note">
-                                  将在点击“保存修订并重验”时提交至后端（当前{" "}
-                                  {activeWaiver.reason.trim().length} 字）
-                                </span>
-                              )}
-                            </div>
-                          ) : null}
-                        </div>
-                      ) : null}
                     </div>
-                  );
-                })}
+
+                    <div>{alert.message}</div>
+
+                    {alert.expected || alert.actual ? (
+                      <div className="wb-mono wb-tabular" style={{ fontSize: "11px" }}>
+                        期望: {alert.expected ?? "—"} | 实际:{" "}
+                        {alert.actual ?? "—"}
+                      </div>
+                    ) : null}
+
+                    {alert.severity === "BLOCKER" ? (
+                      <div style={{ fontSize: "11px", opacity: 0.9 }}>
+                        硬性阻断严禁强行解除，请修订对应字段、修正单据总额或选择驳回。
+                      </div>
+                    ) : null}
+
+                    {alert.severity === "WARNING" ? (
+                      <div style={{ fontSize: "11px", opacity: 0.85 }}>
+                        软告警可通过修订对应字段保存重验，或直接在底部填写批准理由特例放行。
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
               </div>
             ) : null}
 
@@ -1012,10 +1050,10 @@ export function ReviewInspector({
                 </span>
               </div>
 
-              {selectedRecord.inherited_fields.length > 0 ? (
+              {(selectedRecord.inherited_fields?.length ?? 0) > 0 ? (
                 <div className="wb-chip-row">
                   <span className="wb-helper-note">历史继承字段：</span>
-                  {selectedRecord.inherited_fields.map((fld) => (
+                  {(selectedRecord.inherited_fields ?? []).map((fld) => (
                     <span key={fld} className="wb-badge wb-badge--ok">
                       {fld}
                     </span>
@@ -1567,13 +1605,13 @@ export function ReviewInspector({
 
               <label className="wb-form-field">
                 {renderLabelWithProvenance(
-                  "人工复核备注 (review_note)",
+                  "本次修订说明 (review_note)",
                   "review_note",
                   "review_note"
                 )}
                 <LumnoTextarea
                   value={formValues.review_note}
-                  placeholder="可选填写财务核对说明（将一并写入修订日志）"
+                  placeholder="仅本次提交写入审计历史，保存后恢复空白（既往记录请见下方审计历史）"
                   ref={(node) => {
                     fieldRefs.current.review_note = node;
                   }}
@@ -1589,8 +1627,7 @@ export function ReviewInspector({
 
               {diffPreview && diffPreview.hasChanges ? (
                 <div className="wb-helper-note wb-mono">
-                  待提交差量字段：
-                  {Object.keys(diffPreview.patch).join(", ") || "仅软告警解除"}
+                  待提交差量字段：{Object.keys(diffPreview.patch).join(", ")}
                 </div>
               ) : null}
             </div>
@@ -1607,12 +1644,26 @@ export function ReviewInspector({
                 </span>
               </div>
 
-              {typeof selectedRecord.source_evidence?.source_file === "string" ? (
+              {typeof selectedRecord.source_evidence?.source_file === "string" ||
+              typeof selectedRecord.source_evidence?.page === "number" ||
+              typeof selectedRecord.source_evidence?.sheet === "string" ||
+              typeof selectedRecord.source_evidence?.line_number === "number" ||
+              typeof selectedRecord.source_evidence?.row === "number" ? (
                 <div className="wb-helper-note">
-                  文件：{selectedRecord.source_evidence.source_file}
-                  {typeof selectedRecord.source_evidence.page === "number"
+                  {typeof selectedRecord.source_evidence?.source_file === "string"
+                    ? `文件：${selectedRecord.source_evidence.source_file}`
+                    : "来源位置"}
+                  {typeof selectedRecord.source_evidence?.page === "number"
                     ? ` · 第 ${selectedRecord.source_evidence.page} 页`
                     : ""}
+                  {typeof selectedRecord.source_evidence?.sheet === "string"
+                    ? ` · 工作表：${selectedRecord.source_evidence.sheet}`
+                    : ""}
+                  {typeof selectedRecord.source_evidence?.line_number === "number"
+                    ? ` · 第 ${selectedRecord.source_evidence.line_number} 行`
+                    : typeof selectedRecord.source_evidence?.row === "number"
+                      ? ` · 第 ${selectedRecord.source_evidence.row} 行`
+                      : ""}
                 </div>
               ) : null}
 
@@ -1644,9 +1695,13 @@ export function ReviewInspector({
                   gap: "3px",
                 }}
               >
-                {selectedRecord.ai_reasoning.map((line, i) => (
-                  <li key={i}>{line}</li>
-                ))}
+                {(selectedRecord.ai_reasoning ?? []).length > 0 ? (
+                  (selectedRecord.ai_reasoning ?? []).map((line, i) => (
+                    <li key={i}>{line}</li>
+                  ))
+                ) : (
+                  <li className="wb-helper-note">暂无推理说明</li>
+                )}
               </ul>
 
               {(recordSourceDoc?.excluded_clauses?.length ?? 0) > 0 ? (
@@ -1673,7 +1728,7 @@ export function ReviewInspector({
                 }}
               >
                 <span className="wb-field-label">
-                  <span>审计历史与 AI / OCR 重试次数（按需加载）</span>
+                  <span>审计历史与提取重试次数（按需加载）</span>
                 </span>
                 <LumnoButton
                   variant="ghost"
@@ -1701,10 +1756,11 @@ export function ReviewInspector({
                   ) : auditState ? (
                     <>
                       <div className="wb-chip-row wb-tabular">
-                        <span className="wb-badge wb-badge--muted">
-                          LLM 调用次数 (llm_calls_used)：
-                          {auditState.llmCallsUsed ?? "—"}
-                        </span>
+                        {auditState.extractionChannel ? (
+                          <span className="wb-badge wb-badge--muted">
+                            提取通道：{auditState.extractionChannel}
+                          </span>
+                        ) : null}
                         <span className="wb-badge wb-badge--muted">
                           OCR/解析重试次数 (retry_count)：
                           {auditState.retryCount ?? 0}
@@ -1733,18 +1789,26 @@ export function ReviewInspector({
 
             {/* Bottom Review Decision & Save Action Bar */}
             <div className="wb-section-box wb-review-footer" aria-label="人工裁决与保存操作栏">
+              {recordDirty ? (
+                <div className="wb-draft-banner" role="status">
+                  <span>
+                    请先保存当前未保存修改，或放弃草稿后再执行批准/驳回
+                  </span>
+                </div>
+              ) : null}
+
               {hasBlockers ? (
                 <div className="wb-field-error">
                   存在未解除的 BLOCKER 硬性门禁阻断，人工批准按钮已锁定；请修正以上标红字段/单据总额，或通过“驳回排除”移出正式口径。
                 </div>
               ) : null}
 
-              {approvePanelOpen ? (
+              {approvePanelOpen && !recordDirty ? (
                 <div className="wb-approve-inline">
                   <div className="wb-field-label">
                     <span>填写批准理由（2–500 字符）</span>
                     <span className="wb-tabular">
-                      {approveReason.trim().length} / 500
+                      {countCodePoints(approveReason)} / 500
                     </span>
                   </div>
                   <LumnoInput
@@ -1780,6 +1844,7 @@ export function ReviewInspector({
                       compact
                       icon="ri-check-double-line"
                       busy={approvingOrRejecting}
+                      disabled={recordDirty || approvingOrRejecting}
                       onClick={() => void handleConfirmApproveClick()}
                     >
                       确认批准入账
@@ -1796,13 +1861,25 @@ export function ReviewInspector({
                   requireReason
                   reasonPlaceholder="请填写驳回原因（2–500 字符）"
                   defaultReason="非真实计费/确认无效"
+                  disabled={
+                    recordDirty ||
+                    approvingOrRejecting ||
+                    savingRecord ||
+                    selectedRecord.review_status === "REJECTED"
+                  }
                   onConfirm={(reason) => onRejectRecord(selectedRecord, reason)}
                 >
                   {(triggerProps) => (
                     <LumnoButton
                       variant="ghost"
                       icon="ri-close-circle-line"
+                      title={
+                        recordDirty
+                          ? "请先保存当前未保存修改，或放弃草稿后再执行批准/驳回"
+                          : undefined
+                      }
                       disabled={
+                        recordDirty ||
                         approvingOrRejecting ||
                         savingRecord ||
                         selectedRecord.review_status === "REJECTED"
@@ -1817,11 +1894,13 @@ export function ReviewInspector({
                 <div className="wb-action-row">
                   <LumnoTooltip
                     content={
-                      hasBlockers
-                        ? "存在未解决的硬性数值或平账阻断，禁止直接批准"
-                        : selectedRecord.review_status !== "NEEDS_REVIEW"
-                          ? "仅待复核（NEEDS_REVIEW）状态的记录需要人工批准"
-                          : "填写 2–500 字符核对理由后批准入账"
+                      recordDirty
+                        ? "请先保存当前未保存修改，或放弃草稿后再执行批准/驳回"
+                        : hasBlockers
+                          ? "存在未解决的硬性数值或平账阻断，禁止直接批准"
+                          : selectedRecord.review_status !== "NEEDS_REVIEW"
+                            ? "仅待复核（NEEDS_REVIEW）状态的记录需要人工批准"
+                            : "填写 2–500 字符核对理由后批准入账"
                     }
                   >
                     <LumnoButton
@@ -1829,6 +1908,7 @@ export function ReviewInspector({
                       icon="ri-check-double-line"
                       busy={approvingOrRejecting}
                       disabled={
+                        recordDirty ||
                         savingRecord ||
                         selectedRecord.review_status !== "NEEDS_REVIEW" ||
                         hasBlockers

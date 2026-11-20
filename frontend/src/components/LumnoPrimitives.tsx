@@ -14,6 +14,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { mountProceduralLumnoBackground } from "../lib/lumno-background.js";
+import { countCodePoints, validateReviewReason } from "../api/reviewState.ts";
 
 export type LumnoTheme = "light" | "dark";
 
@@ -600,6 +601,7 @@ export interface LumnoPopconfirmProps {
   reasonPlaceholder?: string;
   defaultReason?: string;
   onConfirm: (reason: string) => Promise<void> | void;
+  disabled?: boolean;
   children: (props: {
     onClick: () => void;
     ref: (node: HTMLButtonElement | null) => void;
@@ -616,6 +618,7 @@ export function LumnoPopconfirm({
   reasonPlaceholder = "请输入确认理由（2–500 字符）",
   defaultReason = "",
   onConfirm,
+  disabled = false,
   children,
 }: LumnoPopconfirmProps) {
   const [open, setOpen] = useState(false);
@@ -683,9 +686,12 @@ export function LumnoPopconfirm({
 
   const handleConfirm = async () => {
     const trimmed = reason.trim();
-    if (requireReason && (trimmed.length < 2 || trimmed.length > 500)) {
-      setReasonError("请填写 2–500 字符说明理由");
-      return;
+    if (requireReason) {
+      const reasonErr = validateReviewReason(trimmed);
+      if (reasonErr) {
+        setReasonError(reasonErr);
+        return;
+      }
     }
     setBusy(true);
     try {
@@ -701,6 +707,7 @@ export function LumnoPopconfirm({
     <>
       {children({
         onClick: () => {
+          if (disabled) return;
           setReason(defaultReason);
           setReasonError(null);
           setOpen((prev) => !prev);
@@ -727,13 +734,19 @@ export function LumnoPopconfirm({
 
               {requireReason ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                  <div className="wb-field-label">
+                    <span>原因说明（2–500 字符）</span>
+                    <span className="wb-tabular">
+                      {countCodePoints(reason)} / 500
+                    </span>
+                  </div>
                   <LumnoInput
                     value={reason}
                     placeholder={reasonPlaceholder}
                     aria-label={reasonPlaceholder}
                     onChange={(e) => {
                       setReason(e.target.value);
-                      if (e.target.value.trim().length >= 2) {
+                      if (!validateReviewReason(e.target.value)) {
                         setReasonError(null);
                       }
                     }}

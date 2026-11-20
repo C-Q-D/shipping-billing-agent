@@ -1,8 +1,9 @@
 import type { components } from "./schema";
 import { rawDecimal, readDecimalString } from "./decimalJson.ts";
-import type {
-  RecordPatchInput,
-  WarningWaiverItem,
+import {
+  ApiClientError,
+  isValidIso4217Currency,
+  type RecordPatchInput,
 } from "./client.ts";
 
 type BatchDetail = components["schemas"]["BatchDetail"];
@@ -35,16 +36,9 @@ export interface RecordFormValues {
   review_note: string;
 }
 
-export interface WarningWaiverDraft {
-  code: string;
-  field: string | null;
-  actual: string | null;
-  reason: string;
-}
-
 export interface RecordDraftEntry {
+  draftVersion: number;
   fields: Partial<RecordFormValues>;
-  waivedWarnings: Record<string, WarningWaiverDraft>;
 }
 
 export interface DocTotalsFormValues {
@@ -56,10 +50,12 @@ export interface DocTotalsFormValues {
 }
 
 export interface DocTotalsDraftEntry {
+  draftVersion: number;
   fields: Partial<DocTotalsFormValues>;
 }
 
 export interface DraftStoreState {
+  nextDraftVersion: number;
   recordDrafts: Record<string, RecordDraftEntry>;
   docDrafts: Record<string, DocTotalsDraftEntry>;
 }
@@ -69,7 +65,6 @@ export interface RecordDiffPatchResult {
   hasChanges: boolean;
   fieldErrors: Record<string, string>;
   patch: RecordPatchInput;
-  resolvedWarnings: WarningWaiverItem[];
 }
 
 export interface DocTotalsDiffPatchPayload {
@@ -85,6 +80,22 @@ export interface DocTotalsDiffPatchResult {
   hasChanges: boolean;
   fieldErrors: Record<string, string>;
   patch: DocTotalsDiffPatchPayload;
+}
+
+export interface MutationBlockerItem {
+  code: string;
+  field?: string | null;
+  message: string;
+  expected?: string | null;
+  actual?: string | null;
+}
+
+export interface MutationErrorBanner {
+  title: string;
+  code?: string;
+  message: string;
+  blockers?: MutationBlockerItem[];
+  isConflict?: boolean;
 }
 
 export interface PollRaceTracker {
@@ -113,7 +124,6 @@ const CREDIT_DOC_TYPE_PATTERN =
   /(?:\bcredit\s+(?:note|memo|invoice|advice|voucher|adjustment)\b|\bc\s*\/\s*n\b|\bcn\b|贷项(?:通知|凭证)?|貸項(?:通知|憑證)?|红字|紅字)/i;
 
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-const ISO_CURRENCY_PATTERN = /^[A-Z]{3}$/;
 
 export const HARD_BLOCKER_CODES: ReadonlySet<string> = new Set([
   "LINE_ARITHMETIC_MISMATCH",
@@ -132,7 +142,7 @@ export const HARD_BLOCKER_CODES: ReadonlySet<string> = new Set([
 ]);
 
 export function createEmptyDraftStore(): DraftStoreState {
-  return { recordDrafts: {}, docDrafts: {} };
+  return { nextDraftVersion: 0, recordDrafts: {}, docDrafts: {} };
 }
 
 export function makeRecordDraftKey(batchId: string, recordId: string): string {
@@ -143,24 +153,63 @@ export function makeDocDraftKey(batchId: string, docId: string): string {
   return `${batchId}::${docId}`;
 }
 
-export function makeWarningKey(alert: {
-  code: string;
-  field?: string | null;
-  actual?: string | null;
-}): string {
-  return `${alert.code}::${alert.field ?? ""}::${alert.actual ?? ""}`;
-}
-
-export function canWaiveValidationAlert(alert: ValidationAlert): boolean {
-  return alert.severity === "WARNING" && !HARD_BLOCKER_CODES.has(alert.code);
+export function countCodePoints(text: string): number {
+  return Array.from(text.trim()).length;
 }
 
 export function validateReviewReason(reason: string): string | null {
-  const len = reason.trim().length;
+  const len = countCodePoints(reason);
   if (len < 2 || len > 500) {
     return "理由说明须为 2–500 个字符";
   }
   return null;
+}
+
+export function extractMutationErrorBanner(
+  title: string,
+  err: unknown,
+  recordAlerts: ReadonlyArray<ValidationAlert> = []
+): MutationErrorBanner {
+  if (err instanceof ApiClientError) {
+    const rawCodes = Array.isArray(err.details?.blocker_codes)
+      ? (err.details.blocker_codes as unknown[])
+          .filter((code): code is string => typeof code === "string" && code.trim().length > 0)
+      : [];
+
+    const blockers: MutationBlockerItem[] = rawCodes.map((code) => {
+      const matched =
+        recordAlerts.find((a) => a.code === code && a.severity === "BLOCKER") ??
+        recordAlerts.find((a) => a.code === code);
+      if (matched) {
+        return {
+          code,
+          field: matched.field ?? null,
+          message: matched.message,
+          expected: matched.expected ?? null,
+          actual: matched.actual ?? null,
+        };
+      }
+      return {
+        code,
+        field: null,
+        message: "存在未解决的硬性门禁阻断，请修正对应字段、单据总额或选择驳回",
+        expected: null,
+        actual: null,
+      };
+    });
+
+    return {
+      title,
+      code: err.code,
+      message: err.message,
+      blockers: blockers.length > 0 ? blockers : undefined,
+      isConflict: err.status === 409,
+    };
+  }
+  return {
+    title,
+    message: err instanceof Error ? err.message : "操作失败，请重试",
+  };
 }
 
 function isValidCalendarDate(dateStr: string): boolean {
@@ -192,36 +241,53 @@ export function isCreditDocumentType(docType: string | null | undefined): boolea
 export function extractServerRecordFormValues(
   record: BillingRecordDetail
 ): RecordFormValues {
-  const amountStr = readDecimalString(record.charge_details, "amount") ?? "";
-  const docType = record.document_info.document_type ?? "";
+  const chargeDetails = record.charge_details ?? {
+    charge_item: null,
+    amount: null,
+    currency: null,
+    payment_term: null,
+  };
+  const docInfo = record.document_info ?? {
+    document_type: null,
+    reference_no: null,
+    document_date: null,
+  };
+  const party = record.transaction_party ?? {
+    issuer: null,
+    recipient: null,
+  };
+  const financial = record.financial_attributes ?? {
+    accounting_entity: "",
+    posting_type: null,
+  };
+  const amountStr = readDecimalString(chargeDetails, "amount") ?? "";
+  const docType = docInfo.document_type ?? "";
   const isNegativeAmount =
     amountStr.startsWith("-") && amountStr !== "-0" && amountStr !== "-0.00";
   const overrides = record.human_overrides ?? {};
-  const serverReviewNote =
-    typeof overrides.review_note === "string" ? overrides.review_note : "";
 
   return {
-    charge_item: record.charge_details.charge_item ?? "",
-    quantity: readDecimalString(record.charge_details, "quantity") ?? "",
-    unit_price: readDecimalString(record.charge_details, "unit_price") ?? "",
+    charge_item: chargeDetails.charge_item ?? "",
+    quantity: readDecimalString(chargeDetails, "quantity") ?? "",
+    unit_price: readDecimalString(chargeDetails, "unit_price") ?? "",
     amount: amountStr,
-    currency: record.charge_details.currency ?? "",
-    payment_term: record.charge_details.payment_term ?? "",
-    posting_type: record.financial_attributes.posting_type ?? "",
+    currency: chargeDetails.currency ?? "",
+    payment_term: chargeDetails.payment_term ?? "",
+    posting_type: financial.posting_type ?? "",
     debit_credit:
       isCreditDocumentType(docType) || isNegativeAmount ? "CREDIT" : "DEBIT",
     document_type: docType,
-    reference_no: record.document_info.reference_no ?? "",
-    document_date: record.document_info.document_date ?? "",
-    issuer: record.transaction_party.issuer ?? "",
-    recipient: record.transaction_party.recipient ?? "",
+    reference_no: docInfo.reference_no ?? "",
+    document_date: docInfo.document_date ?? "",
+    issuer: party.issuer ?? "",
+    recipient: party.recipient ?? "",
     mbl_no: record.shipment_refs?.mbl_nos?.[0]?.value ?? "",
     hbl_no: record.shipment_refs?.hbl_no ?? "",
     booking_no: record.shipment_refs?.booking_no ?? "",
     container_nos_text: (record.shipment_refs?.container_nos ?? []).join(", "),
     matched_existing_bill_id: record.matched_existing_bill_id ?? null,
     force_create_new: Boolean(overrides.force_create_new),
-    review_note: serverReviewNote,
+    review_note: "",
   };
 }
 
@@ -239,20 +305,28 @@ export function getEffectiveRecordFormValues(
   return { ...server, ...draft.fields };
 }
 
-export function getRecordWarningWaivers(
+export function getRecordDraftVersion(
   store: DraftStoreState,
   batchId: string,
   recordId: string
-): Record<string, WarningWaiverDraft> {
-  const key = makeRecordDraftKey(batchId, recordId);
-  return store.recordDrafts[key]?.waivedWarnings ?? {};
+): number | null {
+  const entry = store.recordDrafts[makeRecordDraftKey(batchId, recordId)];
+  return entry ? entry.draftVersion : null;
 }
 
-function pruneRecordDraft(
+export function getDocTotalsDraftVersion(
+  store: DraftStoreState,
+  batchId: string,
+  docId: string
+): number | null {
+  const entry = store.docDrafts[makeDocDraftKey(batchId, docId)];
+  return entry ? entry.draftVersion : null;
+}
+
+function pruneRecordFields(
   server: RecordFormValues,
-  fields: Partial<RecordFormValues>,
-  waivedWarnings: Record<string, WarningWaiverDraft>
-): RecordDraftEntry | null {
+  fields: Partial<RecordFormValues>
+): Partial<RecordFormValues> | null {
   const nextFields: Partial<RecordFormValues> = {};
   (Object.keys(fields) as Array<keyof RecordFormValues>).forEach((k) => {
     const val = fields[k];
@@ -260,13 +334,7 @@ function pruneRecordDraft(
       (nextFields as Record<string, unknown>)[k] = val;
     }
   });
-  if (
-    Object.keys(nextFields).length === 0 &&
-    Object.keys(waivedWarnings).length === 0
-  ) {
-    return null;
-  }
-  return { fields: nextFields, waivedWarnings };
+  return Object.keys(nextFields).length > 0 ? nextFields : null;
 }
 
 export function setRecordDraftField<K extends keyof RecordFormValues>(
@@ -279,8 +347,8 @@ export function setRecordDraftField<K extends keyof RecordFormValues>(
   const server = extractServerRecordFormValues(record);
   const key = makeRecordDraftKey(batchId, record.id);
   const existing = store.recordDrafts[key] ?? {
+    draftVersion: store.nextDraftVersion,
     fields: {},
-    waivedWarnings: {},
   };
   const nextFields: Partial<RecordFormValues> = {
     ...existing.fields,
@@ -325,82 +393,58 @@ export function setRecordDraftField<K extends keyof RecordFormValues>(
     }
   }
 
-  const pruned = pruneRecordDraft(server, nextFields, existing.waivedWarnings);
+  const nextVersion = store.nextDraftVersion + 1;
+  const prunedFields = pruneRecordFields(server, nextFields);
   const nextRecordDrafts = { ...store.recordDrafts };
-  if (pruned) {
-    nextRecordDrafts[key] = pruned;
+  if (prunedFields) {
+    nextRecordDrafts[key] = {
+      draftVersion: nextVersion,
+      fields: prunedFields,
+    };
   } else {
     delete nextRecordDrafts[key];
   }
-  return { ...store, recordDrafts: nextRecordDrafts };
-}
-
-export function setRecordWarningWaiver(
-  store: DraftStoreState,
-  batchId: string,
-  recordId: string,
-  waiver: WarningWaiverDraft
-): DraftStoreState {
-  const key = makeRecordDraftKey(batchId, recordId);
-  const warningKey = makeWarningKey(waiver);
-  const existing = store.recordDrafts[key] ?? {
-    fields: {},
-    waivedWarnings: {},
-  };
   return {
     ...store,
-    recordDrafts: {
-      ...store.recordDrafts,
-      [key]: {
-        fields: existing.fields,
-        waivedWarnings: {
-          ...existing.waivedWarnings,
-          [warningKey]: waiver,
-        },
-      },
-    },
+    nextDraftVersion: nextVersion,
+    recordDrafts: nextRecordDrafts,
   };
-}
-
-export function removeRecordWarningWaiver(
-  store: DraftStoreState,
-  batchId: string,
-  recordId: string,
-  warningKey: string
-): DraftStoreState {
-  const key = makeRecordDraftKey(batchId, recordId);
-  const existing = store.recordDrafts[key];
-  if (!existing || !(warningKey in existing.waivedWarnings)) {
-    return store;
-  }
-  const nextWaived = { ...existing.waivedWarnings };
-  delete nextWaived[warningKey];
-  const nextRecordDrafts = { ...store.recordDrafts };
-  if (
-    Object.keys(existing.fields).length === 0 &&
-    Object.keys(nextWaived).length === 0
-  ) {
-    delete nextRecordDrafts[key];
-  } else {
-    nextRecordDrafts[key] = {
-      fields: existing.fields,
-      waivedWarnings: nextWaived,
-    };
-  }
-  return { ...store, recordDrafts: nextRecordDrafts };
 }
 
 export function clearRecordDraft(
   store: DraftStoreState,
   batchId: string,
-  recordId: string
+  recordId: string,
+  expectedVersion?: number,
+  updatedRecord?: BillingRecordDetail
 ): DraftStoreState {
   const key = makeRecordDraftKey(batchId, recordId);
-  if (!(key in store.recordDrafts)) {
+  const current = store.recordDrafts[key];
+  if (!current) {
     return store;
   }
+  if (
+    expectedVersion === undefined ||
+    current.draftVersion === expectedVersion
+  ) {
+    const nextRecordDrafts = { ...store.recordDrafts };
+    delete nextRecordDrafts[key];
+    return { ...store, recordDrafts: nextRecordDrafts };
+  }
+  if (!updatedRecord) {
+    return store;
+  }
+  const nextServer = extractServerRecordFormValues(updatedRecord);
+  const remainingFields = pruneRecordFields(nextServer, current.fields);
   const nextRecordDrafts = { ...store.recordDrafts };
-  delete nextRecordDrafts[key];
+  if (!remainingFields) {
+    delete nextRecordDrafts[key];
+  } else {
+    nextRecordDrafts[key] = {
+      draftVersion: current.draftVersion,
+      fields: remainingFields,
+    };
+  }
   return { ...store, recordDrafts: nextRecordDrafts };
 }
 
@@ -410,11 +454,7 @@ export function hasRecordDraft(
   recordId: string
 ): boolean {
   const entry = store.recordDrafts[makeRecordDraftKey(batchId, recordId)];
-  if (!entry) return false;
-  return (
-    Object.keys(entry.fields).length > 0 ||
-    Object.keys(entry.waivedWarnings).length > 0
-  );
+  return Boolean(entry && Object.keys(entry.fields).length > 0);
 }
 
 export function getDirtyRecordIds(
@@ -456,6 +496,20 @@ export function getEffectiveDocTotalsValues(
   return { ...server, ...draft.fields };
 }
 
+function pruneDocFields(
+  server: DocTotalsFormValues,
+  fields: Partial<DocTotalsFormValues>
+): Partial<DocTotalsFormValues> | null {
+  const prunedFields: Partial<DocTotalsFormValues> = {};
+  (Object.keys(fields) as Array<keyof DocTotalsFormValues>).forEach((k) => {
+    const val = fields[k];
+    if (val !== undefined && val !== server[k]) {
+      prunedFields[k] = val;
+    }
+  });
+  return Object.keys(prunedFields).length > 0 ? prunedFields : null;
+}
+
 export function setDocTotalsDraftField<K extends keyof DocTotalsFormValues>(
   store: DraftStoreState,
   batchId: string,
@@ -465,38 +519,66 @@ export function setDocTotalsDraftField<K extends keyof DocTotalsFormValues>(
 ): DraftStoreState {
   const server = extractServerDocTotalsValues(doc);
   const key = makeDocDraftKey(batchId, doc.id);
-  const existing = store.docDrafts[key] ?? { fields: {} };
+  const existing = store.docDrafts[key] ?? {
+    draftVersion: store.nextDraftVersion,
+    fields: {},
+  };
   const nextFields: Partial<DocTotalsFormValues> = {
     ...existing.fields,
     [field]: value,
   };
-  const prunedFields: Partial<DocTotalsFormValues> = {};
-  (Object.keys(nextFields) as Array<keyof DocTotalsFormValues>).forEach((k) => {
-    const val = nextFields[k];
-    if (val !== undefined && val !== server[k]) {
-      prunedFields[k] = val;
-    }
-  });
+  const nextVersion = store.nextDraftVersion + 1;
+  const prunedFields = pruneDocFields(server, nextFields);
   const nextDocDrafts = { ...store.docDrafts };
-  if (Object.keys(prunedFields).length === 0) {
+  if (!prunedFields) {
     delete nextDocDrafts[key];
   } else {
-    nextDocDrafts[key] = { fields: prunedFields };
+    nextDocDrafts[key] = {
+      draftVersion: nextVersion,
+      fields: prunedFields,
+    };
   }
-  return { ...store, docDrafts: nextDocDrafts };
+  return {
+    ...store,
+    nextDraftVersion: nextVersion,
+    docDrafts: nextDocDrafts,
+  };
 }
 
 export function clearDocTotalsDraft(
   store: DraftStoreState,
   batchId: string,
-  docId: string
+  docId: string,
+  expectedVersion?: number,
+  updatedDoc?: SourceDocumentSummary
 ): DraftStoreState {
   const key = makeDocDraftKey(batchId, docId);
-  if (!(key in store.docDrafts)) {
+  const current = store.docDrafts[key];
+  if (!current) {
     return store;
   }
+  if (
+    expectedVersion === undefined ||
+    current.draftVersion === expectedVersion
+  ) {
+    const nextDocDrafts = { ...store.docDrafts };
+    delete nextDocDrafts[key];
+    return { ...store, docDrafts: nextDocDrafts };
+  }
+  if (!updatedDoc) {
+    return store;
+  }
+  const nextServer = extractServerDocTotalsValues(updatedDoc);
+  const remainingFields = pruneDocFields(nextServer, current.fields);
   const nextDocDrafts = { ...store.docDrafts };
-  delete nextDocDrafts[key];
+  if (!remainingFields) {
+    delete nextDocDrafts[key];
+  } else {
+    nextDocDrafts[key] = {
+      draftVersion: current.draftVersion,
+      fields: remainingFields,
+    };
+  }
   return { ...store, docDrafts: nextDocDrafts };
 }
 
@@ -528,8 +610,8 @@ export function countUnsavedDraftsInBatch(
   batch: BatchDetail | null
 ): number {
   if (!batch) return 0;
-  const dirtyRecs = getDirtyRecordIds(store, batch.id, batch.records);
-  const dirtyDocs = getDirtyDocIds(store, batch.id, batch.documents);
+  const dirtyRecs = getDirtyRecordIds(store, batch.id, batch.records ?? []);
+  const dirtyDocs = getDirtyDocIds(store, batch.id, batch.documents ?? []);
   return dirtyRecs.size + dirtyDocs.size;
 }
 
@@ -540,11 +622,9 @@ export function buildRecordDiffPatch(
 ): RecordDiffPatchResult {
   const server = extractServerRecordFormValues(record);
   const effective = getEffectiveRecordFormValues(record, store, batchId);
-  const waivers = getRecordWarningWaivers(store, batchId, record.id);
 
   const fieldErrors: Record<string, string> = {};
   const patch: RecordPatchInput = {};
-  const resolvedWarnings: WarningWaiverItem[] = [];
 
   if (effective.charge_item.trim() !== server.charge_item.trim()) {
     const trimmed = effective.charge_item.trim();
@@ -556,11 +636,7 @@ export function buildRecordDiffPatch(
     const prevRaw = server[numField].trim();
     if (nextRaw !== prevRaw) {
       if (nextRaw === "") {
-        if (numField === "amount") {
-          fieldErrors.amount = "金额不能为空（请输入有效十进制数字）";
-        } else {
-          patch[numField] = null;
-        }
+        patch[numField] = null;
       } else {
         try {
           patch[numField] = rawDecimal(nextRaw);
@@ -576,8 +652,8 @@ export function buildRecordDiffPatch(
     const upper = effective.currency.trim().toUpperCase();
     if (upper === "") {
       patch.currency = null;
-    } else if (!ISO_CURRENCY_PATTERN.test(upper)) {
-      fieldErrors.currency = "币种须为 3 位大写 ISO 4217 代码（如 USD、CNY）";
+    } else if (!isValidIso4217Currency(upper)) {
+      fieldErrors.currency = "币种须为有效 3 位大写 ISO 4217 代码（如 USD、CNY）";
     } else {
       patch.currency = upper;
     }
@@ -632,13 +708,18 @@ export function buildRecordDiffPatch(
     patch.booking_no = effective.booking_no.trim() || null;
   }
 
-  const prevContainers = record.shipment_refs?.container_nos ?? [];
-  const nextContainers = parseContainerNosInput(effective.container_nos_text);
-  const containersChanged =
-    prevContainers.length !== nextContainers.length ||
-    prevContainers.some((c, idx) => c !== nextContainers[idx]);
-  if (containersChanged) {
-    patch.container_nos = nextContainers;
+  // A9: Only emit container_nos diff when the user actually edited the field
+  if (effective.container_nos_text !== server.container_nos_text) {
+    const prevContainers = (record.shipment_refs?.container_nos ?? [])
+      .map((c) => c.trim().toUpperCase())
+      .filter((c) => c.length > 0);
+    const nextContainers = parseContainerNosInput(effective.container_nos_text);
+    const containersChanged =
+      prevContainers.length !== nextContainers.length ||
+      prevContainers.some((c, idx) => c !== nextContainers[idx]);
+    if (containersChanged) {
+      patch.container_nos = nextContainers;
+    }
   }
 
   if (effective.matched_existing_bill_id !== server.matched_existing_bill_id) {
@@ -649,43 +730,17 @@ export function buildRecordDiffPatch(
     patch.force_create_new = effective.force_create_new;
   }
 
-  if (effective.review_note.trim() !== server.review_note.trim()) {
-    patch.review_note = effective.review_note.trim() || null;
+  const trimmedNote = effective.review_note.trim();
+  if (trimmedNote.length > 0) {
+    patch.review_note = trimmedNote;
   }
 
-  for (const [wKey, waiver] of Object.entries(waivers)) {
-    const matchedAlert = (record.validation_alerts ?? []).find(
-      (a) => makeWarningKey(a) === wKey
-    );
-    if (!matchedAlert || matchedAlert.severity === "RESOLVED") {
-      continue;
-    }
-    if (!canWaiveValidationAlert(matchedAlert)) {
-      fieldErrors[`waive:${wKey}`] =
-        "硬性阻断或核心门禁告警严禁前端强行解除";
-      continue;
-    }
-    const reasonErr = validateReviewReason(waiver.reason);
-    if (reasonErr) {
-      fieldErrors[`waive:${wKey}`] = reasonErr;
-      continue;
-    }
-    resolvedWarnings.push({
-      code: matchedAlert.code,
-      field: matchedAlert.field ?? null,
-      actual: matchedAlert.actual ?? null,
-      reason: waiver.reason.trim(),
-    });
-  }
-
-  const hasChanges =
-    Object.keys(patch).length > 0 || resolvedWarnings.length > 0;
+  const hasChanges = Object.keys(patch).length > 0;
   return {
     valid: Object.keys(fieldErrors).length === 0,
     hasChanges,
     fieldErrors,
     patch,
-    resolvedWarnings,
   };
 }
 
@@ -725,15 +780,16 @@ export function buildDocTotalsDiffPatch(
     const upper = effective.total_currency.trim().toUpperCase();
     if (upper === "") {
       patch.total_currency = null;
-    } else if (!ISO_CURRENCY_PATTERN.test(upper)) {
-      fieldErrors.total_currency = "币种须为 3 位大写 ISO 4217 代码";
+    } else if (!isValidIso4217Currency(upper)) {
+      fieldErrors.total_currency = "币种须为有效 3 位大写 ISO 4217 代码";
     } else {
       patch.total_currency = upper;
     }
   }
 
-  if (effective.review_note.trim() !== server.review_note.trim()) {
-    patch.review_note = effective.review_note.trim() || null;
+  const trimmedNote = effective.review_note.trim();
+  if (trimmedNote.length > 0) {
+    patch.review_note = trimmedNote;
   }
 
   const hasChanges = Object.keys(patch).length > 0;

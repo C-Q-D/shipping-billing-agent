@@ -3,10 +3,19 @@ import type {
   BatchDetail,
   BillingApiClient,
   ExportMode,
-  ExportResponse,
   SyncBaselineResult,
 } from "../api/client.ts";
 import { stringifyLosslessJson } from "../api/decimalJson.ts";
+import {
+  beginExportModalLoad,
+  completeExportModalLoadFailure,
+  completeExportModalLoadSuccess,
+  createExportModalCacheState,
+  getExportModalActionEligibility,
+  getExportResponseForBatchMode,
+  resetExportModalForBatch,
+  type ExportModalCacheState,
+} from "../api/managementHelpers.ts";
 import {
   LumnoButton,
   LumnoModal,
@@ -28,11 +37,8 @@ export interface ExportAndSyncModalProps {
   lastSyncResult: SyncResultRecord | null;
   onClose: () => void;
   onSyncBaseline: () => Promise<void>;
-  onOpenBundleExport?: () => void;
   onNotify: (message: string, tone?: "info" | "error") => void;
 }
-
-type ExportsByMode = Partial<Record<ExportMode, ExportResponse>>;
 
 const MODE_LABELS: Record<ExportMode, string> = {
   official: "正式标准 (official)",
@@ -49,62 +55,100 @@ export function ExportAndSyncModal({
   lastSyncResult,
   onClose,
   onSyncBaseline,
-  onOpenBundleExport,
   onNotify,
 }: ExportAndSyncModalProps) {
   const [activeMode, setActiveMode] = useState<ExportMode>("official");
-  const [exportsByMode, setExportsByMode] = useState<ExportsByMode>({});
-  const [loading, setLoading] = useState(false);
+  const [cacheState, setCacheState] = useState<ExportModalCacheState>(() =>
+    createExportModalCacheState(batch?.id ?? null)
+  );
   const [downloading, setDownloading] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
   const requestSeqRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
 
   const loadAllModePreviews = useCallback(
     async (targetBatchId: string) => {
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
       const seq = ++requestSeqRef.current;
-      setLoading(true);
-      setLoadError(null);
+
+      setCacheState((prev) => beginExportModalLoad(prev, targetBatchId));
       try {
         const [official, fullStandard, audit] = await Promise.all([
-          api.exportBatchJson(targetBatchId, "official"),
-          api.exportBatchJson(targetBatchId, "full_standard"),
-          api.exportBatchJson(targetBatchId, "audit"),
+          api.exportBatchJson(targetBatchId, "official", controller.signal),
+          api.exportBatchJson(
+            targetBatchId,
+            "full_standard",
+            controller.signal
+          ),
+          api.exportBatchJson(targetBatchId, "audit", controller.signal),
         ]);
-        if (requestSeqRef.current !== seq) return;
-        setExportsByMode({
-          official,
-          full_standard: fullStandard,
-          audit,
-        });
+        if (controller.signal.aborted || requestSeqRef.current !== seq) {
+          return;
+        }
+        setCacheState(
+          completeExportModalLoadSuccess(targetBatchId, {
+            official,
+            full_standard: fullStandard,
+            audit,
+          })
+        );
       } catch (err) {
-        if (requestSeqRef.current !== seq) return;
+        if (controller.signal.aborted || requestSeqRef.current !== seq) {
+          return;
+        }
         const msg =
           err instanceof Error ? err.message : "读取三口径导出预览失败";
-        setLoadError(msg);
+        setCacheState(completeExportModalLoadFailure(targetBatchId, msg));
         onNotify(msg, "error");
-      } finally {
-        if (requestSeqRef.current === seq) {
-          setLoading(false);
-        }
       }
     },
     [api, onNotify]
   );
 
+  // A3: Strictly clear stale cache on batch change or modal close/reopen
   useEffect(() => {
-    if (!open || !batch) {
+    const targetId = batch?.id ?? null;
+    if (!open || !targetId) {
+      abortRef.current?.abort();
+      requestSeqRef.current += 1;
+      setCacheState((prev) => resetExportModalForBatch(prev, targetId));
       return;
     }
-    void loadAllModePreviews(batch.id);
-  }, [open, batch, batchRevision, loadAllModePreviews]);
+    setCacheState((prev) => resetExportModalForBatch(prev, targetId));
+    void loadAllModePreviews(targetId);
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, [open, batch?.id, batchRevision, loadAllModePreviews]);
 
-  const activeExport = exportsByMode[activeMode] ?? null;
+  const activeBatchId = batch?.id ?? null;
+  const officialExport = getExportResponseForBatchMode(
+    cacheState,
+    activeBatchId,
+    "official"
+  );
+  const fullStandardExport = getExportResponseForBatchMode(
+    cacheState,
+    activeBatchId,
+    "full_standard"
+  );
+  const auditExport = getExportResponseForBatchMode(
+    cacheState,
+    activeBatchId,
+    "audit"
+  );
+  const { activeExport, canCopy, canDownload } = getExportModalActionEligibility(
+    cacheState,
+    activeBatchId,
+    activeMode
+  );
   const serializedRecordsText = activeExport
     ? stringifyLosslessJson(activeExport.records, 2)
     : "";
 
   const handleCopyJson = async () => {
-    if (!activeExport) return;
+    if (!canCopy || !activeExport) return;
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(serializedRecordsText);
@@ -125,7 +169,7 @@ export function ExportAndSyncModal({
   };
 
   const handleDownload = async () => {
-    if (!batch) return;
+    if (!batch || !canDownload) return;
     setDownloading(true);
     try {
       const { rawJsonText } = await api.downloadBatchJsonArray(
@@ -178,23 +222,10 @@ export function ExportAndSyncModal({
           >
             同步至基准库 (sync-baseline)
           </LumnoButton>
-          {onOpenBundleExport ? (
-            <LumnoButton
-              variant="secondary"
-              icon="ri-share-forward-line"
-              disabled={!batch}
-              onClick={() => {
-                onClose();
-                onOpenBundleExport();
-              }}
-            >
-              导出复核包 (v1.0)
-            </LumnoButton>
-          ) : null}
           <LumnoButton
             variant="secondary"
             icon="ri-file-copy-line"
-            disabled={!activeExport || loading}
+            disabled={!canCopy}
             onClick={() => void handleCopyJson()}
           >
             复制完整 JSON
@@ -202,7 +233,7 @@ export function ExportAndSyncModal({
           <LumnoButton
             variant="primary"
             icon="ri-download-2-line"
-            disabled={!batch || loading}
+            disabled={!canDownload}
             busy={downloading}
             onClick={() => void handleDownload()}
           >
@@ -220,39 +251,50 @@ export function ExportAndSyncModal({
             {
               value: "official",
               label: "正式标准 official",
-              count: exportsByMode.official?.included_count,
+              count: officialExport?.included_count,
             },
             {
               value: "full_standard",
               label: "四态全量 full_standard",
-              count: exportsByMode.full_standard?.included_count,
+              count: fullStandardExport?.included_count,
             },
             {
               value: "audit",
               label: "完整审计 audit",
-              count: exportsByMode.audit?.included_count,
+              count: auditExport?.included_count,
             },
           ]}
           onChange={setActiveMode}
         />
 
-        {exportsByMode.official &&
-        exportsByMode.full_standard &&
-        exportsByMode.audit ? (
+        {officialExport && fullStandardExport && auditExport ? (
           <div className="wb-helper-note wb-tabular">
             三口径总览计数：正式入账{" "}
-            <strong>{exportsByMode.official.included_count}</strong> 条 /
-            四态全量{" "}
-            <strong>{exportsByMode.full_standard.included_count}</strong> 条 /
-            完整审计 <strong>{exportsByMode.audit.included_count}</strong> 条
+            <strong>{officialExport.included_count}</strong> 条 / 四态全量{" "}
+            <strong>{fullStandardExport.included_count}</strong> 条 / 完整审计{" "}
+            <strong>{auditExport.included_count}</strong> 条
             {batch ? `（批内共 ${batch.records.length} 条记录）` : ""}
           </div>
         ) : null}
 
-        {loading && !activeExport ? (
+        {cacheState.loading ? (
           <div className="wb-helper-note">正在读取三口径实时导出数据...</div>
-        ) : loadError ? (
-          <div className="wb-field-error">{loadError}</div>
+        ) : cacheState.loadError ? (
+          <div className="wb-alert-item" data-severity="BLOCKER" role="alert">
+            <div>{cacheState.loadError}</div>
+            {batch ? (
+              <div style={{ marginTop: "4px" }}>
+                <LumnoButton
+                  variant="secondary"
+                  compact
+                  icon="ri-refresh-line"
+                  onClick={() => void loadAllModePreviews(batch.id)}
+                >
+                  重试读取导出数据
+                </LumnoButton>
+              </div>
+            ) : null}
+          </div>
         ) : activeExport ? (
           <>
             <div className="wb-export-counts-grid">
@@ -300,7 +342,9 @@ export function ExportAndSyncModal({
         <div className="wb-section-box" aria-label="基准库同步状态">
           <div className="wb-field-label">
             <span>写入工作台历史账单基准库（幂等可重跑）</span>
-            <span className="wb-helper-note">仅请求中防连点，同步后可再次增量同步</span>
+            <span className="wb-helper-note">
+              仅请求中防连点，同步后可再次增量同步
+            </span>
           </div>
           {currentBatchSync ? (
             <div className="wb-export-counts-grid">
@@ -325,7 +369,8 @@ export function ExportAndSyncModal({
             </div>
           ) : (
             <div className="wb-helper-note">
-              点击底部“同步至基准库 (sync-baseline)”可将当前已就绪的 CREATE / UPDATE 记录幂等写入全局历史基准库；补审或修订后可再次点击。
+              点击底部“同步至基准库 (sync-baseline)”可将当前已就绪的 CREATE /
+              UPDATE 记录幂等写入全局历史基准库；补审或修订后可再次点击。
             </div>
           )}
         </div>

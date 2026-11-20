@@ -10,12 +10,17 @@ import {
   toSchemaDecimal,
 } from "./decimalJson.ts";
 import {
-  HARD_BLOCKER_CODES,
+  countCodePoints,
   isCreditDocumentType,
-  makeWarningKey,
 } from "./reviewState.ts";
-import { normalizeChargeAliasKey } from "./managementHelpers.ts";
-import type { WarningWaiverItem } from "./client.ts";
+import {
+  normalizeChargeAliasKey,
+  validateReviewBundleInput,
+} from "./managementHelpers.ts";
+import {
+  isValidIso4217Currency,
+  validateExistingBillsJsonText,
+} from "./client.ts";
 import type { components } from "./schema";
 
 type AccountingEntity = components["schemas"]["AccountingEntity"];
@@ -37,7 +42,6 @@ type ExportResponse = components["schemas"]["ExportResponse"];
 type HealthStatus = components["schemas"]["HealthStatus"];
 type ManualRecordCreate = components["schemas"]["ManualRecordCreate"];
 type RecordPatchRequest = components["schemas"]["RecordPatchRequest"];
-type ReviewBundleV1 = components["schemas"]["ReviewBundleV1"];
 type SourceDocumentSummary = components["schemas"]["SourceDocumentSummary"];
 type StandardOutputRecord = components["schemas"]["StandardOutputRecord"];
 type SwitchEntityResponse = components["schemas"]["SwitchEntityResponse"];
@@ -101,21 +105,12 @@ function cloneBatchDetail(detail: BatchDetail): BatchDetail {
   return parseLosslessJson<BatchDetail>(stringifyLosslessJson(detail));
 }
 
-function getHeaderIgnoreCase(
-  headers: HeadersInit | undefined,
-  name: string
-): string | null {
-  if (!headers) return null;
-  if (headers instanceof Headers) return headers.get(name);
-  if (Array.isArray(headers)) {
-    const found = headers.find(([k]) => k.toLowerCase() === name.toLowerCase());
-    return found ? found[1] : null;
-  }
-  const lower = name.toLowerCase();
-  for (const [k, v] of Object.entries(headers)) {
-    if (k.toLowerCase() === lower) return v;
-  }
-  return null;
+function makeWarningKey(alert: {
+  code: string;
+  field?: string | null;
+  actual?: string | null;
+}): string {
+  return `${alert.code}::${alert.field ?? ""}::${alert.actual ?? ""}`;
 }
 
 const ISO_6346_LETTER_VALS: Record<string, number> = {
@@ -157,17 +152,15 @@ interface HumanReviewHistoryItem {
 }
 
 interface BatchAuditMeta {
-  llmCallsUsed: number;
   docRetryCount: Map<string, number>;
   docTotalsEdited: Set<string>;
   recordEdited: Set<string>;
   recordHistory: Map<string, HumanReviewHistoryItem[]>;
-  resolvedWaivers: Map<string, Map<string, WarningWaiverItem>>;
+  resolvedWaivers: Map<string, Map<string, { reason: string }>>;
 }
 
 function createBatchAuditMeta(): BatchAuditMeta {
   return {
-    llmCallsUsed: 3,
     docRetryCount: new Map(),
     docTotalsEdited: new Set(),
     recordEdited: new Set(),
@@ -1140,6 +1133,10 @@ function buildExportRecords(
         ai_reasoning: rec.ai_reasoning,
         match_level: rec.match_level,
         matched_bill_ref: rec.matched_bill_ref ?? null,
+        source_file:
+          typeof rec.source_evidence?.source_file === "string"
+            ? rec.source_evidence.source_file
+            : null,
         ...(mode === "audit"
           ? {
               record_id: rec.id,
@@ -1150,7 +1147,6 @@ function buildExportRecords(
               validation_alerts: rec.validation_alerts ?? [],
               human_overrides: rec.human_overrides ?? {},
               retry_count: meta?.docRetryCount.get(rec.source_doc_id) ?? 0,
-              llm_calls_used: meta?.llmCallsUsed ?? 3,
               human_review_history: meta?.recordHistory.get(rec.id) ?? [],
             }
           : {}),
@@ -1565,30 +1561,93 @@ export function createDevStubTransport(): FetchLike {
         }
       }
       let imported = 0;
+      const seenBillIds = new Set<string>();
       for (const item of payload.bills) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          return errorJsonResponse(
+            { code: "INVALID_EXISTING_BILLS", message: "历史账单条目必须为 JSON 对象" },
+            400
+          );
+        }
         const amtStr = readDecimalString(item, "amount");
         if (amtStr === null) {
           return errorJsonResponse(
             {
-              code: "INVALID_BILL_AMOUNT",
+              code: "INVALID_EXISTING_BILLS",
               message: "导入的历史账单缺少合法十进制金额 (amount)",
             },
             400
           );
         }
+        const chargeItem =
+          typeof item.charge_item === "string" ? item.charge_item.trim() : "";
+        if (!chargeItem) {
+          return errorJsonResponse(
+            {
+              code: "INVALID_EXISTING_BILLS",
+              message: "导入的历史账单缺少费用名称 (charge_item)",
+            },
+            400
+          );
+        }
+        const currency =
+          typeof item.currency === "string"
+            ? item.currency.trim().toUpperCase()
+            : "";
+        if (!isValidIso4217Currency(currency)) {
+          return errorJsonResponse(
+            {
+              code: "INVALID_EXISTING_BILLS",
+              message: "导入的历史账单缺少有效 3 位 ISO 4217 币种代码 (currency)",
+            },
+            400
+          );
+        }
+        if (item.posting_type !== "AR" && item.posting_type !== "AP") {
+          return errorJsonResponse(
+            {
+              code: "INVALID_EXISTING_BILLS",
+              message: '导入的历史账单 posting_type 必须严格为 "AR" 或 "AP"',
+            },
+            400
+          );
+        }
+        const accountingEntity =
+          typeof item.accounting_entity === "string" && item.accounting_entity.trim()
+            ? item.accounting_entity.trim()
+            : payload.default_accounting_entity?.trim() ?? "";
+        if (!accountingEntity || countCodePoints(accountingEntity) > 120) {
+          return errorJsonResponse(
+            {
+              code: "INVALID_EXISTING_BILLS",
+              message: "导入的历史账单缺少 1–120 字符记账主体 (accounting_entity)",
+            },
+            400
+          );
+        }
+        const billId =
+          typeof item.id === "string" && item.id.trim()
+            ? item.id.trim()
+            : `bill-imp-${existingBills.length + 1}`;
+        if (seenBillIds.has(billId)) {
+          return errorJsonResponse(
+            {
+              code: "INVALID_EXISTING_BILLS",
+              message: `导入的历史账单存在重复 id "${billId}"`,
+            },
+            400
+          );
+        }
+        seenBillIds.add(billId);
         const qtyStr = readDecimalString(item, "quantity");
         const unitStr = readDecimalString(item, "unit_price");
         existingBills.push({
-          id: `bill-imp-${existingBills.length + 1}`,
+          id: billId,
           external_bill_key:
             typeof item.external_bill_key === "string"
               ? item.external_bill_key
               : null,
-          accounting_entity: String(
-            item.accounting_entity ??
-              payload.default_accounting_entity ??
-              "NEPTUNE SHIPPING LIMITED"
-          ),
+          accounting_entity: accountingEntity,
           document_type:
             typeof item.document_type === "string" ? item.document_type : null,
           reference_no:
@@ -1604,7 +1663,7 @@ export function createDevStubTransport(): FetchLike {
           container_nos: Array.isArray(item.container_nos)
             ? item.container_nos.map((c) => String(c))
             : [],
-          charge_item: String(item.charge_item ?? "Handling Charge"),
+          charge_item: chargeItem,
           raw_charge_name:
             typeof item.raw_charge_name === "string"
               ? item.raw_charge_name
@@ -1612,12 +1671,12 @@ export function createDevStubTransport(): FetchLike {
           quantity: qtyStr !== null ? toSchemaDecimal(qtyStr) : null,
           unit_price: unitStr !== null ? toSchemaDecimal(unitStr) : null,
           amount: toSchemaDecimal(amtStr),
-          currency: String(item.currency ?? "USD"),
+          currency,
           payment_term:
             item.payment_term === "PP" || item.payment_term === "CC"
               ? item.payment_term
               : null,
-          posting_type: item.posting_type === "AR" ? "AR" : "AP",
+          posting_type: item.posting_type,
           version: typeof item.version === "number" ? item.version : 1,
         });
         imported++;
@@ -1683,14 +1742,17 @@ export function createDevStubTransport(): FetchLike {
         }
         const billsField = init.body.get("existing_bills_json");
         if (typeof billsField === "string" && billsField.trim()) {
-          try {
-            const parsedSnap = parseLosslessJson<unknown>(billsField);
-            if (Array.isArray(parsedSnap)) {
-              batchSnapshotBills = parsedSnap as ExistingBill[];
-            }
-          } catch {
-            // ignore malformed optional snapshot in stub
+          const billsErr = validateExistingBillsJsonText(billsField);
+          if (billsErr) {
+            return errorJsonResponse(
+              {
+                code: "INVALID_EXISTING_BILLS",
+                message: "随批历史账单须是有效的 JSON 数组，账单 ID 须唯一",
+              },
+              400
+            );
           }
+          batchSnapshotBills = parseLosslessJson<ExistingBill[]>(billsField);
         }
       }
       batchSeq++;
@@ -1719,25 +1781,19 @@ export function createDevStubTransport(): FetchLike {
       pathname === "/api/v1/batches/import-review-bundle" &&
       method === "POST"
     ) {
-      const bundle = parseLosslessJson<ReviewBundleV1>(
-        String(init?.body ?? "{}")
-      );
-      if (
-        !bundle ||
-        bundle.bundle_version !== "1.0" ||
-        typeof bundle.accounting_entity !== "string" ||
-        !bundle.accounting_entity.trim() ||
-        !Array.isArray(bundle.documents) ||
-        !Array.isArray(bundle.records)
-      ) {
+      const rawBody = String(init?.body ?? "{}");
+      const check = validateReviewBundleInput(rawBody);
+      if (!check.valid) {
         return errorJsonResponse(
           {
-            code: "INVALID_BUNDLE_VERSION",
-            message: '仅支持符合 ReviewBundleV1 契约且 bundle_version 为 "1.0" 的复核包',
+            code: "INVALID_REVIEW_BUNDLE",
+            message: check.error,
           },
           400
         );
       }
+      const bundle = check.bundle;
+      const rawParsed = parseLosslessJson<Record<string, unknown>>(rawBody);
       batchSeq++;
       const id = `batch-bundle-0${batchSeq}`;
       const clonedDocs = parseLosslessJson<SourceDocumentSummary[]>(
@@ -1750,37 +1806,47 @@ export function createDevStubTransport(): FetchLike {
         charge_details: preserveChargeDetailsDecimals(rec.charge_details),
       }));
       const meta = createBatchAuditMeta();
-      for (const rec of clonedRecs) {
+      const rawDocs = Array.isArray(rawParsed.documents)
+        ? (rawParsed.documents as Array<Record<string, unknown>>)
+        : [];
+      for (const rawDoc of rawDocs) {
+        if (
+          typeof rawDoc.id === "string" &&
+          typeof rawDoc.retry_count === "number" &&
+          rawDoc.retry_count > 0
+        ) {
+          meta.docRetryCount.set(rawDoc.id, rawDoc.retry_count);
+        }
+      }
+      const rawRecs = Array.isArray(rawParsed.records)
+        ? (rawParsed.records as Array<Record<string, unknown>>)
+        : [];
+      for (let idx = 0; idx < clonedRecs.length; idx++) {
+        const rec = clonedRecs[idx];
+        const rawRec = rawRecs[idx] ?? {};
         if (Object.keys(rec.human_overrides ?? {}).length > 0) {
           meta.recordEdited.add(rec.id);
         }
-        const snap = rec.source_evidence?.audit_snapshot as
-          | {
-              human_review_history?: unknown;
-              retry_count?: unknown;
-              llm_calls_used?: unknown;
-            }
-          | undefined;
-        if (snap && typeof snap === "object") {
-          if (typeof snap.llm_calls_used === "number") {
-            meta.llmCallsUsed = snap.llm_calls_used;
-          }
-          if (typeof snap.retry_count === "number" && snap.retry_count > 0) {
-            meta.docRetryCount.set(rec.source_doc_id, snap.retry_count);
-          }
-          if (Array.isArray(snap.human_review_history)) {
-            const items: HumanReviewHistoryItem[] =
-              snap.human_review_history.map((entry) => {
-                const e = (entry ?? {}) as Record<string, unknown>;
-                return {
-                  action: String(e.action ?? "UPDATED"),
-                  operator: String(e.operator ?? "财务复核员"),
-                  timestamp: String(e.timestamp ?? ""),
-                  reason: typeof e.reason === "string" ? e.reason : undefined,
-                };
-              });
-            meta.recordHistory.set(rec.id, items);
-          }
+        const rawLogs = Array.isArray(rawRec.review_audit_logs)
+          ? rawRec.review_audit_logs
+          : Array.isArray(
+                (rawRec.record_state as Record<string, unknown> | undefined)
+                  ?.human_review_history
+              )
+            ? ((rawRec.record_state as Record<string, unknown>)
+                .human_review_history as unknown[])
+            : [];
+        if (rawLogs.length > 0) {
+          const items: HumanReviewHistoryItem[] = rawLogs.map((entry) => {
+            const e = (entry ?? {}) as Record<string, unknown>;
+            return {
+              action: String(e.action ?? "UPDATED"),
+              operator: String(e.operator ?? "财务复核员"),
+              timestamp: String(e.timestamp ?? ""),
+              reason: typeof e.reason === "string" ? e.reason : undefined,
+            };
+          });
+          meta.recordHistory.set(rec.id, items);
         }
       }
       const failedDocs = clonedDocs
@@ -2000,9 +2066,17 @@ export function createDevStubTransport(): FetchLike {
           hasPublicUrl = true;
         }
       }
+      if (hasReplacementFile && hasPublicUrl) {
+        return errorJsonResponse(
+          {
+            code: "CONFLICTING_SOURCE_INPUTS",
+            message: "请上传文件或提供公网 URL",
+          },
+          400
+        );
+      }
       const meta = getAuditMeta(next.id);
       meta.docRetryCount.set(docId, (meta.docRetryCount.get(docId) ?? 0) + 1);
-      meta.llmCallsUsed += 1;
 
       targetDoc.status = "METADATA_ONLY";
       targetDoc.extraction_channel =
@@ -2048,7 +2122,6 @@ export function createDevStubTransport(): FetchLike {
       }
       const meta = getAuditMeta(next.id);
       meta.docRetryCount.set(docId, (meta.docRetryCount.get(docId) ?? 0) + 1);
-      meta.llmCallsUsed += 1;
 
       targetDoc.status = "METADATA_ONLY";
       targetDoc.extraction_channel = "REMOTE_OCR";
@@ -2222,75 +2295,7 @@ export function createDevStubTransport(): FetchLike {
         );
       }
 
-      const expectedUpdatedAt = getHeaderIgnoreCase(
-        init?.headers,
-        "X-Record-Updated-At"
-      );
-      if (
-        expectedUpdatedAt &&
-        target.updated_at &&
-        expectedUpdatedAt !== target.updated_at
-      ) {
-        return errorJsonResponse(
-          {
-            code: "RECORD_CONFLICT",
-            message: "该记录已被其他操作更新（版本冲突），请刷新最新数据后重试",
-            details: {
-              server_updated_at: target.updated_at,
-              client_updated_at: expectedUpdatedAt,
-            },
-          },
-          409
-        );
-      }
-
       const meta = getAuditMeta(next.id);
-      const waiversHeader = getHeaderIgnoreCase(
-        init?.headers,
-        "X-Resolved-Warnings"
-      );
-      if (waiversHeader) {
-        const waivers = parseLosslessJson<WarningWaiverItem[]>(
-          decodeURIComponent(waiversHeader)
-        );
-        const recordWaivers =
-          meta.resolvedWaivers.get(recordId) ??
-          new Map<string, WarningWaiverItem>();
-        for (const w of waivers) {
-          const reasonLen = (w.reason ?? "").trim().length;
-          if (reasonLen < 2 || reasonLen > 500) {
-            return errorJsonResponse(
-              {
-                code: "INVALID_REASON_LENGTH",
-                message: "软告警解除说明须为 2–500 个字符",
-              },
-              422
-            );
-          }
-          const matchedAlert = (target.validation_alerts ?? []).find(
-            (a) =>
-              a.code === w.code &&
-              (a.field ?? null) === (w.field ?? null) &&
-              (a.actual ?? null) === (w.actual ?? null)
-          );
-          if (
-            !matchedAlert ||
-            matchedAlert.severity === "BLOCKER" ||
-            HARD_BLOCKER_CODES.has(w.code)
-          ) {
-            return errorJsonResponse(
-              {
-                code: "CANNOT_WAIVE_HARD_BLOCKER",
-                message: "硬性阻断或核心算术/总计门禁告警不可强行解除",
-                details: { code: w.code, field: w.field ?? null },
-              },
-              422
-            );
-          }
-          recordWaivers.set(makeWarningKey(w), w);
-        }
-        meta.resolvedWaivers.set(recordId, recordWaivers);
-      }
 
       if (payload.charge_item !== undefined) {
         target.charge_details.charge_item = payload.charge_item;
@@ -2378,6 +2383,7 @@ export function createDevStubTransport(): FetchLike {
 
       const overridePatch = { ...payload } as Record<string, unknown>;
       delete overridePatch.raw_charge_name;
+      delete overridePatch.review_note;
       for (const k of ["quantity", "unit_price", "amount"] as const) {
         if (overridePatch[k] !== undefined) {
           overridePatch[k] = readDecimalString(payload, k);
@@ -2394,7 +2400,7 @@ export function createDevStubTransport(): FetchLike {
       const ts = nextStubTimestamp();
       target.updated_at = ts;
       appendRecordHistory(meta, recordId, {
-        action: "PATCHED",
+        action: "PATCH_RECORD",
         operator: "财务复核员",
         timestamp: ts,
         reason: payload.review_note ?? "保存全字段人工修订并重跑门禁",
@@ -2422,7 +2428,8 @@ export function createDevStubTransport(): FetchLike {
         String(init?.body ?? "{}")
       );
       const reason = (payload.reason ?? "").trim();
-      if (reason.length < 2 || reason.length > 500) {
+      const reasonLen = countCodePoints(reason);
+      if (reasonLen < 2 || reasonLen > 500) {
         return errorJsonResponse(
           {
             code: "INVALID_REASON_LENGTH",
@@ -2439,23 +2446,6 @@ export function createDevStubTransport(): FetchLike {
           404
         );
       }
-      const expectedUpdatedAt = getHeaderIgnoreCase(
-        init?.headers,
-        "X-Record-Updated-At"
-      );
-      if (
-        expectedUpdatedAt &&
-        target.updated_at &&
-        expectedUpdatedAt !== target.updated_at
-      ) {
-        return errorJsonResponse(
-          {
-            code: "RECORD_CONFLICT",
-            message: "该记录已被其他操作更新（版本冲突），请刷新最新数据后重试",
-          },
-          409
-        );
-      }
 
       const blockers = (target.validation_alerts ?? []).filter(
         (a) => a.severity === "BLOCKER"
@@ -2467,14 +2457,7 @@ export function createDevStubTransport(): FetchLike {
             message:
               "该记录存在未解决的硬性数值或对账错误，请先修正金额/币种或选择驳回",
             details: {
-              blocker_codes: blockers.map((b) => b.code),
-              blockers: blockers.map((b) => ({
-                code: b.code,
-                field: b.field ?? null,
-                message: b.message,
-                expected: b.expected ?? null,
-                actual: b.actual ?? null,
-              })),
+              blocker_codes: Array.from(new Set(blockers.map((b) => b.code))),
             },
             request_id: "stub-422-blocker",
           },
@@ -2485,15 +2468,10 @@ export function createDevStubTransport(): FetchLike {
       const meta = getAuditMeta(next.id);
       const recordWaivers =
         meta.resolvedWaivers.get(target.id) ??
-        new Map<string, WarningWaiverItem>();
+        new Map<string, { reason: string }>();
       target.validation_alerts = (target.validation_alerts ?? []).map((a) => {
         if (a.severity === "WARNING") {
-          recordWaivers.set(makeWarningKey(a), {
-            code: a.code,
-            field: a.field ?? null,
-            actual: a.actual ?? null,
-            reason,
-          });
+          recordWaivers.set(makeWarningKey(a), { reason });
           return {
             ...a,
             severity: "RESOLVED",
@@ -2534,7 +2512,8 @@ export function createDevStubTransport(): FetchLike {
         String(init?.body ?? "{}")
       );
       const reason = (payload.reason ?? "").trim();
-      if (reason.length < 2 || reason.length > 500) {
+      const rejectLen = countCodePoints(reason);
+      if (rejectLen < 2 || rejectLen > 500) {
         return errorJsonResponse(
           {
             code: "INVALID_REASON_LENGTH",
@@ -2739,7 +2718,7 @@ export function createDevStubTransport(): FetchLike {
           run_mode: "OFFLINE_DETERMINISTIC",
           status: "COMPLETED",
           error_message: null,
-          model_name: "offline-rules-v1",
+          model_name: "deterministic-rules",
           k_trials: requestedK,
           actual_trials: requestedK,
           total_cases: 12,
@@ -2751,23 +2730,68 @@ export function createDevStubTransport(): FetchLike {
           pass_at_k: rawDecimal("1.0") as unknown as number,
           pass_pow_k: rawDecimal("1.0") as unknown as number,
           report: {
-            amount_accuracy: rawDecimal("1.0") as unknown as number,
-            currency_accuracy: rawDecimal("1.0") as unknown as number,
-            false_positive_rate: rawDecimal("0.0") as unknown as number,
-            metric_counts: {
-              schema_valid_rate: { passed: 12, total: 12 },
-              field_exact_match: { passed: 47, total: 48 },
-              ar_ap_accuracy: { passed: 12, total: 12 },
-              operation_accuracy: { passed: 12, total: 12 },
-              conflict_recall: { passed: 6, total: 6 },
-              amount_accuracy: { passed: 24, total: 24 },
-              currency_accuracy: { passed: 24, total: 24 },
-              false_positive_rate: { passed: 0, total: 12 },
-              pass_at_k: { passed: 12, total: 12 },
-              pass_pow_k: { passed: 12, total: 12 },
+            schema_valid_rate: {
+              rate: rawDecimal("1.0") as unknown as number,
+              numerator: 12,
+              denominator: 12,
             },
-            notes:
-              "12 组真值与对抗用例全量离线确定性回归完成（含 4 份真实原题与 8 组边界对抗）",
+            field_exact_match: {
+              rate: rawDecimal("0.9792") as unknown as number,
+              numerator: 47,
+              denominator: 48,
+            },
+            ar_ap_accuracy: {
+              rate: rawDecimal("1.0") as unknown as number,
+              numerator: 12,
+              denominator: 12,
+            },
+            operation_accuracy: {
+              rate: rawDecimal("1.0") as unknown as number,
+              numerator: 12,
+              denominator: 12,
+            },
+            conflict_recall: {
+              rate: rawDecimal("1.0") as unknown as number,
+              numerator: 6,
+              denominator: 6,
+            },
+            amount_accuracy: {
+              rate: rawDecimal("1.0") as unknown as number,
+              numerator: 24,
+              denominator: 24,
+            },
+            currency_accuracy: {
+              rate: rawDecimal("1.0") as unknown as number,
+              numerator: 24,
+              denominator: 24,
+            },
+            false_positive_rate: {
+              rate: rawDecimal("0.0") as unknown as number,
+              numerator: 0,
+              denominator: 12,
+            },
+            alert_precision: {
+              rate: rawDecimal("1.0") as unknown as number,
+              numerator: 8,
+              denominator: 8,
+            },
+            pass_at_k: {
+              rate: rawDecimal("1.0") as unknown as number,
+              numerator: 12,
+              denominator: 12,
+            },
+            pass_pow_k: {
+              rate: rawDecimal("1.0") as unknown as number,
+              numerator: 12,
+              denominator: 12,
+            },
+            avg_latency_ms: rawDecimal("18.4") as unknown as number,
+            executed_cases: 12 * requestedK,
+            llm_calls: 0,
+            ocr_calls: 0,
+            self_repair_evidence: "UNVERIFIED",
+            failing_cases: [],
+            case_results: [],
           },
           created_at: ts,
         };
@@ -2790,10 +2814,33 @@ export function createDevStubTransport(): FetchLike {
           pass_at_k: null,
           pass_pow_k: null,
           report: {
-            amount_accuracy: null,
-            currency_accuracy: null,
-            false_positive_rate: null,
-            failed_trial: 2,
+            schema_valid_rate: { rate: null, numerator: 0, denominator: 0 },
+            field_exact_match: { rate: null, numerator: 0, denominator: 0 },
+            ar_ap_accuracy: { rate: null, numerator: 0, denominator: 0 },
+            operation_accuracy: { rate: null, numerator: 0, denominator: 0 },
+            conflict_recall: { rate: null, numerator: 0, denominator: 0 },
+            amount_accuracy: { rate: null, numerator: 0, denominator: 0 },
+            currency_accuracy: { rate: null, numerator: 0, denominator: 0 },
+            false_positive_rate: { rate: null, numerator: 0, denominator: 0 },
+            alert_precision: { rate: null, numerator: 0, denominator: 0 },
+            pass_at_k: { rate: null, numerator: 0, denominator: 0 },
+            pass_pow_k: { rate: null, numerator: 0, denominator: 0 },
+            avg_latency_ms: null,
+            executed_cases: 0,
+            llm_calls: 0,
+            ocr_calls: 1,
+            self_repair_evidence: "UNVERIFIED",
+            failing_cases: [
+              {
+                trial: 2,
+                group_id: "G02",
+                case_id: "real-img-sample",
+                reason: "OcrGatewayError: 远端 OCR 网关连接中断",
+                expected: "完成当前用例并返回可评分结果",
+                actual: "REMOTE_OCR_UNAVAILABLE",
+              },
+            ],
+            case_results: [],
           },
           created_at: ts,
         };
@@ -2816,10 +2863,24 @@ export function createDevStubTransport(): FetchLike {
           pass_at_k: null,
           pass_pow_k: null,
           report: {
-            amount_accuracy: null,
-            currency_accuracy: null,
-            false_positive_rate: null,
-            unverified_reason: "MISSING_DEEPSEEK_API_KEY",
+            schema_valid_rate: { rate: null, numerator: 0, denominator: 0 },
+            field_exact_match: { rate: null, numerator: 0, denominator: 0 },
+            ar_ap_accuracy: { rate: null, numerator: 0, denominator: 0 },
+            operation_accuracy: { rate: null, numerator: 0, denominator: 0 },
+            conflict_recall: { rate: null, numerator: 0, denominator: 0 },
+            amount_accuracy: { rate: null, numerator: 0, denominator: 0 },
+            currency_accuracy: { rate: null, numerator: 0, denominator: 0 },
+            false_positive_rate: { rate: null, numerator: 0, denominator: 0 },
+            alert_precision: { rate: null, numerator: 0, denominator: 0 },
+            pass_at_k: { rate: null, numerator: 0, denominator: 0 },
+            pass_pow_k: { rate: null, numerator: 0, denominator: 0 },
+            avg_latency_ms: null,
+            executed_cases: 0,
+            llm_calls: 0,
+            ocr_calls: 0,
+            self_repair_evidence: "UNVERIFIED",
+            failing_cases: [],
+            case_results: [],
           },
           created_at: ts,
         };

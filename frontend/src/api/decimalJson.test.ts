@@ -2,6 +2,8 @@ import {
   ApiClientError,
   BillingApiClient,
   MAX_SINGLE_FILE_BYTES,
+  isValidIso4217Currency,
+  normalizeBatchDetail,
   validateBatchIngestionInput,
 } from "./client.ts";
 import {
@@ -21,9 +23,14 @@ import { createDevStubTransport } from "./devStubTransport.ts";
 import {
   NO_EVAL_RESULT_LABEL,
   buildEvalRunViewModel,
-  buildReviewBundleV1,
+  completeExportModalLoadFailure,
+  completeExportModalLoadSuccess,
+  createExportModalCacheState,
   formatEvalMetricValue,
+  getExportModalActionEligibility,
+  getExportResponseForBatchMode,
   parseExistingBillsImportInput,
+  resetExportModalForBatch,
   validateAccountingEntityInput,
   validateChargeDictionaryInput,
   validateReviewBundleInput,
@@ -32,21 +39,44 @@ import {
   acceptPollResult,
   buildDocTotalsDiffPatch,
   buildRecordDiffPatch,
-  canWaiveValidationAlert,
   clearRecordDraft,
+  countCodePoints,
   createEmptyDraftStore,
   createPollRaceTracker,
+  extractMutationErrorBanner,
+  extractServerRecordFormValues,
   finishMutationSuccess,
   getEffectiveDocTotalsValues,
   getEffectiveRecordFormValues,
+  getRecordDraftVersion,
   hasRecordDraft,
   setDocTotalsDraftField,
   setRecordDraftField,
-  setRecordWarningWaiver,
   startMutation,
   startPoll,
   validateReviewReason,
 } from "./reviewState.ts";
+
+function collectLowerHeaders(
+  headersInit: RequestInit["headers"]
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!headersInit) return out;
+  if (headersInit instanceof Headers) {
+    headersInit.forEach((v, k) => {
+      out[k.toLowerCase()] = v;
+    });
+  } else if (Array.isArray(headersInit)) {
+    for (const [k, v] of headersInit) {
+      out[k.toLowerCase()] = v;
+    }
+  } else {
+    for (const [k, v] of Object.entries(headersInit)) {
+      if (v !== undefined) out[k.toLowerCase()] = String(v);
+    }
+  }
+  return out;
+}
 
 function assertEqual<T>(actual: T, expected: T, message: string): void {
   if (!Object.is(actual, expected)) {
@@ -243,8 +273,12 @@ export async function runDecimalJsonTests(): Promise<void> {
   results.push("PASS 5: Pre-upload 0-byte / >50 MiB / >50 items / URL validation");
 
   // 6. BillingApiClient + devStubTransport integration contract checks
-  const capturedCalls: Array<{ url: string; method: string; bodyText?: string }> =
-    [];
+  const capturedCalls: Array<{
+    url: string;
+    method: string;
+    bodyText?: string;
+    headers: Record<string, string>;
+  }> = [];
   const stubTransport = createDevStubTransport();
   const client = new BillingApiClient({
     transport: async (input, init) => {
@@ -253,6 +287,7 @@ export async function runDecimalJsonTests(): Promise<void> {
         url,
         method: init?.method ?? "GET",
         bodyText: typeof init?.body === "string" ? init.body : undefined,
+        headers: collectLowerHeaders(init?.headers),
       });
       return stubTransport(input, init);
     },
@@ -542,15 +577,12 @@ export async function runDecimalJsonTests(): Promise<void> {
     docEml2.id,
     docDiff2.patch
   );
-  const refreshedTarget2 = afterDocPatch2.records.find(
-    (r) => r.id === targetRec.id
-  )!;
+  assertTrue(afterDocPatch2.id === batch2.id, "doc totals patched cleanly");
 
   const patchedBatch2 = await client.patchBillingRecord(
     batch2.id,
     targetRec.id,
-    diff.patch,
-    { expectedRecordUpdatedAt: refreshedTarget2.updated_at ?? null }
+    diff.patch
   );
   assertEqual(
     readDecimalString(
@@ -565,23 +597,10 @@ export async function runDecimalJsonTests(): Promise<void> {
     lastPatchCall.method === "PATCH" &&
       (lastPatchCall.bodyText ?? "").includes('"amount":9007199254740991.01') &&
       (lastPatchCall.bodyText ?? "").includes('"unit_price":0.0025') &&
-      !(lastPatchCall.bodyText ?? "").includes("raw_charge_name"),
-    "PATCH HTTP body carries unquoted 9007199254740991.01 & 0.0025 and omits raw_charge_name"
-  );
-
-  // Stale updated_at triggers 409 RECORD_CONFLICT
-  const conflictErr = await assertRejectsAsync(
-    client.patchBillingRecord(
-      batch2.id,
-      targetRec.id,
-      { review_note: "stale overwrite attempt" },
-      { expectedRecordUpdatedAt: targetRec.updated_at ?? null }
-    ),
-    "stale updated_at conflict"
-  );
-  assertTrue(
-    conflictErr instanceof ApiClientError && conflictErr.status === 409,
-    "stale optimistic lock triggers 409 RECORD_CONFLICT"
+      !(lastPatchCall.bodyText ?? "").includes("raw_charge_name") &&
+      lastPatchCall.headers["x-record-updated-at"] === undefined &&
+      lastPatchCall.headers["x-resolved-warnings"] === undefined,
+    "PATCH HTTP body carries unquoted 9007199254740991.01 & 0.0025, omits raw_charge_name and private headers"
   );
 
   // Reload & Export & Download round-trip checks
@@ -610,10 +629,10 @@ export async function runDecimalJsonTests(): Promise<void> {
     "export/download raw JSON array keeps unquoted 9007199254740991.01 & 0.0025"
   );
   results.push(
-    "PASS 10: Diff-only PATCH, read-only raw_charge_name, 409 conflict & lossless save->reload->export->download"
+    "PASS 10: Diff-only PATCH, contract-only headers, read-only raw_charge_name & lossless save->reload->export->download"
   );
 
-  // 11. 6-record mixed batch 3/5/6 counts, 422 BLOCKER guard, per-item WARNING waiver, 2-500 reason, doc repair & on-demand audit
+  // 11. 6-record mixed batch 3/5/6 counts, 422 BLOCKER guard (details.blocker_codes), contract-only approve resolving WARNING, doc repair & audit
   const freshBatch3Queued = await client.createDemoBatch({
     accounting_entity: "NEPTUNE SHIPPING LIMITED",
     ocr_mode: "REMOTE_ONLY",
@@ -645,84 +664,59 @@ export async function runDecimalJsonTests(): Promise<void> {
   assertEqual(dlFull.records.length, 5, "downloaded full_standard array has 5 items");
   assertEqual(dlAudit.records.length, 6, "downloaded audit array has 6 items");
 
-  // Validate BLOCKER cannot be waived while soft WARNING can be waived by exact (code, field, actual)
+  // Validate BLOCKER cannot be approved (422 details.blocker_codes) while soft WARNING is resolved on approve
   const blockerRec = batch3.records.find((r) => r.id === "rec-precision-blocker")!;
   const blockerAlert = blockerRec.validation_alerts!.find(
     (a) => a.severity === "BLOCKER"
   )!;
-  const warningAlertOnBlocker = blockerRec.validation_alerts!.find(
-    (a) => a.severity === "WARNING"
-  )!;
-  assertEqual(canWaiveValidationAlert(blockerAlert), false, "BLOCKER cannot be waived");
-  assertEqual(
-    canWaiveValidationAlert(warningAlertOnBlocker),
-    true,
-    "CONTAINER_ISO6346_MISMATCH WARNING is waivable"
-  );
   assertTrue(validateReviewReason("a") !== null, "1-char reason rejected");
   assertTrue(validateReviewReason("核对无误") === null, "valid reason accepted");
 
-  // Client rejects waiver attempt on BLOCKER
-  let badWaiveStore = setRecordWarningWaiver(createEmptyDraftStore(), batch3.id, blockerRec.id, {
-    code: blockerAlert.code,
-    field: blockerAlert.field ?? null,
-    actual: blockerAlert.actual ?? null,
-    reason: "强行跳过总计错误",
-  });
-  const badWaiveDiff = buildRecordDiffPatch(blockerRec, badWaiveStore, batch3.id);
-  assertEqual(badWaiveDiff.valid, false, "client rejects waiving BLOCKER");
-
-  // Server also rejects waiving BLOCKER with 422
-  const serverWaiveErr = await assertRejectsAsync(
-    client.patchBillingRecord(
+  const serverApproveBlockerErr = await assertRejectsAsync(
+    client.approveBillingRecord(
       batch3.id,
       blockerRec.id,
-      { review_note: "try waive blocker" },
-      {
-        resolvedWarnings: [
-          {
-            code: blockerAlert.code,
-            field: blockerAlert.field ?? null,
-            actual: blockerAlert.actual ?? null,
-            reason: "试图强行解除红灯",
-          },
-        ],
-      }
+      "试图强行批准含硬阻断的记录"
     ),
-    "422 CANNOT_WAIVE_HARD_BLOCKER"
+    "422 HARD_BLOCKER_CANNOT_APPROVE"
   );
   assertTrue(
-    serverWaiveErr instanceof ApiClientError && serverWaiveErr.status === 422,
-    "server rejects BLOCKER waiver with 422"
+    serverApproveBlockerErr instanceof ApiClientError &&
+      serverApproveBlockerErr.status === 422 &&
+      Array.isArray(serverApproveBlockerErr.details?.blocker_codes) &&
+      (serverApproveBlockerErr.details?.blocker_codes as string[]).includes(
+        blockerAlert.code
+      ),
+    "server rejects BLOCKER approval with 422 and standard details.blocker_codes"
   );
 
-  // Soft warning record: waive by exact (code, field, actual) -> transitions to CREATE/AUTO_READY
+  // Soft warning record: approve directly with strict { reason } (NO private headers) -> APPROVED & WARNING -> RESOLVED
   const softRec = batch3.records.find((r) => r.id === "rec-soft-warning")!;
-  const softWarning = softRec.validation_alerts![0];
-  let softStore = setRecordWarningWaiver(createEmptyDraftStore(), batch3.id, softRec.id, {
-    code: softWarning.code,
-    field: softWarning.field ?? null,
-    actual: softWarning.actual ?? null,
-    reason: "已核对提单原件，历史非标箱号特例放行",
-  });
-  const softDiff = buildRecordDiffPatch(softRec, softStore, batch3.id);
-  assertEqual(softDiff.valid, true, "soft warning waiver valid");
-  assertEqual(softDiff.resolvedWarnings.length, 1, "1 resolved warning produced");
-  const afterSoftWaive = await client.patchBillingRecord(
+  const afterSoftApprove = await client.approveBillingRecord(
     batch3.id,
     softRec.id,
-    softDiff.patch,
-    {
-      expectedRecordUpdatedAt: softRec.updated_at ?? null,
-      resolvedWarnings: softDiff.resolvedWarnings,
-    }
+    "已核对提单原件，历史非标箱号特例放行"
   );
-  const updatedSoftRec = afterSoftWaive.records.find((r) => r.id === softRec.id)!;
-  assertEqual(updatedSoftRec.review_status, "AUTO_READY", "soft waiver clears NEEDS_REVIEW");
+  const lastApproveCall = capturedCalls[capturedCalls.length - 1];
+  assertTrue(
+    lastApproveCall.method === "POST" &&
+      lastApproveCall.url.endsWith(`/records/${softRec.id}/approve`) &&
+      lastApproveCall.headers["x-record-updated-at"] === undefined &&
+      lastApproveCall.headers["x-resolved-warnings"] === undefined,
+    "approve request omits custom record-version and warning-waiver headers"
+  );
+  const updatedSoftRec = afterSoftApprove.records.find(
+    (r) => r.id === softRec.id
+  )!;
+  assertEqual(
+    updatedSoftRec.review_status,
+    "APPROVED",
+    "approving soft-warning record transitions NEEDS_REVIEW -> APPROVED"
+  );
   assertEqual(
     updatedSoftRec.validation_alerts![0].severity,
     "RESOLVED",
-    "warning marked RESOLVED"
+    "soft warning marked RESOLVED upon approval"
   );
 
   // Doc repair: force-parse & retry
@@ -745,11 +739,12 @@ export async function runDecimalJsonTests(): Promise<void> {
   )!;
   assertTrue(
     Array.isArray(softAudit.audit_trail.human_review_history) &&
-      (softAudit.audit_trail.human_review_history as unknown[]).length >= 1,
-    "audit mode exposes human_review_history"
+      (softAudit.audit_trail.human_review_history as unknown[]).length >= 1 &&
+      !("llm_calls_used" in softAudit.audit_trail),
+    "audit mode exposes human_review_history and standard B03 audit_trail shape"
   );
   results.push(
-    "PASS 11: 6-record 3/5/6 export counts, 422 BLOCKER guard, soft WARNING waiver, doc retry/force-parse & audit history"
+    "PASS 11: 6-record 3/5/6 export counts, 422 blocker_codes guard, contract approve, doc retry/force-parse & audit history"
   );
 
   // 12. sync-baseline repeatable 3-cycle execution (1st create/update -> 2nd skip -> edit+approve -> 3rd update/create/skip)
@@ -1056,11 +1051,22 @@ export async function runDecimalJsonTests(): Promise<void> {
   });
   assertEqual(offlineRun.status, "COMPLETED", "OFFLINE_DETERMINISTIC returns COMPLETED");
   const offlineVm = buildEvalRunViewModel(offlineRun);
+  assertEqual(
+    offlineVm.truthMetrics.length,
+    9,
+    "B05 view model exposes all 9 truth metrics including alert_precision"
+  );
   const schemaMetric = offlineVm.truthMetrics.find(
     (m) => m.key === "schema_valid_rate"
   )!;
   const exactMetric = offlineVm.truthMetrics.find(
     (m) => m.key === "field_exact_match"
+  )!;
+  const amountMetric = offlineVm.truthMetrics.find(
+    (m) => m.key === "amount_accuracy"
+  )!;
+  const alertPrecisionMetric = offlineVm.truthMetrics.find(
+    (m) => m.key === "alert_precision"
   )!;
   const fpMetric = offlineVm.truthMetrics.find(
     (m) => m.key === "false_positive_rate"
@@ -1072,57 +1078,177 @@ export async function runDecimalJsonTests(): Promise<void> {
   assertEqual(schemaMetric.fractionText, "12 / 12", "COMPLETED schema_valid_rate shows 12 / 12");
   assertEqual(exactMetric.displayText, "97.92%", "COMPLETED field_exact_match formats 97.92%");
   assertEqual(exactMetric.fractionText, "47 / 48", "COMPLETED field_exact_match shows 47 / 48");
+  assertEqual(amountMetric.displayText, "100.0%", "COMPLETED amount_accuracy parsed from B05 report object");
+  assertEqual(amountMetric.fractionText, "24 / 24", "COMPLETED amount_accuracy shows 24 / 24");
+  assertEqual(alertPrecisionMetric.fractionText, "8 / 8", "COMPLETED alert_precision shows 8 / 8");
   assertEqual(fpMetric.displayText, "0.0%", "COMPLETED legitimate 0 false positive rate formats 0.0%");
   assertEqual(passAtKMetric.displayText, "100.0%", "COMPLETED pass@3 formats 100.0%");
   assertEqual(passAtKMetric.fractionText, "12 / 12", "COMPLETED pass@3 shows 12 / 12");
+  assertTrue(
+    offlineVm.avgLatencyText.endsWith("ms") && offlineVm.executedCases === 36,
+    "B05 telemetry avgLatencyText & executedCases populated"
+  );
   results.push(
-    "PASS 14: Harness eval formatting (UNVERIFIED/FAILED/null -> 无结果, COMPLETED percentages & fractions)"
+    "PASS 14: Harness eval formatting (UNVERIFIED/FAILED/null -> 无结果, B05 report metrics & fractions)"
   );
 
-  // 15. ReviewBundleV1 ("1.0") export -> import round-trip preserving 9007199254740991.01 / 0.0025, review history & XSS plain text
+  // 15. CLI ReviewBundleV1 ("1.0") import contract: lossless decimals, BATCH_PRIVATE snapshot, review_audit_logs & XSS plain text
   const invalidBundleCheck = validateReviewBundleInput(
     '{"bundle_version":"2.0","accounting_entity":"NEPTUNE","documents":[],"records":[]}'
   );
   assertEqual(invalidBundleCheck.valid, false, "unsupported bundle_version 2.0 rejected");
 
-  const bundleSourceQueued = await client.createDemoBatch({
+  const cliBundlePayloadText = stringifyLosslessJson({
+    bundle_version: "1.0",
+    short_code: "B-CLI-15",
     accounting_entity: "NEPTUNE SHIPPING LIMITED",
     ocr_mode: "REMOTE_ONLY",
-    wait: false,
+    documents: [
+      {
+        id: "doc-eml-1",
+        parent_doc_id: null,
+        original_filename: "cli_invoice.pdf",
+        sanitized_filename: "cli_invoice.pdf",
+        source_kind: "PDF",
+        extraction_channel: "REMOTE_OCR",
+        status: "PARSED",
+        error_message: null,
+        affected_record_ids: ["rec-precision-blocker", "rec-soft-warning"],
+        excluded_clauses: [],
+        shipment_refs: { mbl_nos: [], container_nos: [] },
+        subtotal_amount: rawDecimal("9007199254740991.01"),
+        tax_amount: rawDecimal("0.00"),
+        total_amount: rawDecimal("9007199254740991.01"),
+        total_currency: "USD",
+      },
+      {
+        id: "doc-fail-zero",
+        parent_doc_id: null,
+        original_filename: "scan_retry.png",
+        sanitized_filename: "scan_retry.png",
+        source_kind: "IMAGE",
+        extraction_channel: "LOCAL_OCR_FALLBACK",
+        status: "METADATA_ONLY",
+        error_message: null,
+        retry_count: 2,
+        affected_record_ids: [],
+        excluded_clauses: [],
+        shipment_refs: { mbl_nos: [], container_nos: [] },
+        subtotal_amount: null,
+        tax_amount: null,
+        total_amount: null,
+        total_currency: null,
+      },
+    ],
+    records: [
+      {
+        id: "rec-precision-blocker",
+        source_doc_id: "doc-eml-1",
+        source_line_index: 0,
+        operation: "PENDING_REVIEW",
+        review_status: "NEEDS_REVIEW",
+        match_level: "NONE",
+        matched_existing_bill_id: null,
+        document_info: {
+          document_type: "Debit Note",
+          reference_no: "CLI-MEGA-9007",
+          document_date: "2026-11-19",
+        },
+        transaction_party: {
+          issuer: "COSCO SHIPPING",
+          recipient: "NEPTUNE SHIPPING LIMITED",
+        },
+        charge_details: {
+          charge_item: "Handling Charge",
+          raw_charge_name: "HIGH PRECISION TEST FEE",
+          quantity: rawDecimal("1"),
+          unit_price: rawDecimal("0.0025"),
+          amount: rawDecimal("9007199254740991.01"),
+          currency: "USD",
+          payment_term: "PP",
+        },
+        financial_attributes: {
+          accounting_entity: "NEPTUNE SHIPPING LIMITED",
+          posting_type: "AP",
+        },
+        shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: [] },
+        source_evidence: {
+          source_file: "cli_invoice.pdf",
+          sheet: "FreightDetail",
+          line_number: 18,
+          snippet:
+            "<script>alert('xss')</script><img src=x onerror=alert(1)> RAW_AMOUNT: 9007199254740991.01 USD | RATE: 0.0025",
+        },
+        ai_reasoning: ["CLI 复核包无损小数与 Excel 证据行透传验证"],
+        human_overrides: {},
+        reject_reason: null,
+      },
+      {
+        id: "rec-soft-warning",
+        source_doc_id: "doc-eml-1",
+        source_line_index: 1,
+        operation: "CREATE",
+        review_status: "APPROVED",
+        match_level: "NONE",
+        matched_existing_bill_id: null,
+        document_info: {
+          document_type: "Debit Note",
+          reference_no: "CLI-MEGA-9007",
+          document_date: "2026-11-19",
+        },
+        transaction_party: {
+          issuer: "COSCO SHIPPING",
+          recipient: "NEPTUNE SHIPPING LIMITED",
+        },
+        charge_details: {
+          charge_item: "Handling Charge",
+          raw_charge_name: "H/C",
+          quantity: rawDecimal("1"),
+          unit_price: rawDecimal("245.00"),
+          amount: rawDecimal("245.00"),
+          currency: "USD",
+          payment_term: "PP",
+        },
+        financial_attributes: {
+          accounting_entity: "NEPTUNE SHIPPING LIMITED",
+          posting_type: "AP",
+        },
+        shipment_refs: { mbl_nos: [], hbl_no: null, booking_no: null, container_nos: ["ABCD1234567"] },
+        source_evidence: { source_file: "cli_invoice.pdf", page: 1, snippet: "H/C 245.00 USD" },
+        ai_reasoning: ["已核对人工历史记录"],
+        human_overrides: {},
+        reject_reason: null,
+        review_audit_logs: [
+          {
+            action: "APPROVED",
+            operator: "CLI 复核员",
+            timestamp: "2026-11-19T10:00:00Z",
+            reason: "复核包互通测试批准原因",
+          },
+        ],
+      },
+    ],
+    existing_bills_snapshot: [
+      {
+        id: "bill-private-only",
+        accounting_entity: "NEPTUNE SHIPPING LIMITED",
+        reference_no: "BATCH_PRIVATE",
+        document_type: "Debit Note",
+        issuer: "COSCO SHIPPING",
+        recipient: "NEPTUNE SHIPPING LIMITED",
+        charge_item: "Handling Charge",
+        raw_charge_name: "H/C",
+        amount: rawDecimal("245.00"),
+        currency: "USD",
+        payment_term: "PP",
+        posting_type: "AP",
+        version: 1,
+      },
+    ],
   });
-  let bundleSource = await client.getBatchDetail(bundleSourceQueued.id);
-  while (bundleSource.stage !== "COMPLETED") {
-    bundleSource = await client.getBatchDetail(bundleSourceQueued.id);
-  }
-  await client.retryOrReplaceDocument(bundleSource.id, "doc-fail-zero", {
-    ocr_mode: "REMOTE_WITH_LOCAL_FALLBACK",
-  });
-  bundleSource = await client.approveBillingRecord(
-    bundleSource.id,
-    "rec-soft-warning",
-    "复核包互通测试批准原因"
-  );
-  const sourceAuditExport = await client.exportBatchJson(bundleSource.id, "audit");
-  const sourceBillsSnapshot = await client.listExistingBills(
-    bundleSource.accounting_entity
-  );
 
-  const builtBundle = buildReviewBundleV1(
-    bundleSource,
-    sourceBillsSnapshot,
-    sourceAuditExport
-  );
-  assertEqual(builtBundle.bundle_version, "1.0", 'bundle_version strictly "1.0"');
-  const serializedBundle = stringifyLosslessJson(builtBundle);
-  assertTrue(
-    serializedBundle.includes('"bundle_version":"1.0"') &&
-      serializedBundle.includes("9007199254740991.01") &&
-      serializedBundle.includes("0.0025"),
-    "serialized ReviewBundleV1 keeps bundle_version 1.0 and lossless decimals"
-  );
-
-  const validatedImport = validateReviewBundleInput(serializedBundle);
-  assertEqual(validatedImport.valid, true, "serialized bundle passes pre-import check");
+  const validatedImport = validateReviewBundleInput(cliBundlePayloadText);
+  assertEqual(validatedImport.valid, true, "CLI ReviewBundleV1 passes strict schema validation");
   if (!validatedImport.valid) throw new Error("unreachable");
 
   // Import into a brand new client instance to prove zero shared in-memory state
@@ -1165,14 +1291,15 @@ export async function runDecimalJsonTests(): Promise<void> {
         (h) =>
           h.action === "APPROVED" && h.reason === "复核包互通测试批准原因"
       ),
-    "imported ReviewBundleV1 restores human_review_history cleanly"
+    "imported ReviewBundleV1 restores review_audit_logs -> human_review_history without audit_snapshot"
   );
   const importedFailDocAudit = importedAudit.records.find(
-    (r) => r.audit_trail.source_doc_id === "doc-eml-1"
-  );
-  assertTrue(
-    importedFailDocAudit !== undefined,
-    "imported audit export intact"
+    (r) => r.audit_trail.record_id === "rec-precision-blocker"
+  )!;
+  assertEqual(
+    importedFailDocAudit.audit_trail.retry_count,
+    0,
+    "imported audit export reads standard retry_count without llm_calls_used"
   );
   const importedDocFailRecord = importedBatch.documents.find(
     (d) => d.id === "doc-fail-zero"
@@ -1184,7 +1311,649 @@ export async function runDecimalJsonTests(): Promise<void> {
   );
 
   results.push(
-    "PASS 15: ReviewBundleV1 (1.0) export->import round-trip, 9007199254740991.01/0.0025, review history & XSS plain text"
+    "PASS 15: CLI ReviewBundleV1 (1.0) import round-trip, BATCH_PRIVATE isolation, review_audit_logs & XSS plain text"
+  );
+
+  // 16. A1 & B3: OpenAPI batch-edge-01 normalization + Vite SSR UI render (missing inherited_fields, Excel sheet/line_number)
+  const openApiBatchEdge01RawText = stringifyLosslessJson({
+    id: "batch-edge-01",
+    short_code: "B-1119-09",
+    accounting_entity: "ALL AMERICA FORWARDING, INC.",
+    source_channel: "WEB",
+    status: "PARTIAL_ERROR",
+    stage: "COMPLETED",
+    stage_message: "解析完成（1 份成功，1 份失败）",
+    ocr_mode: "REMOTE_ONLY",
+    total_files: 2,
+    succeeded_files: 1,
+    failed_files: 1,
+    counts: {
+      create: 1,
+      update: 0,
+      no_change: 0,
+      pending_review: 0,
+      rejected: 0,
+    },
+    documents: [
+      {
+        id: "doc-fail-1",
+        parent_doc_id: null,
+        original_filename: "scan_corrupted.png",
+        sanitized_filename: "scan_corrupted.png",
+        source_kind: "IMAGE",
+        extraction_channel: "FAILED",
+        status: "FAILED",
+        error_message: "远端 OCR 网关超时或无法读取该本地图片（未配置公网地址）",
+        affected_record_ids: [],
+        excluded_clauses: [],
+        shipment_refs: {},
+        subtotal_amount: null,
+        tax_amount: null,
+        total_amount: null,
+        total_currency: null,
+      },
+    ],
+    failed_documents: [
+      {
+        doc_id: "doc-fail-1",
+        filename: "scan_corrupted.png",
+        error_message: "远端 OCR 网关超时或无法读取该本地图片（未配置公网地址）",
+        affected_record_ids: [],
+      },
+    ],
+    records: [
+      {
+        id: "rec-cn-1",
+        source_doc_id: "doc-ok-1",
+        source_line_index: 0,
+        operation: "CREATE",
+        review_status: "AUTO_READY",
+        match_level: "NONE",
+        matched_existing_bill_id: null,
+        candidate_bills: [],
+        document_info: {
+          document_type: "Credit Note",
+          reference_no: "CN-202611-01",
+          document_date: "2026-11-10",
+        },
+        transaction_party: {
+          issuer: "ZIM INTEGRATED SHIPPING",
+          recipient: "ALL AMERICA FORWARDING, INC.",
+        },
+        charge_details: {
+          charge_item: "Handling Charge",
+          raw_charge_name: "H/D Fee Rebate",
+          quantity: 1,
+          unit_price: -40.0,
+          amount: -40.0,
+          currency: "USD",
+          payment_term: "PP",
+        },
+        financial_attributes: {
+          accounting_entity: "ALL AMERICA FORWARDING, INC.",
+          posting_type: "AP",
+        },
+        shipment_refs: {
+          mbl_nos: [],
+          hbl_no: null,
+          booking_no: null,
+          container_nos: [],
+        },
+        source_evidence: {
+          source_file: "cn_sample.pdf",
+          page: 1,
+          sheet: "FreightSummary",
+          line_number: 14,
+          snippet: "CREDIT(-): H/D Fee Rebate 40.00 USD",
+        },
+        field_diffs: [],
+        validation_alerts: [],
+        ai_reasoning: [
+          "贷项冲减：我方作为接收方收到供应商 Credit Note，保持 AP 归属并将冲减金额表达为 -40.00",
+        ],
+        human_overrides: {},
+        reject_reason: null,
+        created_at: "2026-11-19T09:00:00Z",
+        updated_at: "2026-11-19T09:00:00Z",
+      },
+    ],
+    created_at: "2026-11-19T09:00:00Z",
+    updated_at: "2026-11-19T09:01:00Z",
+  });
+
+  const edgeClient = new BillingApiClient({
+    transport: async () =>
+      new Response(openApiBatchEdge01RawText, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+  });
+  const normalizedEdgeBatch = await edgeClient.getBatchDetail("batch-edge-01");
+  assertEqual(
+    normalizedEdgeBatch.records[0].inherited_fields.length,
+    0,
+    "missing inherited_fields on batch-edge-01 normalized to []"
+  );
+  // Also test defensive normalizer directly on stripped BatchDetail object
+  const strippedNormalized = normalizeBatchDetail({
+    ...normalizedEdgeBatch,
+    records: [
+      {
+        ...normalizedEdgeBatch.records[0],
+        inherited_fields: undefined as unknown as string[],
+        validation_alerts: undefined,
+        field_diffs: undefined,
+        candidate_bills: undefined,
+        ai_reasoning: undefined as unknown as string[],
+      },
+    ],
+  });
+  assertEqual(
+    strippedNormalized.records[0].inherited_fields.length,
+    0,
+    "normalizeBatchDetail safely supplies default empty arrays"
+  );
+
+  // Vite SSR UI mount verification for batch-edge-01 (ensures zero white-screen TypeError)
+  const viteModUrl = new URL(
+    "../../node_modules/vite/dist/node/index.js",
+    import.meta.url
+  ).href;
+  const { createServer } = (await import(viteModUrl)) as {
+    createServer: (opts: Record<string, unknown>) => Promise<{
+      ssrLoadModule: (id: string) => Promise<Record<string, unknown>>;
+      close: () => Promise<void>;
+    }>;
+  };
+  const frontendRootDir = decodeURIComponent(
+    new URL("../..", import.meta.url).pathname
+  ).replace(/^\/([A-Za-z]:)/, "$1");
+  const viteServer = await createServer({
+    root: frontendRootDir,
+    server: { middlewareMode: true, hmr: false, ws: false },
+    optimizeDeps: { noDiscovery: true },
+    appType: "custom",
+    logLevel: "silent",
+  });
+  try {
+    const nodeModuleSpec = "node:" + "module";
+    const modPkg = (await import(/* @vite-ignore */ nodeModuleSpec)) as {
+      createRequire: (url: string) => (id: string) => unknown;
+    };
+    const req = modPkg.createRequire(import.meta.url);
+    const ReactMod = req("react") as {
+      createElement: (
+        type: unknown,
+        props: Record<string, unknown> | null
+      ) => unknown;
+    };
+    const ReactDomServer = req("react-dom/server") as {
+      renderToStaticMarkup: (el: unknown) => string;
+    };
+    const { ReviewInspector } = (await viteServer.ssrLoadModule(
+      "/src/components/ReviewInspector.tsx"
+    )) as { ReviewInspector: unknown };
+    const { BatchQueuePanel } = (await viteServer.ssrLoadModule(
+      "/src/components/BatchQueuePanel.tsx"
+    )) as { BatchQueuePanel: unknown };
+    const { UploadAndFileTree } = (await viteServer.ssrLoadModule(
+      "/src/components/UploadAndFileTree.tsx"
+    )) as { UploadAndFileTree: unknown };
+
+    const noop = () => undefined;
+    const noopAsync = async () => undefined;
+    const queueHtml = ReactDomServer.renderToStaticMarkup(
+      ReactMod.createElement(BatchQueuePanel, {
+        batch: normalizedEdgeBatch,
+        filterTab: "all",
+        activeDocFilterId: null,
+        selectedRecordId: "rec-cn-1",
+        retryingDocId: null,
+        entityNotice: null,
+        onChangeFilterTab: noop,
+        onClearDocFilter: noop,
+        onSelectRecord: noop,
+        onInspectDoc: noop,
+        onRetryOrReplaceDoc: noop,
+        onDismissEntityNotice: noop,
+        onOpenManualRecord: noop,
+      })
+    );
+    const inspectorHtml = ReactDomServer.renderToStaticMarkup(
+      ReactMod.createElement(ReviewInspector, {
+        batch: normalizedEdgeBatch,
+        selectedRecord: normalizedEdgeBatch.records[0],
+        inspectedDocId: null,
+        draftStore: createEmptyDraftStore(),
+        dictionaryList: [],
+        savingRecord: false,
+        approvingOrRejecting: false,
+        savingDocTotals: false,
+        retryingDocId: null,
+        forcingDocId: null,
+        mutationError: null,
+        auditHistoryByKey: {},
+        onClearMutationError: noop,
+        onRefreshBatch: noop,
+        onClearInspectedDoc: noop,
+        onUpdateRecordField: noop,
+        onResetRecordDraft: noop,
+        onSaveRecordPatch: noopAsync,
+        onApproveRecord: noopAsync,
+        onRejectRecord: noopAsync,
+        onUpdateDocField: noop,
+        onResetDocDraft: noop,
+        onSaveDocTotals: noopAsync,
+        onRetryDoc: noopAsync,
+        onForceParseDoc: noopAsync,
+        onOpenManualRecordModal: noop,
+        onRequestAuditHistory: noopAsync,
+      })
+    );
+    const uploadHtml = ReactDomServer.renderToStaticMarkup(
+      ReactMod.createElement(UploadAndFileTree, {
+        selectedEntity: "ALL AMERICA FORWARDING, INC.",
+        activeBatch: normalizedEdgeBatch,
+        activeDocFilterId: null,
+        submittingBatch: false,
+        submittingDemo: false,
+        retryingDocId: null,
+        forcingDocId: null,
+        onSubmitBatch: async () => true,
+        onSubmitDemo: noopAsync,
+        onSelectDocFilter: noop,
+        onInspectDoc: noop,
+        onForceParseDoc: noop,
+        onRetryOrReplaceDoc: noop,
+      })
+    );
+    assertTrue(
+      queueHtml.includes("Handling Charge") &&
+        queueHtml.includes("scan_corrupted.png") &&
+        inspectorHtml.includes("ALL AMERICA FORWARDING, INC.") &&
+        inspectorHtml.includes("工作表：FreightSummary") &&
+        inspectorHtml.includes("第 14 行") &&
+        uploadHtml.includes("scan_corrupted.png"),
+      "batch-edge-01 SSR render succeeds without crash and shows Excel sheet/line_number evidence"
+    );
+  } finally {
+    await viteServer.close();
+  }
+  results.push(
+    "PASS 16: OpenAPI batch-edge-01 normalization, optional-array fallbacks & UI SSR render (sheet/line_number)"
+  );
+
+  // 17. A3: Export modal per-batch cache isolation & 503 failure clearing (A batch audit -> B batch 503)
+  let exportCache = createExportModalCacheState("batch-a");
+  const makeExportPayload = (
+    mode: "official" | "full_standard" | "audit",
+    count: number
+  ) => ({
+    mode,
+    included_count: count,
+    excluded_pending_count: 0,
+    excluded_rejected_count: 0,
+    records: Array.from({ length: count }, (_, idx) => ({
+      operation: "CREATE" as const,
+      document_info: {
+        document_type: "Debit Note",
+        reference_no: `REF-${idx}`,
+        document_date: "2026-11-20",
+      },
+      transaction_party: {
+        issuer: "COSCO",
+        recipient: "NEPTUNE SHIPPING LIMITED",
+      },
+      charge_details: {
+        charge_item: "Handling Charge",
+        raw_charge_name: "H/C",
+        quantity: 1,
+        unit_price: 100,
+        amount: 100,
+        currency: "USD",
+        payment_term: "PP" as const,
+      },
+      financial_attributes: {
+        accounting_entity: "NEPTUNE SHIPPING LIMITED",
+        posting_type: "AP" as const,
+      },
+      shipment_refs: {
+        mbl_nos: [],
+        hbl_no: null,
+        booking_no: null,
+        container_nos: [],
+      },
+      audit_trail: { record_id: `r-${idx}`, ai_reasoning: [] },
+    })),
+  });
+  exportCache = completeExportModalLoadSuccess("batch-a", {
+    official: makeExportPayload("official", 3),
+    full_standard: makeExportPayload("full_standard", 5),
+    audit: makeExportPayload("audit", 6),
+  });
+  const eligA = getExportModalActionEligibility(exportCache, "batch-a", "audit");
+  assertEqual(eligA.canCopy, true, "batch-a audit ready for copy");
+  assertEqual(eligA.activeExport?.included_count, 6, "batch-a audit count = 6");
+
+  // Switch to batch-b and simulate three 503 failures
+  exportCache = resetExportModalForBatch(exportCache, "batch-b");
+  assertEqual(
+    getExportResponseForBatchMode(exportCache, "batch-b", "audit"),
+    null,
+    "resetExportModalForBatch wipes batch-a entries immediately"
+  );
+  exportCache = completeExportModalLoadFailure(
+    "batch-b",
+    "HTTP 503: 导出服务暂不可用"
+  );
+  const eligB = getExportModalActionEligibility(exportCache, "batch-b", "audit");
+  assertEqual(eligB.activeExport, null, "batch-b 503 clears all preview data");
+  assertEqual(eligB.canCopy, false, "batch-b 503 disables copy button");
+  assertEqual(eligB.canDownload, false, "batch-b 503 disables download button");
+  results.push(
+    "PASS 17: Export cache isolated per batch and cleared on 503 failure (copy/download disabled)"
+  );
+
+  // 18. A12: B05 runner.py real report shape ({rate, numerator, denominator}) + null in COMPLETED renders "无结果"
+  const b05PartialEvalRun = {
+    id: "eval-b05-real",
+    run_mode: "OFFLINE_DETERMINISTIC" as const,
+    k_trials: 3,
+    actual_trials: 3,
+    status: "COMPLETED" as const,
+    model_name: "b05-harness-v1",
+    total_cases: 12,
+    schema_valid_rate: 1,
+    field_exact_match: 0.9792,
+    ar_ap_accuracy: 1,
+    operation_accuracy: 0.9167,
+    conflict_recall: 1,
+    pass_at_k: 1,
+    pass_pow_k: 1,
+    report: {
+      executed_cases: 12,
+      avg_latency_ms: 184.5,
+      llm_calls: 24,
+      ocr_calls: 4,
+      self_repair_evidence: "2 次局部字段修复后复核通过",
+      schema_valid_rate: { rate: 1, numerator: 12, denominator: 12 },
+      field_exact_match: { rate: 47 / 48, numerator: 47, denominator: 48 },
+      ar_ap_accuracy: { rate: 1, numerator: 12, denominator: 12 },
+      operation_accuracy: { rate: 11 / 12, numerator: 11, denominator: 12 },
+      conflict_recall: { rate: 1, numerator: 6, denominator: 6 },
+      amount_accuracy: { rate: null, numerator: 0, denominator: 0 },
+      currency_accuracy: { rate: 1, numerator: 12, denominator: 12 },
+      false_positive_rate: { rate: 0, numerator: 0, denominator: 4 },
+      alert_precision: { rate: 1, numerator: 8, denominator: 8 },
+      pass_at_k: { rate: 1, numerator: 12, denominator: 12 },
+      pass_pow_k: { rate: 1, numerator: 12, denominator: 12 },
+      failing_cases: [
+        {
+          trial: 2,
+          case_id: "case-adversarial-09",
+          reason: "误匹配跨主体账单",
+          expected: "CREATE",
+          actual: "UPDATE",
+        },
+      ],
+    },
+    error_message: null,
+    created_at: "2026-11-20T08:00:00Z",
+    completed_at: "2026-11-20T08:00:05Z",
+  };
+  const b05Vm = buildEvalRunViewModel(b05PartialEvalRun);
+  const b05NullAmtRow = b05Vm.truthMetrics.find(
+    (m) => m.key === "amount_accuracy"
+  );
+  assertTrue(
+    b05NullAmtRow !== undefined &&
+      b05NullAmtRow.isUnavailable &&
+      b05NullAmtRow.displayText === NO_EVAL_RESULT_LABEL,
+    "COMPLETED run preserves row with null rate and renders 无结果"
+  );
+  assertEqual(
+    b05Vm.avgLatencyText,
+    "184.5 ms",
+    "B05 avg_latency_ms rendered accurately"
+  );
+  assertEqual(b05Vm.failingCases.length, 1, "B05 failing_cases parsed");
+  results.push(
+    "PASS 18: B05 real report shape parsed cleanly and null COMPLETED metrics render 无结果"
+  );
+
+  // 19. A6, A7 & A9: Zero phantom container diff on lowercase server value, explicit cleared amount -> null, blank initial review_note & blocker_codes banner
+  const lowerCaseRec = {
+    ...normalizedEdgeBatch.records[0],
+    id: "rec-a9-check",
+    charge_details: {
+      ...normalizedEdgeBatch.records[0].charge_details,
+      amount: 245.0,
+    },
+    shipment_refs: {
+      ...normalizedEdgeBatch.records[0].shipment_refs,
+      container_nos: ["abcd1234567"],
+    },
+    human_overrides: { review_note: "旧审计备注不应回填编辑框" },
+    validation_alerts: [
+      {
+        code: "LINE_AMOUNT_MISMATCH",
+        severity: "BLOCKER" as const,
+        field: "amount",
+        message: "数量×单价与行金额不一致",
+        expected: "245.00",
+        actual: "240.00",
+      },
+    ],
+  };
+  assertEqual(
+    extractServerRecordFormValues(lowerCaseRec).review_note,
+    "",
+    "A6: review_note always initializes blank rather than copying human_overrides.review_note"
+  );
+  const emptyDraftDiff = buildRecordDiffPatch(
+    lowerCaseRec,
+    createEmptyDraftStore(),
+    "batch-a9"
+  );
+  assertEqual(
+    emptyDraftDiff.hasChanges,
+    false,
+    "A9: unedited lowercase container_nos ['abcd1234567'] emits zero phantom patch fields"
+  );
+  const clearAmtStore = setRecordDraftField(
+    createEmptyDraftStore(),
+    "batch-a9",
+    lowerCaseRec,
+    "amount",
+    ""
+  );
+  const clearAmtDiff = buildRecordDiffPatch(
+    lowerCaseRec,
+    clearAmtStore,
+    "batch-a9"
+  );
+  assertEqual(clearAmtDiff.valid, true, "A9: clearing existing amount is valid");
+  assertEqual(
+    stringifyLosslessJson(clearAmtDiff.patch),
+    '{"amount":null}',
+    'A9: cleared amount serializes as {"amount":null}'
+  );
+
+  const blockerErr422 = new ApiClientError({
+    status: 422,
+    code: "HARD_BLOCKER_CANNOT_APPROVE",
+    message: "存在未解决的硬性阻断",
+    details: { blocker_codes: ["LINE_AMOUNT_MISMATCH"] },
+  });
+  const extractedBanner = extractMutationErrorBanner(
+    "批准入账被拦截",
+    blockerErr422,
+    lowerCaseRec.validation_alerts
+  );
+  assertTrue(
+    extractedBanner.blockers?.length === 1 &&
+      extractedBanner.blockers[0].code === "LINE_AMOUNT_MISMATCH" &&
+      extractedBanner.blockers[0].field === "amount",
+    "A7: 422 details.blocker_codes mapped cleanly against record validation_alerts"
+  );
+  results.push(
+    "PASS 19: Zero lowercase container phantom diff, explicit amount:null PATCH, blank review_note & 422 blocker_codes"
+  );
+
+  // 20. A13: Unicode code-point counting across review reason client & stub checks
+  assertEqual(countCodePoints("😀"), 1, "single supplementary-plane emoji counts as 1 code point");
+  assertTrue(
+    validateReviewReason("😀") !== null,
+    "1 code point (2 UTF-16 units) rejected by client"
+  );
+  assertTrue(
+    validateReviewReason("😀😀") === null,
+    "2 code points accepted by client"
+  );
+  const valid500Surrogates = "\u{20000}".repeat(500);
+  const invalid501Surrogates = "\u{20000}".repeat(501);
+  assertEqual(
+    countCodePoints(valid500Surrogates),
+    500,
+    "500 CJK Ext-B characters count as 500 code points"
+  );
+  assertTrue(
+    validateReviewReason(valid500Surrogates) === null,
+    "500 supplementary code points accepted"
+  );
+  assertTrue(
+    validateReviewReason(invalid501Surrogates) !== null,
+    "501 supplementary code points rejected"
+  );
+  const stubEmojiReject = await assertRejectsAsync(
+    client.approveBillingRecord(batch3.id, "rec-precision-blocker", "😀"),
+    "stub rejects single emoji reason"
+  );
+  assertTrue(
+    stubEmojiReject instanceof ApiClientError &&
+      stubEmojiReject.status === 422 &&
+      stubEmojiReject.code === "INVALID_REASON_LENGTH",
+    "stub enforces Unicode code-point minimum length"
+  );
+  results.push(
+    "PASS 20: Unicode code-point validation (1 emoji rejected, 2 accepted, 500 Ext-B accepted, 501 rejected)"
+  );
+
+  // 21. A8 & A10: Pre-check rejections (existing_bills_json object, malformed ReviewBundleV1, file+URL conflict, missing currency/posting_type)
+  const nonArrayBillsBatch = validateBatchIngestionInput({
+    accountingEntity: "NEPTUNE SHIPPING LIMITED",
+    files: [{ name: "a.pdf", size: 100 }],
+    publicUrlLinesText: "",
+    existingBillsJsonText: '{"bills":[]}',
+  });
+  assertEqual(
+    nonArrayBillsBatch.valid,
+    false,
+    'existing_bills_json strictly rejects {"bills":[]} object wrapper'
+  );
+  assertEqual(
+    validateReviewBundleInput(
+      '{"bundle_version":"1.0","accounting_entity":"NEPTUNE","ocr_mode":"NOT_A_MODE","documents":[],"records":[]}'
+    ).valid,
+    false,
+    "ReviewBundleV1 rejects invalid ocr_mode"
+  );
+  assertEqual(
+    validateReviewBundleInput(
+      '{"bundle_version":"1.0","accounting_entity":"NEPTUNE","ocr_mode":"REMOTE_ONLY","documents":[{}],"records":[]}'
+    ).valid,
+    false,
+    "ReviewBundleV1 rejects empty document element {}"
+  );
+  assertEqual(
+    validateReviewBundleInput(
+      '{"bundle_version":"1.0","accounting_entity":"NEPTUNE","ocr_mode":"REMOTE_ONLY","documents":[],"records":[{}]}'
+    ).valid,
+    false,
+    "ReviewBundleV1 rejects empty record element {}"
+  );
+
+  const conflictDocErr = await assertRejectsAsync(
+    client.retryOrReplaceDocument(batch3.id, "doc-fail-zero", {
+      file: new Blob(["pdf"], { type: "application/pdf" }),
+      public_url: "https://example.com/file.pdf",
+    }),
+    "conflicting file + public_url"
+  );
+  assertTrue(
+    conflictDocErr instanceof ApiClientError &&
+      conflictDocErr.code === "CONFLICTING_SOURCE_INPUTS",
+    "retryOrReplaceDocument blocks simultaneous file and public_url with CONFLICTING_SOURCE_INPUTS"
+  );
+
+  assertEqual(
+    isValidIso4217Currency("USD"),
+    true,
+    "ISO 4217 accepts USD"
+  );
+  assertEqual(
+    isValidIso4217Currency("ZZZ"),
+    false,
+    "ISO 4217 rejects synthetic ZZZ"
+  );
+  const badBillsImport = parseExistingBillsImportInput(
+    '[{"charge_item":"Handling Charge","amount":120.00,"posting_type":"unknown"}]',
+    { defaultAccountingEntity: "NEPTUNE SHIPPING LIMITED" }
+  );
+  assertEqual(
+    badBillsImport.valid,
+    false,
+    "historical import refuses silent USD/AP defaults on missing currency & invalid posting_type"
+  );
+  if (!badBillsImport.valid) {
+    assertTrue(
+      badBillsImport.rowErrors.length >= 2,
+      "historical import reports all row-level validation failures"
+    );
+  }
+  results.push(
+    "PASS 21: Strict pre-checks reject non-array bills, malformed ReviewBundleV1, file+URL conflict & missing currency/AR-AP"
+  );
+
+  // 22. A2: Concurrent draft version isolation during in-flight PATCH save + unsaved draft blocks approve/reject
+  let vStore = createEmptyDraftStore();
+  vStore = setRecordDraftField(vStore, "b-ver", recA, "amount", "111.00");
+  const ver1 = getRecordDraftVersion(vStore, "b-ver", recA.id);
+  assertTrue(ver1 !== null && hasRecordDraft(vStore, "b-ver", recA.id), "v1 draft active");
+  // While v1 save is in-flight, user keeps typing v2:
+  vStore = setRecordDraftField(vStore, "b-ver", recA, "amount", "111.05");
+  const ver2 = getRecordDraftVersion(vStore, "b-ver", recA.id);
+  assertTrue(ver2 !== null && ver2 > ver1!, "v2 draft version strictly incremented");
+
+  // Simulate v1 save returning from server with amount = 111.00
+  const recAtV1Server = {
+    ...recA,
+    charge_details: { ...recA.charge_details, amount: 111.0 },
+  };
+  vStore = clearRecordDraft(vStore, "b-ver", recA.id, ver1!, recAtV1Server);
+  assertEqual(
+    hasRecordDraft(vStore, "b-ver", recA.id),
+    true,
+    "completing stale v1 save must NOT wipe newer v2 user typing"
+  );
+  assertEqual(
+    getEffectiveRecordFormValues(recAtV1Server, vStore, "b-ver").amount,
+    "111.05",
+    "newer v2 typed amount preserved intact"
+  );
+  // Now v2 save finishes with amount = 111.05
+  const recAtV2Server = {
+    ...recA,
+    charge_details: { ...recA.charge_details, amount: 111.05 },
+  };
+  vStore = clearRecordDraft(vStore, "b-ver", recA.id, ver2!, recAtV2Server);
+  assertEqual(
+    hasRecordDraft(vStore, "b-ver", recA.id),
+    false,
+    "matching v2 save clears draft cleanly"
+  );
+  results.push(
+    "PASS 22: Draft version isolation keeps concurrent edits alive when earlier PATCH completes"
   );
 
   for (const line of results) {

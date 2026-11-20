@@ -115,6 +115,11 @@ export function ManagementDrawer({
   const [entityIsDefault, setEntityIsDefault] = useState(false);
   const [entityError, setEntityError] = useState<string | null>(null);
   const [savingEntity, setSavingEntity] = useState(false);
+  const [loadingEntities, setLoadingEntities] = useState(false);
+  const [entitiesLoadError, setEntitiesLoadError] = useState<string | null>(
+    null
+  );
+  const entitiesReqSeqRef = useRef(0);
 
   // Tab 2: Charge Dictionary & Reapply
   const [dictSearch, setDictSearch] = useState("");
@@ -124,12 +129,17 @@ export function ManagementDrawer({
   const [editingDictId, setEditingDictId] = useState<string | null>(null);
   const [dictError, setDictError] = useState<string | null>(null);
   const [savingDict, setSavingDict] = useState(false);
+  const [loadingDict, setLoadingDict] = useState(false);
+  const [dictLoadError, setDictLoadError] = useState<string | null>(null);
+  const dictReqSeqRef = useRef(0);
 
   // Tab 3: Shared Existing Bills Baseline
   const [billEntityFilter, setBillEntityFilter] = useState<string>("");
   const [existingBills, setExistingBills] = useState<ExistingBill[]>([]);
   const [totalBillsCount, setTotalBillsCount] = useState<number>(0);
   const [loadingBills, setLoadingBills] = useState(false);
+  const [billsLoadError, setBillsLoadError] = useState<string | null>(null);
+  const billsReqSeqRef = useRef(0);
   const [billsImportText, setBillsImportText] = useState("");
   const [billsImportFilename, setBillsImportFilename] = useState<string | null>(
     null
@@ -139,6 +149,9 @@ export function ManagementDrawer({
   );
   const [replaceExistingBills, setReplaceExistingBills] = useState(false);
   const [billsImportError, setBillsImportError] = useState<string | null>(null);
+  const [billsImportRowErrors, setBillsImportRowErrors] = useState<string[]>(
+    []
+  );
   const [lastImportSummary, setLastImportSummary] = useState<string | null>(
     null
   );
@@ -151,6 +164,8 @@ export function ManagementDrawer({
   const [kTrials, setKTrials] = useState<"1" | "3" | "5">("3");
   const [runningEval, setRunningEval] = useState(false);
   const [loadingEval, setLoadingEval] = useState(false);
+  const [evalLoadError, setEvalLoadError] = useState<string | null>(null);
+  const evalReqSeqRef = useRef(0);
   const [selectedEvalRunId, setSelectedEvalRunId] = useState<string | null>(
     null
   );
@@ -167,53 +182,113 @@ export function ManagementDrawer({
     }
   }, [selectedEntity, billsImportEntity]);
 
+  const loadEntitiesData = useCallback(async () => {
+    const seq = ++entitiesReqSeqRef.current;
+    setLoadingEntities(true);
+    setEntitiesLoadError(null);
+    try {
+      const list = await api.listAccountingEntities();
+      if (seq !== entitiesReqSeqRef.current) return;
+      onEntitiesChanged(list);
+      setEntitiesLoadError(null);
+    } catch (err) {
+      if (seq !== entitiesReqSeqRef.current) return;
+      setEntitiesLoadError(
+        err instanceof Error ? err.message : "查询记账主体档案失败"
+      );
+    } finally {
+      if (seq === entitiesReqSeqRef.current) {
+        setLoadingEntities(false);
+      }
+    }
+  }, [api, onEntitiesChanged]);
+
+  const loadDictionaryData = useCallback(async () => {
+    const seq = ++dictReqSeqRef.current;
+    setLoadingDict(true);
+    setDictLoadError(null);
+    try {
+      const list = await api.listChargeDictionary();
+      if (seq !== dictReqSeqRef.current) return;
+      onDictionaryChanged(list);
+      setDictLoadError(null);
+    } catch (err) {
+      if (seq !== dictReqSeqRef.current) return;
+      setDictLoadError(
+        err instanceof Error ? err.message : "查询费用标准映射词典失败"
+      );
+    } finally {
+      if (seq === dictReqSeqRef.current) {
+        setLoadingDict(false);
+      }
+    }
+  }, [api, onDictionaryChanged]);
+
   const loadBillsData = useCallback(
     async (entityFilter: string) => {
+      const seq = ++billsReqSeqRef.current;
       setLoadingBills(true);
+      setBillsLoadError(null);
       try {
         const [filtered, all] = await Promise.all([
           api.listExistingBills(entityFilter || undefined),
           entityFilter ? api.listExistingBills() : Promise.resolve(null),
         ]);
+        if (seq !== billsReqSeqRef.current) return;
         setExistingBills(filtered);
         const nextTotal = all ? all.length : filtered.length;
         setTotalBillsCount(nextTotal);
         onExistingBillsCountChanged(nextTotal);
+        setBillsLoadError(null);
       } catch (err) {
-        onNotify(
-          err instanceof Error ? err.message : "查询历史账单基准失败",
-          "error"
+        if (seq !== billsReqSeqRef.current) return;
+        setBillsLoadError(
+          err instanceof Error ? err.message : "查询历史账单基准失败"
         );
       } finally {
-        setLoadingBills(false);
+        if (seq === billsReqSeqRef.current) {
+          setLoadingBills(false);
+        }
       }
     },
-    [api, onExistingBillsCountChanged, onNotify]
+    [api, onExistingBillsCountChanged]
   );
 
   const refreshEvalRuns = useCallback(async () => {
+    const seq = ++evalReqSeqRef.current;
     setLoadingEval(true);
+    setEvalLoadError(null);
     try {
       const list = await api.listEvalRuns();
+      if (seq !== evalReqSeqRef.current) return;
       onEvalRunsChanged(list);
       setSelectedEvalRunId((prev) =>
         prev && list.some((r) => r.id === prev) ? prev : list[0]?.id ?? null
       );
+      setEvalLoadError(null);
     } catch (err) {
-      onNotify(
-        err instanceof Error ? err.message : "刷新 Harness 评测记录失败",
-        "error"
+      if (seq !== evalReqSeqRef.current) return;
+      setEvalLoadError(
+        err instanceof Error ? err.message : "查询 Harness 评测记录失败"
       );
     } finally {
-      setLoadingEval(false);
+      if (seq === evalReqSeqRef.current) {
+        setLoadingEval(false);
+      }
     }
-  }, [api, onEvalRunsChanged, onNotify]);
+  }, [api, onEvalRunsChanged]);
+
+  useEffect(() => {
+    if (!open) return;
+    void loadEntitiesData();
+    void loadDictionaryData();
+    void refreshEvalRuns();
+  }, [open, loadEntitiesData, loadDictionaryData, refreshEvalRuns]);
 
   useEffect(() => {
     if (!open) return;
     void loadBillsData(billEntityFilter);
-    void refreshEvalRuns();
-  }, [open, billEntityFilter, loadBillsData, refreshEvalRuns]);
+  }, [open, billEntityFilter, loadBillsData]);
 
   useEffect(() => {
     if (!open) return;
@@ -254,6 +329,14 @@ export function ManagementDrawer({
     }
     return Array.from(set);
   }, [dictionaryList]);
+
+  const editingDictEntry = useMemo(
+    () =>
+      editingDictId
+        ? dictionaryList.find((d) => d.id === editingDictId) ?? null
+        : null,
+    [dictionaryList, editingDictId]
+  );
 
   const selectedEvalRun = useMemo(() => {
     if (evalRuns.length === 0) return null;
@@ -323,8 +406,11 @@ export function ManagementDrawer({
   };
 
   const handleSaveDictionaryEntry = async () => {
+    const aliasToSave = editingDictEntry
+      ? editingDictEntry.raw_alias
+      : dictAliasInput;
     const check = validateChargeDictionaryInput(
-      dictAliasInput,
+      aliasToSave,
       dictStandardInput,
       dictCategoryInput
     );
@@ -338,6 +424,7 @@ export function ManagementDrawer({
       await api.upsertChargeDictionaryEntry(check.payload);
       const nextDict = await api.listChargeDictionary();
       onDictionaryChanged(nextDict);
+      setDictLoadError(null);
       onNotify(
         editingDictId
           ? `已更新词典映射：${check.payload.raw_alias} → ${check.payload.standard_name}`
@@ -379,6 +466,7 @@ export function ManagementDrawer({
     setBillsImportFilename(file.name);
     setBillsImportText(text);
     setBillsImportError(null);
+    setBillsImportRowErrors([]);
   };
 
   const handleImportBills = async () => {
@@ -388,9 +476,11 @@ export function ManagementDrawer({
     });
     if (!parsed.valid) {
       setBillsImportError(parsed.error);
+      setBillsImportRowErrors(parsed.rowErrors);
       return;
     }
     setBillsImportError(null);
+    setBillsImportRowErrors([]);
     setImportingBills(true);
     try {
       const res = await api.importExistingBills({
@@ -403,12 +493,14 @@ export function ManagementDrawer({
       );
       setBillsImportText("");
       setBillsImportFilename(null);
+      setBillsImportRowErrors([]);
       await loadBillsData(billEntityFilter);
       onNotify(`已成功导入 ${res.imported_count} 条历史账单基准`);
     } catch (err) {
-      setBillsImportError(
-        err instanceof Error ? err.message : "导入历史账单基准失败"
-      );
+      const msg =
+        err instanceof Error ? err.message : "导入历史账单基准失败";
+      setBillsImportError(msg);
+      setBillsImportRowErrors([]);
     } finally {
       setImportingBills(false);
     }
@@ -637,6 +729,15 @@ export function ManagementDrawer({
               <div className="wb-section-box" aria-label="记账主体列表">
                 <div className="wb-field-label">
                   <span>已登记记账主体 ({filteredEntities.length})</span>
+                  <LumnoButton
+                    variant="ghost"
+                    compact
+                    icon="ri-refresh-line"
+                    busy={loadingEntities}
+                    onClick={() => void loadEntitiesData()}
+                  >
+                    刷新
+                  </LumnoButton>
                 </div>
                 <LumnoInput
                   value={entitySearch}
@@ -645,9 +746,28 @@ export function ManagementDrawer({
                   onChange={(e) => setEntitySearch(e.target.value)}
                 />
 
-                {filteredEntities.length === 0 ? (
+                {entitiesLoadError ? (
+                  <div className="wb-alert-item" data-severity="BLOCKER" role="alert">
+                    <strong>查询记账主体档案失败</strong>
+                    <div>{entitiesLoadError}</div>
+                    <div>
+                      <LumnoButton
+                        variant="secondary"
+                        compact
+                        icon="ri-refresh-line"
+                        onClick={() => void loadEntitiesData()}
+                      >
+                        重试加载
+                      </LumnoButton>
+                    </div>
+                  </div>
+                ) : filteredEntities.length === 0 ? (
                   <div className="wb-empty-state">
-                    <span>暂无匹配的记账主体档案</span>
+                    <span>
+                      {loadingEntities
+                        ? "正在读取记账主体档案..."
+                        : "暂无匹配的记账主体档案"}
+                    </span>
                   </div>
                 ) : (
                   <div className="wb-mgmt-list">
@@ -746,14 +866,25 @@ export function ManagementDrawer({
                   <label className="wb-form-field">
                     <span className="wb-form-label">原始费用别名 (raw_alias) *</span>
                     <LumnoInput
-                      value={dictAliasInput}
+                      value={
+                        editingDictEntry
+                          ? editingDictEntry.raw_alias
+                          : dictAliasInput
+                      }
                       placeholder="如 HIGH PRECISION TEST FEE"
                       aria-label="原始费用别名"
+                      readOnly={Boolean(editingDictId)}
+                      disabled={Boolean(editingDictId)}
                       onChange={(e) => {
                         setDictAliasInput(e.target.value);
                         setDictError(null);
                       }}
                     />
+                    {editingDictId ? (
+                      <span className="wb-helper-note">
+                        编辑模式已锁定原始别名（如需更名请删除后新增）
+                      </span>
+                    ) : null}
                   </label>
                   <label className="wb-form-field">
                     <span className="wb-form-label">标准费用名称 (standard_name) *</span>
@@ -797,6 +928,15 @@ export function ManagementDrawer({
               <div className="wb-section-box" aria-label="费用标准映射列表">
                 <div className="wb-field-label">
                   <span>词典映射条目 ({filteredDictionary.length})</span>
+                  <LumnoButton
+                    variant="ghost"
+                    compact
+                    icon="ri-refresh-line"
+                    busy={loadingDict}
+                    onClick={() => void loadDictionaryData()}
+                  >
+                    刷新
+                  </LumnoButton>
                 </div>
                 <LumnoInput
                   value={dictSearch}
@@ -805,9 +945,28 @@ export function ManagementDrawer({
                   onChange={(e) => setDictSearch(e.target.value)}
                 />
 
-                {filteredDictionary.length === 0 ? (
+                {dictLoadError ? (
+                  <div className="wb-alert-item" data-severity="BLOCKER" role="alert">
+                    <strong>查询费用映射词典失败</strong>
+                    <div>{dictLoadError}</div>
+                    <div>
+                      <LumnoButton
+                        variant="secondary"
+                        compact
+                        icon="ri-refresh-line"
+                        onClick={() => void loadDictionaryData()}
+                      >
+                        重试加载
+                      </LumnoButton>
+                    </div>
+                  </div>
+                ) : filteredDictionary.length === 0 ? (
                   <div className="wb-empty-state">
-                    <span>暂无匹配的词典映射条目</span>
+                    <span>
+                      {loadingDict
+                        ? "正在读取费用映射词典..."
+                        : "暂无匹配的词典映射条目"}
+                    </span>
                   </div>
                 ) : (
                   <div className="wb-mgmt-list">
@@ -969,13 +1128,14 @@ export function ManagementDrawer({
                 <LumnoTextarea
                   value={billsImportText}
                   placeholder={
-                    '粘贴 JSON 数组（如 [{"reference_no":"DN-202609-001","charge_item":"Handling Charge","amount":9007199254740991.01,"currency":"USD","posting_type":"AP"}]）或带表头 CSV'
+                    '粘贴 JSON 数组（每行必填 charge_item、amount、currency、posting_type（AR/AP），如 [{"reference_no":"DN-202609-001","charge_item":"Handling Charge","amount":9007199254740991.01,"currency":"USD","posting_type":"AP"}]）或含必填表头的 CSV'
                   }
                   aria-label="历史账单 JSON 或 CSV 导入内容"
                   style={{ minHeight: "100px", fontFamily: "var(--lumno-font-mono)" }}
                   onChange={(e) => {
                     setBillsImportText(e.target.value);
                     setBillsImportError(null);
+                    setBillsImportRowErrors([]);
                   }}
                 />
 
@@ -1007,7 +1167,18 @@ export function ManagementDrawer({
                   </div>
                 </div>
 
-                {billsImportError ? (
+                {billsImportRowErrors.length > 0 ? (
+                  <div className="wb-alert-item" data-severity="BLOCKER" role="alert">
+                    <strong>
+                      共发现 {billsImportRowErrors.length} 处必填或格式校验错误（已拒绝本次导入，绝不静默填充默认币种或 AR/AP）
+                    </strong>
+                    <ul style={{ margin: "4px 0 0", paddingLeft: "18px", fontSize: "12px" }}>
+                      {billsImportRowErrors.map((errMsg, idx) => (
+                        <li key={idx}>{errMsg}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : billsImportError ? (
                   <div className="wb-field-error">{billsImportError}</div>
                 ) : null}
                 {lastImportSummary ? (
@@ -1032,9 +1203,28 @@ export function ManagementDrawer({
                 <div className="wb-field-label">
                   <span>共享基准账单明细</span>
                 </div>
-                {existingBills.length === 0 ? (
+                {billsLoadError ? (
+                  <div className="wb-alert-item" data-severity="BLOCKER" role="alert">
+                    <strong>查询共享历史账单失败</strong>
+                    <div>{billsLoadError}</div>
+                    <div>
+                      <LumnoButton
+                        variant="secondary"
+                        compact
+                        icon="ri-refresh-line"
+                        onClick={() => void loadBillsData(billEntityFilter)}
+                      >
+                        重试加载
+                      </LumnoButton>
+                    </div>
+                  </div>
+                ) : existingBills.length === 0 ? (
                   <div className="wb-empty-state">
-                    <span>当前筛选下暂无共享历史账单基准</span>
+                    <span>
+                      {loadingBills
+                        ? "正在读取共享历史账单基准..."
+                        : "当前筛选下暂无共享历史账单基准"}
+                    </span>
                   </div>
                 ) : (
                   <div className="wb-mgmt-list">
@@ -1142,19 +1332,40 @@ export function ManagementDrawer({
                 </div>
               </div>
 
-              {evalRuns.length === 0 ? (
+              {evalLoadError ? (
+                <div className="wb-alert-item" data-severity="BLOCKER" role="alert">
+                  <strong>查询 Harness 评测记录失败</strong>
+                  <div>{evalLoadError}</div>
+                  <div>
+                    <LumnoButton
+                      variant="secondary"
+                      compact
+                      icon="ri-refresh-line"
+                      onClick={() => void refreshEvalRuns()}
+                    >
+                      重试加载
+                    </LumnoButton>
+                  </div>
+                </div>
+              ) : null}
+
+              {!evalLoadError && evalRuns.length === 0 ? (
                 <div className="wb-empty-state lumno-paper-card">
                   <i
                     className="ri-icon ri-bar-chart-box-line"
                     style={{ "--ri-size": "28px" } as React.CSSProperties}
                     aria-hidden="true"
                   />
-                  <strong>尚未运行过 Harness 评测基准</strong>
+                  <strong>
+                    {loadingEval
+                      ? "正在读取 Harness 评测记录..."
+                      : "尚未运行过 Harness 评测基准"}
+                  </strong>
                   <span>
                     本看板绝不伪造任何示例高分。请选择上方「离线确定性基准」或「联机 LLM 稳定性」运行并查看真实观测指标。
                   </span>
                 </div>
-              ) : (
+              ) : evalRuns.length > 0 ? (
                 <>
                   <div className="wb-section-box" aria-label="历史评测运行记录切换">
                     <div className="wb-field-label">
@@ -1205,6 +1416,26 @@ export function ManagementDrawer({
                           <span className="wb-badge wb-badge--muted">
                             用例总数：{evalViewModel.totalCases} 组
                           </span>
+                          <span className="wb-badge wb-badge--muted">
+                            已执行用例：
+                            {evalViewModel.executedCases ?? evalViewModel.totalCases} 组
+                          </span>
+                          <span className="wb-badge wb-badge--muted">
+                            平均耗时：{evalViewModel.avgLatencyText}
+                          </span>
+                          <span className="wb-badge wb-badge--muted">
+                            LLM 调用：
+                            {evalViewModel.llmCalls ?? NO_EVAL_RESULT_LABEL}
+                          </span>
+                          <span className="wb-badge wb-badge--muted">
+                            OCR 调用：
+                            {evalViewModel.ocrCalls ?? NO_EVAL_RESULT_LABEL}
+                          </span>
+                          {evalViewModel.selfRepairEvidence ? (
+                            <span className="wb-badge wb-badge--info">
+                              自修复证据：{evalViewModel.selfRepairEvidence}
+                            </span>
+                          ) : null}
                         </div>
 
                         {evalViewModel.hasFailureBanner ? (
@@ -1289,10 +1520,49 @@ export function ManagementDrawer({
                           ))}
                         </div>
                       </div>
+
+                      {evalViewModel.failingCases.length > 0 ? (
+                        <div className="wb-section-box" aria-label="未通过用例明细">
+                          <div className="wb-field-label">
+                            <span>
+                              未通过用例明细 ({evalViewModel.failingCases.length})
+                            </span>
+                            <span className="wb-helper-note">
+                              逐项对照期望与实测结果
+                            </span>
+                          </div>
+                          <div className="wb-mgmt-list">
+                            {evalViewModel.failingCases.map((fc, idx) => (
+                              <div
+                                key={`${fc.caseId ?? "case"}-${fc.trial ?? idx}-${idx}`}
+                                className="wb-mgmt-card"
+                              >
+                                <div className="wb-mgmt-card-head">
+                                  <strong className="wb-mono">
+                                    {fc.caseId ?? fc.groupId ?? `用例 #${idx + 1}`}
+                                  </strong>
+                                  {fc.trial !== null ? (
+                                    <span className="wb-badge wb-badge--error wb-tabular">
+                                      第 {fc.trial} 轮
+                                    </span>
+                                  ) : null}
+                                </div>
+                                <div className="wb-field-error">{fc.reason}</div>
+                                {fc.expected || fc.actual ? (
+                                  <div className="wb-helper-note wb-mono">
+                                    期望：{fc.expected ?? "—"} | 实际：
+                                    {fc.actual ?? "—"}
+                                  </div>
+                                ) : null}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
                     </>
                   ) : null}
                 </>
-              )}
+              ) : null}
             </div>
           ) : null}
         </div>

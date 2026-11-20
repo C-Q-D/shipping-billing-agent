@@ -121,6 +121,17 @@ function attachDecimalMeta(target: object, decimalMap: DecimalMap): void {
   });
 }
 
+export function copyDecimalMeta<T extends object>(source: unknown, target: T): T {
+  if (source === null || source === undefined || typeof source !== "object") {
+    return target;
+  }
+  const map = (source as WithDecimalMeta)[LOSSLESS_DECIMALS_SYMBOL];
+  if (map && typeof map === "object") {
+    attachDecimalMeta(target, { ...map });
+  }
+  return target;
+}
+
 function readStoredLiteral(
   holder: unknown,
   key: string | number

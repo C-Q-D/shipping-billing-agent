@@ -1,4 +1,5 @@
 import {
+  copyDecimalMeta,
   parseLosslessJson,
   rawDecimal,
   RawDecimalLiteral,
@@ -6,7 +7,7 @@ import {
   toSchemaDecimal,
 } from "./decimalJson.ts";
 import { createDevStubTransport, type FetchLike } from "./devStubTransport.ts";
-import type { components } from "./schema";
+import type { components, operations } from "./schema";
 
 export type ErrorResponse = components["schemas"]["ErrorResponse"];
 export type HealthStatus = components["schemas"]["HealthStatus"];
@@ -24,6 +25,7 @@ export type ExistingBillImportResult =
   components["schemas"]["ExistingBillImportResult"];
 export type BatchCounts = components["schemas"]["BatchCounts"];
 export type BatchSummary = components["schemas"]["BatchSummary"];
+export type ShipmentRefs = components["schemas"]["ShipmentRefs"];
 export type SourceDocumentSummary =
   components["schemas"]["SourceDocumentSummary"];
 export type FailedDocumentAlert = components["schemas"]["FailedDocumentAlert"];
@@ -45,21 +47,25 @@ export type ExportResponse = components["schemas"]["ExportResponse"];
 export type SyncBaselineResult = components["schemas"]["SyncBaselineResult"];
 export type EvalRunSummary = components["schemas"]["EvalRunSummary"];
 
+// C1: Directly derive inline operation request bodies from schema.d.ts operations[...]
+export type ApproveRecordRequest =
+  operations["approveBillingRecord"]["requestBody"]["content"]["application/json"];
+export type RejectRecordRequest =
+  operations["rejectBillingRecord"]["requestBody"]["content"]["application/json"];
+export type TriggerEvalRunRequest =
+  operations["triggerEvalRun"]["requestBody"]["content"]["application/json"];
+export type SwitchBatchEntityRequest =
+  operations["switchBatchAccountingEntity"]["requestBody"]["content"]["application/json"];
+export type CreateDemoBatchRequest = NonNullable<
+  operations["createDemoBatch"]["requestBody"]
+>["content"]["application/json"];
+export type SyncBaselineRequest = NonNullable<
+  operations["syncBatchToBaseline"]["requestBody"]
+>["content"]["application/json"];
+
 export type OcrMode = BatchSummary["ocr_mode"];
 export type ExportMode = ExportResponse["mode"];
 export type DecimalInput = string | number | RawDecimalLiteral;
-
-export interface WarningWaiverItem {
-  code: string;
-  field?: string | null;
-  actual?: string | null;
-  reason: string;
-}
-
-export interface RecordMutationHeadersOptions {
-  expectedRecordUpdatedAt?: string | null;
-  resolvedWarnings?: ReadonlyArray<WarningWaiverItem>;
-}
 
 export type RecordPatchInput = Omit<
   RecordPatchRequest,
@@ -104,7 +110,10 @@ export class ApiClientError extends Error {
     requestId?: string | null;
     cause?: unknown;
   }) {
-    super(args.message, args.cause !== undefined ? { cause: args.cause } : undefined);
+    super(
+      args.message,
+      args.cause !== undefined ? { cause: args.cause } : undefined
+    );
     this.name = "ApiClientError";
     this.status = args.status;
     this.code = args.code;
@@ -151,27 +160,120 @@ export function isValidPublicHttpUrl(raw: string): boolean {
   }
 }
 
+const NON_ACTIVE_ISO_CURRENCIES = new Set(["XXX", "XTS"]);
+const ISO_4217_RUNTIME_SET: ReadonlySet<string> | null = (() => {
+  try {
+    const intlObj = Intl as unknown as {
+      supportedValuesOf?: (key: string) => string[];
+    };
+    if (typeof intlObj.supportedValuesOf === "function") {
+      const list = intlObj.supportedValuesOf("currency");
+      if (Array.isArray(list) && list.length > 50) {
+        return new Set(
+          list.filter(
+            (c) =>
+              typeof c === "string" &&
+              /^[A-Z]{3}$/.test(c) &&
+              !NON_ACTIVE_ISO_CURRENCIES.has(c)
+          )
+        );
+      }
+    }
+  } catch {
+    // Fallback below if Intl.supportedValuesOf is unavailable
+  }
+  return null;
+})();
+
+export function isValidIso4217Currency(code: unknown): boolean {
+  if (typeof code !== "string") return false;
+  const trimmed = code.trim();
+  if (!/^[A-Z]{3}$/.test(trimmed) || NON_ACTIVE_ISO_CURRENCIES.has(trimmed)) {
+    return false;
+  }
+  if (ISO_4217_RUNTIME_SET) {
+    return ISO_4217_RUNTIME_SET.has(trimmed);
+  }
+  return true;
+}
+
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+  return Boolean(val) && typeof val === "object" && !Array.isArray(val);
+}
+
+function hasValidDecimalNumber(val: unknown): boolean {
+  if (val instanceof RawDecimalLiteral) return true;
+  if (typeof val === "number") return Number.isFinite(val);
+  if (typeof val === "string") {
+    try {
+      rawDecimal(val);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function countUnicodePoints(str: string): number {
+  return Array.from(str.trim()).length;
+}
+
 export function validateExistingBillsJsonText(text: string): string | null {
   const trimmed = text.trim();
   if (!trimmed) {
     return null;
   }
+  let parsed: unknown;
   try {
-    const parsed = parseLosslessJson<unknown>(trimmed);
-    if (Array.isArray(parsed)) {
-      return null;
-    }
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      Array.isArray((parsed as { bills?: unknown }).bills)
-    ) {
-      return null;
-    }
-    return "随批已有账单 JSON 必须为账单数组，或包含 bills 数组的对象";
+    parsed = parseLosslessJson<unknown>(trimmed);
   } catch {
     return "随批已有账单 JSON 语法无效，请检查括号与逗号";
   }
+  if (!Array.isArray(parsed)) {
+    return "随批已有账单 JSON 必须为 JSON 数组（[...]），禁止使用对象包装";
+  }
+  const seenIds = new Set<string>();
+  for (let i = 0; i < parsed.length; i++) {
+    const item = parsed[i];
+    const rowNo = i + 1;
+    if (!isPlainObject(item)) {
+      return `第 ${rowNo} 条随批账单必须是 JSON 对象`;
+    }
+    const id = typeof item.id === "string" ? item.id.trim() : "";
+    if (!id) {
+      return `第 ${rowNo} 条随批账单缺少非空字符串 id`;
+    }
+    if (seenIds.has(id)) {
+      return `第 ${rowNo} 条随批账单 id "${id}" 重复`;
+    }
+    seenIds.add(id);
+
+    const entity =
+      typeof item.accounting_entity === "string"
+        ? item.accounting_entity.trim()
+        : "";
+    const entityLen = countUnicodePoints(entity);
+    if (entityLen < 1 || entityLen > 120) {
+      return `第 ${rowNo} 条随批账单缺少 1–120 字符 accounting_entity`;
+    }
+    if (typeof item.charge_item !== "string" || !item.charge_item.trim()) {
+      return `第 ${rowNo} 条随批账单缺少非空 charge_item`;
+    }
+    if (!hasValidDecimalNumber(item.amount)) {
+      return `第 ${rowNo} 条随批账单缺少合法数值 amount`;
+    }
+    if (
+      typeof item.currency !== "string" ||
+      !isValidIso4217Currency(item.currency)
+    ) {
+      return `第 ${rowNo} 条随批账单币种须为有效 3 位大写 ISO 4217 代码`;
+    }
+    if (item.posting_type !== "AR" && item.posting_type !== "AP") {
+      return `第 ${rowNo} 条随批账单 posting_type 须为 "AR" 或 "AP"`;
+    }
+  }
+  return null;
 }
 
 export function validateBatchIngestionInput(args: {
@@ -185,8 +287,8 @@ export function validateBatchIngestionInput(args: {
   const parsedUrls: string[] = [];
   const summaryErrors: string[] = [];
 
-  const entityTrimmed = args.accountingEntity.trim();
-  if (!entityTrimmed || entityTrimmed.length > 120) {
+  const entityLen = countUnicodePoints(args.accountingEntity);
+  if (entityLen < 1 || entityLen > 120) {
     summaryErrors.push("记账主体名称须为 1–120 个字符");
   }
 
@@ -278,6 +380,216 @@ function normalizeDecimalField(
   return toSchemaDecimal(val);
 }
 
+export function normalizeShipmentRefs(
+  raw: ShipmentRefs | undefined | null
+): ShipmentRefs {
+  const safe = raw && typeof raw === "object" ? raw : {};
+  return {
+    mbl_nos: Array.isArray(safe.mbl_nos) ? safe.mbl_nos : [],
+    hbl_no: safe.hbl_no ?? null,
+    booking_no: safe.booking_no ?? null,
+    container_nos: Array.isArray(safe.container_nos) ? safe.container_nos : [],
+  };
+}
+
+export function normalizeSourceEvidence(
+  raw: Record<string, unknown> | undefined | null
+): Record<string, unknown> {
+  const safe = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const next = copyDecimalMeta(safe, {
+    ...safe,
+    source_paths: Array.isArray(safe.source_paths) ? safe.source_paths : [],
+  });
+  return next;
+}
+
+export function normalizeSourceDocument(
+  raw: SourceDocumentSummary
+): SourceDocumentSummary {
+  return copyDecimalMeta(raw, {
+    ...raw,
+    parent_doc_id: raw.parent_doc_id ?? null,
+    error_message: raw.error_message ?? null,
+    affected_record_ids: Array.isArray(raw.affected_record_ids)
+      ? raw.affected_record_ids
+      : [],
+    excluded_clauses: Array.isArray(raw.excluded_clauses)
+      ? raw.excluded_clauses
+      : [],
+    shipment_refs: normalizeShipmentRefs(raw.shipment_refs),
+    subtotal_amount: raw.subtotal_amount ?? null,
+    tax_amount: raw.tax_amount ?? null,
+    total_amount: raw.total_amount ?? null,
+    total_currency: raw.total_currency ?? null,
+  });
+}
+
+export function normalizeBillingRecord(
+  raw: BillingRecordDetail
+): BillingRecordDetail {
+  const safeDocInfo =
+    raw.document_info && typeof raw.document_info === "object"
+      ? raw.document_info
+      : { document_type: null, reference_no: null, document_date: null };
+  const safeParty =
+    raw.transaction_party && typeof raw.transaction_party === "object"
+      ? raw.transaction_party
+      : { issuer: null, recipient: null };
+  const safeCharge = copyDecimalMeta(
+    raw.charge_details,
+    raw.charge_details && typeof raw.charge_details === "object"
+      ? {
+          ...raw.charge_details,
+          charge_item: raw.charge_details.charge_item ?? null,
+          raw_charge_name: raw.charge_details.raw_charge_name ?? null,
+          quantity: raw.charge_details.quantity ?? null,
+          unit_price: raw.charge_details.unit_price ?? null,
+          amount: raw.charge_details.amount ?? null,
+          currency: raw.charge_details.currency ?? null,
+          payment_term: raw.charge_details.payment_term ?? null,
+        }
+      : {
+          charge_item: null,
+          raw_charge_name: null,
+          quantity: null,
+          unit_price: null,
+          amount: null,
+          currency: null,
+          payment_term: null,
+        }
+  );
+  const safeFinancial =
+    raw.financial_attributes && typeof raw.financial_attributes === "object"
+      ? {
+          accounting_entity: raw.financial_attributes.accounting_entity ?? "",
+          posting_type: raw.financial_attributes.posting_type ?? null,
+        }
+      : { accounting_entity: "", posting_type: null };
+
+  return copyDecimalMeta(raw, {
+    ...raw,
+    matched_existing_bill_id: raw.matched_existing_bill_id ?? null,
+    matched_bill_ref: raw.matched_bill_ref ?? null,
+    inherited_fields: Array.isArray(raw.inherited_fields)
+      ? raw.inherited_fields
+      : [],
+    candidate_bills: Array.isArray(raw.candidate_bills)
+      ? raw.candidate_bills.map((cand) => copyDecimalMeta(cand, { ...cand }))
+      : [],
+    document_info: {
+      document_type: safeDocInfo.document_type ?? null,
+      reference_no: safeDocInfo.reference_no ?? null,
+      document_date: safeDocInfo.document_date ?? null,
+    },
+    transaction_party: {
+      issuer: safeParty.issuer ?? null,
+      recipient: safeParty.recipient ?? null,
+    },
+    charge_details: safeCharge,
+    financial_attributes: safeFinancial,
+    shipment_refs: normalizeShipmentRefs(raw.shipment_refs),
+    source_evidence: normalizeSourceEvidence(raw.source_evidence),
+    field_diffs: Array.isArray(raw.field_diffs)
+      ? raw.field_diffs.map((diff) => copyDecimalMeta(diff, { ...diff }))
+      : [],
+    validation_alerts: Array.isArray(raw.validation_alerts)
+      ? raw.validation_alerts
+      : [],
+    ai_reasoning: Array.isArray(raw.ai_reasoning) ? raw.ai_reasoning : [],
+    human_overrides:
+      raw.human_overrides &&
+      typeof raw.human_overrides === "object" &&
+      !Array.isArray(raw.human_overrides)
+        ? copyDecimalMeta(raw.human_overrides, { ...raw.human_overrides })
+        : {},
+    reject_reason: raw.reject_reason ?? null,
+  });
+}
+
+export function normalizeBatchSummary(raw: BatchSummary): BatchSummary {
+  const counts =
+    raw.counts && typeof raw.counts === "object"
+      ? raw.counts
+      : {
+          create: 0,
+          update: 0,
+          no_change: 0,
+          pending_review: 0,
+          rejected: 0,
+        };
+  return {
+    ...raw,
+    stage_message: raw.stage_message ?? null,
+    counts: {
+      create: counts.create ?? 0,
+      update: counts.update ?? 0,
+      no_change: counts.no_change ?? 0,
+      pending_review: counts.pending_review ?? 0,
+      rejected: counts.rejected ?? 0,
+    },
+  };
+}
+
+export function normalizeBatchDetail(raw: BatchDetail): BatchDetail {
+  const summary = normalizeBatchSummary(raw);
+  return {
+    ...summary,
+    documents: Array.isArray(raw.documents)
+      ? raw.documents.map(normalizeSourceDocument)
+      : [],
+    failed_documents: Array.isArray(raw.failed_documents)
+      ? raw.failed_documents.map((f) => ({
+          ...f,
+          affected_record_ids: Array.isArray(f.affected_record_ids)
+            ? f.affected_record_ids
+            : [],
+        }))
+      : [],
+    records: Array.isArray(raw.records)
+      ? raw.records.map(normalizeBillingRecord)
+      : [],
+  };
+}
+
+export function normalizeAccountingEntity(
+  raw: AccountingEntity
+): AccountingEntity {
+  return {
+    ...raw,
+    aliases: Array.isArray(raw.aliases) ? raw.aliases : [],
+    is_default: Boolean(raw.is_default),
+  };
+}
+
+export function normalizeExistingBill(raw: ExistingBill): ExistingBill {
+  return copyDecimalMeta(raw, {
+    ...raw,
+    container_nos: Array.isArray(raw.container_nos) ? raw.container_nos : [],
+  });
+}
+
+export function normalizeExportResponse(raw: ExportResponse): ExportResponse {
+  return {
+    ...raw,
+    records: Array.isArray(raw.records)
+      ? raw.records.map((rec) =>
+          copyDecimalMeta(rec, {
+            ...rec,
+            charge_details: copyDecimalMeta(rec.charge_details, {
+              ...rec.charge_details,
+            }),
+            audit_trail: {
+              ...rec.audit_trail,
+              ai_reasoning: Array.isArray(rec.audit_trail?.ai_reasoning)
+                ? rec.audit_trail.ai_reasoning
+                : [],
+            },
+          })
+        )
+      : [],
+  };
+}
+
 function buildRecordPatchPayload(
   patch: RecordPatchInput
 ): Partial<RecordPatchRequest> {
@@ -324,22 +636,6 @@ function buildRecordPatchPayload(
   }
   if (patch.review_note !== undefined) payload.review_note = patch.review_note;
   return payload;
-}
-
-function buildRecordMutationHeaders(
-  options?: RecordMutationHeadersOptions
-): Record<string, string> | undefined {
-  if (!options) return undefined;
-  const headers: Record<string, string> = {};
-  if (options.expectedRecordUpdatedAt) {
-    headers["X-Record-Updated-At"] = options.expectedRecordUpdatedAt;
-  }
-  if (options.resolvedWarnings && options.resolvedWarnings.length > 0) {
-    headers["X-Resolved-Warnings"] = encodeURIComponent(
-      stringifyLosslessJson(options.resolvedWarnings)
-    );
-  }
-  return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
 export interface CreateBatchInput {
@@ -517,32 +813,37 @@ export class BillingApiClient {
     return this.requestJson<HealthStatus>("/api/v1/health", { signal });
   }
 
-  listAccountingEntities(signal?: AbortSignal): Promise<AccountingEntity[]> {
-    return this.requestJson<AccountingEntity[]>("/api/v1/entities", {
+  async listAccountingEntities(
+    signal?: AbortSignal
+  ): Promise<AccountingEntity[]> {
+    const res = await this.requestJson<AccountingEntity[]>("/api/v1/entities", {
       signal,
     });
+    return Array.isArray(res) ? res.map(normalizeAccountingEntity) : [];
   }
 
-  createAccountingEntity(
+  async createAccountingEntity(
     payload: AccountingEntityUpsert
   ): Promise<AccountingEntity> {
-    return this.requestJson<AccountingEntity>("/api/v1/entities", {
+    const res = await this.requestJson<AccountingEntity>("/api/v1/entities", {
       method: "POST",
       jsonBody: payload,
     });
+    return normalizeAccountingEntity(res);
   }
 
-  updateAccountingEntity(
+  async updateAccountingEntity(
     entityId: string,
     payload: AccountingEntityUpsert
   ): Promise<AccountingEntity> {
-    return this.requestJson<AccountingEntity>(
+    const res = await this.requestJson<AccountingEntity>(
       `/api/v1/entities/${encodeURIComponent(entityId)}`,
       {
         method: "PUT",
         jsonBody: payload,
       }
     );
+    return normalizeAccountingEntity(res);
   }
 
   listChargeDictionary(
@@ -569,16 +870,18 @@ export class BillingApiClient {
     );
   }
 
-  listExistingBills(
+  async listExistingBills(
     accountingEntity?: string,
     signal?: AbortSignal
   ): Promise<ExistingBill[]> {
     const query = accountingEntity
       ? `?accounting_entity=${encodeURIComponent(accountingEntity)}`
       : "";
-    return this.requestJson<ExistingBill[]>(`/api/v1/existing-bills${query}`, {
-      signal,
-    });
+    const res = await this.requestJson<ExistingBill[]>(
+      `/api/v1/existing-bills${query}`,
+      { signal }
+    );
+    return Array.isArray(res) ? res.map(normalizeExistingBill) : [];
   }
 
   async clearExistingBills(accountingEntity?: string): Promise<void> {
@@ -602,14 +905,15 @@ export class BillingApiClient {
     );
   }
 
-  listBatches(limit = 20, signal?: AbortSignal): Promise<BatchSummary[]> {
-    return this.requestJson<BatchSummary[]>(
+  async listBatches(limit = 20, signal?: AbortSignal): Promise<BatchSummary[]> {
+    const res = await this.requestJson<BatchSummary[]>(
       `/api/v1/batches?limit=${encodeURIComponent(String(limit))}`,
       { signal }
     );
+    return Array.isArray(res) ? res.map(normalizeBatchSummary) : [];
   }
 
-  createBatch(
+  async createBatch(
     input: CreateBatchInput
   ): Promise<BatchSummary | BatchDetail> {
     const wait = input.wait ?? false;
@@ -634,7 +938,7 @@ export class BillingApiClient {
       }
     }
 
-    return this.requestJson<BatchSummary | BatchDetail>(
+    const res = await this.requestJson<BatchSummary | BatchDetail>(
       `/api/v1/batches?wait=${wait ? "true" : "false"}`,
       {
         method: "POST",
@@ -642,80 +946,108 @@ export class BillingApiClient {
         timeoutMs: UPLOAD_REQUEST_TIMEOUT_MS,
       }
     );
+    return "records" in res
+      ? normalizeBatchDetail(res)
+      : normalizeBatchSummary(res);
   }
 
-  createDemoBatch(args: {
+  async createDemoBatch(args: {
     accounting_entity: string;
     ocr_mode?: OcrMode;
     wait?: boolean;
   }): Promise<BatchSummary | BatchDetail> {
     const wait = args.wait ?? false;
-    return this.requestJson<BatchSummary | BatchDetail>(
+    const body: CreateDemoBatchRequest = {
+      accounting_entity: args.accounting_entity.trim(),
+      ocr_mode: args.ocr_mode ?? "REMOTE_ONLY",
+    };
+    const res = await this.requestJson<BatchSummary | BatchDetail>(
       `/api/v1/batches/demo?wait=${wait ? "true" : "false"}`,
       {
         method: "POST",
-        jsonBody: {
-          accounting_entity: args.accounting_entity.trim(),
-          ocr_mode: args.ocr_mode ?? "REMOTE_ONLY",
-        },
+        jsonBody: body,
       }
     );
+    return "records" in res
+      ? normalizeBatchDetail(res)
+      : normalizeBatchSummary(res);
   }
 
-  importReviewBundle(bundle: ReviewBundleV1): Promise<BatchDetail> {
-    return this.requestJson<BatchDetail>(
+  async importReviewBundle(bundle: ReviewBundleV1): Promise<BatchDetail> {
+    const res = await this.requestJson<BatchDetail>(
       "/api/v1/batches/import-review-bundle",
       {
         method: "POST",
         jsonBody: bundle,
       }
     );
+    return normalizeBatchDetail(res);
   }
 
-  getBatchDetail(batchId: string, signal?: AbortSignal): Promise<BatchDetail> {
-    return this.requestJson<BatchDetail>(
+  async getBatchDetail(
+    batchId: string,
+    signal?: AbortSignal
+  ): Promise<BatchDetail> {
+    const res = await this.requestJson<BatchDetail>(
       `/api/v1/batches/${encodeURIComponent(batchId)}`,
       { signal }
     );
+    return normalizeBatchDetail(res);
   }
 
-  switchBatchAccountingEntity(
+  async switchBatchAccountingEntity(
     batchId: string,
     accountingEntity: string
   ): Promise<SwitchEntityResponse> {
-    return this.requestJson<SwitchEntityResponse>(
+    const body: SwitchBatchEntityRequest = {
+      accounting_entity: accountingEntity.trim(),
+    };
+    const res = await this.requestJson<SwitchEntityResponse>(
       `/api/v1/batches/${encodeURIComponent(batchId)}/switch-entity`,
       {
         method: "POST",
-        jsonBody: { accounting_entity: accountingEntity.trim() },
+        jsonBody: body,
       }
     );
+    return {
+      ...res,
+      batch: normalizeBatchDetail(res.batch),
+    };
   }
 
-  reapplyBatchChargeDictionary(batchId: string): Promise<BatchDetail> {
-    return this.requestJson<BatchDetail>(
+  async reapplyBatchChargeDictionary(batchId: string): Promise<BatchDetail> {
+    const res = await this.requestJson<BatchDetail>(
       `/api/v1/batches/${encodeURIComponent(batchId)}/reapply-dictionary`,
       { method: "POST" }
     );
+    return normalizeBatchDetail(res);
   }
 
-  retryOrReplaceDocument(
+  async retryOrReplaceDocument(
     batchId: string,
     docId: string,
     input: RetryDocumentInput = {}
   ): Promise<BatchDetail> {
+    const trimmedUrl = input.public_url?.trim() || undefined;
+    if (input.file && trimmedUrl) {
+      throw new ApiClientError({
+        status: 400,
+        code: "CONFLICTING_SOURCE_INPUTS",
+        message: "替换文件与公网 URL 互斥，请仅提供一种重试来源",
+      });
+    }
     const formData = new FormData();
     if (input.ocr_mode) {
       formData.append("ocr_mode", input.ocr_mode);
     }
-    if (input.public_url) {
-      formData.append("public_url", input.public_url);
+    if (trimmedUrl) {
+      formData.append("public_url", trimmedUrl);
     }
     if (input.file) {
       const name = input.file instanceof File ? input.file.name : "replace.bin";
       formData.append("file", input.file, name);
     }
-    return this.requestJson<BatchDetail>(
+    const res = await this.requestJson<BatchDetail>(
       `/api/v1/batches/${encodeURIComponent(batchId)}/documents/${encodeURIComponent(docId)}/retry`,
       {
         method: "POST",
@@ -723,9 +1055,10 @@ export class BillingApiClient {
         timeoutMs: UPLOAD_REQUEST_TIMEOUT_MS,
       }
     );
+    return normalizeBatchDetail(res);
   }
 
-  patchDocumentTotals(
+  async patchDocumentTotals(
     batchId: string,
     docId: string,
     patch: {
@@ -752,26 +1085,28 @@ export class BillingApiClient {
     if (patch.review_note !== undefined) {
       payload.review_note = patch.review_note;
     }
-    return this.requestJson<BatchDetail>(
+    const res = await this.requestJson<BatchDetail>(
       `/api/v1/batches/${encodeURIComponent(batchId)}/documents/${encodeURIComponent(docId)}`,
       {
         method: "PATCH",
         jsonBody: payload,
       }
     );
+    return normalizeBatchDetail(res);
   }
 
-  forceParseSkippedDocument(
+  async forceParseSkippedDocument(
     batchId: string,
     docId: string
   ): Promise<BatchDetail> {
-    return this.requestJson<BatchDetail>(
+    const res = await this.requestJson<BatchDetail>(
       `/api/v1/batches/${encodeURIComponent(batchId)}/documents/${encodeURIComponent(docId)}/force-parse`,
       { method: "POST" }
     );
+    return normalizeBatchDetail(res);
   }
 
-  addManualBillingRecord(
+  async addManualBillingRecord(
     batchId: string,
     record: Omit<ManualRecordCreate, "amount"> & { amount: DecimalInput }
   ): Promise<BatchDetail> {
@@ -779,71 +1114,74 @@ export class BillingApiClient {
       ...record,
       amount: toSchemaDecimal(record.amount),
     };
-    return this.requestJson<BatchDetail>(
+    const res = await this.requestJson<BatchDetail>(
       `/api/v1/batches/${encodeURIComponent(batchId)}/records`,
       {
         method: "POST",
         jsonBody: payload,
       }
     );
+    return normalizeBatchDetail(res);
   }
 
-  patchBillingRecord(
+  async patchBillingRecord(
     batchId: string,
     recordId: string,
-    patch: RecordPatchInput,
-    options?: RecordMutationHeadersOptions
+    patch: RecordPatchInput
   ): Promise<BatchDetail> {
     const payload = buildRecordPatchPayload(patch);
-    return this.requestJson<BatchDetail>(
+    const res = await this.requestJson<BatchDetail>(
       `/api/v1/batches/${encodeURIComponent(batchId)}/records/${encodeURIComponent(recordId)}`,
       {
         method: "PATCH",
         jsonBody: payload,
-        headers: buildRecordMutationHeaders(options),
       }
     );
+    return normalizeBatchDetail(res);
   }
 
-  approveBillingRecord(
-    batchId: string,
-    recordId: string,
-    reason: string,
-    options?: RecordMutationHeadersOptions
-  ): Promise<BatchDetail> {
-    return this.requestJson<BatchDetail>(
-      `/api/v1/batches/${encodeURIComponent(batchId)}/records/${encodeURIComponent(recordId)}/approve`,
-      {
-        method: "POST",
-        jsonBody: { reason },
-        headers: buildRecordMutationHeaders(options),
-      }
-    );
-  }
-
-  rejectBillingRecord(
+  async approveBillingRecord(
     batchId: string,
     recordId: string,
     reason: string
   ): Promise<BatchDetail> {
-    return this.requestJson<BatchDetail>(
+    const body: ApproveRecordRequest = { reason };
+    const res = await this.requestJson<BatchDetail>(
+      `/api/v1/batches/${encodeURIComponent(batchId)}/records/${encodeURIComponent(recordId)}/approve`,
+      {
+        method: "POST",
+        jsonBody: body,
+      }
+    );
+    return normalizeBatchDetail(res);
+  }
+
+  async rejectBillingRecord(
+    batchId: string,
+    recordId: string,
+    reason: string
+  ): Promise<BatchDetail> {
+    const body: RejectRecordRequest = { reason };
+    const res = await this.requestJson<BatchDetail>(
       `/api/v1/batches/${encodeURIComponent(batchId)}/records/${encodeURIComponent(recordId)}/reject`,
       {
         method: "POST",
-        jsonBody: { reason },
+        jsonBody: body,
       }
     );
+    return normalizeBatchDetail(res);
   }
 
-  exportBatchJson(
+  async exportBatchJson(
     batchId: string,
     mode: ExportMode = "official",
     signal?: AbortSignal
   ): Promise<ExportResponse> {
-    return this.requestJson<ExportResponse>(
+    const res = await this.requestJson<ExportResponse>(
       `/api/v1/batches/${encodeURIComponent(batchId)}/export?mode=${encodeURIComponent(mode)}`,
       { signal }
     );
+    return normalizeExportResponse(res);
   }
 
   async downloadBatchJsonArray(
@@ -853,7 +1191,8 @@ export class BillingApiClient {
     const { text } = await this.requestRaw(
       `/api/v1/batches/${encodeURIComponent(batchId)}/export/download?mode=${encodeURIComponent(mode)}`
     );
-    const records = parseLosslessJson<StandardOutputRecord[]>(text);
+    const parsed = parseLosslessJson<StandardOutputRecord[]>(text);
+    const records = Array.isArray(parsed) ? parsed : [];
     return { rawJsonText: text, records };
   }
 
@@ -861,11 +1200,14 @@ export class BillingApiClient {
     batchId: string,
     idempotencyKey?: string
   ): Promise<SyncBaselineResult> {
+    const body: SyncBaselineRequest = idempotencyKey
+      ? { idempotency_key: idempotencyKey }
+      : {};
     return this.requestJson<SyncBaselineResult>(
       `/api/v1/batches/${encodeURIComponent(batchId)}/sync-baseline`,
       {
         method: "POST",
-        jsonBody: idempotencyKey ? { idempotency_key: idempotencyKey } : {},
+        jsonBody: body,
       }
     );
   }
@@ -874,10 +1216,7 @@ export class BillingApiClient {
     return this.requestJson<EvalRunSummary[]>("/api/v1/eval-runs", { signal });
   }
 
-  triggerEvalRun(args: {
-    run_mode: EvalRunSummary["run_mode"];
-    k_trials?: number;
-  }): Promise<EvalRunSummary> {
+  triggerEvalRun(args: TriggerEvalRunRequest): Promise<EvalRunSummary> {
     return this.requestJson<EvalRunSummary>("/api/v1/eval-runs", {
       method: "POST",
       jsonBody: args,

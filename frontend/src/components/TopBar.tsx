@@ -21,6 +21,7 @@ export interface TopBarProps {
   batches: ReadonlyArray<BatchSummary>;
   activeBatchId: string | null;
   activeBatch: BatchDetail | null;
+  switchingBatchId?: string | null;
   entities: ReadonlyArray<AccountingEntity>;
   selectedEntity: string;
   existingBillCount: number;
@@ -32,7 +33,6 @@ export interface TopBarProps {
   onConfirmSwitchEntity: (entityName: string) => Promise<void> | void;
   onToggleTheme: () => void;
   onOpenImportBundle: () => void;
-  onOpenExportBundle: () => void;
   onOpenMasterData: () => void;
   onOpenEvalDashboard: () => void;
   onSyncBaseline: () => void;
@@ -46,6 +46,7 @@ export function TopBar({
   batches,
   activeBatchId,
   activeBatch,
+  switchingBatchId = null,
   entities,
   selectedEntity,
   existingBillCount,
@@ -57,7 +58,6 @@ export function TopBar({
   onConfirmSwitchEntity,
   onToggleTheme,
   onOpenImportBundle,
-  onOpenExportBundle,
   onOpenMasterData,
   onOpenEvalDashboard,
   onSyncBaseline,
@@ -178,9 +178,10 @@ export function TopBar({
               options={batchOptions}
               ariaLabel="选择最近处理批次"
               placeholder="暂无批次"
+              disabled={Boolean(switchingBatchId)}
               onChange={onSelectBatch}
               footerAction={{
-                label: "复核包互通 (v1.0)...",
+                label: "导入 CLI 复核包 (v1.0)...",
                 icon: "ri-upload-cloud-2-line",
                 onClick: onOpenImportBundle,
               }}
@@ -207,7 +208,7 @@ export function TopBar({
             className="wb-desktop-only"
             onClick={onOpenImportBundle}
           >
-            复核包 v1.0
+            导入复核包
           </LumnoButton>
 
           <LumnoButton
@@ -333,17 +334,6 @@ export function TopBar({
             }}
           >
             导入 CLI 复核包 (v1.0)
-          </LumnoButton>
-          <LumnoButton
-            variant="secondary"
-            icon="ri-share-forward-line"
-            disabled={!activeBatch}
-            onClick={() => {
-              setMobileMenuOpen(false);
-              onOpenExportBundle();
-            }}
-          >
-            导出当前批复核包 (v1.0)
           </LumnoButton>
           <LumnoButton
             variant="secondary"

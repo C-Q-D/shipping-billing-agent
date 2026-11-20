@@ -10,6 +10,7 @@ import {
   ApiClientError,
   BillingApiClient,
   isStubModeActive,
+  isValidIso4217Currency,
   type AccountingEntity,
   type BatchDetail,
   type BatchSummary,
@@ -21,11 +22,8 @@ import {
   type ReviewBundleV1,
   type SourceDocumentSummary,
 } from "./api/client.ts";
-import { rawDecimal, stringifyLosslessJson } from "./api/decimalJson.ts";
-import {
-  buildReviewBundleV1,
-  validateReviewBundleInput,
-} from "./api/managementHelpers.ts";
+import { rawDecimal } from "./api/decimalJson.ts";
+import { validateReviewBundleInput } from "./api/managementHelpers.ts";
 import {
   acceptPollResult,
   buildDocTotalsDiffPatch,
@@ -35,19 +33,22 @@ import {
   countUnsavedDraftsInBatch,
   createEmptyDraftStore,
   createPollRaceTracker,
+  extractMutationErrorBanner,
   finishMutationError,
   finishMutationSuccess,
   getDirtyDocIds,
   getDirtyRecordIds,
+  getDocTotalsDraftVersion,
+  getRecordDraftVersion,
+  hasRecordDraft,
   setDocTotalsDraftField,
   setRecordDraftField,
-  setRecordWarningWaiver,
-  removeRecordWarningWaiver,
   setTrackerActiveBatch,
   startMutation,
   startPoll,
+  validateReviewReason,
   type DraftStoreState,
-  type WarningWaiverDraft,
+  type MutationErrorBanner,
 } from "./api/reviewState.ts";
 import {
   BatchQueuePanel,
@@ -70,7 +71,6 @@ import {
 } from "./components/LumnoPrimitives.tsx";
 import {
   ReviewInspector,
-  type MutationErrorBanner,
   type RecordAuditHistoryState,
 } from "./components/ReviewInspector.tsx";
 import {
@@ -113,48 +113,12 @@ function getInitialBatchIdFromUrlOrStorage(): string | null {
   }
 }
 
-function toMutationErrorBanner(
-  title: string,
-  err: unknown
-): MutationErrorBanner {
-  if (err instanceof ApiClientError) {
-    const rawBlockers = Array.isArray(err.details?.blockers)
-      ? (err.details.blockers as Array<{
-          code?: unknown;
-          field?: unknown;
-          message?: unknown;
-          expected?: unknown;
-          actual?: unknown;
-        }>)
-      : [];
-    const blockers = rawBlockers.map((b) => ({
-      code: String(b.code ?? "BLOCKER"),
-      field: typeof b.field === "string" ? b.field : null,
-      message: String(b.message ?? ""),
-      expected: typeof b.expected === "string" ? b.expected : null,
-      actual: typeof b.actual === "string" ? b.actual : null,
-    }));
-
-    return {
-      title,
-      code: err.code,
-      message: err.message,
-      blockers: blockers.length > 0 ? blockers : undefined,
-      isConflict: err.status === 409,
-    };
-  }
-  return {
-    title,
-    message: err instanceof Error ? err.message : "操作失败，请重试",
-  };
-}
-
 export default function App() {
   const api = useMemo(() => new BillingApiClient(), []);
   const stubMode = useMemo(() => isStubModeActive(), []);
 
   const [theme, setTheme] = useState<LumnoTheme>("light");
-  const [mobileTab, setMobileTab] = useState<MobileViewTab>("queue");
+  const [mobileTab, setMobileTab] = useState<MobileViewTab>("upload");
 
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
@@ -165,10 +129,10 @@ export default function App() {
   const [existingBillCount, setExistingBillCount] = useState<number>(0);
 
   const [batches, setBatches] = useState<BatchSummary[]>([]);
-  const [activeBatchId, setActiveBatchId] = useState<string | null>(
-    getInitialBatchIdFromUrlOrStorage
-  );
+  const [activeBatchId, setActiveBatchId] = useState<string | null>(null);
   const [activeBatch, setActiveBatch] = useState<BatchDetail | null>(null);
+  const [switchingBatchId, setSwitchingBatchId] = useState<string | null>(null);
+  const switchBatchSeqRef = useRef(0);
 
   const [filterTab, setFilterTab] = useState<RecordFilterTab>("all");
   const [activeDocFilterId, setActiveDocFilterId] = useState<string | null>(
@@ -187,11 +151,14 @@ export default function App() {
     Record<string, RecordAuditHistoryState>
   >({});
 
-  // T02: Monotonic revision & poll-race guard
-  const pollTrackerRef = useRef(
-    createPollRaceTracker(getInitialBatchIdFromUrlOrStorage())
-  );
+  // T02: Monotonic revision, poll-race guard & polling transient resilience
+  const pollTrackerRef = useRef(createPollRaceTracker(null));
   const [batchRevision, setBatchRevision] = useState<number>(0);
+  const [pollRetryAttempt, setPollRetryAttempt] = useState<number>(0);
+  const [pollCycle, setPollCycle] = useState<number>(0);
+  const [pollTransientError, setPollTransientError] = useState<string | null>(
+    null
+  );
 
   const [submittingBatch, setSubmittingBatch] = useState(false);
   const [submittingDemo, setSubmittingDemo] = useState(false);
@@ -214,17 +181,9 @@ export default function App() {
   // Modals & Management Drawer
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [importModalOpen, setImportModalOpen] = useState(false);
-  const [bundleModalMode, setBundleModalMode] = useState<"import" | "export">(
-    "import"
-  );
   const [bundleJsonText, setBundleJsonText] = useState("");
   const [bundleError, setBundleError] = useState<string | null>(null);
   const [importingBundle, setImportingBundle] = useState(false);
-  const [exportBundleJsonText, setExportBundleJsonText] = useState("");
-  const [exportBundleLoading, setExportBundleLoading] = useState(false);
-  const [exportBundleError, setExportBundleError] = useState<string | null>(
-    null
-  );
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerTab, setDrawerTab] =
@@ -296,6 +255,8 @@ export default function App() {
     setActiveBatch(detail);
     setActiveBatchId(detail.id);
     setSelectedEntity(detail.accounting_entity);
+    setPollRetryAttempt(0);
+    setPollTransientError(null);
     setBatches((prev) => {
       const summary: BatchSummary = {
         id: detail.id,
@@ -321,17 +282,16 @@ export default function App() {
       next[idx] = summary;
       return next;
     });
+    const safeRecords = detail.records ?? [];
+    const safeDocs = detail.documents ?? [];
     setSelectedRecordId((prevSelected) => {
-      if (
-        prevSelected &&
-        detail.records.some((r) => r.id === prevSelected)
-      ) {
+      if (prevSelected && safeRecords.some((r) => r.id === prevSelected)) {
         return prevSelected;
       }
-      return detail.records[0]?.id ?? null;
+      return safeRecords[0]?.id ?? null;
     });
     setInspectedDocId((prevDoc) => {
-      if (prevDoc && detail.documents.some((d) => d.id === prevDoc)) {
+      if (prevDoc && safeDocs.some((d) => d.id === prevDoc)) {
         return prevDoc;
       }
       return null;
@@ -381,26 +341,76 @@ export default function App() {
         setExistingBillCount(billsRes.length);
         setBatches(batchList);
 
+        // A11: Restore preferred batch directly by id even if outside recent-20 list
         const preferredId = getInitialBatchIdFromUrlOrStorage();
-        const targetId =
-          preferredId && batchList.some((b) => b.id === preferredId)
-            ? preferredId
-            : batchList[0]?.id ?? null;
+        let loadedDetail: BatchDetail | null = null;
 
-        if (targetId) {
+        if (preferredId) {
+          try {
+            pollTrackerRef.current = setTrackerActiveBatch(
+              pollTrackerRef.current,
+              preferredId
+            );
+            const started = startPoll(pollTrackerRef.current, preferredId);
+            pollTrackerRef.current = started.nextTracker;
+            const detail = await api.getBatchDetail(
+              preferredId,
+              controller.signal
+            );
+            if (controller.signal.aborted) return;
+            const check = acceptPollResult(
+              pollTrackerRef.current,
+              started.ticket
+            );
+            pollTrackerRef.current = check.nextTracker;
+            if (check.accepted) {
+              loadedDetail = detail;
+            }
+          } catch (err) {
+            if (
+              controller.signal.aborted ||
+              (err instanceof ApiClientError && err.code === "REQUEST_ABORTED")
+            ) {
+              return;
+            }
+            if (err instanceof ApiClientError && err.status === 404) {
+              try {
+                window.localStorage.removeItem(LAST_BATCH_STORAGE_KEY);
+              } catch {
+                // ignore storage failures
+              }
+            } else {
+              pushToast(
+                err instanceof Error
+                  ? `恢复批次 ${preferredId} 失败：${err.message}`
+                  : `恢复批次 ${preferredId} 失败`,
+                "error"
+              );
+            }
+          }
+        }
+
+        if (!loadedDetail && batchList[0]?.id) {
+          const fallbackId = batchList[0].id;
           pollTrackerRef.current = setTrackerActiveBatch(
             pollTrackerRef.current,
-            targetId
+            fallbackId
           );
-          const started = startPoll(pollTrackerRef.current, targetId);
+          const started = startPoll(pollTrackerRef.current, fallbackId);
           pollTrackerRef.current = started.nextTracker;
-          const detail = await api.getBatchDetail(targetId, controller.signal);
+          const detail = await api.getBatchDetail(fallbackId, controller.signal);
           if (controller.signal.aborted) return;
           const check = acceptPollResult(pollTrackerRef.current, started.ticket);
           pollTrackerRef.current = check.nextTracker;
           if (check.accepted) {
-            applyFreshBatchDetail(detail);
+            loadedDetail = detail;
           }
+        }
+
+        if (loadedDetail) {
+          setBatchRevision(pollTrackerRef.current.batchRevision);
+          applyFreshBatchDetail(loadedDetail);
+          setMobileTab("queue");
         }
       } catch (err) {
         if (
@@ -420,13 +430,17 @@ export default function App() {
     return () => controller.abort();
   }, [api, applyFreshBatchDetail, pushToast]);
 
-  // Real-time polling while batch stage is active (guarded by PollRaceTracker)
+  // Real-time polling while batch stage is active (guarded by PollRaceTracker + backoff retry)
   useEffect(() => {
     if (!activeBatch || !isActiveBatchStage(activeBatch.stage)) {
       return;
     }
     const targetBatchId = activeBatch.id;
     const controller = new AbortController();
+    const delayMs =
+      pollRetryAttempt === 0
+        ? POLL_INTERVAL_MS
+        : Math.min(4000, 1000 * 2 ** Math.min(pollRetryAttempt - 1, 2));
 
     const timer = window.setTimeout(async () => {
       const started = startPoll(pollTrackerRef.current, targetBatchId);
@@ -440,6 +454,9 @@ export default function App() {
           return;
         }
         applyFreshBatchDetail(detail);
+        if (isActiveBatchStage(detail.stage)) {
+          setPollCycle((c) => c + 1);
+        }
       } catch (err) {
         if (
           controller.signal.aborted ||
@@ -447,27 +464,44 @@ export default function App() {
         ) {
           return;
         }
-        pushToast(
-          err instanceof Error ? err.message : "轮询批次状态失败",
-          "error"
+        const msg = err instanceof Error ? err.message : "轮询批次状态失败";
+        setPollRetryAttempt((n) => n + 1);
+        setPollCycle((c) => c + 1);
+        setPollTransientError(
+          `状态轮询临时中断（${msg}），正在自动退避重试…`
         );
       }
-    }, POLL_INTERVAL_MS);
+    }, delayMs);
 
     return () => {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [api, activeBatch, applyFreshBatchDetail, pushToast]);
+  }, [
+    api,
+    activeBatch?.id,
+    activeBatch?.stage,
+    pollCycle,
+    pollRetryAttempt,
+    applyFreshBatchDetail,
+  ]);
 
   const dirtyRecordIds = useMemo(() => {
     if (!activeBatch) return new Set<string>();
-    return getDirtyRecordIds(draftStore, activeBatch.id, activeBatch.records);
+    return getDirtyRecordIds(
+      draftStore,
+      activeBatch.id,
+      activeBatch.records ?? []
+    );
   }, [activeBatch, draftStore]);
 
   const dirtyDocIds = useMemo(() => {
     if (!activeBatch) return new Set<string>();
-    return getDirtyDocIds(draftStore, activeBatch.id, activeBatch.documents);
+    return getDirtyDocIds(
+      draftStore,
+      activeBatch.id,
+      activeBatch.documents ?? []
+    );
   }, [activeBatch, draftStore]);
 
   const unsavedDraftCount = useMemo(
@@ -477,31 +511,38 @@ export default function App() {
 
   const executeSelectBatch = async (batchId: string) => {
     if (!batchId) return;
-    pollTrackerRef.current = setTrackerActiveBatch(
-      pollTrackerRef.current,
-      batchId
-    );
-    setBatchRevision(pollTrackerRef.current.batchRevision);
-    setActiveDocFilterId(null);
-    setInspectedDocId(null);
-    setFilterTab("all");
-    setEntityNotice(null);
-    setMutationError(null);
-    setActiveBatchId(batchId);
-    const started = startPoll(pollTrackerRef.current, batchId);
-    pollTrackerRef.current = started.nextTracker;
+    const switchSeq = ++switchBatchSeqRef.current;
+    setSwitchingBatchId(batchId);
     try {
       const detail = await api.getBatchDetail(batchId);
-      const check = acceptPollResult(pollTrackerRef.current, started.ticket);
-      pollTrackerRef.current = check.nextTracker;
-      if (check.accepted) {
-        applyFreshBatchDetail(detail);
+      if (switchBatchSeqRef.current !== switchSeq) {
+        return;
       }
-    } catch (err) {
-      pushToast(
-        err instanceof Error ? err.message : "加载批次详情失败",
-        "error"
+      pollTrackerRef.current = setTrackerActiveBatch(
+        pollTrackerRef.current,
+        batchId
       );
+      setBatchRevision(pollTrackerRef.current.batchRevision);
+      setActiveDocFilterId(null);
+      setInspectedDocId(null);
+      setFilterTab("all");
+      setEntityNotice(null);
+      setMutationError(null);
+      applyFreshBatchDetail(detail);
+      setMobileTab("queue");
+    } catch (err) {
+      if (switchBatchSeqRef.current === switchSeq) {
+        pushToast(
+          err instanceof Error
+            ? `切换批次失败，已保留原批次：${err.message}`
+            : "加载批次详情失败，已保留原批次",
+          "error"
+        );
+      }
+    } finally {
+      if (switchBatchSeqRef.current === switchSeq) {
+        setSwitchingBatchId(null);
+      }
     }
   };
 
@@ -552,6 +593,7 @@ export default function App() {
         existing_bills_json: args.existingBillsJsonText,
         wait: false,
       });
+      const detail = await api.getBatchDetail(res.id);
       pollTrackerRef.current = setTrackerActiveBatch(
         pollTrackerRef.current,
         res.id
@@ -559,17 +601,10 @@ export default function App() {
       setBatchRevision(pollTrackerRef.current.batchRevision);
       setActiveDocFilterId(null);
       setInspectedDocId(null);
+      setFilterTab("all");
       setEntityNotice(null);
       setMutationError(null);
-      setActiveBatchId(res.id);
-      const started = startPoll(pollTrackerRef.current, res.id);
-      pollTrackerRef.current = started.nextTracker;
-      const detail = await api.getBatchDetail(res.id);
-      const check = acceptPollResult(pollTrackerRef.current, started.ticket);
-      pollTrackerRef.current = check.nextTracker;
-      if (check.accepted) {
-        applyFreshBatchDetail(detail);
-      }
+      applyFreshBatchDetail(detail);
       await refreshBatchesList().catch(() => undefined);
       setMobileTab("queue");
       pushToast(`批次 ${res.short_code} 已入队启动解析`);
@@ -596,6 +631,7 @@ export default function App() {
         ocr_mode: args.ocrMode,
         wait: false,
       });
+      const detail = await api.getBatchDetail(res.id);
       pollTrackerRef.current = setTrackerActiveBatch(
         pollTrackerRef.current,
         res.id
@@ -603,17 +639,10 @@ export default function App() {
       setBatchRevision(pollTrackerRef.current.batchRevision);
       setActiveDocFilterId(null);
       setInspectedDocId(null);
+      setFilterTab("all");
       setEntityNotice(null);
       setMutationError(null);
-      setActiveBatchId(res.id);
-      const started = startPoll(pollTrackerRef.current, res.id);
-      pollTrackerRef.current = started.nextTracker;
-      const detail = await api.getBatchDetail(res.id);
-      const check = acceptPollResult(pollTrackerRef.current, started.ticket);
-      pollTrackerRef.current = check.nextTracker;
-      if (check.accepted) {
-        applyFreshBatchDetail(detail);
-      }
+      applyFreshBatchDetail(detail);
       await refreshBatchesList().catch(() => undefined);
       setMobileTab("queue");
       pushToast(`已载入 4 份真样本批次 ${res.short_code}`);
@@ -691,7 +720,7 @@ export default function App() {
       pushToast("已强制将该跳过图片纳入 OCR 解析");
     } catch (err) {
       pollTrackerRef.current = finishMutationError(pollTrackerRef.current);
-      const banner = toMutationErrorBanner("强制 OCR 提取失败", err);
+      const banner = extractMutationErrorBanner("强制 OCR 提取失败", err);
       setMutationError(banner);
       pushToast(banner.message, "error");
     } finally {
@@ -729,7 +758,7 @@ export default function App() {
       );
     } catch (err) {
       pollTrackerRef.current = finishMutationError(pollTrackerRef.current);
-      const banner = toMutationErrorBanner("重试或替换文件失败", err);
+      const banner = extractMutationErrorBanner("重试或替换文件失败", err);
       setMutationError(banner);
       pushToast(banner.message, "error");
     } finally {
@@ -739,17 +768,23 @@ export default function App() {
 
   const handleSaveDocTotals = async (doc: SourceDocumentSummary) => {
     if (!activeBatch) return;
-    const diff = buildDocTotalsDiffPatch(doc, draftStore, activeBatch.id);
+    const batchId = activeBatch.id;
+    const diff = buildDocTotalsDiffPatch(doc, draftStore, batchId);
     if (!diff.valid || !diff.hasChanges) return;
 
+    const submittedVersion = getDocTotalsDraftVersion(
+      draftStore,
+      batchId,
+      doc.id
+    );
     setSavingDocTotals(true);
     const { nextTracker, ticket } = startMutation(
       pollTrackerRef.current,
-      activeBatch.id
+      batchId
     );
     pollTrackerRef.current = nextTracker;
     try {
-      const updated = await api.patchDocumentTotals(activeBatch.id, doc.id, {
+      const updated = await api.patchDocumentTotals(batchId, doc.id, {
         subtotal_amount: diff.patch.subtotal_amount,
         tax_amount: diff.patch.tax_amount,
         total_amount: diff.patch.total_amount,
@@ -761,8 +796,17 @@ export default function App() {
       setBatchRevision(finished.nextTracker.batchRevision);
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
+        const updatedDoc = (updated.documents ?? []).find(
+          (d) => d.id === doc.id
+        );
         setDraftStore((prev) =>
-          clearDocTotalsDraft(prev, activeBatch.id, doc.id)
+          clearDocTotalsDraft(
+            prev,
+            batchId,
+            doc.id,
+            submittedVersion ?? undefined,
+            updatedDoc
+          )
         );
         setMutationError(null);
         setAuditHistoryByKey({});
@@ -770,7 +814,7 @@ export default function App() {
       pushToast(`已保存 ${doc.sanitized_filename} 汇总并重算同单所有行`);
     } catch (err) {
       pollTrackerRef.current = finishMutationError(pollTrackerRef.current);
-      const banner = toMutationErrorBanner("保存单据汇总失败", err);
+      const banner = extractMutationErrorBanner("保存单据汇总失败", err);
       setMutationError(banner);
       pushToast(banner.message, "error");
     } finally {
@@ -780,44 +824,59 @@ export default function App() {
 
   const handleSaveRecordPatch = async (record: BillingRecordDetail) => {
     if (!activeBatch) return;
-    const diff = buildRecordDiffPatch(record, draftStore, activeBatch.id);
+    const batchId = activeBatch.id;
+    const diff = buildRecordDiffPatch(record, draftStore, batchId);
     if (!diff.valid || !diff.hasChanges) return;
 
+    const submittedVersion = getRecordDraftVersion(
+      draftStore,
+      batchId,
+      record.id
+    );
     setSavingRecord(true);
     const { nextTracker, ticket } = startMutation(
       pollTrackerRef.current,
-      activeBatch.id
+      batchId
     );
     pollTrackerRef.current = nextTracker;
     try {
       const updated = await api.patchBillingRecord(
-        activeBatch.id,
+        batchId,
         record.id,
-        diff.patch,
-        {
-          expectedRecordUpdatedAt: record.updated_at ?? null,
-          resolvedWarnings: diff.resolvedWarnings,
-        }
+        diff.patch
       );
       const finished = finishMutationSuccess(pollTrackerRef.current, ticket);
       pollTrackerRef.current = finished.nextTracker;
       setBatchRevision(finished.nextTracker.batchRevision);
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
+        const updatedRecord = (updated.records ?? []).find(
+          (r) => r.id === record.id
+        );
         setDraftStore((prev) =>
-          clearRecordDraft(prev, activeBatch.id, record.id)
+          clearRecordDraft(
+            prev,
+            batchId,
+            record.id,
+            submittedVersion ?? undefined,
+            updatedRecord
+          )
         );
         setMutationError(null);
         setAuditHistoryByKey((prev) => {
           const next = { ...prev };
-          delete next[`${activeBatch.id}::${record.id}`];
+          delete next[`${batchId}::${record.id}`];
           return next;
         });
       }
       pushToast("已保存修订并完成门禁重验");
     } catch (err) {
       pollTrackerRef.current = finishMutationError(pollTrackerRef.current);
-      const banner = toMutationErrorBanner("保存修订未通过", err);
+      const banner = extractMutationErrorBanner(
+        "保存修订未通过",
+        err,
+        record.validation_alerts
+      );
       setMutationError(banner);
       pushToast(banner.message, "error");
     } finally {
@@ -830,40 +889,42 @@ export default function App() {
     reason: string
   ) => {
     if (!activeBatch) return;
+    const batchId = activeBatch.id;
+    if (hasRecordDraft(draftStore, batchId, record.id)) {
+      const msg = "请先保存当前未保存修改，或放弃草稿后再执行批准/驳回";
+      setMutationError({ title: "存在未保存修改", message: msg });
+      pushToast(msg, "error");
+      return;
+    }
+
     setApprovingOrRejecting(true);
     const { nextTracker, ticket } = startMutation(
       pollTrackerRef.current,
-      activeBatch.id
+      batchId
     );
     pollTrackerRef.current = nextTracker;
     try {
-      const updated = await api.approveBillingRecord(
-        activeBatch.id,
-        record.id,
-        reason,
-        {
-          expectedRecordUpdatedAt: record.updated_at ?? null,
-        }
-      );
+      const updated = await api.approveBillingRecord(batchId, record.id, reason);
       const finished = finishMutationSuccess(pollTrackerRef.current, ticket);
       pollTrackerRef.current = finished.nextTracker;
       setBatchRevision(finished.nextTracker.batchRevision);
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
-        setDraftStore((prev) =>
-          clearRecordDraft(prev, activeBatch.id, record.id)
-        );
         setMutationError(null);
         setAuditHistoryByKey((prev) => {
           const next = { ...prev };
-          delete next[`${activeBatch.id}::${record.id}`];
+          delete next[`${batchId}::${record.id}`];
           return next;
         });
       }
       pushToast("已批准该条费用记录入账");
     } catch (err) {
       pollTrackerRef.current = finishMutationError(pollTrackerRef.current);
-      const banner = toMutationErrorBanner("批准入账被拦截", err);
+      const banner = extractMutationErrorBanner(
+        "批准入账被拦截",
+        err,
+        record.validation_alerts
+      );
       setMutationError(banner);
       pushToast(banner.message, "error");
     } finally {
@@ -876,37 +937,42 @@ export default function App() {
     reason: string
   ) => {
     if (!activeBatch) return;
+    const batchId = activeBatch.id;
+    if (hasRecordDraft(draftStore, batchId, record.id)) {
+      const msg = "请先保存当前未保存修改，或放弃草稿后再执行批准/驳回";
+      setMutationError({ title: "存在未保存修改", message: msg });
+      pushToast(msg, "error");
+      return;
+    }
+
     setApprovingOrRejecting(true);
     const { nextTracker, ticket } = startMutation(
       pollTrackerRef.current,
-      activeBatch.id
+      batchId
     );
     pollTrackerRef.current = nextTracker;
     try {
-      const updated = await api.rejectBillingRecord(
-        activeBatch.id,
-        record.id,
-        reason
-      );
+      const updated = await api.rejectBillingRecord(batchId, record.id, reason);
       const finished = finishMutationSuccess(pollTrackerRef.current, ticket);
       pollTrackerRef.current = finished.nextTracker;
       setBatchRevision(finished.nextTracker.batchRevision);
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
-        setDraftStore((prev) =>
-          clearRecordDraft(prev, activeBatch.id, record.id)
-        );
         setMutationError(null);
         setAuditHistoryByKey((prev) => {
           const next = { ...prev };
-          delete next[`${activeBatch.id}::${record.id}`];
+          delete next[`${batchId}::${record.id}`];
           return next;
         });
       }
       pushToast("已将该费用记录驳回并从 official 口径排除");
     } catch (err) {
       pollTrackerRef.current = finishMutationError(pollTrackerRef.current);
-      const banner = toMutationErrorBanner("驳回操作失败", err);
+      const banner = extractMutationErrorBanner(
+        "驳回操作失败",
+        err,
+        record.validation_alerts
+      );
       setMutationError(banner);
       pushToast(banner.message, "error");
     } finally {
@@ -922,19 +988,21 @@ export default function App() {
         [key]: {
           loading: true,
           error: null,
-          llmCallsUsed: prev[key]?.llmCallsUsed ?? null,
           retryCount: prev[key]?.retryCount ?? null,
+          extractionChannel: prev[key]?.extractionChannel ?? null,
           history: prev[key]?.history ?? [],
         },
       }));
       try {
         const res = await api.exportBatchJson(batchId, "audit");
-        const matched = res.records.find(
+        const matched = (res.records ?? []).find(
           (item) => item.audit_trail.record_id === recordId
         );
         const trail: Record<string, unknown> = matched?.audit_trail ?? {};
-        const llmCallsUsed =
-          typeof trail.llm_calls_used === "number" ? trail.llm_calls_used : null;
+        const extractionChannel =
+          typeof trail.extraction_channel === "string"
+            ? trail.extraction_channel
+            : null;
         const retryCount =
           typeof trail.retry_count === "number" ? trail.retry_count : 0;
         const rawHist = Array.isArray(trail.human_review_history)
@@ -953,8 +1021,8 @@ export default function App() {
           [key]: {
             loading: false,
             error: null,
-            llmCallsUsed,
             retryCount,
+            extractionChannel,
             history,
           },
         }));
@@ -965,8 +1033,8 @@ export default function App() {
             loading: false,
             error:
               err instanceof Error ? err.message : "按需加载审计历史失败",
-            llmCallsUsed: null,
             retryCount: null,
+            extractionChannel: null,
             history: [],
           },
         }));
@@ -1000,26 +1068,9 @@ export default function App() {
     }
   };
 
-  const handleOpenManagementDrawer = async (tab: ManagementDrawerTab) => {
+  const handleOpenManagementDrawer = (tab: ManagementDrawerTab) => {
     setDrawerTab(tab);
     setDrawerOpen(true);
-    try {
-      const [ents, dict, runs, bills] = await Promise.all([
-        api.listAccountingEntities(),
-        api.listChargeDictionary(),
-        api.listEvalRuns(),
-        api.listExistingBills(),
-      ]);
-      setEntities(ents);
-      setDictionaryList(dict);
-      setEvalRuns(runs);
-      setExistingBillCount(bills.length);
-    } catch (err) {
-      pushToast(
-        err instanceof Error ? err.message : "读取主数据与评测概览失败",
-        "error"
-      );
-    }
   };
 
   const handleReapplyDictionary = async () => {
@@ -1055,7 +1106,6 @@ export default function App() {
   };
 
   const handleOpenImportBundleClick = () => {
-    setBundleModalMode("import");
     setBundleError(null);
     if (unsavedDraftCount > 0) {
       setPendingDraftGuard({ kind: "open_import_bundle" });
@@ -1063,48 +1113,6 @@ export default function App() {
     }
     setImportModalOpen(true);
   };
-
-  const handleOpenExportBundleClick = () => {
-    setBundleModalMode("export");
-    setBundleError(null);
-    setImportModalOpen(true);
-  };
-
-  useEffect(() => {
-    if (!importModalOpen || bundleModalMode !== "export" || !activeBatch) {
-      return;
-    }
-    let cancelled = false;
-    setExportBundleLoading(true);
-    setExportBundleError(null);
-    void Promise.all([
-      api.listExistingBills(activeBatch.accounting_entity).catch(() => []),
-      api.exportBatchJson(activeBatch.id, "audit").catch(() => null),
-    ])
-      .then(([billsSnapshot, auditExport]) => {
-        if (cancelled) return;
-        const bundle = buildReviewBundleV1(
-          activeBatch,
-          billsSnapshot,
-          auditExport
-        );
-        setExportBundleJsonText(stringifyLosslessJson(bundle, 2));
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setExportBundleError(
-          err instanceof Error ? err.message : "生成 ReviewBundleV1 复核包失败"
-        );
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setExportBundleLoading(false);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [importModalOpen, bundleModalMode, activeBatch, batchRevision, api]);
 
   const handleBundleFilePick = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1157,51 +1165,15 @@ export default function App() {
     await executeImportBundle(check.bundle);
   };
 
-  const handleCopyExportBundle = async () => {
-    if (!exportBundleJsonText) return;
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(exportBundleJsonText);
-      } else {
-        const ta = document.createElement("textarea");
-        ta.value = exportBundleJsonText;
-        ta.style.position = "fixed";
-        ta.style.opacity = "0";
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        ta.remove();
-      }
-      pushToast("已复制 ReviewBundleV1 (v1.0) 无损复核包 JSON");
-    } catch {
-      pushToast("复制到剪贴板失败，请手动选中预览内容复制", "error");
-    }
-  };
-
-  const handleDownloadExportBundle = () => {
-    if (!activeBatch || !exportBundleJsonText) return;
-    const blob = new Blob([exportBundleJsonText], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `${activeBatch.short_code}.review-bundle.v1.json`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
-    pushToast(`已导出 ${activeBatch.short_code}.review-bundle.v1.json`);
-  };
-
   const handleOpenManualModal = (defaultDocId?: string) => {
     if (!activeBatch) return;
+    const safeDocs = activeBatch.documents ?? [];
     const fallbackDocId =
       defaultDocId ??
       inspectedDocId ??
       selectedRecord?.source_doc_id ??
-      activeBatch.documents.find((d) => d.status !== "FAILED")?.id ??
-      activeBatch.documents[0]?.id ??
+      safeDocs.find((d) => d.status !== "FAILED")?.id ??
+      safeDocs[0]?.id ??
       "";
     setManualSourceDocId(fallbackDocId);
     setManualChargeItem("");
@@ -1240,12 +1212,20 @@ export default function App() {
       return;
     }
     const currUpper = manualCurrency.trim().toUpperCase();
-    if (!/^[A-Z]{3}$/.test(currUpper)) {
-      setManualFormError("币种须为 3 位大写 ISO 4217 代码（如 USD）");
+    if (!isValidIso4217Currency(currUpper)) {
+      setManualFormError("币种须为有效的 3 位大写 ISO 4217 代码（如 USD）");
       return;
     }
-    if (manualDocumentDate.trim() && !/^\d{4}-\d{2}-\d{2}$/.test(manualDocumentDate.trim())) {
+    if (
+      manualDocumentDate.trim() &&
+      !/^\d{4}-\d{2}-\d{2}$/.test(manualDocumentDate.trim())
+    ) {
       setManualFormError("单据日期格式须为 YYYY-MM-DD");
+      return;
+    }
+    const manualReasonErr = validateReviewReason(manualReason);
+    if (manualReasonErr) {
+      setManualFormError(`补录原因：${manualReasonErr}`);
       return;
     }
 
@@ -1268,14 +1248,15 @@ export default function App() {
         document_date: manualDocumentDate.trim() || null,
         issuer: manualIssuer.trim() || null,
         recipient: manualRecipient.trim() || null,
-        reason: manualReason.trim() || "人工补录漏提费用行",
+        reason: manualReason.trim(),
       });
       const finished = finishMutationSuccess(pollTrackerRef.current, ticket);
       pollTrackerRef.current = finished.nextTracker;
       setBatchRevision(finished.nextTracker.batchRevision);
       if (finished.shouldApply) {
         applyFreshBatchDetail(updated);
-        const newest = updated.records[updated.records.length - 1];
+        const safeRecords = updated.records ?? [];
+        const newest = safeRecords[safeRecords.length - 1];
         if (newest) {
           setSelectedRecordId(newest.id);
         }
@@ -1296,7 +1277,7 @@ export default function App() {
   const selectedRecord = useMemo<BillingRecordDetail | null>(() => {
     if (!activeBatch || !selectedRecordId) return null;
     return (
-      activeBatch.records.find((r) => r.id === selectedRecordId) ?? null
+      (activeBatch.records ?? []).find((r) => r.id === selectedRecordId) ?? null
     );
   }, [activeBatch, selectedRecordId]);
 
@@ -1313,6 +1294,7 @@ export default function App() {
           batches={batches}
           activeBatchId={activeBatchId}
           activeBatch={activeBatch}
+          switchingBatchId={switchingBatchId}
           entities={entities}
           selectedEntity={selectedEntity}
           existingBillCount={existingBillCount}
@@ -1326,9 +1308,8 @@ export default function App() {
             setTheme((prev) => (prev === "light" ? "dark" : "light"))
           }
           onOpenImportBundle={handleOpenImportBundleClick}
-          onOpenExportBundle={handleOpenExportBundleClick}
-          onOpenMasterData={() => void handleOpenManagementDrawer("entities")}
-          onOpenEvalDashboard={() => void handleOpenManagementDrawer("eval_runs")}
+          onOpenMasterData={() => handleOpenManagementDrawer("entities")}
+          onOpenEvalDashboard={() => handleOpenManagementDrawer("eval_runs")}
           onSyncBaseline={() => void handleSyncBaseline()}
           onOpenExport={() => setExportModalOpen(true)}
         />
@@ -1387,6 +1368,7 @@ export default function App() {
               selectedRecordId={selectedRecordId}
               dirtyRecordIds={dirtyRecordIds}
               retryingDocId={retryingDocId}
+              pollTransientError={pollTransientError}
               entityNotice={entityNotice}
               onChangeFilterTab={setFilterTab}
               onClearDocFilter={() => setActiveDocFilterId(null)}
@@ -1402,6 +1384,7 @@ export default function App() {
               onRetryOrReplaceDoc={(docId, file) =>
                 void handleRetryDoc(docId, { file })
               }
+              onRefreshBatch={() => void handleRefreshActiveBatch()}
               onDismissEntityNotice={() => setEntityNotice(null)}
               onOpenManualRecord={() => handleOpenManualModal()}
             />
@@ -1437,23 +1420,6 @@ export default function App() {
                     record,
                     field,
                     value
-                  )
-                );
-              }}
-              onSetWarningWaiver={(recordId, waiver: WarningWaiverDraft) => {
-                if (!activeBatch) return;
-                setDraftStore((prev) =>
-                  setRecordWarningWaiver(prev, activeBatch.id, recordId, waiver)
-                );
-              }}
-              onRemoveWarningWaiver={(recordId, warningKey) => {
-                if (!activeBatch) return;
-                setDraftStore((prev) =>
-                  removeRecordWarningWaiver(
-                    prev,
-                    activeBatch.id,
-                    recordId,
-                    warningKey
                   )
                 );
               }}
@@ -1505,7 +1471,6 @@ export default function App() {
         lastSyncResult={lastSyncResult}
         onClose={() => setExportModalOpen(false)}
         onSyncBaseline={handleSyncBaseline}
-        onOpenBundleExport={handleOpenExportBundleClick}
         onNotify={pushToast}
       />
 
@@ -1542,7 +1507,7 @@ export default function App() {
                 value={manualSourceDocId}
                 onChange={(e) => setManualSourceDocId(e.target.value)}
               >
-                {activeBatch.documents.map((doc) => (
+                {(activeBatch.documents ?? []).map((doc) => (
                   <option key={doc.id} value={doc.id}>
                     {doc.sanitized_filename} ({doc.status})
                   </option>
@@ -1684,7 +1649,6 @@ export default function App() {
                 if (action.kind === "switch_batch") {
                   void executeSelectBatch(action.batchId);
                 } else if (action.kind === "open_import_bundle") {
-                  setBundleModalMode("import");
                   setImportModalOpen(true);
                 } else if (action.kind === "confirm_import_bundle") {
                   void executeImportBundle(action.bundle);
@@ -1702,133 +1666,65 @@ export default function App() {
         </div>
       </LumnoModal>
 
-      {/* Bidirectional ReviewBundleV1 ("1.0") Interop Modal */}
+      {/* CLI ReviewBundleV1 ("1.0") Import Modal */}
       <LumnoModal
         open={importModalOpen}
-        title="复核包互通（ReviewBundleV1 · bundle_version: 1.0）"
+        title="导入 CLI 复核包（ReviewBundleV1 · bundle_version: 1.0）"
         onClose={() => setImportModalOpen(false)}
         footer={
-          bundleModalMode === "import" ? (
-            <>
-              <LumnoButton
-                variant="secondary"
-                onClick={() => setImportModalOpen(false)}
-              >
-                取消
-              </LumnoButton>
-              <LumnoButton
-                variant="primary"
-                busy={importingBundle}
-                onClick={() => void handleImportBundle()}
-              >
-                导入并接手复核
-              </LumnoButton>
-            </>
-          ) : (
-            <>
-              <LumnoButton
-                variant="secondary"
-                onClick={() => setImportModalOpen(false)}
-              >
-                关闭
-              </LumnoButton>
-              <LumnoButton
-                variant="secondary"
-                icon="ri-file-copy-line"
-                disabled={!exportBundleJsonText || exportBundleLoading}
-                onClick={() => void handleCopyExportBundle()}
-              >
-                复制复核包 JSON
-              </LumnoButton>
-              <LumnoButton
-                variant="primary"
-                icon="ri-download-2-line"
-                disabled={!activeBatch || !exportBundleJsonText || exportBundleLoading}
-                onClick={handleDownloadExportBundle}
-              >
-                下载复核包 (.json)
-              </LumnoButton>
-            </>
-          )
+          <>
+            <LumnoButton
+              variant="secondary"
+              onClick={() => setImportModalOpen(false)}
+            >
+              取消
+            </LumnoButton>
+            <LumnoButton
+              variant="primary"
+              busy={importingBundle}
+              onClick={() => void handleImportBundle()}
+            >
+              导入并接手复核
+            </LumnoButton>
+          </>
         }
       >
-        <LumnoSegmentedControl<"import" | "export">
-          value={bundleModalMode}
-          ariaLabel="复核包互通操作模式"
-          options={[
-            { value: "import", label: "导入接手复核包" },
-            { value: "export", label: "导出当前批复核包" },
-          ]}
-          onChange={(mode) => {
-            setBundleModalMode(mode);
+        <div className="wb-notice-banner">
+          <span>
+            支持导入 CLI 端导出的标准 ReviewBundleV1（含 bundle_version: "1.0"、无损高精度数值、随批私有基准快照与审计记录）。标准口径结果请使用「导出标准 JSON」。
+          </span>
+        </div>
+        {unsavedDraftCount > 0 ? (
+          <div className="wb-alert-item" data-severity="WARNING">
+            提示：当前批次有 {unsavedDraftCount} 项未保存草稿，提交导入时将再次确认，切换后当前草稿保留在原批次本地缓存中。
+          </div>
+        ) : null}
+        <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+          <label className="lumno-btn lumno-pill lumno-btn--secondary lumno-btn--compact">
+            <i className="ri-icon ri-file-code-line" aria-hidden="true" />
+            <span>选择 .json 文件</span>
+            <input
+              type="file"
+              accept=".json,application/json"
+              style={{ display: "none" }}
+              onChange={(e) => void handleBundleFilePick(e)}
+            />
+          </label>
+          <span className="wb-helper-note">
+            须包含 bundle_version: "1.0"、非空 accounting_entity、合法 ocr_mode 与有效 documents / records
+          </span>
+        </div>
+        <LumnoTextarea
+          value={bundleJsonText}
+          placeholder='{"bundle_version":"1.0","accounting_entity":"NEPTUNE SHIPPING LIMITED","ocr_mode":"REMOTE_ONLY","documents":[...],"records":[...]}'
+          aria-label="ReviewBundleV1 JSON 内容"
+          style={{ minHeight: "160px", fontFamily: "var(--lumno-font-mono)" }}
+          onChange={(e) => {
+            setBundleJsonText(e.target.value);
             setBundleError(null);
           }}
         />
-
-        {bundleModalMode === "import" ? (
-          <>
-            {unsavedDraftCount > 0 ? (
-              <div className="wb-alert-item" data-severity="WARNING">
-                提示：当前批次有 {unsavedDraftCount} 项未保存草稿，提交导入时将再次确认，切换后当前草稿保留在原批次本地缓存中。
-              </div>
-            ) : null}
-            <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
-              <label className="lumno-btn lumno-pill lumno-btn--secondary lumno-btn--compact">
-                <i className="ri-icon ri-file-code-line" aria-hidden="true" />
-                <span>选择 .json 文件</span>
-                <input
-                  type="file"
-                  accept=".json,application/json"
-                  style={{ display: "none" }}
-                  onChange={(e) => void handleBundleFilePick(e)}
-                />
-              </label>
-              <span className="wb-helper-note">
-                须包含 bundle_version: "1.0"、accounting_entity、documents 与 records
-              </span>
-            </div>
-            <LumnoTextarea
-              value={bundleJsonText}
-              placeholder='{"bundle_version":"1.0","accounting_entity":"NEPTUNE SHIPPING LIMITED","ocr_mode":"REMOTE_ONLY","documents":[],"records":[]}'
-              aria-label="ReviewBundleV1 JSON 内容"
-              style={{ minHeight: "160px", fontFamily: "var(--lumno-font-mono)" }}
-              onChange={(e) => {
-                setBundleJsonText(e.target.value);
-                setBundleError(null);
-              }}
-            />
-            {bundleError ? <div className="wb-field-error">{bundleError}</div> : null}
-          </>
-        ) : !activeBatch ? (
-          <div className="wb-empty-state">
-            <span>当前尚未选中批次，请先在工作台加载或选择一个批次后再导出 ReviewBundleV1。</span>
-          </div>
-        ) : (
-          <>
-            {unsavedDraftCount > 0 ? (
-              <div className="wb-alert-item" data-severity="WARNING">
-                当前批次尚有 {unsavedDraftCount} 项未保存本地草稿，导出的复核包基于服务端已保存快照与审计历史，建议先保存修订。
-              </div>
-            ) : null}
-            <div className="wb-notice-banner">
-              <span>
-                导出批次 <strong>{activeBatch.short_code}</strong> 的完整 ReviewBundleV1（含 bundle_version: "1.0"、高精度数值、历史快照与人工复核历史），可供 CLI 或另一工作台实例无损接手。
-              </span>
-            </div>
-            {exportBundleLoading ? (
-              <div className="wb-helper-note">正在生成无损 ReviewBundleV1 快照...</div>
-            ) : exportBundleError ? (
-              <div className="wb-field-error">{exportBundleError}</div>
-            ) : (
-              <pre
-                className="wb-evidence-pre wb-tabular"
-                style={{ maxHeight: "240px", overflowY: "auto" }}
-              >
-                {exportBundleJsonText}
-              </pre>
-            )}
-          </>
-        )}
+        {bundleError ? <div className="wb-field-error">{bundleError}</div> : null}
       </LumnoModal>
 
       <ManagementDrawer

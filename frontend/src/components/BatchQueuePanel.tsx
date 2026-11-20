@@ -65,12 +65,14 @@ export interface BatchQueuePanelProps {
   selectedRecordId: string | null;
   dirtyRecordIds?: ReadonlySet<string>;
   retryingDocId: string | null;
+  pollTransientError?: string | null;
   entityNotice: { count: number; message: string } | null;
   onChangeFilterTab: (tab: RecordFilterTab) => void;
   onClearDocFilter: () => void;
   onSelectRecord: (recordId: string) => void;
   onInspectDoc: (docId: string) => void;
   onRetryOrReplaceDoc: (docId: string, file?: File) => void;
+  onRefreshBatch?: () => void;
   onDismissEntityNotice: () => void;
   onOpenManualRecord: () => void;
 }
@@ -82,12 +84,14 @@ export function BatchQueuePanel({
   selectedRecordId,
   dirtyRecordIds,
   retryingDocId,
+  pollTransientError = null,
   entityNotice,
   onChangeFilterTab,
   onClearDocFilter,
   onSelectRecord,
   onInspectDoc,
   onRetryOrReplaceDoc,
+  onRefreshBatch,
   onDismissEntityNotice,
   onOpenManualRecord,
 }: BatchQueuePanelProps) {
@@ -96,7 +100,7 @@ export function BatchQueuePanel({
 
   const filteredRecords = useMemo(() => {
     if (!batch) return [];
-    return batch.records.filter((rec) => {
+    return (batch.records ?? []).filter((rec) => {
       if (activeDocFilterId && rec.source_doc_id !== activeDocFilterId) {
         return false;
       }
@@ -119,7 +123,7 @@ export function BatchQueuePanel({
   const activeDocName = useMemo(() => {
     if (!batch || !activeDocFilterId) return null;
     return (
-      batch.documents.find((d) => d.id === activeDocFilterId)
+      (batch.documents ?? []).find((d) => d.id === activeDocFilterId)
         ?.sanitized_filename ?? null
     );
   }, [batch, activeDocFilterId]);
@@ -217,6 +221,36 @@ export function BatchQueuePanel({
               {batch.stage_message ? (
                 <div className="wb-helper-note">{batch.stage_message}</div>
               ) : null}
+              {pollTransientError ? (
+                <div
+                  className="wb-alert-item"
+                  data-severity="WARNING"
+                  role="status"
+                  style={{ marginTop: "4px" }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <span>{pollTransientError}</span>
+                    {onRefreshBatch ? (
+                      <LumnoButton
+                        variant="ghost"
+                        compact
+                        icon="ri-refresh-line"
+                        onClick={onRefreshBatch}
+                      >
+                        立即刷新
+                      </LumnoButton>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
             </div>
 
             {entityNotice ? (
@@ -233,103 +267,104 @@ export function BatchQueuePanel({
             ) : null}
 
             {/* Pinned FailedDocumentAlert cards: always visible at top even with 0 affected records */}
-            {batch.failed_documents.length > 0 ? (
+            {(batch.failed_documents?.length ?? 0) > 0 ? (
               <section
                 aria-label="失败文档置顶告警"
                 style={{ display: "flex", flexDirection: "column", gap: "8px" }}
               >
-                {batch.failed_documents.map((failDoc) => (
-                  <div key={failDoc.doc_id} className="wb-failed-doc-card">
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: "8px",
-                      }}
-                    >
-                      <span
+                {(batch.failed_documents ?? []).map((failDoc) => {
+                  const affectedIds = failDoc.affected_record_ids ?? [];
+                  return (
+                    <div key={failDoc.doc_id} className="wb-failed-doc-card">
+                      <div
                         style={{
-                          display: "inline-flex",
+                          display: "flex",
                           alignItems: "center",
-                          gap: "6px",
-                          fontWeight: 600,
-                          color: "var(--wb-error-text)",
-                          minWidth: 0,
-                          overflowWrap: "anywhere",
+                          justifyContent: "space-between",
+                          gap: "8px",
                         }}
                       >
-                        <i
-                          className="ri-icon ri-icon--compact ri-error-warning-line"
-                          aria-hidden="true"
-                        />
-                        <span>失败附件：{failDoc.filename}</span>
-                      </span>
-                      <span className="wb-badge wb-badge--error wb-tabular">
-                        影响记录 {failDoc.affected_record_ids.length} 条
-                      </span>
-                    </div>
+                        <span
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "6px",
+                            fontWeight: 600,
+                            color: "var(--wb-error-text)",
+                            minWidth: 0,
+                            overflowWrap: "anywhere",
+                          }}
+                        >
+                          <i
+                            className="ri-icon ri-icon--compact ri-error-warning-line"
+                            aria-hidden="true"
+                          />
+                          <span>失败附件：{failDoc.filename}</span>
+                        </span>
+                        <span className="wb-badge wb-badge--error wb-tabular">
+                          影响记录 {affectedIds.length} 条
+                        </span>
+                      </div>
 
-                    <div className="wb-field-error">{failDoc.error_message}</div>
+                      <div className="wb-field-error">{failDoc.error_message}</div>
 
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: "8px",
-                        flexWrap: "wrap",
-                      }}
-                    >
-                      <span className="wb-helper-note">
-                        {failDoc.affected_record_ids.length === 0
-                          ? "该附件产出 0 条费用行，同批其余正常单据结果已保留；可直接重试或替换恢复。"
-                          : `受影响记录：${failDoc.affected_record_ids.length} 条`}
-                      </span>
-                      <div style={{ display: "inline-flex", gap: "6px" }}>
-                        {failDoc.affected_record_ids.length > 0 ? (
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: "8px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span className="wb-helper-note">
+                          {affectedIds.length === 0
+                            ? "该附件产出 0 条费用行，同批其余正常单据结果已保留；可直接重试或替换恢复。"
+                            : `受影响记录：${affectedIds.length} 条`}
+                        </span>
+                        <div style={{ display: "inline-flex", gap: "6px" }}>
+                          {affectedIds.length > 0 ? (
+                            <LumnoButton
+                              variant="ghost"
+                              compact
+                              onClick={() => onSelectRecord(affectedIds[0])}
+                            >
+                              定位记录
+                            </LumnoButton>
+                          ) : null}
                           <LumnoButton
                             variant="ghost"
                             compact
-                            onClick={() =>
-                              onSelectRecord(failDoc.affected_record_ids[0])
-                            }
+                            icon="ri-tools-line"
+                            onClick={() => onInspectDoc(failDoc.doc_id)}
                           >
-                            定位记录
+                            详情修理
                           </LumnoButton>
-                        ) : null}
-                        <LumnoButton
-                          variant="ghost"
-                          compact
-                          icon="ri-tools-line"
-                          onClick={() => onInspectDoc(failDoc.doc_id)}
-                        >
-                          详情修理
-                        </LumnoButton>
-                        <LumnoButton
-                          variant="secondary"
-                          compact
-                          icon="ri-refresh-line"
-                          busy={retryingDocId === failDoc.doc_id}
-                          onClick={() => onRetryOrReplaceDoc(failDoc.doc_id)}
-                        >
-                          原地重试
-                        </LumnoButton>
-                        <LumnoButton
-                          variant="primary"
-                          compact
-                          icon="ri-upload-2-line"
-                          onClick={() => {
-                            replaceDocIdRef.current = failDoc.doc_id;
-                            replaceInputRef.current?.click();
-                          }}
-                        >
-                          替换上传
-                        </LumnoButton>
+                          <LumnoButton
+                            variant="secondary"
+                            compact
+                            icon="ri-refresh-line"
+                            busy={retryingDocId === failDoc.doc_id}
+                            onClick={() => onRetryOrReplaceDoc(failDoc.doc_id)}
+                          >
+                            原地重试
+                          </LumnoButton>
+                          <LumnoButton
+                            variant="primary"
+                            compact
+                            icon="ri-upload-2-line"
+                            onClick={() => {
+                              replaceDocIdRef.current = failDoc.doc_id;
+                              replaceInputRef.current?.click();
+                            }}
+                          >
+                            替换上传
+                          </LumnoButton>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </section>
             ) : null}
 
@@ -339,7 +374,7 @@ export function BatchQueuePanel({
                 wrap
                 ariaLabel="按状态筛选账单记录"
                 options={[
-                  { value: "all", label: "全部", count: batch.records.length },
+                  { value: "all", label: "全部", count: (batch.records ?? []).length },
                   {
                     value: "pending_review",
                     label: "待复核",

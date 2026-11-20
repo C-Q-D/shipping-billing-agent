@@ -269,7 +269,7 @@ export function UploadAndFileTree({
 
   const orderedDocs = useMemo(() => {
     if (!activeBatch) return [];
-    const docs = activeBatch.documents;
+    const docs = activeBatch.documents ?? [];
     const roots = docs.filter((d) => !d.parent_doc_id);
     const childrenByParent = new Map<string, SourceDocumentSummary[]>();
     for (const d of docs) {
@@ -490,7 +490,7 @@ export function UploadAndFileTree({
               />
             </div>
             <div className="wb-helper-note">
-              仅作用于本批匹配，不改写全局库（全局导入请见顶栏主数据）
+              仅作用于本批匹配，须为标准 JSON 数组 [{`{...}`}]（拒绝对象包裹），不改写全局库
             </div>
             {validation.existingBillsError ? (
               <div className="wb-field-error">
