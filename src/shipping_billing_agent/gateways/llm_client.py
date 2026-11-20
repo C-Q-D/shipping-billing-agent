@@ -12,6 +12,7 @@ from traceback import format_exception
 from typing import Any, Generic, Protocol, TypeVar
 
 import httpx
+import openai
 from langchain_core.messages import BaseMessage, convert_to_messages
 from langchain_core.messages.utils import MessageLikeRepresentation
 from langchain_openai import ChatOpenAI
@@ -33,11 +34,14 @@ class LlmNotConfiguredError(RuntimeError):
 
 
 class LlmGatewayError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class LlmBudgetExhaustedError(LlmGatewayError):
-    pass
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
 
 
 @dataclass(slots=True)
@@ -199,13 +203,26 @@ class OpenAICompatibleLlmClient:
     def _gateway_error(self, context: str, cause: Exception) -> LlmGatewayError:
         current: BaseException | None = cause
         seen = set()
+        retryable = False
+        status_code = None
         while current is not None and id(current) not in seen:
             if isinstance(current, LlmBudgetExhaustedError):
                 return current
+            if status_code is None:
+                if isinstance(current, openai.APIStatusError):
+                    status_code = current.status_code
+                elif isinstance(current, httpx.HTTPStatusError):
+                    status_code = current.response.status_code
+            if isinstance(current, (openai.APIConnectionError, httpx.TransportError)):
+                retryable = True
             seen.add(id(current))
             current = current.__cause__ or current.__context__
+        if status_code is not None:
+            retryable = status_code == 429 or status_code >= 500
         details = self._redact_response_text(str(cause))
-        error = LlmGatewayError(f"{context}（{type(cause).__name__}）：{details}")
+        error = LlmGatewayError(
+            f"{context}（{type(cause).__name__}）：{details}", retryable=retryable
+        )
         # Retain diagnostics without exposing SDK exceptions that hold request credentials.
         _LOGGER.warning("%s", error)
         return error

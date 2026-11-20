@@ -381,6 +381,29 @@ def test_omitted_currency_with_multiple_legacy_currencies_stops_before_amount_pa
     assert explicit.operation is OperationType.NO_CHANGE
 
 
+@pytest.mark.parametrize("reference_field", ["hbl_no", "booking_no"], ids=["L2", "L3"])
+@pytest.mark.parametrize("claim", ["manual", "L1"])
+def test_occupied_bill_does_not_hide_cross_currency_ambiguity(
+    reference_field: str, claim: str
+) -> None:
+    refs = {reference_field: "shared-ref"}
+    usd = _bill("usd", reference_no="HIST-USD", **refs)
+    eur = _bill("eur", currency="EUR", **refs)
+    claimed = _line(
+        "claimed",
+        reference_no="HIST-USD" if claim == "L1" else None,
+        human_overrides={"matched_existing_bill_id": usd.id} if claim == "manual" else {},
+    )
+    omitted = _line("omitted", amount="35", posting_type="AR", shipment_refs=refs)
+
+    matched, unmatched = match_and_inherit_batch([claimed, omitted], [usd, eur])
+
+    assert matched.matched_existing_bill_id == usd.id
+    _assert_ambiguous(unmatched, [eur.id, usd.id])
+    assert unmatched.currency is None
+    assert validate_record(unmatched).review_status is ReviewStatus.NEEDS_REVIEW
+
+
 @pytest.mark.parametrize(
     "field, level",
     [("hbl_no", MatchLevel.L2_BL_CHARGE_CURR), ("booking_no", MatchLevel.L3_BOOKING_CHARGE_CURR)],

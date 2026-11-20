@@ -675,6 +675,39 @@ def _llm_settings(base_url: str, **overrides) -> AppSettings:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "failure, retryable",
+    [(400, False), (429, True), (503, True), (httpx.ConnectError, True), (httpx.ReadTimeout, True)],
+)
+async def test_llm_gateway_exposes_transient_failures_without_an_automatic_retry(
+    failure: int | type[httpx.TransportError], retryable: bool, use_async: bool
+) -> None:
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if isinstance(failure, int):
+            return httpx.Response(failure, json={"error": "synthetic gateway failure"})
+        raise failure("synthetic transport failure", request=request)
+
+    transport = httpx.MockTransport(respond)
+    client = llm_client.OpenAICompatibleLlmClient(
+        _llm_settings("https://llm.example.test"), transport=transport, async_transport=transport
+    )
+    try:
+        with pytest.raises(llm_client.LlmGatewayError) as error:
+            if use_async:
+                await client.ainvoke_structured("Extract invoice", _ExtractedInvoice)
+            else:
+                client.invoke_structured("Extract invoice", _ExtractedInvoice)
+        assert error.value.retryable is retryable
+        assert [request.method for request in requests] == ["POST"]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize("budget", [1, 2])
 @pytest.mark.parametrize("reserved", [0, 1])
 async def test_llm_retries_charge_actual_http_attempts(
@@ -733,8 +766,9 @@ async def test_llm_retries_charge_actual_http_attempts(
     try:
         with llm_client.llm_request_budget(acquire_sync, acquire_async, initial_slots=reserved):
             if budget == 1:
-                with pytest.raises(llm_client.LlmBudgetExhaustedError):
+                with pytest.raises(llm_client.LlmBudgetExhaustedError) as error:
                     await invoke()
+                assert error.value.retryable is False
             else:
                 reply = await invoke()
                 assert reply.parsed == _ExtractedInvoice(invoice_number="RETRIED")

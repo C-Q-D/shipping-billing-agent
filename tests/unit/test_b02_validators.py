@@ -7,11 +7,13 @@ from hashlib import sha256
 import pytest
 
 from shipping_billing_agent.domain import (
+    AccountingEntityProfile,
     AlertCode,
     AlertSeverity,
     ChargeDictionaryItem,
     DocumentExtractionBundle,
     ExistingBillRecord,
+    HumanReviewAction,
     MatchLevel,
     OperationType,
     ParsedDocument,
@@ -62,6 +64,8 @@ def _bundle(
     digest: str | None = None,
     public_url: str | None = None,
     source_kind: str = "PDF",
+    subtotals_by_currency: dict[str, str] | None = None,
+    taxes_by_currency: dict[str, str] | None = None,
     totals_by_currency: dict[str, str] | None = None,
     ocr_payload: dict | None = None,
     **fields,
@@ -84,6 +88,8 @@ def _bundle(
         ),
         extraction=RawExtractionEnvelope(
             extraction=RawDocumentExtraction.model_validate(fields),
+            subtotals_by_currency=subtotals_by_currency or {},
+            taxes_by_currency=taxes_by_currency or {},
             totals_by_currency=totals_by_currency or {},
         ),
     )
@@ -258,7 +264,7 @@ def test_credit_line_checks_magnitude_and_keeps_negative_posting(
     assert result.validation_alerts == []
 
 
-def test_partial_update_checks_arithmetic_when_one_of_the_numbers_is_current() -> None:
+def test_partial_update_only_multiplies_three_current_or_manually_edited_values() -> None:
     old = _bill(quantity="2", unit_price="15.00")
     source = _line(
         reference_no="NOTICE-1", amount="35.00", explicit_fields={"reference_no", "amount"}
@@ -268,8 +274,18 @@ def test_partial_update_checks_arithmetic_when_one_of_the_numbers_is_current() -
     result = validate_record(matched)
 
     assert {"quantity", "unit_price"} <= matched.inherited_fields.keys()
-    _assert_review(result, AlertCode.LINE_ARITHMETIC_MISMATCH)
-    assert [(alert.expected, alert.actual) for alert in result.validation_alerts] == [
+    assert result.operation is OperationType.UPDATE
+    assert result.review_status is ReviewStatus.AUTO_READY and result.validation_alerts == []
+
+    one_edit = matched.model_copy(update={"human_overrides": {"quantity": "2"}})
+    assert validate_record(one_edit).validation_alerts == []
+
+    both_edited = matched.model_copy(
+        update={"human_overrides": {"quantity": "2", "unit_price": "15.00"}}
+    )
+    checked = validate_record(both_edited)
+    _assert_review(checked, AlertCode.LINE_ARITHMETIC_MISMATCH)
+    assert [(alert.expected, alert.actual) for alert in checked.validation_alerts] == [
         ("30.00", "35.00")
     ]
 
@@ -291,15 +307,18 @@ def test_fully_inherited_arithmetic_does_not_block_payment_term_only_updates() -
 
 @pytest.mark.parametrize("status", [ReviewStatus.APPROVED, ReviewStatus.REJECTED])
 def test_resolved_alert_stays_resolved_for_the_same_source_value(status: ReviewStatus) -> None:
-    original = ValidationAlert.from_code(
-        AlertCode.INVALID_OR_MISSING_CURRENCY, "Invalid currency", field="currency", actual="ZZZ"
+    bad_container = "JXLU4504464"
+    resolved = ValidationAlert(
+        code=AlertCode.CONTAINER_ISO6346_MISMATCH,
+        severity=AlertSeverity.RESOLVED,
+        message="箱号已复核",
+        field="container_nos",
+        actual=bad_container,
     )
-    resolved = original.model_copy(update={"severity": AlertSeverity.RESOLVED})
     line = _line(
         review_status=status,
-        raw_invalid_fields={"currency": "ZZZ"},
-        raw_parse_issues=[original],
-        validation_alerts=[resolved, original],
+        shipment_refs={"container_nos": [bad_container]},
+        validation_alerts=[resolved],
     )
 
     result = validate_record(line)
@@ -307,8 +326,19 @@ def test_resolved_alert_stays_resolved_for_the_same_source_value(status: ReviewS
     assert result.validation_alerts == [resolved]
     assert result.operation is OperationType.CREATE
     assert result.review_status is status
-    changed = line.model_copy(update={"raw_invalid_fields": {"currency": "XYZ"}})
-    _assert_review(validate_record(changed), AlertCode.INVALID_OR_MISSING_CURRENCY)
+    changed = line.model_copy(
+        update={
+            "shipment_refs": line.shipment_refs.model_copy(
+                update={"container_nos": ["MSCU663987O"]}
+            )
+        }
+    )
+    (warning,) = validate_record(changed).validation_alerts
+    assert (warning.code, warning.severity, warning.actual) == (
+        AlertCode.CONTAINER_ISO6346_MISMATCH,
+        AlertSeverity.WARNING,
+        "MSCU663987O",
+    )
 
 
 def test_validator_recomputes_entity_gate_and_preserves_match_ambiguity() -> None:
@@ -366,6 +396,54 @@ def test_same_entity_recalculation_rematches_against_reloaded_history_without_ca
     assert approved.matched_existing_bill_id == "old" and approved.amount == Decimal("30")
 
 
+@pytest.mark.parametrize("status", [ReviewStatus.APPROVED, ReviewStatus.REJECTED])
+def test_unchanged_recalculation_keeps_manual_decision_under_an_entity_alias(
+    status: ReviewStatus,
+) -> None:
+    profiles = [AccountingEntityProfile(canonical_name=ENTITY, aliases=["Neptune"])]
+    source = _line(reference_no="NOTICE-1", issuer=ENTITY, recipient="Buyer", amount="35")
+    bills = [_bill(issuer=ENTITY, recipient="Buyer")]
+    history = [HumanReviewAction(action=status, operator="reviewer", timestamp="2026-02-28")]
+    reason = "duplicate" if status is ReviewStatus.REJECTED else None
+    original = validate_record(match_record(source, bills, profiles)).model_copy(
+        update={"review_status": status, "reject_reason": reason, "human_review_history": history}
+    )
+
+    (recalculated,), reset = recalculate_for_entity([original], "Neptune", profiles, bills)
+
+    assert reset == 0
+    assert recalculated.review_status is status
+    assert recalculated.reject_reason == reason
+    assert recalculated.human_review_history == history
+    assert recalculated.operation is OperationType.UPDATE
+    assert len(serialize_records([recalculated], "official")) == (status is ReviewStatus.APPROVED)
+
+
+@pytest.mark.parametrize("change", ["amount", "total_gate"])
+def test_effective_amount_or_new_total_gate_resets_a_rejection(change: str) -> None:
+    source = _line(issuer=ENTITY, recipient="Buyer", amount="30")
+    (balanced,) = validate_batch([source], [_bundle(total_amount="30")])
+    rejected = balanced.model_copy(
+        update={"review_status": ReviewStatus.REJECTED, "reject_reason": "duplicate"}
+    )
+    bundles = []
+    if change == "amount":
+        rejected = rejected.model_copy(update={"human_overrides": {"amount": "30.01"}})
+    else:
+        bundles = [_bundle(total_amount="40")]
+
+    (recalculated,), reset = recalculate_for_entity([rejected], ENTITY, bundles=bundles)
+
+    assert reset == 1
+    assert recalculated.reject_reason is None
+    if change == "amount":
+        assert recalculated.amount == Decimal("30.01")
+        assert recalculated.review_status is ReviewStatus.AUTO_READY
+    else:
+        assert recalculated.amount == balanced.amount
+        _assert_review(recalculated, AlertCode.AMOUNT_TOTAL_MISMATCH)
+
+
 def test_document_total_survives_detached_revalidation_and_updates_with_new_bundles() -> None:
     line = _line(issuer=ENTITY, recipient="Buyer", amount="30")
     original_bundle = _bundle(total_amount="40", total_currency="USD")
@@ -376,6 +454,8 @@ def test_document_total_survives_detached_revalidation_and_updates_with_new_bund
     assert mismatch.source_doc_totals.total_amount == Decimal("40")
 
     detached = ProcessedBillingRecord.model_validate_json(mismatch.model_dump_json())
+    _assert_review(validate_record(detached), AlertCode.AMOUNT_TOTAL_MISMATCH)
+    assert serialize_records([validate_record(detached)], "official") == []
     (direct,) = validate_records([detached])
     _assert_review(direct, AlertCode.AMOUNT_TOTAL_MISMATCH)
     (recalculated,), _ = recalculate_for_entity(
@@ -392,6 +472,70 @@ def test_document_total_survives_detached_revalidation_and_updates_with_new_bund
     assert balanced.operation is OperationType.CREATE and balanced.validation_alerts == []
     (detached_again,) = validate_records([balanced])
     assert detached_again == balanced
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        AlertCode.AMOUNT_TOTAL_MISMATCH,
+        AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH,
+        AlertCode.MULTI_CURRENCY_TOTAL_AMBIGUITY,
+        AlertCode.DUPLICATE_LINE_EXTRACTED,
+        AlertCode.CROSS_DOCUMENT_CONFLICT,
+        AlertCode.MULTI_SOURCE_BL_MISMATCH,
+        AlertCode.OCR_SUSPICIOUS_FLAG,
+    ],
+)
+def test_single_line_validation_keeps_prior_contextual_alerts(code: AlertCode) -> None:
+    alert = ValidationAlert.from_code(code, "依赖完整文档或邮件包复核")
+    result = validate_record(_line(validation_alerts=[alert]))
+
+    assert result.validation_alerts == [alert]
+    assert result.operation is OperationType.PENDING_REVIEW
+    assert result.review_status is ReviewStatus.NEEDS_REVIEW
+
+
+def test_revalidating_original_bundle_respects_each_rows_valid_edits_and_keeps_audit() -> None:
+    parsed = parse_llm_raw_extraction("""{
+        "document_date": "2026-02-30",
+        "charges": [{"raw_charge_name": "Handling Charge", "amount": "1.310.40", "currency": "ZZZ"}]
+    }""")
+    (raw,) = parsed.charges
+    bundle = _bundle().model_copy(update={"extraction": parsed})
+    source = _line(
+        amount=raw.charge.amount,
+        currency=raw.charge.currency,
+        raw_amount_text=raw.raw_amount_text,
+        raw_invalid_fields=raw.raw_invalid_fields | parsed.raw_invalid_fields,
+        raw_parse_issues=[*raw.raw_parse_issues, *parsed.raw_parse_issues],
+        human_overrides={"currency": "USD", "document_date": "2026-02-28", "amount": "30.00"},
+    )
+    invalid_edit = source.model_copy(
+        update={
+            "id": "invalid",
+            "human_overrides": source.human_overrides | {"document_date": "2026-02-31"},
+        }
+    )
+
+    fixed, blocked = validate_batch(match_and_inherit_batch([source, invalid_edit], []), [bundle])
+
+    assert (fixed.currency, fixed.document_date, fixed.amount) == (
+        "USD",
+        "2026-02-28",
+        Decimal("30.00"),
+    )
+    assert (fixed.operation, fixed.review_status) == (OperationType.CREATE, ReviewStatus.AUTO_READY)
+    assert fixed.validation_alerts == []
+    assert fixed.raw_invalid_fields == source.raw_invalid_fields
+    assert fixed.raw_parse_issues == source.raw_parse_issues
+    (exported,) = serialize_records([fixed], "audit")
+    assert exported["audit_trail"]["raw_invalid_fields"] == {
+        "currency": "ZZZ",
+        "document_date": "2026-02-30",
+        "amount": "1.310.40",
+    }
+    _assert_review(blocked, AlertCode.INVALID_DOCUMENT_DATE)
+    assert {issue.actual for issue in blocked.validation_alerts} == {"2026-02-30", "2026-02-31"}
 
 
 def test_human_overrides_fix_only_corresponding_original_format_alerts() -> None:
@@ -563,7 +707,7 @@ def test_human_override_on_inherited_amount_is_counted_until_the_edit_is_removed
 
     edited = matched.model_copy(update={"human_overrides": {"amount": "60"}})
     (blocked,) = validate_records([edited])
-    assert _codes(blocked) == {AlertCode.AMOUNT_TOTAL_MISMATCH, AlertCode.LINE_ARITHMETIC_MISMATCH}
+    assert _codes(blocked) == {AlertCode.AMOUNT_TOTAL_MISMATCH}
 
     removed_edit = blocked.model_copy(update={"human_overrides": {}})
     (reverted,), _ = recalculate_for_entity([removed_edit], ENTITY, existing_bills=[old])
@@ -678,14 +822,19 @@ def test_incomplete_resolution_never_suppresses_current_container_warnings(
     }
 
 
-def test_total_confirmation_is_matched_against_the_recomputed_document_alert() -> None:
+def test_exact_total_confirmation_cannot_release_the_blocker() -> None:
     (blocked,) = validate_batch([_line()], [_bundle(total_amount="110")])
     (alert,) = blocked.validation_alerts
+    with pytest.raises(ValueError, match="告警严重度"):
+        ValidationAlert.model_validate(alert.model_dump() | {"severity": AlertSeverity.RESOLVED})
+
+    # model_copy bypasses validation and represents a legacy in-memory confirmation.
     confirmation = alert.model_copy(update={"severity": AlertSeverity.RESOLVED})
     confirmed = blocked.model_copy(update={"validation_alerts": [confirmation]})
     (revalidated,) = validate_records([confirmed])
-    assert revalidated.validation_alerts == [confirmation]
-    assert revalidated.operation is OperationType.CREATE
+    _assert_review(revalidated, AlertCode.AMOUNT_TOTAL_MISMATCH)
+    assert revalidated.validation_alerts == [alert]
+    _assert_review(validate_record(confirmed), AlertCode.AMOUNT_TOTAL_MISMATCH)
 
     changed = confirmed.model_copy(update={"human_overrides": {"amount": "105"}})
     (fresh,) = validate_records([changed])
@@ -693,6 +842,10 @@ def test_total_confirmation_is_matched_against_the_recomputed_document_alert() -
     assert [(alert.actual, alert.severity) for alert in fresh.validation_alerts] == [
         ("105", AlertSeverity.BLOCKER)
     ]
+    repaired = confirmed.model_copy(update={"human_overrides": {"amount": "110"}})
+    (ready,) = validate_records([repaired])
+    assert ready.operation is OperationType.CREATE
+    assert ready.validation_alerts == []
 
 
 def test_ocr_suspicion_from_payload_item_is_a_warning() -> None:
@@ -781,6 +934,62 @@ def test_currency_totals_are_independent_and_do_not_offset_one_another() -> None
             "totals_by_currency.USD",
             "totals_by_currency.EUR",
         }
+
+
+@pytest.mark.parametrize("declare_subtotals", [True, False])
+def test_multicurrency_totals_include_the_tax_for_each_currency(declare_subtotals: bool) -> None:
+    lines = [
+        _line("usd", amount="30", issuer=ENTITY),
+        _line("eur", currency="EUR", amount="40", issuer=ENTITY),
+    ]
+    subtotals = {"USD": "30", "EUR": "40"} if declare_subtotals else {}
+    taxes = {"USD": "3", "EUR": "4"}
+    balanced = _bundle(
+        subtotals_by_currency=subtotals,
+        taxes_by_currency=taxes,
+        totals_by_currency={"USD": "33", "EUR": "44"},
+    )
+    off = _bundle(
+        subtotals_by_currency=subtotals,
+        taxes_by_currency=taxes,
+        totals_by_currency={"USD": "30", "EUR": "40"},
+    )
+
+    results = validate_batch(lines, [balanced])
+    assert all(row.review_status is ReviewStatus.AUTO_READY for row in results)
+    for row in results:
+        assert row.source_doc_totals is not None
+        assert row.source_doc_totals.subtotals_by_currency == {
+            currency: Decimal(amount) for currency, amount in subtotals.items()
+        }
+        assert row.source_doc_totals.taxes_by_currency == {"USD": Decimal("3"), "EUR": Decimal("4")}
+    detached = [
+        ProcessedBillingRecord.model_validate_json(row.model_dump_json()) for row in results
+    ]
+    rechecked, _ = recalculate_for_entity(detached, ENTITY)
+    assert all(row.operation is OperationType.CREATE for row in rechecked)
+
+    code = (
+        AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH
+        if declare_subtotals
+        else AlertCode.AMOUNT_TOTAL_MISMATCH
+    )
+    for row in validate_batch(lines, [off]):
+        _assert_review(row, code)
+        assert {(alert.field, alert.actual) for alert in row.validation_alerts} == {
+            ("totals_by_currency.USD", "33"),
+            ("totals_by_currency.EUR", "44"),
+        }
+
+
+def test_each_currency_subtotal_is_checked_even_without_grand_totals() -> None:
+    lines = [_line("usd", amount="30"), _line("eur", currency="EUR", amount="40")]
+    summary = _bundle(subtotals_by_currency={"USD": "30.02", "EUR": "40.021"})
+
+    for row in validate_batch(lines, [summary]):
+        _assert_review(row, AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH)
+        assert [alert.field for alert in row.validation_alerts] == ["subtotals_by_currency.EUR"]
+        assert "单据无汇总行，免汇总对账" not in row.ai_reasoning
 
 
 def test_unallocated_total_cannot_combine_different_legal_currencies() -> None:
@@ -943,6 +1152,19 @@ def test_duplicate_group_cannot_mix_currency_when_only_one_currency_exceeds_its_
     for result in validate_batch(rows, [_bundle(totals_by_currency={"USD": "0", "EUR": "35"})]):
         _assert_review(result, AlertCode.AMOUNT_TOTAL_MISMATCH)
         assert AlertCode.DUPLICATE_LINE_EXTRACTED not in _codes(result)
+
+
+@pytest.mark.parametrize(
+    "field, first, second",
+    [("payment_term", "PP", "CC"), ("debit_credit", "DEBIT", "UNKNOWN")],
+)
+def test_duplicate_charge_attribution_keeps_distinct_terms_and_directions_separate(
+    field: str, first: str, second: str
+) -> None:
+    rows = [_line("a", amount="35", **{field: first}), _line("b", amount="35", **{field: second})]
+    for result in validate_batch(rows, [_bundle(subtotal_amount="35")]):
+        _assert_review(result, AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH)
+        assert _codes(result) == {AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH}
 
 
 @pytest.mark.parametrize(
@@ -1111,3 +1333,56 @@ def test_package_warns_about_conflicting_hbls_and_clears_after_realignment() -> 
     realigned = _bundle("second", parent_doc_id="mail", shipment_refs={"hbl_no": " ｈｂｌ - ａ "})
     (fixed,) = validate_batch([checked], [body, first, realigned])
     assert fixed.validation_alerts == [] and fixed.operation is OperationType.CREATE
+
+
+def test_detached_recalculation_keeps_both_package_conflicts_and_the_source_total() -> None:
+    body = _bundle("body", parent_doc_id="mail", source_kind="EML_BODY", total_amount="40")
+    attachments = [
+        _bundle(
+            doc_id,
+            parent_doc_id="mail",
+            shipment_refs={
+                "hbl_no": f"HBL-{doc_id}",
+                "mbl_nos": [{"value": f"MBL-{doc_id}", "source": f"{doc_id}.pdf"}],
+            },
+        )
+        for doc_id in ("A", "B")
+    ]
+    source = _line("instruction", "body", amount="30", issuer=ENTITY, recipient="Buyer")
+    (checked,) = validate_batch([source], [body, *attachments])
+    expected = {
+        (AlertCode.AMOUNT_TOTAL_MISMATCH, "total_amount", "30"),
+        (AlertCode.MULTI_SOURCE_BL_MISMATCH, "mbl_nos", "MBL-A、MBL-B"),
+        (AlertCode.MULTI_SOURCE_BL_MISMATCH, "hbl_no", "HBL-A、HBL-B"),
+    }
+    assert {
+        (alert.code, alert.field, alert.actual) for alert in checked.validation_alerts
+    } == expected
+    detached = ProcessedBillingRecord.model_validate_json(checked.model_dump_json())
+    assert {refs.source_doc_id for refs in detached.package_sibling_refs} == {"body", "A", "B"}
+
+    for new_entity in (ENTITY, "Buyer"):
+        (recalculated,), _ = recalculate_for_entity([detached], new_entity)
+        assert recalculated.validation_alerts == checked.validation_alerts
+        assert recalculated.source_doc_totals == checked.source_doc_totals
+        assert recalculated.shipment_refs.mbl_nos == checked.shipment_refs.mbl_nos
+        assert serialize_records([recalculated], "official") == []
+
+    legacy = detached.model_copy(update={"package_sibling_refs": [], "source_doc_totals": None})
+    (recalculated,), _ = recalculate_for_entity([legacy], ENTITY)
+    assert recalculated.validation_alerts == checked.validation_alerts
+
+
+def test_detached_package_reconciles_a_corrected_hbl_using_original_sibling_evidence() -> None:
+    first = _bundle("first", parent_doc_id="mail", shipment_refs={"hbl_no": "HBL-A"})
+    second = _bundle("second", parent_doc_id="mail", shipment_refs={"hbl_no": "HBL-B"})
+    source = _line("instruction", "second", issuer=ENTITY, shipment_refs={"hbl_no": "HBL-B"})
+    (checked,) = validate_batch([source], [first, second])
+    edited = checked.model_copy(update={"human_overrides": {"hbl_no": "HBL-A"}})
+
+    (recalculated,), _ = recalculate_for_entity([edited], ENTITY)
+
+    assert recalculated.validation_alerts == []
+    assert recalculated.operation is OperationType.CREATE
+    assert recalculated.shipment_refs.hbl_no == "HBL-A"
+    assert recalculated.package_sibling_refs == checked.package_sibling_refs

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from shipping_billing_agent.domain import CREDIT_DOCUMENT_PATTERN, is_credit_document_type
 from shipping_billing_agent.domain.charge_normalizer import (
     normalize_charge_item,
     normalize_document_date,
@@ -232,6 +233,8 @@ def test_source_json_overrides_lossy_typed_fallback_and_keeps_decimal_totals() -
         """{
             "subtotal_amount": 9007199254740991.0100, "tax_amount": 0.0025,
             "total_amount": 9007199254740991.0125, "total_currency": "USD",
+            "subtotals_by_currency": {"USD": 9007199254740991.0100},
+            "taxes_by_currency": {"USD": 0.0025},
             "totals_by_currency": {"USD": 9007199254740991.0125}, "document_date": "10-24-2026",
             "charges": [{"raw_charge_name": "Wharfage", "amount": 9007199254740991.01,
                          "unit_price": 0.0025, "currency": " $ ",
@@ -243,6 +246,8 @@ def test_source_json_overrides_lossy_typed_fallback_and_keeps_decimal_totals() -
     assert result.subtotal_amount.as_tuple() == Decimal("9007199254740991.0100").as_tuple()
     assert result.tax_amount == Decimal("0.0025")
     assert result.total_amount == Decimal("9007199254740991.0125")
+    assert result.subtotals_by_currency["USD"].as_tuple() == result.subtotal_amount.as_tuple()
+    assert result.taxes_by_currency == {"USD": Decimal("0.0025")}
     assert result.totals_by_currency == {"USD": Decimal("9007199254740991.0125")}
     charge = result.charges[0]
     assert charge.charge.amount == Decimal("9007199254740991.01")
@@ -509,8 +514,37 @@ def test_negative_non_credit_amount_keeps_its_sign_and_blocks_the_record() -> No
     ]
 
 
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Credit Note",
+        "Credit Memo",
+        "Credit Invoice",
+        "Credit Advice",
+        "Credit Voucher",
+        "Credit Adjustment",
+        "C/N",
+        "CN",
+        "贷项通知",
+        "贷项凭证",
+        "贷项",
+        "红字",
+    ],
+)
+def test_credit_document_vocabulary_is_shared_with_title_extraction(title: str) -> None:
+    assert is_credit_document_type(title)
+    match = CREDIT_DOCUMENT_PATTERN.match(f"{title} REF-123")
+    assert match is not None and match[0] == title
+    result = resolve_entity_perspective(
+        ZIM, issuer=ZIM, document_type=title, raw_amount=Decimal("30")
+    )
+    assert result.amount == Decimal("-30")
+
+
 @pytest.mark.parametrize("document_type", ["Credit Card Invoice", "Letter of Credit"])
 def test_credit_in_non_credit_titles_never_negates_a_charge(document_type: str) -> None:
+    assert not is_credit_document_type(document_type)
+    assert CREDIT_DOCUMENT_PATTERN.search(document_type) is None
     result = resolve_entity_perspective(
         ZIM, issuer=ZIM, document_type=document_type, raw_amount=Decimal("30")
     )
@@ -567,7 +601,7 @@ def test_switching_entity_resets_approvals_links_and_inherited_values_before_rem
         ],
         raw_invalid_fields={"document_date": "2026-02-30"},
         raw_parse_issues=[invalid_date],
-        validation_alerts=[invalid_date.model_copy(update={"severity": AlertSeverity.RESOLVED})],
+        validation_alerts=[invalid_date],
         inherited_fields={"amount": None, "currency": None, "document_date": None},
         human_overrides={
             "raw_charge_name": "Handling adjustment",

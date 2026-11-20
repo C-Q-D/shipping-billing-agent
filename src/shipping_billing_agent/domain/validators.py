@@ -20,11 +20,14 @@ from .entity_resolver import (
     source_format_alerts,
 )
 from .models import (
+    ALERT_SEVERITY_MAP,
     DECIMAL_TOLERANCE,
     AlertCode,
     AlertSeverity,
     DocumentExtractionBundle,
     OperationType,
+    PackageShipmentRefs,
+    PaymentTerm,
     ProcessedBillingRecord,
     ReviewStatus,
     ShipmentRefs,
@@ -37,19 +40,24 @@ from .models import (
 
 _ZERO = Decimal(0)
 _NUMERIC_FIELDS = ("amount", "quantity", "unit_price")
-_RECALCULATED_CODES = {
+_LINE_ALERT_CODES = {
     AlertCode.LINE_ARITHMETIC_MISMATCH,
     AlertCode.NEGATIVE_NON_CREDIT_AMOUNT,
     AlertCode.INVALID_OR_MISSING_CURRENCY,
     AlertCode.INVALID_DOCUMENT_DATE,
     AlertCode.ENTITY_NOT_MATCHED,
+    AlertCode.OCR_NUMERIC_CONFUSION,
+    AlertCode.CONTAINER_ISO6346_MISMATCH,
+}
+_TOTAL_ALERT_CODES = {
     AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH,
     AlertCode.AMOUNT_TOTAL_MISMATCH,
     AlertCode.MULTI_CURRENCY_TOTAL_AMBIGUITY,
-    AlertCode.OCR_NUMERIC_CONFUSION,
+}
+_CONTEXT_ALERT_CODES = {
+    *_TOTAL_ALERT_CODES,
     AlertCode.DUPLICATE_LINE_EXTRACTED,
     AlertCode.CROSS_DOCUMENT_CONFLICT,
-    AlertCode.CONTAINER_ISO6346_MISMATCH,
     AlertCode.OCR_SUSPICIOUS_FLAG,
     AlertCode.MULTI_SOURCE_BL_MISMATCH,
 }
@@ -113,13 +121,16 @@ def _amounts_differ(left: Decimal, right: Decimal) -> bool:
 
 
 def _with_alerts(
-    record: ProcessedBillingRecord, additions: Sequence[ValidationAlert]
+    record: ProcessedBillingRecord,
+    additions: Sequence[ValidationAlert],
+    recalculated: set[AlertCode],
 ) -> ProcessedBillingRecord:
     prior = [*record.validation_alerts, *additions]
     resolved = {
         (alert.code, alert.field, alert.actual): alert
         for alert in prior
         if alert.severity is AlertSeverity.RESOLVED
+        and ALERT_SEVERITY_MAP[alert.code] is AlertSeverity.WARNING
         and alert.field
         and alert.field.strip()
         and alert.actual
@@ -128,18 +139,20 @@ def _with_alerts(
     upstream = [
         alert
         for alert in record.validation_alerts
-        if alert.code not in _RECALCULATED_CODES
+        if alert.code not in recalculated
         and alert not in record.raw_parse_issues
         and not (alert.code is AlertCode.LLM_EXTRACTION_FAILED and alert.field is not None)
     ]
     alerts = {}
     for alert in (*upstream, *additions):
-        if alert.severity is not AlertSeverity.RESOLVED:
-            key = (alert.code, alert.field, alert.actual)
-            if confirmation := resolved.get(key):
-                alerts.setdefault((*key, confirmation.expected), confirmation)
-            else:
-                alerts.setdefault((*key, alert.expected), alert)
+        if alert.severity is AlertSeverity.RESOLVED:
+            severity = ALERT_SEVERITY_MAP[alert.code]
+            if severity is AlertSeverity.WARNING and alert.code not in _CONTEXT_ALERT_CODES:
+                continue
+            alert = alert.model_copy(update={"severity": severity})
+        key = (alert.code, alert.field, alert.actual)
+        current = resolved.get(key, alert)
+        alerts.setdefault((*key, current.expected), current)
 
     operation, status = record.operation, record.review_status
     if any(
@@ -171,15 +184,13 @@ def _is_finite_number(value: object) -> bool:
 def _line_arithmetic_alert(
     record: ProcessedBillingRecord, invalid: set[str]
 ) -> ValidationAlert | None:
-    quantity, unit_price = record.quantity, record.unit_price
-    if not (_is_finite_number(quantity) and _is_finite_number(unit_price)) or invalid.intersection(
-        _NUMERIC_FIELDS
+    quantity, unit_price, target = record.quantity, record.unit_price, record.amount
+    if invalid.intersection(_NUMERIC_FIELDS) or not all(
+        _is_finite_number(value) for value in (quantity, unit_price, target)
     ):
         return None
-    current_fields = set(_NUMERIC_FIELDS) - (
-        record.inherited_fields.keys() - record.human_overrides.keys()
-    )
-    if not current_fields:
+    historical_fields = record.inherited_fields.keys() - record.human_overrides.keys()
+    if historical_fields.intersection(_NUMERIC_FIELDS):
         return None
 
     if quantity >= 0 and unit_price < 0:
@@ -190,9 +201,6 @@ def _line_arithmetic_alert(
             actual=str(unit_price),
         )
 
-    target = record.amount
-    if not _is_finite_number(target):
-        return None
     if record.is_credit:
         target, unit_price = target.copy_abs(), unit_price.copy_abs()
     precision = len(quantity.as_tuple().digits) + len(unit_price.as_tuple().digits)
@@ -332,7 +340,7 @@ def _line_alerts(
 
 def _prepare_line(
     record: ProcessedBillingRecord,
-) -> tuple[ProcessedBillingRecord, list[ValidationAlert]]:
+) -> tuple[ProcessedBillingRecord, set[str], list[ValidationAlert]]:
     record, corrected, override_issues = apply_human_overrides(record)
     if record.document_type or record.debit_credit != "UNKNOWN":
         credit = is_credit_document(record.document_type, record.debit_credit)
@@ -343,13 +351,13 @@ def _prepare_line(
     evidence = record.source_evidence.with_sanitized_paths()
     if evidence != record.source_evidence:
         record = record.model_copy(update={"source_evidence": evidence})
-    return record, _line_alerts(record, corrected, override_issues)
+    return record, corrected, _line_alerts(record, corrected, override_issues)
 
 
 def validate_record(record: ProcessedBillingRecord) -> ProcessedBillingRecord:
     """Apply line gates using the current fields and the original parse evidence."""
-    record, alerts = _prepare_line(record)
-    return _with_alerts(record, alerts)
+    record, _, alerts = _prepare_line(record)
+    return _with_alerts(record, alerts, _LINE_ALERT_CODES)
 
 
 def _document_groups(
@@ -492,6 +500,65 @@ def _total_alert(
     )
 
 
+def _reconcile_currency_totals(
+    by_currency: dict[str, list[Decimal]], totals: SourceDocTotalsSnapshot, credit_only: bool
+) -> tuple[list[ValidationAlert], dict[str, Decimal]]:
+    alerts = []
+    excess_by_currency = {}
+    declared = totals.subtotals_by_currency.keys() | totals.totals_by_currency.keys()
+    for currency in sorted(declared):
+        lines = _decimal_sum(by_currency.get(currency, ()))
+        subtotal = totals.subtotals_by_currency.get(currency)
+        tax = totals.taxes_by_currency.get(currency, _ZERO)
+        total = totals.totals_by_currency.get(currency)
+        expected_total = total if total is not None else _ZERO
+        if credit_only:
+            lines = lines.copy_abs()
+            expected_total = expected_total.copy_abs()
+
+        if subtotal is not None:
+            expected_lines = subtotal.copy_abs() if credit_only else subtotal
+            if _amounts_differ(lines, expected_lines):
+                alerts.append(
+                    _total_alert(
+                        AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH,
+                        f"subtotals_by_currency.{currency}",
+                        f"{currency} 明细合计与源单同币种小计不符",
+                        subtotal,
+                        lines,
+                    )
+                )
+            calculated = _decimal_sum((subtotal, tax))
+            code = AlertCode.AMOUNT_SUBTOTAL_TAX_MISMATCH
+            message = f"{currency} 小计加税额与源单同币种总额不符"
+        else:
+            line_tax = tax.copy_abs() if credit_only else tax
+            expected_lines = _decimal_sum((expected_total, line_tax.copy_negate()))
+            calculated = _decimal_sum((lines, line_tax))
+            code = AlertCode.AMOUNT_TOTAL_MISMATCH
+            message = f"{currency} 明细合计及税额与源单同币种总额不符"
+
+        excess_by_currency[currency] = _decimal_sum((lines, expected_lines.copy_negate()))
+        if total is not None:
+            actual = calculated.copy_abs() if credit_only else calculated
+            if _amounts_differ(actual, expected_total):
+                alerts.append(
+                    _total_alert(code, f"totals_by_currency.{currency}", message, total, actual)
+                )
+
+    if totals.totals_by_currency:
+        for currency in sorted(by_currency.keys() - declared):
+            alerts.append(
+                ValidationAlert.from_code(
+                    AlertCode.AMOUNT_TOTAL_MISMATCH,
+                    f"源单缺少 {currency} 的分币种小计或总额",
+                    field=f"totals_by_currency.{currency}",
+                    actual=str(_decimal_sum(by_currency[currency])),
+                )
+            )
+    return alerts, excess_by_currency
+
+
 def _reconcile_totals(
     records: Sequence[ProcessedBillingRecord], totals: SourceDocTotalsSnapshot
 ) -> tuple[list[ValidationAlert], dict[str, Decimal], bool]:
@@ -511,31 +578,8 @@ def _reconcile_totals(
             by_currency[record.currency].append(signed)
     credit_only = bool(amounts) and credit_only
 
-    if totals.totals_by_currency:
-        for currency, total in totals.totals_by_currency.items():
-            actual = _decimal_sum(by_currency.get(currency, ()))
-            expected = total.copy_abs().copy_negate() if credit_only else total
-            difference = _decimal_sum((actual, expected.copy_negate()))
-            excess_by_currency[currency] = difference.copy_negate() if credit_only else difference
-            if _amounts_differ(actual, expected):
-                alerts.append(
-                    _total_alert(
-                        AlertCode.AMOUNT_TOTAL_MISMATCH,
-                        f"totals_by_currency.{currency}",
-                        f"{currency} 明细合计与源单同币种总额不符",
-                        total,
-                        actual,
-                    )
-                )
-        for currency in sorted(by_currency.keys() - totals.totals_by_currency.keys()):
-            alerts.append(
-                ValidationAlert.from_code(
-                    AlertCode.AMOUNT_TOTAL_MISMATCH,
-                    f"源单缺少 {currency} 的分币种总额",
-                    field=f"totals_by_currency.{currency}",
-                    actual=str(_decimal_sum(by_currency[currency])),
-                )
-            )
+    if totals.subtotals_by_currency or totals.totals_by_currency:
+        alerts, excess_by_currency = _reconcile_currency_totals(by_currency, totals, credit_only)
         return alerts, excess_by_currency, credit_only
 
     subtotal, total = totals.subtotal_amount, totals.total_amount
@@ -602,7 +646,9 @@ def _duplicate_line_alerts(
     credit_only: bool,
 ) -> dict[int, list[ValidationAlert]]:
     by_position: dict[tuple[str | None, int | None, int], list[int]] = defaultdict(list)
-    by_charge: dict[tuple[str, str, Decimal], list[int]] = defaultdict(list)
+    by_charge: dict[tuple[str, str, Decimal, PaymentTerm | None, str], list[int]] = defaultdict(
+        list
+    )
     for index, record in enumerate(records):
         evidence = record.source_evidence
         if evidence.line_number is not None:
@@ -614,7 +660,9 @@ def _duplicate_line_alerts(
         contribution = raw.copy_abs() if credit_only else _signed_amount(record, raw)
         charge, _ = normalize_charge_item(record.charge_item)
         if charge and contribution > 0:
-            by_charge[currency, charge, contribution].append(index)
+            by_charge[
+                charge, currency, contribution, record.payment_term, record.debit_credit
+            ].append(index)
 
     alerts: dict[int, list[ValidationAlert]] = defaultdict(list)
     for (_, page, line), indexes in by_position.items():
@@ -629,7 +677,7 @@ def _duplicate_line_alerts(
                     )
                 )
     tolerance = Fraction(DECIMAL_TOLERANCE)
-    for (currency, _, amount), indexes in by_charge.items():
+    for (_, currency, amount, _, _), indexes in by_charge.items():
         excess = Fraction(excess_by_currency[currency])
         if any(
             abs(excess - count * Fraction(amount)) <= count * tolerance
@@ -775,105 +823,152 @@ def _cross_document_alerts(
     return alerts
 
 
+def _snapshot_package_source(
+    doc_id: str,
+    bundles: dict[str, DocumentExtractionBundle],
+    doc_records: Sequence[ProcessedBillingRecord],
+) -> PackageShipmentRefs:
+    bundle = bundles[doc_id]
+    own = bundle.extraction.extraction.shipment_refs if bundle.extraction else ShipmentRefs()
+    originals = [
+        ShipmentRefs.model_validate(record.source_values_before_overrides["shipment_refs"] or {})
+        if "shipment_refs" in record.source_values_before_overrides
+        else _source_refs(record)
+        for record in doc_records
+    ]
+    hbls = [own.hbl_no] if own.hbl_no else [refs.hbl_no for refs in originals]
+    mbls = None
+    if bundle.document.source_kind is not SourceKind.EML_BODY:
+        source_path = _document_path(doc_id, bundles)
+        original_mbls = [ref for refs in originals for ref in refs.mbl_nos]
+        mbls = [
+            SourceRefValue(value=ref.value, source=sanitize_source_path(ref.source) or source_path)
+            for ref in (*original_mbls, *own.mbl_nos)
+        ]
+    return PackageShipmentRefs(
+        source_doc_id=doc_id, mbl_nos=mbls, hbl_nos=[hbl for hbl in hbls if hbl]
+    )
+
+
+def _package_conflicts(
+    sources: Sequence[PackageShipmentRefs],
+    records: Sequence[ProcessedBillingRecord],
+    corrected: Sequence[set[str]],
+    indexes_by_doc: dict[str, list[int]],
+) -> tuple[list[ValidationAlert], list[SourceRefValue]]:
+    mbl_sources = []
+    mbl_evidence = {}
+    hbl_sources = []
+    hbl_evidence = {}
+    for source in sources:
+        indexes = indexes_by_doc.get(source.source_doc_id, ())
+        edited_hbls = [
+            records[index].shipment_refs.hbl_no for index in indexes if "hbl_no" in corrected[index]
+        ]
+        hbl_keys = set()
+        for hbl in edited_hbls or source.hbl_nos:
+            if key := _reference_key(hbl):
+                hbl_keys.add(key)
+                hbl_evidence.setdefault(key, hbl)
+        if hbl_keys:
+            hbl_sources.append(hbl_keys)
+
+        mbls = source.mbl_nos
+        if mbls is None:
+            continue
+        if any("mbl_no" in corrected[index] for index in indexes):
+            refs = [
+                records[index].shipment_refs
+                if "mbl_no" in corrected[index]
+                else _source_refs(records[index])
+                for index in indexes
+            ]
+            mbls = [ref for row_refs in refs for ref in row_refs.mbl_nos]
+        mbl_keys = set()
+        for ref in mbls:
+            if key := _reference_key(ref.value):
+                mbl_keys.add(key)
+                label = sanitize_source_path(ref.source) or source.source_doc_id
+                mbl_evidence.setdefault((key, label), SourceRefValue(value=ref.value, source=label))
+        if mbl_keys:
+            mbl_sources.append(mbl_keys)
+
+    alerts = []
+    package_mbls = []
+    if len(mbl_sources) > 1 and not set.intersection(*mbl_sources):
+        package_mbls = [mbl_evidence[key] for key in sorted(mbl_evidence)]
+        alerts.append(
+            ValidationAlert.from_code(
+                AlertCode.MULTI_SOURCE_BL_MISMATCH,
+                "同一邮件包的附件提供了不同的主提单号，待复核",
+                field="mbl_nos",
+                actual="、".join(dict.fromkeys(ref.value for ref in package_mbls)),
+            )
+        )
+    if len(hbl_sources) > 1 and not set.intersection(*hbl_sources):
+        alerts.append(
+            ValidationAlert.from_code(
+                AlertCode.MULTI_SOURCE_BL_MISMATCH,
+                "同一邮件包的子文档提供了不同的分提单号，待复核",
+                field="hbl_no",
+                actual="、".join(hbl_evidence[key] for key in sorted(hbl_evidence)),
+            )
+        )
+    return alerts, package_mbls
+
+
 def _merge_package_mbls(
     records: list[ProcessedBillingRecord],
     alerts_by_line: list[list[ValidationAlert]],
+    corrected: list[set[str]],
     indexes_by_doc: dict[str, list[int]],
     bundles: dict[str, DocumentExtractionBundle],
-) -> None:
+) -> set[str]:
     children: dict[str, list[str]] = defaultdict(list)
     for doc_id, bundle in bundles.items():
         if parent_id := bundle.document.parent_doc_id:
             children[parent_id].append(doc_id)
+
+    snapshots_by_doc = {}
     for parent_id, child_ids in children.items():
-        mbl_sources = []
-        mbl_evidence = {}
-        hbl_sources = []
-        hbl_evidence = {}
-        for doc_id in child_ids:
-            bundle = bundles[doc_id]
-            doc_records = [records[index] for index in indexes_by_doc.get(doc_id, ())]
-            own_refs = (
-                bundle.extraction.extraction.shipment_refs
-                if bundle.extraction is not None
-                else ShipmentRefs()
+        snapshots = [
+            _snapshot_package_source(
+                doc_id, bundles, [records[i] for i in indexes_by_doc.get(doc_id, ())]
             )
-            edited_hbls = [
-                record.shipment_refs.hbl_no
-                for record in doc_records
-                if record.human_overrides.keys() & {"shipment_refs", "hbl_no"}
-            ]
-            hbls = edited_hbls or (
-                [own_refs.hbl_no]
-                if own_refs.hbl_no
-                else [_source_refs(record).hbl_no for record in doc_records]
-            )
-            hbl_keys = set()
-            for hbl in hbls:
-                if key := _reference_key(hbl):
-                    hbl_keys.add(key)
-                    hbl_evidence.setdefault(key, hbl)
-            if hbl_keys:
-                hbl_sources.append(hbl_keys)
-
-            if bundle.document.source_kind is SourceKind.EML_BODY:
-                continue
-            refs = [ref for record in doc_records for ref in _source_refs(record).mbl_nos]
-            if not any(
-                record.human_overrides.keys() & {"shipment_refs", "mbl_no"}
-                for record in doc_records
-            ):
-                refs.extend(own_refs.mbl_nos)
-            keys = set()
-            for ref in refs:
-                if key := _reference_key(ref.value):
-                    keys.add(key)
-                    source = sanitize_source_path(ref.source) or _document_path(doc_id, bundles)
-                    mbl_evidence.setdefault(
-                        (key, source), SourceRefValue(value=ref.value, source=source)
-                    )
-            if keys:
-                mbl_sources.append(keys)
-
-        package_alerts = []
-        package_refs = []
-        if len(mbl_sources) > 1 and not set.intersection(*mbl_sources):
-            package_refs = [mbl_evidence[key] for key in sorted(mbl_evidence)]
-            package_alerts.append(
-                ValidationAlert.from_code(
-                    AlertCode.MULTI_SOURCE_BL_MISMATCH,
-                    "同一邮件包的附件提供了不同的主提单号，待复核",
-                    field="mbl_nos",
-                    actual="、".join(dict.fromkeys(ref.value for ref in package_refs)),
-                )
-            )
-        if len(hbl_sources) > 1 and not set.intersection(*hbl_sources):
-            package_alerts.append(
-                ValidationAlert.from_code(
-                    AlertCode.MULTI_SOURCE_BL_MISMATCH,
-                    "同一邮件包的子文档提供了不同的分提单号，待复核",
-                    field="hbl_no",
-                    actual="、".join(hbl_evidence[key] for key in sorted(hbl_evidence)),
-                )
-            )
-        if not package_alerts:
-            continue
+            for doc_id in sorted(child_ids)
+        ]
         for doc_id in (parent_id, *child_ids):
-            for index in indexes_by_doc.get(doc_id, ()):
-                alerts_by_line[index].extend(package_alerts)
-                record = records[index]
-                if not package_refs or record.human_overrides.keys() & {"shipment_refs", "mbl_no"}:
-                    continue
+            snapshots_by_doc[doc_id] = snapshots
+
+    checked_docs = set()
+    for doc_id, indexes in indexes_by_doc.items():
+        snapshots = snapshots_by_doc.get(doc_id) or next(
+            (records[i].package_sibling_refs for i in indexes if records[i].package_sibling_refs),
+            [],
+        )
+        if not snapshots:
+            continue
+        checked_docs.add(doc_id)
+        alerts, mbls = _package_conflicts(snapshots, records, corrected, indexes_by_doc)
+        for index in indexes:
+            alerts_by_line[index].extend(alerts)
+            record = records[index]
+            updates = {
+                "package_sibling_refs": [source.model_copy(deep=True) for source in snapshots]
+            }
+            if mbls and not record.human_overrides.keys() & {"shipment_refs", "mbl_no"}:
                 shipment_refs = record.shipment_refs
                 refs = {(ref.value, ref.source): ref for ref in shipment_refs.mbl_nos}
-                for ref in package_refs:
+                for ref in mbls:
                     refs.setdefault((ref.value, ref.source), ref)
                 inherited = record.inherited_fields.copy()
                 inherited.setdefault("shipment_refs", shipment_refs.model_dump())
-                updated_refs = shipment_refs.model_copy(update={"mbl_nos": list(refs.values())})
-                records[index] = record.model_copy(
-                    update={"shipment_refs": updated_refs, "inherited_fields": inherited}
+                updates["shipment_refs"] = shipment_refs.model_copy(
+                    update={"mbl_nos": list(refs.values())}
                 )
+                updates["inherited_fields"] = inherited
+            records[index] = record.model_copy(update=updates)
+    return checked_docs
 
 
 def validate_batch(
@@ -883,13 +978,33 @@ def validate_batch(
     selected, canonical = _merge_duplicate_sources(records, bundles)
     validated = []
     alerts_by_line = []
+    corrected_by_line = []
     indexes_by_doc: dict[str, list[int]] = defaultdict(list)
     for index, record in enumerate(selected):
-        prepared, alerts = _prepare_line(record)
+        bundle = canonical.get(record.source_doc_id)
+        extraction = bundle.extraction if bundle is not None else None
+        if extraction is not None:
+            # Route document parse issues through the same per-row override checks.
+            record = record.model_copy(
+                update={
+                    "raw_invalid_fields": extraction.raw_invalid_fields | record.raw_invalid_fields,
+                    "raw_parse_issues": [
+                        *record.raw_parse_issues,
+                        *(
+                            issue
+                            for issue in extraction.raw_parse_issues
+                            if issue not in record.raw_parse_issues
+                        ),
+                    ],
+                }
+            )
+        prepared, corrected, alerts = _prepare_line(record)
         validated.append(prepared)
+        corrected_by_line.append(corrected)
         alerts_by_line.append(alerts)
         indexes_by_doc[record.source_doc_id].append(index)
 
+    recalculated_by_doc = {}
     for doc_id, indexes in indexes_by_doc.items():
         bundle = canonical.get(doc_id)
         extraction = bundle.extraction if bundle is not None else None
@@ -910,15 +1025,24 @@ def validate_batch(
         alerts, excess, credit_only = (
             _reconcile_totals(lines, totals) if totals is not None else ([], {}, False)
         )
+        recalculated = _LINE_ALERT_CODES.copy()
+        if totals is not None:
+            recalculated.update(_TOTAL_ALERT_CODES)
+        if len(indexes) > 1 or bundle is not None:
+            recalculated.add(AlertCode.DUPLICATE_LINE_EXTRACTED)
+        if len(indexes_by_doc) > 1 or bundles:
+            recalculated.add(AlertCode.CROSS_DOCUMENT_CONFLICT)
+        if bundle is not None:
+            recalculated.add(AlertCode.OCR_SUSPICIOUS_FLAG)
+        recalculated_by_doc[doc_id] = recalculated
         no_summary = totals is not None and (
             totals.subtotal_amount is None
             and totals.total_amount is None
+            and not totals.subtotals_by_currency
             and not totals.totals_by_currency
             and not totals.has_explicit_total
             and (extraction is None or "subtotal_amount" not in extraction.raw_invalid_fields)
         )
-        if extraction is not None:
-            alerts.extend(extraction.raw_parse_issues)
         payload = bundle.document.ocr_payload if bundle is not None else None
         if payload and any(
             (item.model_extra or {}).get("suspicious") is True for item in payload.items
@@ -944,9 +1068,12 @@ def validate_batch(
 
     for index, alerts in _cross_document_alerts(validated).items():
         alerts_by_line[index].extend(alerts)
-    _merge_package_mbls(validated, alerts_by_line, indexes_by_doc, canonical)
+    for doc_id in _merge_package_mbls(
+        validated, alerts_by_line, corrected_by_line, indexes_by_doc, canonical
+    ):
+        recalculated_by_doc[doc_id].add(AlertCode.MULTI_SOURCE_BL_MISMATCH)
     return [
-        _with_alerts(record, alerts)
+        _with_alerts(record, alerts, recalculated_by_doc[record.source_doc_id])
         for record, alerts in zip(validated, alerts_by_line, strict=True)
     ]
 

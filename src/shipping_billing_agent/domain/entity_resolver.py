@@ -19,6 +19,7 @@ from .currency import normalize_currency
 from .models import (
     AccountingEntityProfile,
     AlertCode,
+    AlertSeverity,
     ChargeDictionaryItem,
     DocumentExtractionBundle,
     ExistingBillRecord,
@@ -34,9 +35,9 @@ from .models import (
 
 _BRANCH_SUFFIX = re.compile(r"(?:\s*\([^()]*\))+[\W_]*$")
 _PARTY_WORDS = re.compile(r"[^\W_]+")
-_CREDIT_DOCUMENT = re.compile(
-    r"\bcredit\s+(?:note|memo|invoice|advice|voucher|adjustment)\b|\bc\s*/\s*n\b|\bcn\b|"
-    r"贷项|貸項|红字|紅字",
+CREDIT_DOCUMENT_PATTERN = re.compile(
+    r"(?:\bcredit\s+(?:note|memo|invoice|advice|voucher|adjustment)\b|\bc\s*/\s*n\b|\bcn\b|"
+    r"贷项(?:通知|凭证)?|貸項(?:通知|憑證)?|红字|紅字)",
     re.IGNORECASE,
 )
 PARTY_FIELDS = {"issuer", "recipient", "payer_hint", "payee_hint"}
@@ -59,6 +60,25 @@ _SCALAR_OVERRIDES = (
 )
 _REQUIRED_OVERRIDES = {"amount", "currency", "charge_item", "posting_type"}
 _ENTITY_OVERRIDES = {"posting_type", "matched_existing_bill_id", "force_create_new"}
+_REVIEW_FIELDS = (
+    "charge_item",
+    "quantity",
+    "unit_price",
+    "amount",
+    "currency",
+    "payment_term",
+    "document_type",
+    "reference_no",
+    "document_date",
+    "issuer",
+    "recipient",
+    "posting_type",
+    "debit_credit",
+    "is_credit",
+    "matched_existing_bill_id",
+    "matched_bill_ref",
+    "match_level",
+)
 _PartyKey = tuple[str, tuple[str, ...]]
 
 
@@ -132,9 +152,13 @@ def entity_matches(
     )
 
 
+def is_credit_document_type(text: str | None) -> bool:
+    normalized_type = normalize("NFKC", text or "").replace("_", " ")
+    return bool(CREDIT_DOCUMENT_PATTERN.search(normalized_type))
+
+
 def is_credit_document(document_type: str | None, debit_credit: str) -> bool:
-    normalized_type = normalize("NFKC", document_type or "").replace("_", " ")
-    return debit_credit == "CREDIT" or bool(_CREDIT_DOCUMENT.search(normalized_type))
+    return debit_credit == "CREDIT" or is_credit_document_type(document_type)
 
 
 @dataclass(slots=True)
@@ -384,6 +408,15 @@ def has_explicit_parties(record: ProcessedBillingRecord) -> bool:
     )
 
 
+def _review_basis(record: ProcessedBillingRecord) -> tuple[Any, ...]:
+    unresolved = frozenset(
+        (alert.code, alert.severity, alert.field, alert.actual, alert.expected)
+        for alert in record.validation_alerts
+        if alert.severity is not AlertSeverity.RESOLVED
+    )
+    return (*(getattr(record, field) for field in _REVIEW_FIELDS), unresolved)
+
+
 def recalculate_for_entity(
     records: Sequence[ProcessedBillingRecord],
     new_entity: str,
@@ -403,9 +436,11 @@ def recalculate_for_entity(
     from .matcher import _prepare_record, match_and_inherit_batch
     from .validators import validate_batch
 
-    reset_approval_count = sum(
-        record.review_status in (ReviewStatus.APPROVED, ReviewStatus.REJECTED) for record in records
-    )
+    reviewed = {
+        record.id: record
+        for record in records
+        if record.review_status in (ReviewStatus.APPROVED, ReviewStatus.REJECTED)
+    }
     updated = []
     for record in records:
         overrides = record.human_overrides
@@ -419,7 +454,6 @@ def recalculate_for_entity(
                 "operation": OperationType.PENDING_REVIEW,
                 "review_status": ReviewStatus.NEEDS_REVIEW,
                 "human_overrides": overrides,
-                "validation_alerts": [],
                 "ai_reasoning": [],
                 "reject_reason": None,
             }
@@ -435,4 +469,21 @@ def recalculate_for_entity(
         ]
         updated = matcher_fn(updated, scoped_bills)
     updated = validate_batch(updated, bundles) if validator_fn is None else validator_fn(updated)
+    reset_approval_count = 0
+    for index, record in enumerate(updated):
+        previous = reviewed.get(record.id)
+        if previous is None:
+            continue
+        if entity_matches(previous.accounting_entity, record.accounting_entity, profiles) and (
+            _review_basis(previous) == _review_basis(record)
+        ):
+            updated[index] = record.model_copy(
+                update={
+                    "review_status": previous.review_status,
+                    "reject_reason": previous.reject_reason,
+                    "human_review_history": previous.human_review_history,
+                }
+            )
+        else:
+            reset_approval_count += 1
     return updated, reset_approval_count

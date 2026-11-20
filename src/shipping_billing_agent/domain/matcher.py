@@ -568,6 +568,12 @@ def match_and_inherit_batch(
         level, pool = _find_bill_pool(record, bills, charge_item, profiles)
         if not pool:
             results[index] = _with_decision(record, OperationType.CREATE)
+        elif (
+            level in (MatchLevel.L2_BL_CHARGE_CURR, MatchLevel.L3_BOOKING_CHARGE_CURR)
+            and record.currency is None
+            and len({bill.currency for bill in pool}) > 1
+        ):
+            results[index] = _ambiguous(record, level, pool, "源单省略币种，历史候选含多种币种")
         else:
             group = (record.source_doc_id, charge_item, level, tuple(bill.id for bill in pool))
             groups.setdefault(group, (pool, []))[1].append(index)
@@ -589,31 +595,20 @@ def match_and_inherit_batch(
             if group_level is not level:
                 continue
             available = tuple(bill for bill in pool if (doc_id, bill.id) not in occupied)
-            forbidden_by_currency = (
-                level in (MatchLevel.L2_BL_CHARGE_CURR, MatchLevel.L3_BOOKING_CHARGE_CURR)
-                and len({bill.currency for bill in available}) > 1
-            )
-            eligible = [
-                index
-                for index in indexes
-                if not (forbidden_by_currency and prepared[index].currency is None)
-            ]
-            pairs = _pair_group(prepared, eligible, available)
+            pairs = _pair_group(prepared, indexes, available)
             for index in indexes:
                 bill = pairs.get(index)
                 if bill is not None:
                     proposals[doc_id, bill.id].append(index)
-                pending[index] = (doc_id, available, bill, index not in eligible)
+                pending[index] = (doc_id, available, bill)
 
-        for index, (doc_id, available, bill, missing_currency) in pending.items():
+        for index, (doc_id, available, bill) in pending.items():
             if bill is not None and len(proposals[doc_id, bill.id]) == 1:
                 results[index] = _inherit_and_compare(prepared[index], bill, level, profiles)
                 occupied.add((doc_id, bill.id))
                 continue
             message = ambiguity
-            if missing_currency:
-                message = "源单省略币种，历史候选含多种币种"
-            elif not available:
+            if not available:
                 message = "符合条件的历史账单已由同一源单的其他费用行占用"
             results[index] = _ambiguous(prepared[index], level, available, message)
     return results

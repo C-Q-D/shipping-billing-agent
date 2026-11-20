@@ -7,8 +7,10 @@ from .charge_normalizer import (
 )
 from .currency import is_valid_iso4217, normalize_currency
 from .entity_resolver import (
+    CREDIT_DOCUMENT_PATTERN,
     EntityPerspective,
     entity_matches,
+    is_credit_document_type,
     normalize_party_name,
     recalculate_for_entity,
     resolve_entity_perspective,
@@ -32,6 +34,7 @@ from .models import (
     HumanReviewAction,
     MatchLevel,
     OperationType,
+    PackageShipmentRefs,
     ParsedDocument,
     PaymentTerm,
     PostingType,
@@ -69,6 +72,7 @@ from .validators import (
 
 __all__ = [
     "ALERT_SEVERITY_MAP",
+    "CREDIT_DOCUMENT_PATTERN",
     "DECIMAL_TOLERANCE",
     "AccountingEntityProfile",
     "AlertCode",
@@ -87,6 +91,7 @@ __all__ = [
     "HumanReviewAction",
     "MatchLevel",
     "OperationType",
+    "PackageShipmentRefs",
     "ParsedDocument",
     "PaymentTerm",
     "PostingType",
@@ -107,6 +112,7 @@ __all__ = [
     "dumps_decimal_json",
     "entity_matches",
     "inherit_existing_bill",
+    "is_credit_document_type",
     "is_valid_iso4217",
     "loads_decimal_json",
     "match_and_inherit_batch",

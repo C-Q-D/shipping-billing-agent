@@ -247,6 +247,13 @@ class ShipmentRefs(BaseModel):
     container_nos: list[str] = Field(default_factory=list)
 
 
+class PackageShipmentRefs(BaseModel):
+    source_doc_id: str
+    # The mail body can contribute HBL evidence, but only attachments contribute MBLs.
+    mbl_nos: list[SourceRefValue] | None = None
+    hbl_nos: list[str] = Field(default_factory=list)
+
+
 class ExcludedClause(BaseModel):
     text: str
     reason: str
@@ -408,7 +415,10 @@ class ValidationAlert(BaseModel):
 
     @model_validator(mode="after")
     def validate_severity(self) -> Self:
-        if self.severity not in (ALERT_SEVERITY_MAP[self.code], AlertSeverity.RESOLVED):
+        default = ALERT_SEVERITY_MAP[self.code]
+        if self.severity is not default and not (
+            default is AlertSeverity.WARNING and self.severity is AlertSeverity.RESOLVED
+        ):
             raise ValueError("告警严重度必须与错误码的固定映射一致")
         return self
 
@@ -496,6 +506,8 @@ class RawChargeEnvelope(_RawFieldAudit):
 class RawExtractionEnvelope(_RawFieldAudit):
     extraction: RawDocumentExtraction
     charges: list[RawChargeEnvelope] = Field(default_factory=list)
+    subtotals_by_currency: dict[str, DecimalValue] = Field(default_factory=dict)
+    taxes_by_currency: dict[str, DecimalValue] = Field(default_factory=dict)
     totals_by_currency: dict[str, DecimalValue] = Field(default_factory=dict)
     has_explicit_total: bool = False
     metadata_only: bool = False
@@ -523,6 +535,8 @@ class SourceDocTotalsSnapshot(BaseModel):
     tax_amount: DecimalValue | None = None
     total_amount: DecimalValue | None = None
     total_currency: str | None = None
+    subtotals_by_currency: dict[str, DecimalValue] = Field(default_factory=dict)
+    taxes_by_currency: dict[str, DecimalValue] = Field(default_factory=dict)
     totals_by_currency: dict[str, DecimalValue] = Field(default_factory=dict)
     has_explicit_total: bool = False
 
@@ -536,6 +550,8 @@ class SourceDocTotalsSnapshot(BaseModel):
             tax_amount=extraction.tax_amount,
             total_amount=extraction.total_amount,
             total_currency=extraction.total_currency,
+            subtotals_by_currency=extraction.subtotals_by_currency,
+            taxes_by_currency=extraction.taxes_by_currency,
             totals_by_currency=extraction.totals_by_currency,
             has_explicit_total=(
                 extraction.has_explicit_total
@@ -581,6 +597,7 @@ class ProcessedBillingRecord(_RawFieldAudit):
     raw_unit_price_text: str | None = None
     raw_quantity_text: str | None = None
     shipment_refs: ShipmentRefs = Field(default_factory=ShipmentRefs)
+    package_sibling_refs: list[PackageShipmentRefs] = Field(default_factory=list)
     source_evidence: SourceEvidence = Field(default_factory=SourceEvidence)
     source_doc_totals: SourceDocTotalsSnapshot | None = None
     field_diffs: list[FieldDiff] = Field(default_factory=list)
@@ -718,36 +735,39 @@ def _parse_charge_row(row: dict[str, Any], context_currencies: set[str]) -> RawC
     return RawChargeEnvelope(charge=charge, **raw_numbers, **audit.model_dump())
 
 
-def _parse_totals_by_currency(
-    raw_totals: Any, audit: _RawFieldAudit, context_currencies: set[str]
+def _parse_amounts_by_currency(
+    raw_amounts: Any, field: str, audit: _RawFieldAudit, context_currencies: set[str]
 ) -> dict[str, Decimal]:
-    if not isinstance(raw_totals, dict):
+    if not isinstance(raw_amounts, dict):
         audit._reject_field(
-            "totals_by_currency",
-            raw_totals,
+            field,
+            raw_amounts,
             AlertCode.LLM_EXTRACTION_FAILED,
-            "分币种总额必须是对象",
+            "分币种汇总金额必须是对象",
         )
         return {}
 
-    totals: dict[str, Decimal] = {}
-    for token, value in raw_totals.items():
+    amounts: dict[str, Decimal] = {}
+    for token, value in raw_amounts.items():
         if value is None:
             continue
-        field = f"totals_by_currency.{token}"
-        currency = _read_currency(token, field, audit, context_currencies)
+        item_field = f"{field}.{token}"
+        currency = _read_currency(token, item_field, audit, context_currencies)
         if currency is None:
             continue
-        amount = _read_decimal(value, field, audit)
+        amount = _read_decimal(value, item_field, audit)
         if amount is None:
             continue
-        if currency in totals and totals[currency] != amount:
+        if currency in amounts and amounts[currency] != amount:
             audit._reject_field(
-                field, value, AlertCode.MULTI_CURRENCY_TOTAL_AMBIGUITY, "同一币种的总额存在冲突"
+                item_field,
+                value,
+                AlertCode.MULTI_CURRENCY_TOTAL_AMBIGUITY,
+                "同一币种的汇总金额存在冲突",
             )
         else:
-            totals[currency] = amount
-    return totals
+            amounts[currency] = amount
+    return amounts
 
 
 def _failed_extraction(message: str) -> RawExtractionEnvelope:
@@ -778,18 +798,22 @@ def parse_llm_raw_extraction(
     values = {key: value for key, value in payload.items() if value is not None}
     audit = _RawFieldAudit(explicit_fields=set(values))
     raw_rows = values.pop("charges", [])
-    raw_totals = values.pop("totals_by_currency", {})
+    currency_summaries = {
+        field: values.pop(field, {})
+        for field in ("subtotals_by_currency", "taxes_by_currency", "totals_by_currency")
+    }
+    raw_totals = currency_summaries["totals_by_currency"]
     metadata_only = _read_bool(values.pop("metadata_only", False), "metadata_only", audit)
     explicit_total_flag = _read_bool(
         values.pop("has_explicit_total", False), "has_explicit_total", audit
     )
-    has_explicit_total = explicit_total_flag or "total_amount" in values
-    total_currency_tokens = (
-        [token for token, value in raw_totals.items() if value is not None]
-        if isinstance(raw_totals, dict)
-        else []
+    has_explicit_total = (
+        explicit_total_flag
+        or "total_amount" in values
+        or (
+            isinstance(raw_totals, dict) and any(value is not None for value in raw_totals.values())
+        )
     )
-    has_explicit_total = has_explicit_total or bool(total_currency_tokens)
 
     if not isinstance(raw_rows, list):
         audit._reject_field(
@@ -801,10 +825,14 @@ def parse_llm_raw_extraction(
         for token in (
             values.get("total_currency"),
             *(row.get("currency") for row in raw_rows if isinstance(row, dict)),
-            *total_currency_tokens,
         )
         if isinstance(token, str)
     }
+    for amounts in currency_summaries.values():
+        if isinstance(amounts, dict):
+            context_currencies.update(
+                token for token, value in amounts.items() if value is not None
+            )
 
     charges = []
     for index, row in enumerate(raw_rows):
@@ -832,13 +860,16 @@ def parse_llm_raw_extraction(
             values["total_currency"], "total_currency", audit, context_currencies
         )
 
-    totals = _parse_totals_by_currency(raw_totals, audit, context_currencies)
+    summaries = {
+        field: _parse_amounts_by_currency(amounts, field, audit, context_currencies)
+        for field, amounts in currency_summaries.items()
+    }
     extraction = _validate_raw_model(RawDocumentExtraction, values, audit)
     return RawExtractionEnvelope(
         extraction=extraction,
         charges=charges,
-        totals_by_currency=totals,
         has_explicit_total=has_explicit_total,
         metadata_only=metadata_only,
+        **summaries,
         **audit.model_dump(),
     )
