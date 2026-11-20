@@ -1487,7 +1487,8 @@ body[data-theme="dark"] .wb-doc-node[data-active="true"] {
   background: var(--wb-paper-hover-bg);
 }
 
-.wb-record-card[data-selected="true"] {
+.wb-record-card[data-selected="true"],
+.wb-record-card.active {
   background: var(--lumno-color-selected);
   color: var(--lumno-color-selected-text);
   border-color: var(--lumno-color-selected);
@@ -1495,8 +1496,45 @@ body[data-theme="dark"] .wb-doc-node[data-active="true"] {
 }
 
 .wb-record-card[data-selected="true"] .wb-record-sub,
-.wb-record-card[data-selected="true"] .wb-record-footer {
-  color: rgba(249, 250, 251, 0.78);
+.wb-record-card[data-selected="true"] .wb-record-footer,
+.wb-record-card.active .wb-record-sub,
+.wb-record-card.active .wb-record-footer {
+  color: rgba(248, 250, 252, 0.88);
+}
+
+.wb-record-card[data-selected="true"] .wb-badge--muted,
+.wb-record-card.active .wb-badge--muted {
+  background: rgba(248, 250, 252, 0.16);
+  color: #f8fafc;
+  border-color: rgba(248, 250, 252, 0.32);
+}
+
+.wb-record-card[data-selected="true"] .wb-badge--ok,
+.wb-record-card.active .wb-badge--ok {
+  background: rgba(16, 185, 129, 0.22);
+  color: #a7f3d0;
+  border-color: rgba(110, 231, 183, 0.38);
+}
+
+.wb-record-card[data-selected="true"] .wb-badge--info,
+.wb-record-card.active .wb-badge--info {
+  background: rgba(59, 130, 246, 0.24);
+  color: #bfdbfe;
+  border-color: rgba(147, 197, 253, 0.4);
+}
+
+.wb-record-card[data-selected="true"] .wb-badge--warn,
+.wb-record-card.active .wb-badge--warn {
+  background: rgba(245, 158, 11, 0.24);
+  color: #fde68a;
+  border-color: rgba(252, 211, 77, 0.42);
+}
+
+.wb-record-card[data-selected="true"] .wb-badge--error,
+.wb-record-card.active .wb-badge--error {
+  background: rgba(239, 68, 68, 0.26);
+  color: #fecaca;
+  border-color: rgba(252, 165, 165, 0.44);
 }
 
 .wb-record-top {
@@ -2109,6 +2147,53 @@ body[data-theme="dark"] .wb-drawer-panel {
   .wb-export-counts-grid,
   .wb-eval-metrics-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Mobile Touch Target Comfort (< 768px / 390x844): >= 36px height without horizontal overflow */
+@media (max-width: 767px) {
+  .lumno-btn,
+  .lumno-btn--compact,
+  .lumno-btn--ghost {
+    --btn-min-height: 38px;
+    min-height: 38px;
+    --btn-padding: 0 12px;
+  }
+
+  .wb-topbar-actions .lumno-btn--compact {
+    --btn-padding: 0 10px;
+  }
+
+  .lumno-select-trigger {
+    min-height: 38px;
+    height: 38px;
+  }
+
+  .lumno-input {
+    min-height: 38px;
+  }
+
+  .wb-health-badge {
+    min-height: 36px;
+    height: 36px;
+  }
+
+  .lumno-seg,
+  .wb-mobile-bar .lumno-seg,
+  .wb-drawer-tabs .lumno-seg {
+    min-height: 38px;
+  }
+
+  .lumno-seg-option,
+  .wb-mobile-bar .lumno-seg-option,
+  .wb-drawer-tabs .lumno-seg-option,
+  .wb-mobile-tab {
+    min-height: 36px;
+    height: 36px;
+  }
+
+  .wb-eval-run-chip {
+    min-height: 38px;
   }
 }
 

@@ -51,6 +51,9 @@ _OVERRIDE_CODES = {
     **dict.fromkeys(_NUMERIC_FIELDS, AlertCode.OCR_NUMERIC_CONFUSION),
 }
 FIELD_FORMAT_ALERT_CODES = {*_OVERRIDE_CODES.values(), AlertCode.LLM_EXTRACTION_FAILED}
+_EXTRACTION_CONFLICT_FIELDS = {
+    "issuer", "recipient", "reference_no", "document_type", "charge_item",
+}
 PRINTED_CURRENCY_CONFLICT_MESSAGE = "费用明细行标明了不同的币种"
 TRANSPORT_FIELDS = {
     "mbl_no": "mbl_nos",
@@ -432,10 +435,25 @@ def _is_currency_conflict(issue: ValidationAlert) -> bool:
     return issue.code is AlertCode.CROSS_DOCUMENT_CONFLICT and issue.field == "currency"
 
 
+def _confirmed_extraction_issue(issue: ValidationAlert, corrected: set[str]) -> bool:
+    if issue.code is AlertCode.CROSS_DOCUMENT_CONFLICT:
+        if issue.field in _EXTRACTION_CONFLICT_FIELDS:
+            return issue.field in corrected
+        return issue.field in {"payee_hint", "payer_hint"} and bool(
+            {"issuer", "recipient", "posting_type"} & corrected
+        )
+    return (
+        issue.code is AlertCode.AMOUNT_TOTAL_MISMATCH
+        and issue.field == "reported_charge_amount"
+        and bool({"amount", "charge_item"} & corrected)
+    )
+
+
 def source_format_alerts(
     record: ProcessedBillingRecord, corrected: set[str]
 ) -> list[ValidationAlert]:
     invalid = record.raw_invalid_fields
+    # Keep raw issues for audit; only carry active issues into this validation.
     alerts = [
         issue
         for issue in record.raw_parse_issues
@@ -447,6 +465,7 @@ def source_format_alerts(
                 and "payment_term" in corrected
                 and record.payment_term is not None
             )
+            or (corrected and _confirmed_extraction_issue(issue, corrected))
         )
         and (
             issue.code not in FIELD_FORMAT_ALERT_CODES

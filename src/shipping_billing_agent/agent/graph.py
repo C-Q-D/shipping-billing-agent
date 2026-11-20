@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections import defaultdict, deque
+from bisect import bisect_left
+from collections import Counter, defaultdict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -53,6 +54,7 @@ from shipping_billing_agent.domain.entity_resolver import (
     FIELD_FORMAT_ALERT_CODES,
     _match_ledger_records,
     is_credit_document_type,
+    normalize_party_name,
 )
 from shipping_billing_agent.domain.models import DocumentStatus, SourceKind, sanitize_source_path
 from shipping_billing_agent.domain.validators import _document_parse_issues, _validate_batch
@@ -94,6 +96,8 @@ _LINE_TOLERANCE = Fraction(DECIMAL_TOLERANCE)
 _DEFAULT_LIMITS = ResourceLimits()
 _SHEET_ROW = re.compile(r"^\[Sheet: (.+?) \| Row (\d+)\] \[Row (\d+)\]")
 _TABLE_ROW = re.compile(r"^\[[^]]+\] \[Row (\d+)\]")
+_EMAIL_SETTLEMENT_TYPES = frozenset({"email", "email settlement", "email settlement instruction"})
+_AGENCY_DECLARATION = re.compile(r"(?P<agent>.+?) as agents? for (?P<principal>.+)")
 _SiblingSources = Sequence[tuple[ParsedDocument, RawExtractionEnvelope]]
 
 
@@ -397,7 +401,8 @@ def _ground_printed_fields(
         if field == "reference_no":
             return "".join(key.split())
         if field == "document_type":
-            return " ".join(key.replace("_", " ").split())
+            key = " ".join(key.replace("_", " ").split())
+            return "email" if key in _EMAIL_SETTLEMENT_TYPES else key
         return key.strip()
 
     for field in fields:
@@ -474,6 +479,8 @@ def _ground_charge(
     independent: Sequence[RawChargeEnvelope],
     document_type: str | None,
     document_issues: list[ValidationAlert],
+    *,
+    use_printed_name: bool = False,
 ) -> RawChargeEnvelope:
     printed, model = observed.charge, proposed.charge
     updates = {
@@ -481,6 +488,8 @@ def _ground_charge(
         for field in ("source_text", "page", "line_number")
         if (value := getattr(printed, field)) is not None
     }
+    if use_printed_name:
+        updates["raw_charge_name"] = printed.raw_charge_name
     # Only independent source evidence can disambiguate a printed bare dollar sign.
     bare_dollar = observed.raw_invalid_fields.get("currency") == "$" or any(
         issue.field == "currency" and issue.actual == "$" for issue in observed.raw_parse_issues
@@ -558,6 +567,51 @@ def _charge_words(text: str) -> str:
     return " ".join(re.findall(r"[^\W_]+", normalize("NFKC", text).casefold()))
 
 
+def _contains_charge_words(words: Sequence[str], phrase: Sequence[str]) -> bool:
+    # Each match consumes the preceding words so the printed order is preserved.
+    remaining = iter(words)
+    return all(word in remaining for word in phrase)
+
+
+def _charge_variant_pairs(
+    observed: Sequence[RawChargeEnvelope],
+    proposed: Sequence[RawChargeEnvelope],
+    source_names: dict[int, str],
+    model_indexes: Sequence[int],
+) -> dict[int, int]:
+    if not source_names or not model_indexes:
+        return {}
+
+    model_amounts = _amount_pairs(proposed, model_indexes)
+    model_words = {
+        index: _charge_words(proposed[index].charge.raw_charge_name).split()
+        for _, _, index in model_amounts
+    }
+    candidates: dict[int, int | None] = {}
+    proposal_counts: Counter[int] = Counter()
+    # Rule and model rows use the same currency parser and decimal tolerance.
+    for amount, currency, source_index in _amount_pairs(observed, list(source_names)):
+        names = (source_names[source_index], observed[source_index].charge.raw_charge_name)
+        phrases = [words for name in names if (words := _charge_words(name).split())]
+        start = bisect_left(model_amounts, amount - _LINE_TOLERANCE, key=lambda row: row[0])
+        upper_amount = amount + _LINE_TOLERANCE
+        for position in range(start, len(model_amounts)):
+            model_amount, model_currency, model_index = model_amounts[position]
+            if model_amount > upper_amount:
+                break
+            if currency == model_currency and any(
+                _contains_charge_words(model_words[model_index], phrase) for phrase in phrases
+            ):
+                candidates[source_index] = None if source_index in candidates else model_index
+                proposal_counts[model_index] += 1
+
+    return {
+        source_index: model_index
+        for source_index, model_index in candidates.items()
+        if model_index is not None and proposal_counts[model_index] == 1
+    }
+
+
 def _matching_charge_evidence(
     charge: RawChargeItem,
     evidence_by_amount: dict[Decimal, set[tuple[str, _ChargeEvidence]]],
@@ -621,6 +675,8 @@ def _ground_charges(
     grounded = proposed.copy()
     issues = []
     paired_proposals = set()
+    pairs_by_name: dict[str, dict[int, int]] = {}
+    amount_matched_sources = set()
     non_billing = {
         index
         for index, row in enumerate(proposed)
@@ -639,20 +695,6 @@ def _ground_charges(
         model_indexes = model_groups.get(name, [])
         source_amounts = _amount_pairs(observed, source_indexes)
         model_amounts = _amount_pairs(proposed, model_indexes)
-        corroborating_rows = []
-        if len(source_indexes) == 1:
-            printed = observed[source_indexes[0]].charge
-            comparable_fields = ("amount", "currency", "quantity", "unit_price", "payment_term")
-            for rows, groups in independent_groups:
-                if len(indexes := groups.get(name, ())) == 1:
-                    candidate = rows[indexes[0]].charge
-                    if all(
-                        getattr(printed, field) is None
-                        or getattr(candidate, field) is None
-                        or getattr(printed, field) == getattr(candidate, field)
-                        for field in comparable_fields
-                    ):
-                        corroborating_rows.append(rows[indexes[0]])
 
         exact_rows = defaultdict(deque)
         for amount, currency, source_index in source_amounts:
@@ -678,27 +720,72 @@ def _ground_charges(
                     pairs[source_index] = model_index
                     paired_model.add(model_index)
                     break
-        matched_amounts = len(pairs)
+        amount_matched_sources.update(pairs)
         remainder_source = [index for index in source_indexes if index not in pairs]
         remainder_model = [index for index in model_indexes if index not in paired_model]
         pairs.update(zip(remainder_source, remainder_model, strict=False))
+        pairs_by_name[name] = pairs
         paired_proposals.update(pairs.values())
+
+    unmatched_sources = {
+        index: name
+        for name, source_indexes in source_groups.items()
+        for index in source_indexes
+        if index not in pairs_by_name[name]
+    }
+    unavailable_proposals = paired_proposals | non_billing
+    variant_pairs = _charge_variant_pairs(
+        observed,
+        proposed,
+        unmatched_sources,
+        [index for index in range(len(proposed)) if index not in unavailable_proposals],
+    )
+    variant_proposals = set(variant_pairs.values())
+    for source_index, model_index in variant_pairs.items():
+        pairs_by_name[unmatched_sources[source_index]][source_index] = model_index
+    paired_proposals.update(variant_proposals)
+    amount_matched_sources.update(variant_pairs)
+
+    for name, source_indexes in source_groups.items():
+        pairs = pairs_by_name[name]
+        model_indexes = [
+            index for index in model_groups.get(name, []) if index not in variant_proposals
+        ]
+        model_indexes.extend(
+            model_index for source_index, model_index in pairs.items()
+            if source_index in variant_pairs
+        )
+        corroborating_rows = []
+        if len(source_indexes) == 1:
+            printed = observed[source_indexes[0]].charge
+            comparable_fields = ("amount", "currency", "quantity", "unit_price", "payment_term")
+            for rows, groups in independent_groups:
+                if len(indexes := groups.get(name, ())) == 1:
+                    candidate = rows[indexes[0]].charge
+                    if all(
+                        getattr(printed, field) is None
+                        or getattr(candidate, field) is None
+                        or getattr(printed, field) == getattr(candidate, field)
+                        for field in comparable_fields
+                    ):
+                        corroborating_rows.append(rows[indexes[0]])
         for source_index, model_index in pairs.items():
             grounded[model_index] = _ground_charge(
                 proposed[model_index], observed[source_index], corroborating_rows,
-                document_type, issues,
+                document_type, issues, use_printed_name=source_index in variant_pairs,
             )
         unpaired_audited_rows = [
             observed[index]
-            for index in remainder_source[len(remainder_model) :]
-            if observed[index].raw_invalid_fields or observed[index].raw_parse_issues
+            for index in source_indexes
+            if index not in pairs
+            and (observed[index].raw_invalid_fields or observed[index].raw_parse_issues)
         ]
         grounded.extend(unpaired_audited_rows)
-        if (
-            matched_amounts != len(source_amounts)
-            or len(model_indexes) > len(source_indexes)
-            or unpaired_audited_rows
-        ):
+        unmatched_amount = any(
+            index not in amount_matched_sources and observed[index].charge.amount is not None
+            for index in source_indexes
+        )
+        if unmatched_amount or len(model_indexes) > len(source_indexes) or unpaired_audited_rows:
             issues.append(
                 ValidationAlert.from_code(
                     AlertCode.AMOUNT_TOTAL_MISMATCH,
@@ -789,6 +876,19 @@ def _ground_charges(
     return grounded, issues
 
 
+def _matches_agency_declaration(model: str, printed: str) -> bool:
+    # Keep the entity's branch suffix intact when separating the agency declaration.
+    text = " ".join(normalize("NFKC", model).casefold().replace(",", " ").split())
+    declaration = _AGENCY_DECLARATION.fullmatch(text)
+    printed_name = normalize_party_name(printed)
+    return bool(
+        declaration
+        and printed_name
+        and normalize_party_name(declaration["agent"]) == printed_name
+        and any(character.isalnum() for character in declaration["principal"])
+    )
+
+
 def _ground_parties(
     data: RawDocumentExtraction,
     observed: RawDocumentExtraction,
@@ -815,7 +915,12 @@ def _ground_parties(
         printed, model = getattr(observed, field), getattr(data, field)
         if printed:
             updates[field] = printed
-        if not model or (printed and entity_matches(model, printed, profiles)):
+        if not model or (
+            printed and (
+                entity_matches(model, printed, profiles)
+                or _matches_agency_declaration(model, printed)
+            )
+        ):
             continue
         alternative = getattr(observed, counterpart)
         matches_transport = any(entity_matches(model, name, profiles) for name in transport_names)

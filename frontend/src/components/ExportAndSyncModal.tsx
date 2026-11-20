@@ -1,11 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   BatchDetail,
   BillingApiClient,
   ExportMode,
   SyncBaselineResult,
 } from "../api/client.ts";
-import { stringifyLosslessJson } from "../api/decimalJson.ts";
+import {
+  addDecimalStrings,
+  formatDecimalLiteral,
+  readDecimalString,
+  stringifyLosslessJson,
+} from "../api/decimalJson.ts";
 import {
   beginExportModalLoad,
   completeExportModalLoadFailure,
@@ -62,6 +67,7 @@ export function ExportAndSyncModal({
     createExportModalCacheState(batch?.id ?? null)
   );
   const [downloading, setDownloading] = useState(false);
+  const [jsonExpanded, setJsonExpanded] = useState(false);
   const requestSeqRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -106,6 +112,10 @@ export function ExportAndSyncModal({
     [api, onNotify]
   );
 
+  useEffect(() => {
+    setJsonExpanded(false);
+  }, [open, batch?.id]);
+
   // A3: Strictly clear stale cache on batch change or modal close/reopen
   useEffect(() => {
     const targetId = batch?.id ?? null;
@@ -146,6 +156,34 @@ export function ExportAndSyncModal({
   const serializedRecordsText = activeExport
     ? stringifyLosslessJson(activeExport.records, 2)
     : "";
+
+  const exportCurrencySummary = useMemo(() => {
+    if (!activeExport || activeExport.records.length === 0) {
+      return [];
+    }
+    const grouped = new Map<string, { count: number; sum: string }>();
+    for (const rec of activeExport.records) {
+      const currency = (rec.charge_details?.currency ?? "").trim() || "未定币种";
+      const amtStr = readDecimalString(rec.charge_details, "amount") ?? "0";
+      const prev = grouped.get(currency);
+      if (!prev) {
+        grouped.set(currency, { count: 1, sum: amtStr });
+      } else {
+        let nextSum = prev.sum;
+        try {
+          nextSum = addDecimalStrings(prev.sum, amtStr);
+        } catch {
+          // keep previous sum if malformed
+        }
+        grouped.set(currency, { count: prev.count + 1, sum: nextSum });
+      }
+    }
+    return Array.from(grouped.entries()).map(([currency, meta]) => ({
+      currency,
+      count: meta.count,
+      formattedSum: formatDecimalLiteral(meta.sum, "0.00"),
+    }));
+  }, [activeExport]);
 
   const handleCopyJson = async () => {
     if (!canCopy || !activeExport) return;
@@ -243,6 +281,15 @@ export function ExportAndSyncModal({
       }
     >
       <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+        {batch?.status === "PROCESSING" ? (
+          <div className="wb-alert-item" data-severity="WARNING" role="status">
+            <strong>当前批次仍在后台解析中（PROCESSING）</strong>
+            <span>
+              当前批次仍在后台解析中，以下导出仅包含截至当前已就绪的记录，建议等待状态变为 COMPLETED 后导出完整账单。
+            </span>
+          </div>
+        ) : null}
+
         <LumnoSegmentedControl
           value={activeMode}
           wrap
@@ -330,12 +377,88 @@ export function ExportAndSyncModal({
               </span>
             </div>
 
-            <pre
-              className="wb-evidence-pre wb-tabular"
-              style={{ maxHeight: "240px", overflowY: "auto" }}
-            >
-              {serializedRecordsText}
-            </pre>
+            <div className="wb-section-box" aria-label="导出内容结构化摘要与预览">
+              <div className="wb-field-label">
+                <span>导出结构化摘要与无损 JSON 预览</span>
+                <LumnoButton
+                  variant="ghost"
+                  compact
+                  icon={jsonExpanded ? "ri-arrow-up-s-line" : "ri-code-s-slash-line"}
+                  aria-expanded={jsonExpanded}
+                  onClick={() => setJsonExpanded((prev) => !prev)}
+                >
+                  {jsonExpanded
+                    ? "收起完整 JSON 预览"
+                    : `展开完整 JSON 预览（共 ${activeExport.records.length} 条）`}
+                </LumnoButton>
+              </div>
+
+              {activeExport.records.length === 0 ? (
+                <div className="wb-helper-note">
+                  当前口径下暂无可导出的账单记录。
+                </div>
+              ) : (
+                <>
+                  <div className="wb-chip-row wb-tabular">
+                    <span className="wb-helper-note">分币种合计：</span>
+                    {exportCurrencySummary.map((item) => (
+                      <span
+                        key={item.currency}
+                        className="wb-badge wb-badge--info wb-tabular"
+                      >
+                        {item.currency} {item.formattedSum}（{item.count} 条）
+                      </span>
+                    ))}
+                  </div>
+
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "4px",
+                    }}
+                  >
+                    {activeExport.records.slice(0, 3).map((rec, idx) => {
+                      const amtText = formatDecimalLiteral(
+                        readDecimalString(rec.charge_details, "amount"),
+                        "—"
+                      );
+                      return (
+                        <div
+                          key={`${rec.document_info?.reference_no ?? "row"}-${idx}`}
+                          className="wb-diff-row wb-tabular"
+                        >
+                          <span className="wb-mono">{rec.operation}</span>
+                          <span>
+                            {rec.charge_details?.charge_item ?? "未命名费用"}
+                            {rec.document_info?.reference_no
+                              ? ` · ${rec.document_info.reference_no}`
+                              : ""}
+                          </span>
+                          <span style={{ fontWeight: 600, textAlign: "right" }}>
+                            {amtText} {rec.charge_details?.currency ?? "—"}
+                          </span>
+                        </div>
+                      );
+                    })}
+                    {activeExport.records.length > 3 && !jsonExpanded ? (
+                      <div className="wb-helper-note wb-tabular">
+                        其余 {activeExport.records.length - 3} 条记录已包含在下载与复制内容中，可点击右上角展开完整 JSON 检视。
+                      </div>
+                    ) : null}
+                  </div>
+                </>
+              )}
+
+              {jsonExpanded ? (
+                <pre
+                  className="wb-evidence-pre wb-tabular"
+                  style={{ maxHeight: "none", overflowY: "visible" }}
+                >
+                  {serializedRecordsText}
+                </pre>
+              ) : null}
+            </div>
           </>
         ) : null}
 

@@ -67,6 +67,7 @@ import {
   finishMutationSuccess,
   finishRecordSaveError,
   finishRecordSaveSuccess,
+  getConfirmedRecordFields,
   getEffectiveDocTotalsValues,
   getEffectiveRecordFormValues,
   getRecordDraftVersion,
@@ -74,6 +75,8 @@ import {
   hasRecordDraft,
   invalidateAuditHistoryForBatch,
   invalidateAuditHistoryForRecord,
+  markRecordFieldsConfirmed,
+  resolveRecordAlertActions,
   setDocTotalsDraftField,
   setRecordDraftField,
   shouldAcceptAuditHistoryResult,
@@ -4610,6 +4613,435 @@ export async function runDecimalJsonTests(): Promise<void> {
   }
   results.push(
     "PASS 31: R5-A1 App import modal validates effective record_state fallbacks & respects outer override priority"
+  );
+
+  // 32. Wave 13: confirmedFields lossless RawDecimal PATCH, per-record/per-batch isolation, fieldErrors & alert action mapping
+  {
+    const w13RecA = parseLosslessJson<typeof recA>(
+      stringifyLosslessJson({
+        ...recA,
+        id: "rec-w13-a",
+        document_info: {
+          document_type: "Debit Note",
+          reference_no: "OCA17",
+          document_date: "2026-09-12",
+        },
+        transaction_party: {
+          issuer: "NEPTUNE SHIPPING LIMITED",
+          recipient: "OCEANIC FORWARDING CO",
+        },
+        charge_details: {
+          charge_item: "Handling Charge",
+          raw_charge_name: "H/C",
+          quantity: rawDecimal("1"),
+          unit_price: rawDecimal("245.0000"),
+          amount: rawDecimal("9007199254740991.01"),
+          currency: "USD",
+          payment_term: "PP",
+        },
+      })
+    );
+    const w13RecB = parseLosslessJson<typeof recA>(
+      stringifyLosslessJson({
+        ...recA,
+        id: "rec-w13-b",
+        document_info: {
+          document_type: "Invoice",
+          reference_no: "INV-B-002",
+          document_date: "2026-09-13",
+        },
+        charge_details: {
+          charge_item: "Ocean Freight",
+          raw_charge_name: "O/F",
+          quantity: null,
+          unit_price: null,
+          amount: rawDecimal("245.0000"),
+          currency: "USD",
+          payment_term: "CC",
+        },
+      })
+    );
+
+    // (1) Confirming reference_no / issuer / amount when effective === server
+    let w13Store = createEmptyDraftStore();
+    assertEqual(
+      hasRecordDraft(w13Store, "batch-w13", w13RecA.id),
+      false,
+      "W13: initial store has no draft"
+    );
+    w13Store = markRecordFieldsConfirmed(w13Store, w13RecA, "batch-w13", [
+      "reference_no",
+      "issuer",
+      "amount",
+    ]);
+    assertEqual(
+      hasRecordDraft(w13Store, "batch-w13", w13RecA.id),
+      true,
+      "W13: hasRecordDraft is true when confirmedFields is non-empty even with effective === server"
+    );
+    const confirmedMapA = getConfirmedRecordFields(
+      w13Store,
+      "batch-w13",
+      w13RecA.id
+    );
+    assertTrue(
+      confirmedMapA.reference_no === true &&
+        confirmedMapA.issuer === true &&
+        confirmedMapA.amount === true,
+      "W13: getConfirmedRecordFields returns exact confirmed keys"
+    );
+
+    const w13DiffA = buildRecordDiffPatch(w13RecA, w13Store, "batch-w13");
+    assertEqual(w13DiffA.valid, true, "W13: confirmed patch on recA is valid");
+    assertEqual(
+      w13DiffA.hasChanges,
+      true,
+      "W13: confirmed patch on recA reports hasChanges = true"
+    );
+    assertEqual(
+      stringifyLosslessJson(w13DiffA.patch),
+      '{"reference_no":"OCA17","issuer":"NEPTUNE SHIPPING LIMITED","amount":9007199254740991.01}',
+      "W13: confirmed patch serializes exact reference_no, issuer & unquoted 9007199254740991.01 RawDecimal"
+    );
+
+    // Verify 4-decimal trailing zeros (245.0000) preserved losslessly too
+    let w13StoreScale = markRecordFieldsConfirmed(
+      createEmptyDraftStore(),
+      w13RecB,
+      "batch-w13",
+      ["amount"]
+    );
+    const w13DiffScale = buildRecordDiffPatch(
+      w13RecB,
+      w13StoreScale,
+      "batch-w13"
+    );
+    assertEqual(
+      stringifyLosslessJson(w13DiffScale.patch),
+      '{"amount":245.0000}',
+      "W13: confirmed amount preserves exact 4-decimal trailing zeros 245.0000"
+    );
+
+    // (2) Sibling record & batch isolation on edit / clearRecordDraft / finishRecordSaveSuccess
+    w13Store = markRecordFieldsConfirmed(w13Store, w13RecB, "batch-w13", [
+      "reference_no",
+    ]);
+    w13Store = setRecordDraftField(
+      w13Store,
+      "batch-w13",
+      w13RecB,
+      "recipient",
+      "SIBLING RECIPIENT"
+    );
+    assertEqual(
+      Object.keys(getConfirmedRecordFields(w13Store, "batch-other", w13RecA.id))
+        .length,
+      0,
+      "W13: confirmedFields do not leak across batches"
+    );
+    w13Store = clearRecordDraft(w13Store, "batch-w13", w13RecA.id);
+    assertEqual(
+      hasRecordDraft(w13Store, "batch-w13", w13RecA.id),
+      false,
+      "W13: clearRecordDraft clears confirmedFields on recA"
+    );
+    assertEqual(
+      hasRecordDraft(w13Store, "batch-w13", w13RecB.id),
+      true,
+      "W13: clearing recA does not pollute or clear recB confirmedFields/draft"
+    );
+    assertEqual(
+      getConfirmedRecordFields(w13Store, "batch-w13", w13RecB.id).reference_no,
+      true,
+      "W13: recB confirmedFields preserved after clearing recA"
+    );
+    const bVer = getRecordDraftVersion(w13Store, "batch-w13", w13RecB.id);
+    w13Store = beginRecordSave(w13Store, "batch-w13", w13RecB.id, bVer);
+    w13Store = finishRecordSaveSuccess(
+      w13Store,
+      "batch-w13",
+      w13RecB.id,
+      w13RecB,
+      bVer ?? undefined
+    );
+    assertEqual(
+      hasRecordDraft(w13Store, "batch-w13", w13RecB.id),
+      false,
+      "W13: finishRecordSaveSuccess clears confirmedFields cleanly"
+    );
+
+    // (3) Invalid confirmed values (empty charge_item or invalid currency ZZZ) blocked in fieldErrors
+    const invalidServerRec = {
+      ...w13RecA,
+      id: "rec-w13-invalid",
+      charge_details: {
+        ...w13RecA.charge_details,
+        charge_item: "   ",
+        currency: "ZZZ",
+      },
+    };
+    let badConfirmStore = markRecordFieldsConfirmed(
+      createEmptyDraftStore(),
+      invalidServerRec,
+      "batch-w13",
+      ["charge_item", "currency"]
+    );
+    const badConfirmDiff = buildRecordDiffPatch(
+      invalidServerRec,
+      badConfirmStore,
+      "batch-w13"
+    );
+    assertEqual(
+      badConfirmDiff.valid,
+      false,
+      "W13: confirming blank charge_item and ZZZ currency must fail validation"
+    );
+    assertEqual(
+      badConfirmDiff.hasChanges,
+      true,
+      "W13: invalid confirmed draft keeps Save button clickable to surface fieldErrors"
+    );
+    assertTrue(
+      Boolean(badConfirmDiff.fieldErrors.charge_item) &&
+        Boolean(badConfirmDiff.fieldErrors.currency) &&
+        !("charge_item" in badConfirmDiff.patch) &&
+        !("currency" in badConfirmDiff.patch),
+      "W13: invalid confirmed charge_item & currency populate fieldErrors and are excluded from patch"
+    );
+
+    // (4) Alert action mapping: direct equal vs unequal, indirect payee_hint/payer_hint/reported_charge_amount
+    const effA = extractServerRecordFormValues(w13RecA);
+    const sameRefAction = resolveRecordAlertActions(
+      {
+        code: "CROSS_DOCUMENT_CONFLICT",
+        severity: "WARNING",
+        field: "reference_no",
+        message: "单号差异",
+        expected: "OCA17",
+        actual: "CMDUCHN4053601",
+      },
+      effA
+    );
+    assertEqual(
+      sameRefAction.actionButtons[0]?.label,
+      "确认采用原文值",
+      "W13: when form value === alert.expected, renders 确认采用原文值"
+    );
+    const diffIssuerAction = resolveRecordAlertActions(
+      {
+        code: "CROSS_DOCUMENT_CONFLICT",
+        severity: "WARNING",
+        field: "issuer",
+        message: "签发方差异",
+        expected: "CMA CGM S.A.",
+        actual: "NEPTUNE SHIPPING LIMITED",
+      },
+      effA
+    );
+    assertEqual(
+      diffIssuerAction.actionButtons[0]?.label,
+      "采用建议值",
+      "W13: when form value !== alert.expected, renders 采用建议值"
+    );
+    const reportedAmtDescriptive = resolveRecordAlertActions(
+      {
+        code: "AMOUNT_TOTAL_MISMATCH",
+        severity: "BLOCKER",
+        field: "reported_charge_amount",
+        message: "缺少费用名称和金额对应证据",
+        expected: "同一源单中的费用名称和金额",
+        actual: "H/C 9007199254740991.01",
+      },
+      effA
+    );
+    assertEqual(
+      reportedAmtDescriptive.locateButton?.label,
+      "定位关联字段",
+      "W13: reported_charge_amount renders 定位关联字段"
+    );
+    assertTrue(
+      reportedAmtDescriptive.actionButtons.length === 1 &&
+        reportedAmtDescriptive.actionButtons[0].label ===
+          "确认当前金额与费用项" &&
+        reportedAmtDescriptive.actionButtons[0].updateField === undefined,
+      "W13: descriptive expected string on reported_charge_amount is NEVER stuffed into amount input"
+    );
+    const payeeHintAction = resolveRecordAlertActions(
+      {
+        code: "CROSS_DOCUMENT_CONFLICT",
+        severity: "WARNING",
+        field: "payee_hint",
+        message: "收款方提示差异",
+        expected: "NEPTUNE SHIPPING LIMITED",
+        actual: "OTHER PARTY",
+      },
+      effA
+    );
+    assertEqual(
+      payeeHintAction.actionButtons[0]?.label,
+      "确认关联主体",
+      "W13: payee_hint matching current issuer offers 确认关联主体"
+    );
+  }
+  results.push(
+    "PASS 32: Wave 13 confirmedFields lossless RawDecimal PATCH, record/batch isolation, fieldErrors & alert mapping"
+  );
+
+  // 33. Wave 13 Mounted App E2E: confirm original value -> enable Save -> outbound PATCH + TopBar & Export PROCESSING notice
+  {
+    const hostEnv = installFakeDomHost();
+    const capturedPatchBodies: string[] = [];
+    const w13RawBatchText =
+      '{"id":"batch-w13-ui","version":1,"short_code":"B-W13","accounting_entity":"NEPTUNE SHIPPING LIMITED","source_channel":"WEB","status":"PROCESSING","stage":"VALIDATING","stage_message":"校验中","ocr_mode":"REMOTE_ONLY","total_files":1,"succeeded_files":1,"failed_files":0,"counts":{"create":0,"update":0,"no_change":0,"pending_review":1,"rejected":0},"created_at":"2026-11-20T00:00:00Z","updated_at":"2026-11-20T00:00:00Z","documents":[{"id":"doc-w13-1","original_filename":"inv.pdf","sanitized_filename":"inv.pdf","source_kind":"PDF","extraction_channel":"LOCAL_TEXT","status":"PARSED","affected_record_ids":["rec-w13-ui"],"total_amount":9007199254740991.01,"total_currency":"USD"}],"failed_documents":[],"records":[{"id":"rec-w13-ui","source_doc_id":"doc-w13-1","source_line_index":0,"operation":"PENDING_REVIEW","review_status":"NEEDS_REVIEW","match_level":"NONE","inherited_fields":[],"document_info":{"document_type":"Debit Note","reference_no":"OCA17","document_date":"2026-09-12"},"transaction_party":{"issuer":"NEPTUNE SHIPPING LIMITED","recipient":"CLIENT CO"},"charge_details":{"charge_item":"Handling Charge","raw_charge_name":"H/C","quantity":null,"unit_price":null,"amount":9007199254740991.01,"currency":"USD","payment_term":"PP"},"financial_attributes":{"accounting_entity":"NEPTUNE SHIPPING LIMITED","posting_type":"AR"},"ai_reasoning":["test"],"human_overrides":{},"validation_alerts":[{"code":"CROSS_DOCUMENT_CONFLICT","severity":"WARNING","field":"reference_no","message":"单号抽取冲突","expected":"OCA17","actual":"CMDUCHN4053601"},{"code":"AMOUNT_TOTAL_MISMATCH","severity":"BLOCKER","field":"reported_charge_amount","message":"模型另报费用需核对","expected":"同一源单中的费用名称和金额","actual":"H/C 9007199254740991.01"}]}]}';
+    const w13BatchInitial = ssrNormalizeBatchDetail(
+      ssrParseLosslessJson(w13RawBatchText)
+    );
+
+    let serverBatchSnapshot = parseLosslessJson<typeof detail>(w13RawBatchText);
+    const w13Client = new SsrBillingApiClient({
+      transport: async (
+        input: RequestInfo | URL,
+        init?: RequestInit
+      ): Promise<Response> => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (method === "PATCH" && url.includes("/records/rec-w13-ui")) {
+          const bodyStr = String(init?.body ?? "{}");
+          capturedPatchBodies.push(bodyStr);
+          const completedSnapshot = {
+            ...serverBatchSnapshot,
+            status: "COMPLETED" as const,
+            stage: "COMPLETED" as const,
+            records: serverBatchSnapshot.records.map((r) => ({
+              ...r,
+              validation_alerts: [],
+              human_overrides: {
+                reference_no: "OCA17",
+                amount: 9007199254740991.01,
+                charge_item: "Handling Charge",
+              },
+            })),
+          };
+          serverBatchSnapshot = completedSnapshot;
+          return new Response(stringifyLosslessJson(completedSnapshot), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.includes("/export")) {
+          return new Response(
+            '{"mode":"official","included_count":1,"excluded_pending_count":0,"excluded_rejected_count":0,"records":[{"operation":"CREATE","document_info":{"document_type":"Debit Note","reference_no":"OCA17","document_date":"2026-09-12"},"transaction_party":{"issuer":"NEPTUNE SHIPPING LIMITED","recipient":"CLIENT CO"},"charge_details":{"charge_item":"Handling Charge","amount":9007199254740991.01,"currency":"USD","payment_term":"PP"},"financial_attributes":{"accounting_entity":"NEPTUNE SHIPPING LIMITED","posting_type":"AR"},"audit_trail":{"ai_reasoning":[]}}]}',
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        if (url.includes("/api/v1/batches/batch-w13-ui")) {
+          return new Response(stringifyLosslessJson(serverBatchSnapshot), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("[]", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+
+    const mountEl = hostEnv.doc.createElement!("div");
+    hostEnv.doc.body!.appendChild(mountEl);
+    const root = ReactDomClient.createRoot(mountEl);
+    try {
+      await ReactMod.act(async () => {
+        root.render(
+          ReactMod.createElement(AppComponentRef, {
+            apiClient: w13Client,
+            initialBatch: w13BatchInitial,
+            initialBatches: [],
+          })
+        );
+      });
+      await flushActMicrotasks();
+      const ui = createAppMountHelpers(hostEnv);
+
+      // Verify TopBar renders clear "主数据 · 基准 0" instead of misleading "主数据 (0)"
+      assertTrue(
+        mountEl.textContent.includes("主数据 · 基准 0") &&
+          !mountEl.textContent.includes("主数据 (0)"),
+        "W13 UI: TopBar displays clear 主数据 · 基准 0 label"
+      );
+
+      // Verify form inputs carry id & name attributes
+      const namedRefInputs = hostEnv.findNodes(
+        (n) =>
+          n.tagName === "INPUT" &&
+          (n.attributes.id ?? hostEnv.getProps(n).id) ===
+            "wb-rec-reference-no" &&
+          (n.attributes.name ?? hostEnv.getProps(n).name) === "reference_no"
+      );
+      assertEqual(
+        namedRefInputs.length,
+        1,
+        "W13 UI: ReviewInspector inputs expose semantic id and name attributes"
+      );
+
+      // Verify Export modal shows PROCESSING warning banner & collapsed single-scroll summary by default
+      await ui.clickButton("导出标准 JSON");
+      assertTrue(
+        hostEnv.doc.body!.textContent.includes(
+          "当前批次仍在后台解析中，以下导出仅包含截至当前已就绪的记录"
+        ),
+        "W13 UI: Export modal warns when batch.status === PROCESSING"
+      );
+      assertTrue(
+        hostEnv.doc.body!.textContent.includes("展开完整 JSON 预览（共 1 条）"),
+        "W13 UI: Export modal collapses full JSON behind toggle by default to avoid nested scrollbars"
+      );
+      await ui.clickButton("关闭");
+
+      // Initially Save button is disabled because effective === server and nothing confirmed yet
+      const saveBtnBefore = hostEnv.findNodes(
+        (n) => n.tagName === "BUTTON" && n.textContent.includes("保存修订并重验")
+      )[0];
+      assertTrue(
+        Boolean(saveBtnBefore?.disabled),
+        "W13 UI: Save button initially disabled before confirming original values"
+      );
+
+      // Click 确认采用原文值 (for reference_no === "OCA17") AND 确认当前金额与费用项 (for reported_charge_amount)
+      await ui.clickButton("确认采用原文值");
+      await ui.clickButton("确认当前金额与费用项");
+
+      const saveBtnAfterConfirm = hostEnv.findNodes(
+        (n) => n.tagName === "BUTTON" && n.textContent.includes("保存修订并重验")
+      )[0];
+      assertEqual(
+        Boolean(saveBtnAfterConfirm?.disabled),
+        false,
+        "W13 UI: Save button immediately enabled after confirming original/current values"
+      );
+
+      await ui.clickButton("保存修订并重验");
+      assertEqual(
+        capturedPatchBodies.length,
+        1,
+        "W13 UI: clicking Save sends 1 PATCH request"
+      );
+      assertTrue(
+        capturedPatchBodies[0].includes('"reference_no":"OCA17"') &&
+          capturedPatchBodies[0].includes('"charge_item":"Handling Charge"') &&
+          capturedPatchBodies[0].includes('"amount":9007199254740991.01') &&
+          !capturedPatchBodies[0].includes("同一源单中的费用名称和金额"),
+        `W13 UI: outbound PATCH submits exact confirmed reference_no, charge_item & lossless amount, got: ${capturedPatchBodies[0]}`
+      );
+    } finally {
+      await ReactMod.act(async () => {
+        root.unmount();
+      });
+      hostEnv.cleanup();
+    }
+  }
+  results.push(
+    "PASS 33: Wave 13 Mounted App E2E original-value confirmation PATCH, TopBar clarity, form id/name & Export PROCESSING/single-scroll"
   );
 
   } finally {

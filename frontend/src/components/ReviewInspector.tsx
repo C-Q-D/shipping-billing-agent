@@ -15,7 +15,6 @@ import {
   type ChargeDictionaryEntry,
   type OcrMode,
   type SourceDocumentSummary,
-  type ValidationAlert,
 } from "../api/client.ts";
 import { formatLosslessAmount, readDecimalString } from "../api/decimalJson.ts";
 import {
@@ -23,11 +22,16 @@ import {
   buildRecordDiffPatch,
   countCodePoints,
   extractServerRecordFormValues,
+  getConfirmedRecordFields,
   getEffectiveDocTotalsValues,
   getEffectiveRecordFormValues,
   hasDocTotalsDraft,
   hasRecordDraft,
+  resolveAlertFocusTargetKey,
+  resolveRecordAlertActions,
   validateReviewReason,
+  withPendingRecordConfirmation,
+  type AlertActionButtonSpec,
   type DebitCreditOption,
   type DocTotalsFormValues,
   type DraftStoreState,
@@ -80,6 +84,10 @@ export interface ReviewInspectorProps {
     field: K,
     value: RecordFormValues[K]
   ) => void;
+  onConfirmRecordFields?: (
+    record: BillingRecordDetail,
+    fields: ReadonlyArray<string>
+  ) => void;
   onResetRecordDraft: (recordId: string) => void;
   onSaveRecordPatch: (record: BillingRecordDetail) => Promise<void>;
   onApproveRecord: (
@@ -118,7 +126,12 @@ const COMMON_ISO_CURRENCIES = [
   "CAD",
 ] as const;
 
-type ProvenanceKind = "draft" | "override" | "inherited" | "extracted";
+type ProvenanceKind =
+  | "draft"
+  | "confirmed_draft"
+  | "override"
+  | "inherited"
+  | "extracted";
 
 function getProvenanceMeta(kind: ProvenanceKind): {
   label: string;
@@ -127,6 +140,8 @@ function getProvenanceMeta(kind: ProvenanceKind): {
   switch (kind) {
     case "draft":
       return { label: "未保存", className: "wb-badge wb-badge--warn" };
+    case "confirmed_draft":
+      return { label: "待保存确认", className: "wb-badge wb-badge--warn" };
     case "override":
       return { label: "人工修订", className: "wb-badge wb-badge--info" };
     case "inherited":
@@ -141,10 +156,14 @@ function getFieldProvenance(
   formKey: keyof RecordFormValues,
   record: BillingRecordDetail,
   effective: RecordFormValues,
-  server: RecordFormValues
+  server: RecordFormValues,
+  confirmedFields?: Record<string, true>
 ): ProvenanceKind {
   if (effective[formKey] !== server[formKey]) {
     return "draft";
+  }
+  if (confirmedFields && confirmedFields[fieldKey] === true) {
+    return "confirmed_draft";
   }
   const overrides = record.human_overrides ?? {};
   if (
@@ -189,6 +208,7 @@ export function ReviewInspector({
   onRefreshBatch,
   onClearInspectedDoc,
   onUpdateRecordField,
+  onConfirmRecordFields,
   onResetRecordDraft,
   onSaveRecordPatch,
   onApproveRecord,
@@ -208,6 +228,9 @@ export function ReviewInspector({
   const lastAuditStampRef = useRef<string | null>(null);
 
   const [highlightedField, setHighlightedField] = useState<string | null>(null);
+  const [alertActionFeedback, setAlertActionFeedback] = useState<string | null>(
+    null
+  );
   const [recordValidationErrors, setRecordValidationErrors] = useState<
     Record<string, string>
   >({});
@@ -236,6 +259,7 @@ export function ReviewInspector({
 
   useEffect(() => {
     setRecordValidationErrors({});
+    setAlertActionFeedback(null);
     setApprovePanelOpen(false);
     setApproveReason("");
     setApproveReasonError(null);
@@ -320,61 +344,116 @@ export function ReviewInspector({
     return Array.from(names);
   }, [dictionaryList]);
 
+  const clearFieldError = (fieldKey: string) => {
+    setRecordValidationErrors((prev) => {
+      if (!(fieldKey in prev)) return prev;
+      const next = { ...prev };
+      delete next[fieldKey];
+      return next;
+    });
+  };
+
   const focusField = (fieldKey: string) => {
-    const mapKey = fieldKey === "container_nos" ? "container_nos_text" : fieldKey;
-    const el = fieldRefs.current[mapKey];
+    const resolvedKey =
+      resolveAlertFocusTargetKey(fieldKey, Boolean(recordSourceDoc)) ??
+      (fieldKey === "container_nos" ? "container_nos_text" : fieldKey);
+    const el = fieldRefs.current[resolvedKey];
     if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
-      el.focus();
-      setHighlightedField(mapKey);
+      el.scrollIntoView?.({ behavior: "smooth", block: "center" });
+      if (
+        el.tagName === "INPUT" ||
+        el.tagName === "TEXTAREA" ||
+        el.tagName === "SELECT" ||
+        el.tagName === "BUTTON"
+      ) {
+        el.focus?.();
+      } else {
+        const inner = el.querySelector?.("button, input, textarea, select") as
+          | HTMLElement
+          | null
+          | undefined;
+        inner?.focus?.();
+      }
+      setHighlightedField(resolvedKey);
       window.setTimeout(() => {
-        setHighlightedField((curr) => (curr === mapKey ? null : curr));
+        setHighlightedField((curr) => (curr === resolvedKey ? null : curr));
       }, 1500);
     }
   };
 
-  const applySuggestedAlertValue = (alert: ValidationAlert) => {
-    if (!selectedRecord || !alert.field || alert.expected === undefined || alert.expected === null) {
+  const handleAlertActionButtonClick = (spec: AlertActionButtonSpec) => {
+    if (!batch || !selectedRecord) return;
+    const currentFormValues = getEffectiveRecordFormValues(
+      selectedRecord,
+      draftStore,
+      batch.id
+    );
+
+    if (spec.missingRequiredCheck) {
+      const { focusKey, fieldKey, errorMessage, feedbackMessage } =
+        spec.missingRequiredCheck;
+      setRecordValidationErrors((prev) => ({
+        ...prev,
+        [fieldKey]: errorMessage,
+      }));
+      setAlertActionFeedback(feedbackMessage);
+      focusField(focusKey);
       return;
     }
-    const val = alert.expected;
-    switch (alert.field) {
-      case "container_nos": {
-        const current = getEffectiveRecordFormValues(
-          selectedRecord,
-          draftStore,
-          batch!.id
-        ).container_nos_text;
-        const nextVal =
-          alert.actual && current.includes(alert.actual)
-            ? current.replace(alert.actual, val)
-            : val;
-        onUpdateRecordField(selectedRecord, "container_nos_text", nextVal);
-        break;
+
+    setRecordValidationErrors((prev) => {
+      const next = { ...prev };
+      for (const cf of spec.confirmFields) {
+        delete next[cf];
       }
-      case "currency":
-        onUpdateRecordField(selectedRecord, "currency", val.toUpperCase());
-        break;
-      case "amount":
-        onUpdateRecordField(selectedRecord, "amount", val);
-        break;
-      case "unit_price":
-        onUpdateRecordField(selectedRecord, "unit_price", val);
-        break;
-      case "quantity":
-        onUpdateRecordField(selectedRecord, "quantity", val);
-        break;
-      case "document_date":
-        onUpdateRecordField(selectedRecord, "document_date", val);
-        break;
-      case "posting_type":
-        if (val === "AR" || val === "AP") {
-          onUpdateRecordField(selectedRecord, "posting_type", val);
-        }
-        break;
-      default:
-        break;
+      if (spec.updateField) {
+        delete next[spec.updateField.formKey];
+      }
+      return next;
+    });
+
+    if (spec.updateField) {
+      const { formKey, value } = spec.updateField;
+      if (onConfirmRecordFields && spec.confirmFields.length > 0) {
+        onUpdateRecordField(selectedRecord, formKey, value as never);
+        onConfirmRecordFields(selectedRecord, spec.confirmFields);
+      } else if (spec.confirmFields.length > 0) {
+        withPendingRecordConfirmation(
+          batch.id,
+          selectedRecord.id,
+          spec.confirmFields,
+          () => {
+            onUpdateRecordField(selectedRecord, formKey, value as never);
+          }
+        );
+      } else {
+        onUpdateRecordField(selectedRecord, formKey, value as never);
+      }
+    } else if (spec.confirmFields.length > 0) {
+      if (onConfirmRecordFields) {
+        onConfirmRecordFields(selectedRecord, spec.confirmFields);
+      } else {
+        const anchorKey: keyof RecordFormValues =
+          spec.confirmFields[0] === "container_nos"
+            ? "container_nos_text"
+            : (spec.confirmFields[0] as keyof RecordFormValues);
+        withPendingRecordConfirmation(
+          batch.id,
+          selectedRecord.id,
+          spec.confirmFields,
+          () => {
+            onUpdateRecordField(
+              selectedRecord,
+              anchorKey,
+              currentFormValues[anchorKey] as never
+            );
+          }
+        );
+      }
     }
+
+    setAlertActionFeedback(spec.feedbackMessage);
+    focusField(spec.focusFieldKey);
   };
 
   const handleSaveRecordClick = async () => {
@@ -389,6 +468,7 @@ export function ReviewInspector({
       return;
     }
     setRecordValidationErrors({});
+    setAlertActionFeedback(null);
     await onSaveRecordPatch(selectedRecord);
   };
 
@@ -547,6 +627,8 @@ export function ReviewInspector({
               onChange={setRetryOcrMode}
             />
             <LumnoInput
+              id={`wb-doc-retry-url-${doc.id}`}
+              name="retry_public_url"
               value={retryPublicUrl}
               placeholder="可选：填写公网 URL 重试（输入 URL 将清空待传替换文件）"
               aria-label="补充公网 URL 重试"
@@ -649,13 +731,24 @@ export function ReviewInspector({
         </div>
 
         <div className="wb-form-grid-2">
-          <label className="wb-form-field">
+          <label htmlFor={`wb-doc-subtotal-${doc.id}`} className="wb-form-field">
             <span className="wb-form-label">未税小计 (subtotal_amount)</span>
             <LumnoInput
-              className="wb-tabular"
+              id={`wb-doc-subtotal-${doc.id}`}
+              name="subtotal_amount"
+              className={`wb-tabular ${
+                !isStandaloneDocView && highlightedField === "doc_subtotal_amount"
+                  ? "wb-field-flash"
+                  : ""
+              }`}
               inputMode="decimal"
               value={docValues.subtotal_amount}
               placeholder="如 1410.40"
+              ref={(node) => {
+                if (!isStandaloneDocView) {
+                  fieldRefs.current.doc_subtotal_amount = node;
+                }
+              }}
               onChange={(e) =>
                 onUpdateDocField(doc, "subtotal_amount", e.target.value)
               }
@@ -667,13 +760,24 @@ export function ReviewInspector({
             ) : null}
           </label>
 
-          <label className="wb-form-field">
+          <label htmlFor={`wb-doc-tax-${doc.id}`} className="wb-form-field">
             <span className="wb-form-label">税额 (tax_amount)</span>
             <LumnoInput
-              className="wb-tabular"
+              id={`wb-doc-tax-${doc.id}`}
+              name="tax_amount"
+              className={`wb-tabular ${
+                !isStandaloneDocView && highlightedField === "doc_tax_amount"
+                  ? "wb-field-flash"
+                  : ""
+              }`}
               inputMode="decimal"
               value={docValues.tax_amount}
               placeholder="如 0.00"
+              ref={(node) => {
+                if (!isStandaloneDocView) {
+                  fieldRefs.current.doc_tax_amount = node;
+                }
+              }}
               onChange={(e) =>
                 onUpdateDocField(doc, "tax_amount", e.target.value)
               }
@@ -685,13 +789,24 @@ export function ReviewInspector({
             ) : null}
           </label>
 
-          <label className="wb-form-field">
+          <label htmlFor={`wb-doc-total-${doc.id}`} className="wb-form-field">
             <span className="wb-form-label">单据总计 (total_amount)</span>
             <LumnoInput
-              className="wb-tabular"
+              id={`wb-doc-total-${doc.id}`}
+              name="total_amount"
+              className={`wb-tabular ${
+                !isStandaloneDocView && highlightedField === "doc_total_amount"
+                  ? "wb-field-flash"
+                  : ""
+              }`}
               inputMode="decimal"
               value={docValues.total_amount}
               placeholder="如 1410.40"
+              ref={(node) => {
+                if (!isStandaloneDocView) {
+                  fieldRefs.current.doc_total_amount = node;
+                }
+              }}
               onChange={(e) =>
                 onUpdateDocField(doc, "total_amount", e.target.value)
               }
@@ -703,14 +818,25 @@ export function ReviewInspector({
             ) : null}
           </label>
 
-          <label className="wb-form-field">
+          <label htmlFor={`wb-doc-currency-${doc.id}`} className="wb-form-field">
             <span className="wb-form-label">汇总币种 (total_currency)</span>
             <LumnoInput
-              className="wb-mono"
+              id={`wb-doc-currency-${doc.id}`}
+              name="total_currency"
+              className={`wb-mono ${
+                !isStandaloneDocView && highlightedField === "doc_total_currency"
+                  ? "wb-field-flash"
+                  : ""
+              }`}
               maxLength={3}
               list="wb-iso-currency-list"
               value={docValues.total_currency}
               placeholder="USD"
+              ref={(node) => {
+                if (!isStandaloneDocView) {
+                  fieldRefs.current.doc_total_currency = node;
+                }
+              }}
               onChange={(e) =>
                 onUpdateDocField(
                   doc,
@@ -727,9 +853,11 @@ export function ReviewInspector({
           </label>
         </div>
 
-        <label className="wb-form-field">
+        <label htmlFor={`wb-doc-review-note-${doc.id}`} className="wb-form-field">
           <span className="wb-form-label">单据汇总修订说明 (review_note)</span>
           <LumnoInput
+            id={`wb-doc-review-note-${doc.id}`}
+            name="doc_review_note"
             value={docValues.review_note}
             placeholder="例如：修正 OCR 误识单据印章总计为实际应付总额"
             onChange={(e) =>
@@ -787,6 +915,9 @@ export function ReviewInspector({
   const formValues = selectedRecord
     ? getEffectiveRecordFormValues(selectedRecord, draftStore, batch.id)
     : null;
+  const confirmedFields = selectedRecord
+    ? getConfirmedRecordFields(draftStore, batch.id, selectedRecord.id)
+    : {};
   const diffPreview = selectedRecord
     ? buildRecordDiffPatch(selectedRecord, draftStore, batch.id)
     : null;
@@ -813,7 +944,8 @@ export function ReviewInspector({
       formKey,
       selectedRecord,
       formValues,
-      serverValues
+      serverValues,
+      confirmedFields
     );
     const meta = getProvenanceMeta(kind);
     return (
@@ -877,7 +1009,11 @@ export function ReviewInspector({
                         ? `（期望 ${b.expected ?? "—"} / 实际 ${b.actual ?? "—"}）`
                         : ""}
                     </span>
-                    {b.field ? (
+                    {b.field &&
+                    resolveAlertFocusTargetKey(
+                      b.field,
+                      Boolean(recordSourceDoc)
+                    ) !== null ? (
                       <LumnoButton
                         variant="ghost"
                         compact
@@ -934,7 +1070,11 @@ export function ReviewInspector({
                   variant="ghost"
                   compact
                   icon="ri-arrow-go-back-line"
-                  onClick={() => onResetRecordDraft(selectedRecord.id)}
+                  onClick={() => {
+                    setAlertActionFeedback(null);
+                    setRecordValidationErrors({});
+                    onResetRecordDraft(selectedRecord.id);
+                  }}
                 >
                   重置草稿
                 </LumnoButton>
@@ -1003,71 +1143,109 @@ export function ReviewInspector({
                     {selectedRecord.validation_alerts?.length} 项
                   </span>
                 </div>
-                {(selectedRecord.validation_alerts ?? []).map((alert, idx) => (
-                  <div
-                    key={`${alert.code}-${alert.field ?? ""}-${idx}`}
-                    className="wb-alert-item"
-                    data-severity={alert.severity}
-                  >
-                    <div
-                      style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        gap: "6px",
-                        flexWrap: "wrap",
-                      }}
-                    >
-                      <strong style={{ fontSize: "12px" }}>
-                        [{alert.severity}] {alert.code}
-                        {alert.field ? ` · ${alert.field}` : ""}
-                      </strong>
-                      <div style={{ display: "inline-flex", gap: "4px" }}>
-                        {alert.field ? (
-                          <LumnoButton
-                            variant="ghost"
-                            compact
-                            onClick={() => focusField(alert.field!)}
-                          >
-                            定位字段
-                          </LumnoButton>
-                        ) : null}
-                        {alert.severity !== "RESOLVED" &&
-                        alert.field &&
-                        alert.expected ? (
-                          <LumnoButton
-                            variant="ghost"
-                            compact
-                            onClick={() => applySuggestedAlertValue(alert)}
-                          >
-                            采用建议值
-                          </LumnoButton>
-                        ) : null}
-                      </div>
-                    </div>
-
-                    <div>{alert.message}</div>
-
-                    {alert.expected || alert.actual ? (
-                      <div className="wb-mono wb-tabular" style={{ fontSize: "11px" }}>
-                        期望: {alert.expected ?? "—"} | 实际:{" "}
-                        {alert.actual ?? "—"}
-                      </div>
-                    ) : null}
-
-                    {alert.severity === "BLOCKER" ? (
-                      <div style={{ fontSize: "11px", opacity: 0.9 }}>
-                        硬性阻断严禁强行解除，请修订对应字段、修正单据总额或选择驳回。
-                      </div>
-                    ) : null}
-
-                    {alert.severity === "WARNING" ? (
-                      <div style={{ fontSize: "11px", opacity: 0.85 }}>
-                        软告警可通过修订对应字段保存重验，或直接在底部填写批准理由特例放行。
-                      </div>
-                    ) : null}
+                {alertActionFeedback ? (
+                  <div className="wb-notice-banner" role="status">
+                    <span>{alertActionFeedback}</span>
                   </div>
-                ))}
+                ) : null}
+                {(selectedRecord.validation_alerts ?? []).map((alert, idx) => {
+                  const resolvedActions = resolveRecordAlertActions(
+                    alert,
+                    formValues,
+                    { hasSourceDoc: Boolean(recordSourceDoc) }
+                  );
+                  return (
+                    <div
+                      key={`${alert.code}-${alert.field ?? ""}-${idx}`}
+                      className="wb-alert-item"
+                      data-severity={alert.severity}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          gap: "6px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <strong style={{ fontSize: "12px" }}>
+                          [{alert.severity}] {alert.code}
+                          {alert.field ? ` · ${alert.field}` : ""}
+                        </strong>
+                        {resolvedActions.locateButton ||
+                        resolvedActions.actionButtons.length > 0 ? (
+                          <div
+                            style={{
+                              display: "inline-flex",
+                              gap: "4px",
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            {resolvedActions.locateButton ? (
+                              <LumnoButton
+                                variant="ghost"
+                                compact
+                                onClick={() => {
+                                  if (
+                                    resolvedActions.locateButton?.emptyFieldHint
+                                  ) {
+                                    setAlertActionFeedback(
+                                      resolvedActions.locateButton.emptyFieldHint
+                                    );
+                                  }
+                                  focusField(
+                                    resolvedActions.locateButton!.focusFieldKey
+                                  );
+                                }}
+                              >
+                                {resolvedActions.locateButton.label}
+                              </LumnoButton>
+                            ) : null}
+                            {resolvedActions.actionButtons.map((btn, bIdx) => (
+                              <LumnoButton
+                                key={`${btn.kind}-${btn.label}-${bIdx}`}
+                                variant="ghost"
+                                compact
+                                title={btn.title}
+                                onClick={() => handleAlertActionButtonClick(btn)}
+                              >
+                                {btn.label}
+                              </LumnoButton>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+
+                      <div>{alert.message}</div>
+
+                      {resolvedActions.helperNote ? (
+                        <div style={{ fontSize: "11px", opacity: 0.9 }}>
+                          {resolvedActions.helperNote}
+                        </div>
+                      ) : null}
+
+                      {alert.expected || alert.actual ? (
+                        <div className="wb-mono wb-tabular" style={{ fontSize: "11px" }}>
+                          期望: {alert.expected ?? "—"} | 实际:{" "}
+                          {alert.actual ?? "—"}
+                        </div>
+                      ) : null}
+
+                      {alert.severity === "BLOCKER" ? (
+                        <div style={{ fontSize: "11px", opacity: 0.9 }}>
+                          硬性阻断严禁强行解除，请修订对应字段、修正单据总额或选择驳回。
+                        </div>
+                      ) : null}
+
+                      {alert.severity === "WARNING" ? (
+                        <div style={{ fontSize: "11px", opacity: 0.85 }}>
+                          软告警可通过修订对应字段保存重验，或直接在底部填写批准理由特例放行。
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
               </div>
             ) : null}
 
@@ -1158,8 +1336,13 @@ export function ReviewInspector({
                       !formValues.force_create_new &&
                       formValues.matched_existing_bill_id === cand.id;
                     return (
-                      <label key={cand.id} className="wb-candidate-option">
+                      <label
+                        key={cand.id}
+                        htmlFor={`wb-cand-${selectedRecord.id}-${cand.id}`}
+                        className="wb-candidate-option"
+                      >
                         <input
+                          id={`wb-cand-${selectedRecord.id}-${cand.id}`}
                           type="radio"
                           name={`cand-${selectedRecord.id}`}
                           checked={checked}
@@ -1203,13 +1386,15 @@ export function ReviewInspector({
                 <span className="wb-helper-note">支持精确十进制长数值</span>
               </div>
 
-              <label className="wb-form-field">
+              <label htmlFor="wb-rec-charge-item" className="wb-form-field">
                 {renderLabelWithProvenance(
                   "标准费用名称 (charge_item)",
                   "charge_item",
                   "charge_item"
                 )}
                 <LumnoInput
+                  id="wb-rec-charge-item"
+                  name="charge_item"
                   className={
                     highlightedField === "charge_item" ? "wb-field-flash" : ""
                   }
@@ -1219,13 +1404,14 @@ export function ReviewInspector({
                   ref={(node) => {
                     fieldRefs.current.charge_item = node;
                   }}
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    clearFieldError("charge_item");
                     onUpdateRecordField(
                       selectedRecord,
                       "charge_item",
                       e.target.value
-                    )
-                  }
+                    );
+                  }}
                 />
                 {recordValidationErrors.charge_item ? (
                   <span className="wb-field-error">
@@ -1235,9 +1421,11 @@ export function ReviewInspector({
               </label>
 
               <div className="wb-form-grid-3">
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-quantity" className="wb-form-field">
                   {renderLabelWithProvenance("数量 (quantity)", "quantity", "quantity")}
                   <LumnoInput
+                    id="wb-rec-quantity"
+                    name="quantity"
                     className={`wb-tabular ${
                       highlightedField === "quantity" ? "wb-field-flash" : ""
                     }`}
@@ -1247,13 +1435,14 @@ export function ReviewInspector({
                     ref={(node) => {
                       fieldRefs.current.quantity = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("quantity");
                       onUpdateRecordField(
                         selectedRecord,
                         "quantity",
                         e.target.value
-                      )
-                    }
+                      );
+                    }}
                   />
                   {recordValidationErrors.quantity ? (
                     <span className="wb-field-error">
@@ -1262,9 +1451,11 @@ export function ReviewInspector({
                   ) : null}
                 </label>
 
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-unit-price" className="wb-form-field">
                   {renderLabelWithProvenance("单价 (unit_price)", "unit_price", "unit_price")}
                   <LumnoInput
+                    id="wb-rec-unit-price"
+                    name="unit_price"
                     className={`wb-tabular ${
                       highlightedField === "unit_price" ? "wb-field-flash" : ""
                     }`}
@@ -1274,13 +1465,14 @@ export function ReviewInspector({
                     ref={(node) => {
                       fieldRefs.current.unit_price = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("unit_price");
                       onUpdateRecordField(
                         selectedRecord,
                         "unit_price",
                         e.target.value
-                      )
-                    }
+                      );
+                    }}
                   />
                   {recordValidationErrors.unit_price ? (
                     <span className="wb-field-error">
@@ -1289,9 +1481,11 @@ export function ReviewInspector({
                   ) : null}
                 </label>
 
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-amount" className="wb-form-field">
                   {renderLabelWithProvenance("金额 (amount)", "amount", "amount")}
                   <LumnoInput
+                    id="wb-rec-amount"
+                    name="amount"
                     className={`wb-tabular ${
                       highlightedField === "amount" ? "wb-field-flash" : ""
                     }`}
@@ -1301,9 +1495,10 @@ export function ReviewInspector({
                     ref={(node) => {
                       fieldRefs.current.amount = node;
                     }}
-                    onChange={(e) =>
-                      onUpdateRecordField(selectedRecord, "amount", e.target.value)
-                    }
+                    onChange={(e) => {
+                      clearFieldError("amount");
+                      onUpdateRecordField(selectedRecord, "amount", e.target.value);
+                    }}
                   />
                   {recordValidationErrors.amount ? (
                     <span className="wb-field-error">
@@ -1314,9 +1509,11 @@ export function ReviewInspector({
               </div>
 
               <div className="wb-form-grid-2">
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-currency" className="wb-form-field">
                   {renderLabelWithProvenance("币种 (currency)", "currency", "currency")}
                   <LumnoInput
+                    id="wb-rec-currency"
+                    name="currency"
                     className={`wb-mono ${
                       highlightedField === "currency" ? "wb-field-flash" : ""
                     }`}
@@ -1327,13 +1524,14 @@ export function ReviewInspector({
                     ref={(node) => {
                       fieldRefs.current.currency = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("currency");
                       onUpdateRecordField(
                         selectedRecord,
                         "currency",
                         e.target.value.toUpperCase()
-                      )
-                    }
+                      );
+                    }}
                   />
                   {recordValidationErrors.currency ? (
                     <span className="wb-field-error">
@@ -1342,7 +1540,12 @@ export function ReviewInspector({
                   ) : null}
                 </label>
 
-                <div className="wb-form-field">
+                <div
+                  className="wb-form-field"
+                  ref={(node) => {
+                    fieldRefs.current.payment_term = node;
+                  }}
+                >
                   {renderLabelWithProvenance(
                     "付款条款 (payment_term)",
                     "payment_term",
@@ -1356,13 +1559,24 @@ export function ReviewInspector({
                       { value: "PP", label: "PP" },
                       { value: "CC", label: "CC" },
                     ]}
-                    onChange={(val) =>
-                      onUpdateRecordField(selectedRecord, "payment_term", val)
-                    }
+                    onChange={(val) => {
+                      clearFieldError("payment_term");
+                      onUpdateRecordField(selectedRecord, "payment_term", val);
+                    }}
                   />
+                  {recordValidationErrors.payment_term ? (
+                    <span className="wb-field-error">
+                      {recordValidationErrors.payment_term}
+                    </span>
+                  ) : null}
                 </div>
 
-                <div className="wb-form-field">
+                <div
+                  className="wb-form-field"
+                  ref={(node) => {
+                    fieldRefs.current.posting_type = node;
+                  }}
+                >
                   {renderLabelWithProvenance(
                     "记账方向 (posting_type)",
                     "posting_type",
@@ -1376,10 +1590,16 @@ export function ReviewInspector({
                       { value: "AR", label: "AR 应收" },
                       { value: "AP", label: "AP 应付" },
                     ]}
-                    onChange={(val) =>
-                      onUpdateRecordField(selectedRecord, "posting_type", val)
-                    }
+                    onChange={(val) => {
+                      clearFieldError("posting_type");
+                      onUpdateRecordField(selectedRecord, "posting_type", val);
+                    }}
                   />
+                  {recordValidationErrors.posting_type ? (
+                    <span className="wb-field-error">
+                      {recordValidationErrors.posting_type}
+                    </span>
+                  ) : null}
                 </div>
 
                 <div className="wb-form-field">
@@ -1403,58 +1623,83 @@ export function ReviewInspector({
               </div>
 
               <div className="wb-form-grid-3">
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-document-type" className="wb-form-field">
                   {renderLabelWithProvenance(
                     "单据类型 (document_type)",
                     "document_type",
                     "document_type"
                   )}
                   <LumnoInput
+                    id="wb-rec-document-type"
+                    name="document_type"
+                    className={
+                      highlightedField === "document_type"
+                        ? "wb-field-flash"
+                        : ""
+                    }
                     value={formValues.document_type}
                     placeholder="Invoice / Debit Note / Credit Note"
                     ref={(node) => {
                       fieldRefs.current.document_type = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("document_type");
                       onUpdateRecordField(
                         selectedRecord,
                         "document_type",
                         e.target.value
-                      )
-                    }
+                      );
+                    }}
                   />
+                  {recordValidationErrors.document_type ? (
+                    <span className="wb-field-error">
+                      {recordValidationErrors.document_type}
+                    </span>
+                  ) : null}
                 </label>
 
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-reference-no" className="wb-form-field">
                   {renderLabelWithProvenance(
                     "单据编号 (reference_no)",
                     "reference_no",
                     "reference_no"
                   )}
                   <LumnoInput
-                    className="wb-mono"
+                    id="wb-rec-reference-no"
+                    name="reference_no"
+                    className={`wb-mono ${
+                      highlightedField === "reference_no" ? "wb-field-flash" : ""
+                    }`}
                     value={formValues.reference_no}
                     placeholder="如 DN-202609-001"
                     ref={(node) => {
                       fieldRefs.current.reference_no = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("reference_no");
                       onUpdateRecordField(
                         selectedRecord,
                         "reference_no",
                         e.target.value
-                      )
-                    }
+                      );
+                    }}
                   />
+                  {recordValidationErrors.reference_no ? (
+                    <span className="wb-field-error">
+                      {recordValidationErrors.reference_no}
+                    </span>
+                  ) : null}
                 </label>
 
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-document-date" className="wb-form-field">
                   {renderLabelWithProvenance(
                     "单据日期 (document_date)",
                     "document_date",
                     "document_date"
                   )}
                   <LumnoInput
+                    id="wb-rec-document-date"
+                    name="document_date"
                     className={`wb-mono ${
                       highlightedField === "document_date" ? "wb-field-flash" : ""
                     }`}
@@ -1463,13 +1708,14 @@ export function ReviewInspector({
                     ref={(node) => {
                       fieldRefs.current.document_date = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("document_date");
                       onUpdateRecordField(
                         selectedRecord,
                         "document_date",
                         e.target.value
-                      )
-                    }
+                      );
+                    }}
                   />
                   {recordValidationErrors.document_date ? (
                     <span className="wb-field-error">
@@ -1480,124 +1726,178 @@ export function ReviewInspector({
               </div>
 
               <div className="wb-form-grid-2">
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-issuer" className="wb-form-field">
                   {renderLabelWithProvenance("签发方 (issuer)", "issuer", "issuer")}
                   <LumnoInput
+                    id="wb-rec-issuer"
+                    name="issuer"
+                    className={
+                      highlightedField === "issuer" ? "wb-field-flash" : ""
+                    }
                     value={formValues.issuer}
                     placeholder="开票/收款主体名称"
                     ref={(node) => {
                       fieldRefs.current.issuer = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("issuer");
                       onUpdateRecordField(
                         selectedRecord,
                         "issuer",
                         e.target.value
-                      )
-                    }
+                      );
+                    }}
                   />
+                  {recordValidationErrors.issuer ? (
+                    <span className="wb-field-error">
+                      {recordValidationErrors.issuer}
+                    </span>
+                  ) : null}
                 </label>
 
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-recipient" className="wb-form-field">
                   {renderLabelWithProvenance(
                     "接收方 (recipient)",
                     "recipient",
                     "recipient"
                   )}
                   <LumnoInput
+                    id="wb-rec-recipient"
+                    name="recipient"
+                    className={
+                      highlightedField === "recipient" ? "wb-field-flash" : ""
+                    }
                     value={formValues.recipient}
                     placeholder="付款/接收主体名称"
                     ref={(node) => {
                       fieldRefs.current.recipient = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("recipient");
                       onUpdateRecordField(
                         selectedRecord,
                         "recipient",
                         e.target.value
-                      )
-                    }
+                      );
+                    }}
                   />
+                  {recordValidationErrors.recipient ? (
+                    <span className="wb-field-error">
+                      {recordValidationErrors.recipient}
+                    </span>
+                  ) : null}
                 </label>
               </div>
 
               <div className="wb-form-grid-2">
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-mbl-no" className="wb-form-field">
                   {renderLabelWithProvenance(
                     "主提单号 (mbl_no)",
                     "mbl_no",
                     "mbl_no"
                   )}
                   <LumnoInput
-                    className="wb-mono"
+                    id="wb-rec-mbl-no"
+                    name="mbl_no"
+                    className={`wb-mono ${
+                      highlightedField === "mbl_no" ? "wb-field-flash" : ""
+                    }`}
                     value={formValues.mbl_no}
                     placeholder="如 OOLU4055331281"
                     ref={(node) => {
                       fieldRefs.current.mbl_no = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("mbl_no");
                       onUpdateRecordField(
                         selectedRecord,
                         "mbl_no",
                         e.target.value
-                      )
-                    }
+                      );
+                    }}
                   />
+                  {recordValidationErrors.mbl_no ? (
+                    <span className="wb-field-error">
+                      {recordValidationErrors.mbl_no}
+                    </span>
+                  ) : null}
                 </label>
 
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-hbl-no" className="wb-form-field">
                   {renderLabelWithProvenance(
                     "分提单号 (hbl_no)",
                     "hbl_no",
                     "hbl_no"
                   )}
                   <LumnoInput
-                    className="wb-mono"
+                    id="wb-rec-hbl-no"
+                    name="hbl_no"
+                    className={`wb-mono ${
+                      highlightedField === "hbl_no" ? "wb-field-flash" : ""
+                    }`}
                     value={formValues.hbl_no}
                     placeholder="如 STE20264055HBL"
                     ref={(node) => {
                       fieldRefs.current.hbl_no = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("hbl_no");
                       onUpdateRecordField(
                         selectedRecord,
                         "hbl_no",
                         e.target.value
-                      )
-                    }
+                      );
+                    }}
                   />
+                  {recordValidationErrors.hbl_no ? (
+                    <span className="wb-field-error">
+                      {recordValidationErrors.hbl_no}
+                    </span>
+                  ) : null}
                 </label>
 
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-booking-no" className="wb-form-field">
                   {renderLabelWithProvenance(
                     "订舱号 (booking_no)",
                     "booking_no",
                     "booking_no"
                   )}
                   <LumnoInput
-                    className="wb-mono"
+                    id="wb-rec-booking-no"
+                    name="booking_no"
+                    className={`wb-mono ${
+                      highlightedField === "booking_no" ? "wb-field-flash" : ""
+                    }`}
                     value={formValues.booking_no}
                     placeholder="如 4055331281"
                     ref={(node) => {
                       fieldRefs.current.booking_no = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("booking_no");
                       onUpdateRecordField(
                         selectedRecord,
                         "booking_no",
                         e.target.value
-                      )
-                    }
+                      );
+                    }}
                   />
+                  {recordValidationErrors.booking_no ? (
+                    <span className="wb-field-error">
+                      {recordValidationErrors.booking_no}
+                    </span>
+                  ) : null}
                 </label>
 
-                <label className="wb-form-field">
+                <label htmlFor="wb-rec-container-nos" className="wb-form-field">
                   {renderLabelWithProvenance(
                     "箱号列表 (container_nos)",
                     "container_nos",
                     "container_nos_text"
                   )}
                   <LumnoInput
+                    id="wb-rec-container-nos"
+                    name="container_nos"
                     className={`wb-mono ${
                       highlightedField === "container_nos_text"
                         ? "wb-field-flash"
@@ -1608,14 +1908,20 @@ export function ReviewInspector({
                     ref={(node) => {
                       fieldRefs.current.container_nos_text = node;
                     }}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      clearFieldError("container_nos");
                       onUpdateRecordField(
                         selectedRecord,
                         "container_nos_text",
                         e.target.value
-                      )
-                    }
+                      );
+                    }}
                   />
+                  {recordValidationErrors.container_nos ? (
+                    <span className="wb-field-error">
+                      {recordValidationErrors.container_nos}
+                    </span>
+                  ) : null}
                 </label>
               </div>
 
@@ -1633,13 +1939,15 @@ export function ReviewInspector({
                 </div>
               ) : null}
 
-              <label className="wb-form-field">
+              <label htmlFor="wb-rec-review-note" className="wb-form-field">
                 {renderLabelWithProvenance(
                   "本次修订说明 (review_note)",
                   "review_note",
                   "review_note"
                 )}
                 <LumnoTextarea
+                  id="wb-rec-review-note"
+                  name="review_note"
                   value={formValues.review_note}
                   placeholder="仅本次提交写入审计历史，保存后恢复空白（既往记录请见下方审计历史）"
                   ref={(node) => {
@@ -1655,7 +1963,7 @@ export function ReviewInspector({
                 />
               </label>
 
-              {diffPreview && diffPreview.hasChanges ? (
+              {diffPreview && Object.keys(diffPreview.patch).length > 0 ? (
                 <div className="wb-helper-note wb-mono">
                   待提交差量字段：{Object.keys(diffPreview.patch).join(", ")}
                 </div>
@@ -1845,6 +2153,8 @@ export function ReviewInspector({
                     </span>
                   </div>
                   <LumnoInput
+                    id="wb-approve-reason"
+                    name="approve_reason"
                     value={approveReason}
                     placeholder="例如：已核对原始提单与水单无误，确认特例批准入账"
                     aria-label="人工批准理由"
@@ -1980,6 +2290,8 @@ export function ReviewInspector({
         </datalist>
 
         <input
+          id="wb-inspector-replace-file"
+          name="replace_document_file"
           ref={replaceFileInputRef}
           type="file"
           style={{ display: "none" }}

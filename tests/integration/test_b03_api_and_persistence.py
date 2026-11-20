@@ -32,9 +32,12 @@ from typer.testing import CliRunner
 from shipping_billing_agent.api.app import create_app
 from shipping_billing_agent.cli.app import app as cli_app
 from shipping_billing_agent.config.settings import AppSettings
+from shipping_billing_agent.domain import validate_batch
 from shipping_billing_agent.domain.models import (
+    AlertCode,
     BatchStage,
     ParsedDocument,
+    ValidationAlert,
     dumps_decimal_json,
     loads_decimal_json,
 )
@@ -192,6 +195,101 @@ def _assert_decimal_fields(charges: dict) -> None:
 def _assert_decimal_tokens(payload: bytes) -> None:
     assert re.search(rb'"amount"\s*:\s*9007199254740991\.01(?=\s*[,}])', payload)
     assert re.search(rb'"quantity"\s*:\s*0\.0025(?=\s*[,}])', payload)
+
+
+@pytest.mark.parametrize(
+    ("source_total", "peer_amount", "remaining_blocker"),
+    [
+        ("100.00", None, None),
+        ("97.00", None, ("AMOUNT_TOTAL_MISMATCH", "total_amount")),
+        ("100.00", "95.00", ("CROSS_DOCUMENT_CONFLICT", "amount")),
+    ],
+    ids=["confirmed-fields", "printed-total-still-disagrees", "other-document-still-disagrees"],
+)
+def test_review_confirmation_clears_only_the_reported_extraction_conflicts(
+    client: TestClient,
+    settings: AppSettings,
+    source_total: str,
+    peer_amount: str | None,
+    remaining_blocker: tuple[str, str] | None,
+) -> None:
+    reference = "INV-REVIEW-13"
+    files = [_invoice(reference, total=source_total)]
+    if peer_amount is not None:
+        _, peer = _invoice(reference, amount=peer_amount)
+        files.append(("conflicting-invoice.xlsx", peer))
+    batch = _body(_upload(client, *files), 201)
+    batch_id = batch["id"]
+    batch_path = f"{BATCHES}/{batch_id}"
+    repository = _open_repository(settings.sqlite_db_path)
+    rows = repository.list_billing_records(batch_id)
+    original = next(row for row in rows if row.amount == Decimal("100.00"))
+    assert original.reference_no == reference
+    parse_issues = [
+        ValidationAlert.from_code(
+            code, "模型提取的字段与原文不符", field=field, expected=expected, actual=actual
+        )
+        for code, field, expected, actual in (
+            (AlertCode.CROSS_DOCUMENT_CONFLICT, "issuer", NEPTUNE, "CMA CGM"),
+            (AlertCode.CROSS_DOCUMENT_CONFLICT, "reference_no", reference, "MODEL-REF"),
+            (AlertCode.CROSS_DOCUMENT_CONFLICT, "payee_hint", NEPTUNE, "CMA CGM"),
+            (AlertCode.AMOUNT_TOTAL_MISMATCH, "reported_charge_amount", "100.00", "无费用行"),
+        )
+    ]
+    seeded_rows = [
+        row.model_copy(update={"raw_parse_issues": parse_issues}) if row.id == original.id else row
+        for row in rows
+    ]
+    repository.upsert_billing_records(batch_id, validate_batch(seeded_rows))
+    record_url = f"{batch_path}/records/{original.id}"
+    export_url = f"{batch_path}/export?mode=official"
+    approval = {"reason": "已核对原始单据"}
+    totals_or_peer = {remaining_blocker} if remaining_blocker else set()
+
+    def blocker_fields(batch_detail: dict) -> set[tuple[str, str]]:
+        record = next(row for row in batch_detail["records"] if row["id"] == original.id)
+        return {
+            (alert["code"], alert["field"])
+            for alert in record["validation_alerts"]
+            if alert["severity"] == "BLOCKER"
+        }
+
+    blocked = _body(client.post(f"{record_url}/approve", json=approval), 422)
+    assert blocked["code"] == "HARD_BLOCKER_CANNOT_APPROVE"
+    assert set(blocked["details"]["blocker_codes"]) == {
+        "CROSS_DOCUMENT_CONFLICT", "AMOUNT_TOTAL_MISMATCH",
+    }
+    assert blocker_fields(_body(client.get(batch_path))) == totals_or_peer | {
+        (issue.code.value, issue.field) for issue in parse_issues
+    }
+
+    partially_confirmed = _body(client.patch(record_url, json={"issuer": NEPTUNE}))
+    assert blocker_fields(partially_confirmed) == totals_or_peer | {
+        ("CROSS_DOCUMENT_CONFLICT", "reference_no"),
+        ("AMOUNT_TOTAL_MISMATCH", "reported_charge_amount"),
+    }
+    rechecked = _body(client.patch(record_url, json={"reference_no": reference, "amount": 100}))
+    assert blocker_fields(rechecked) == totals_or_peer
+    saved = repository.get_billing_record(batch_id, original.id)
+    assert saved is not None
+    assert saved.human_overrides.keys() == {"issuer", "reference_no", "amount"}
+    assert saved.raw_parse_issues == parse_issues
+    assert _body(client.get(batch_path)) == rechecked
+
+    if remaining_blocker:
+        assert saved.review_status == "NEEDS_REVIEW"
+        blocked = _body(client.post(f"{record_url}/approve", json=approval), 422)
+        assert blocked["details"]["blocker_codes"] == [remaining_blocker[0]]
+        assert _body(client.get(export_url))["records"] == []
+    else:
+        assert (saved.review_status, saved.validation_alerts) == ("AUTO_READY", [])
+        approved = _body(client.post(f"{record_url}/approve", json=approval))
+        assert approved["records"][0]["review_status"] == "APPROVED"
+        (exported,) = _body(client.get(export_url))["records"]
+        assert exported["document_info"]["reference_no"] == reference
+        assert (exported["charge_details"]["amount"], exported["charge_details"]["currency"]) == (
+            Decimal("100.00"), "USD",
+        )
 
 
 def _http_routes(routes: list) -> Iterator[APIRoute]:

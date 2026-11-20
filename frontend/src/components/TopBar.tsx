@@ -216,9 +216,11 @@ export function TopBar({
             compact
             icon="ri-database-2-line"
             className="wb-desktop-only"
+            title={`记账主体、费用词典与共享历史基准库（当前历史基准 ${existingBillCount} 条）`}
+            aria-label={`主数据与历史基准管理，当前历史基准 ${existingBillCount} 条`}
             onClick={onOpenMasterData}
           >
-            主数据 ({existingBillCount})
+            主数据 · 基准 {existingBillCount}
           </LumnoButton>
 
           <LumnoButton
@@ -343,7 +345,7 @@ export function TopBar({
               onOpenMasterData();
             }}
           >
-            主数据管理与历史库 ({existingBillCount})
+            主数据管理 · 历史基准 {existingBillCount} 条
           </LumnoButton>
           <LumnoButton
             variant="secondary"
