@@ -483,6 +483,30 @@ def test_office_summary_bank_rows_and_debit_credit_columns() -> None:
     )
 
 
+def test_office_table_deduplication_keeps_a_separate_identical_paragraph_charge() -> None:
+    headers = ["Description", "Amount", "Currency", "Payment Term"]
+    table_fee = ["Handling Fee", "30", "USD", "PP"]
+    lines = [
+        "Invoice INV-13", f"Issuer: {_ENTITY}", "Handling Fee 30 USD (PP)",
+        "\t".join(headers), "\t".join(table_fee), "Total USD 60",
+    ]
+    doc = _document(
+        "table-and-paragraph",
+        "\n".join(lines),
+        source_kind="WORD",
+        tables=[ParsedTable(source="[Body | Table 1]", rows=[headers, table_fee])],
+    )
+
+    result = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only")
+
+    assert len(result.records) == 2
+    assert {row.source_evidence.line_number for row in result.records} == {3, 5}
+    assert {
+        (row.charge_item, row.amount, row.currency, row.payment_term) for row in result.records
+    } == {("Handling Charge", Decimal(30), "USD", PaymentTerm.PP)}
+    assert len(serialize_records(result.records, "official")) == 2
+
+
 @pytest.mark.parametrize("direction", [None, "UNKNOWN", "CREDIT"])
 def test_grounding_fills_explicit_debit_and_blocks_opposite_model_direction(
     direction: str | None,
@@ -634,10 +658,14 @@ def test_reversed_email_package_resolves_parties_without_inheriting_freight_term
 @pytest.mark.parametrize(
     ("old_term", "operation"), [("PP", OperationType.UPDATE), ("CC", OperationType.NO_CHANGE)]
 )
-def test_term_only_notice_inherits_omitted_billing_fields(old_term, operation) -> None:
+@pytest.mark.parametrize("term_first", [False, True], ids=["label-first", "term-first"])
+def test_term_only_notice_inherits_omitted_billing_fields(old_term, operation, term_first) -> None:
+    details = ["Charge: Handling Charge", "Change payment term to CC"]
+    if term_first:
+        details.reverse()
     doc = _document(
         "notice",
-        "Debit Note DN-202609-001\nCharge: Handling Charge\nChange payment term to CC",
+        "\n".join(["Debit Note DN-202609-001", *details]),
     )
     parsed = extract_document_by_rules(doc)
     assert parsed.extraction.issuer is parsed.extraction.recipient is None
@@ -866,6 +894,8 @@ def test_rule_only_uses_the_printed_title_and_reference(
         "仅供参考",
         "non-billable",
         "not payable",
+        "(excluded)",
+        "not billed",
         "不计费",
         "無需付款",
     ],
@@ -883,9 +913,15 @@ def test_rules_exclude_non_billing_remarks_from_the_invoice(note: str) -> None:
 
 @pytest.mark.parametrize(
     "note_lines",
-    ["\n(waived)", "[Page 2]\n(waived)", "Total USD 30\n(waived)",
-     "(Storage Fee 45 USD waived)", "Invoice INV-123 (for your reference only)"],
-    ids=["blank-line", "different-page", "summary", "own-charge", "invoice-title"],
+    [
+        "\n(waived)", "[Page 2]\n(waived)", "Total USD 30\n(waived)",
+        "(Storage Fee 45 USD waived)", "Invoice INV-123 (for your reference only)",
+        "Storage Fee is waived", "Storage Fee is a quotation\nonly",
+    ],
+    ids=[
+        "blank-line", "different-page", "summary", "own-charge", "invoice-title",
+        "different-named-fee", "different-named-wrapped-fee",
+    ],
 )
 def test_excluded_note_does_not_skip_an_unrelated_preceding_fee(note_lines: str) -> None:
     doc = _document(
@@ -905,7 +941,10 @@ def test_excluded_note_does_not_skip_an_unrelated_preceding_fee(note_lines: str)
     assert len(row.excluded_clauses) == 1 and "Handling Charge" not in row.excluded_clauses[0].text
 
 
-def test_wrapped_note_excludes_the_preceding_table_row() -> None:
+@pytest.mark.parametrize(
+    "notes", [("is a quotation only",), ("is a quotation", "only")], ids=["one-line", "two-lines"]
+)
+def test_wrapped_note_excludes_the_preceding_table_row(notes: tuple[str, ...]) -> None:
     doc = _document(
         "table-note",
         f"Invoice INV-1\nIssuer: {_ENTITY}",
@@ -916,7 +955,7 @@ def test_wrapped_note_excludes_the_preceding_table_row() -> None:
                     ["Description", "Amount", "Currency"],
                     ["Handling Charge", "30", "USD"],
                     ["Storage Fee", "50000", "EUR"],
-                    ["is a quotation only", "", ""],
+                    *([note, "", ""] for note in notes),
                 ],
             )
         ],
@@ -927,6 +966,21 @@ def test_wrapped_note_excludes_the_preceding_table_row() -> None:
     assert (row.charge_item, row.amount, row.currency) == ("Handling Charge", Decimal(30), "USD")
     (clause,) = row.excluded_clauses
     assert clause.page == 2 and "50000" in clause.text and "is a quotation only" in clause.text
+
+
+def test_waiver_can_refer_to_the_preceding_fee_by_its_normalized_name() -> None:
+    doc = _document(
+        "waived-alias",
+        f"Invoice INV-1\nIssuer: {_ENTITY}\nHandling Fee 30 USD (PP)\n"
+        "Storage Fee 500 USD\nStorage Charge is waived",
+    )
+
+    (row,) = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only").records
+
+    assert row.charge_item == "Handling Charge" and row.operation is OperationType.CREATE
+    assert [clause.text for clause in row.excluded_clauses] == [
+        "Storage Fee 500 USD Storage Charge is waived"
+    ]
 
 
 @pytest.mark.parametrize("charge_name", ["THC", "DOC", "HANDLING FEE"])
@@ -966,6 +1020,48 @@ def test_rules_block_currency_disagreement_in_alternate_detail_layouts(detail: s
         for alert in record.validation_alerts
     )
     assert serialize_records([record], "official") == []
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Wharfage @ ZZZ 15 30 USD",
+        "Wharfage at ZZZ 15 line total 30 USD",
+        "Wharfage rate: 15 ZZZ line amount 30 USD",
+    ],
+)
+def test_printed_rate_currency_is_preserved_without_polluting_the_fee_name(detail: str) -> None:
+    doc = _document(
+        "rate-prefix", f"Invoice INV-1\nIssuer: {_ENTITY}\n{detail}\nTotal (USD): 30"
+    )
+
+    (row,) = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only").records
+
+    assert (row.raw_charge_name, row.unit_price, row.amount) == (
+        "Wharfage", Decimal(15), Decimal(30),
+    )
+    assert set(row.raw_invalid_fields["currency"].split(" / ")) == {"ZZZ", "USD"}
+    assert any(
+        alert.code is AlertCode.CROSS_DOCUMENT_CONFLICT and alert.field == "currency"
+        for alert in row.validation_alerts
+    )
+    assert serialize_records([row], "official") == []
+
+
+def test_rated_ocr_row_keeps_amount_after_an_unrecognized_cell() -> None:
+    doc = _document(
+        "rated-ocr-row",
+        f"Invoice INV-13\nIssuer: {_ENTITY}\nR.O.E. Culrr\nAmount\n"
+        "Wharfage\nLlc\n2.85USD\n21.90\n1.0000 USD\n21.90\nUSD\n21.90",
+    )
+
+    (row,) = run_billing_pipeline([doc], _ENTITY, extractor_mode="rule_only").records
+
+    assert (row.charge_item, row.unit_price, row.amount, row.currency, row.payment_term) == (
+        "Wharfage", Decimal("2.85"), Decimal("21.90"), "USD", None,
+    )
+    assert row.operation is OperationType.CREATE
+    assert len(serialize_records([row], "official")) == 1
 
 
 def test_source_evidence_and_summary_are_safe_before_batch_validation(monkeypatch) -> None:

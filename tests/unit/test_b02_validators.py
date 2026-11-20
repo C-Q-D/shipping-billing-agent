@@ -34,6 +34,7 @@ from shipping_billing_agent.domain import (
     validate_record,
     validate_records,
 )
+from shipping_billing_agent.domain.entity_resolver import PRINTED_CURRENCY_CONFLICT_MESSAGE
 
 ENTITY = "NEPTUNE SHIPPING LIMITED"
 
@@ -122,6 +123,40 @@ def _assert_review(record: ProcessedBillingRecord, code: AlertCode) -> None:
         alert.code is code and alert.severity is AlertSeverity.BLOCKER
         for alert in record.validation_alerts
     )
+
+
+@pytest.mark.parametrize("prefix", ["", "US$ / "], ids=["single-token", "printed-pair"])
+def test_legacy_currency_override_keeps_only_other_lines_own_conflicts(prefix: str) -> None:
+    eur, gbp = [
+        ValidationAlert.from_code(
+            AlertCode.CROSS_DOCUMENT_CONFLICT,
+            PRINTED_CURRENCY_CONFLICT_MESSAGE,
+            field="currency",
+            expected="USD",
+            actual=code,
+        )
+        for code in ("EUR", "GBP")
+    ]
+    first = _line(
+        "handling", currency=None, raw_invalid_fields={"currency": f"{prefix}EUR"},
+        raw_parse_issues=[eur, gbp], validation_alerts=[eur, gbp],
+        human_overrides={"currency": "USD"},
+    )
+    second = _line(
+        "storage", charge_item="Storage Charge", currency=None,
+        raw_invalid_fields={"currency": f"{prefix}GBP"},
+        raw_parse_issues=[eur, gbp], validation_alerts=[eur, gbp],
+    )
+
+    checked = validate_batch([first, second])
+
+    assert [row.raw_parse_issues for row in checked] == [[eur], [gbp]]
+    assert [row.validation_alerts for row in checked] == [[gbp], [gbp]]
+    assert serialize_records(checked, "official") == []
+    edited = second.model_copy(update={"human_overrides": {"currency": "USD"}})
+    ready = validate_batch([first, edited])
+    assert [row.validation_alerts for row in ready] == [[], []]
+    assert len(serialize_records(ready, "official")) == 2
 
 
 @pytest.mark.parametrize(("amount", "passes"), [("1.12", True), ("1.121", False)])

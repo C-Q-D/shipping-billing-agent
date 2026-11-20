@@ -13,7 +13,7 @@ from typing import Any
 from unicodedata import normalize
 
 from .charge_normalizer import normalize_charge_item, normalize_document_date
-from .currency import is_valid_iso4217
+from .currency import is_valid_iso4217, normalize_currency
 from .entity_resolver import (
     PRINTED_CURRENCY_CONFLICT_MESSAGE,
     _is_currency_conflict,
@@ -929,7 +929,7 @@ def _package_conflicts(
         for hbl in edited_hbls or source.hbl_nos:
             if key := _reference_key(hbl):
                 hbl_keys.add(key)
-                hbl_evidence.setdefault(key, hbl)
+                hbl_evidence[key] = min(hbl_evidence.get(key, hbl), hbl)
         if hbl_keys:
             hbl_sources.append(hbl_keys)
 
@@ -995,7 +995,7 @@ def _shared_hbl_alert(
         message += "。邮件来源：" + "、".join(f"{path}（{hbls}）" for path, hbls in sorted(sources))
     else:
         # Detached records retain the HBLs and parent IDs, and the alert retains the source names.
-        message = next(
+        message = min(
             (
                 alert.message
                 for alert in prior_alerts
@@ -1004,7 +1004,7 @@ def _shared_hbl_alert(
                 and alert.actual == actual
                 and alert.message.startswith(_SHARED_HBL_MESSAGE)
             ),
-            message,
+            default=message,
         )
     return ValidationAlert.from_code(
         AlertCode.MULTI_SOURCE_BL_MISMATCH, message, field="hbl_no", actual=actual
@@ -1167,22 +1167,37 @@ def _validate_document(
         for issue in record.raw_parse_issues
         if _is_currency_conflict(issue) and issue.message == PRINTED_CURRENCY_CONFLICT_MESSAGE
     ]
+    source_currencies = [
+        {
+            normalize_currency(token)[0] or token.strip().upper()
+            for token in record.raw_invalid_fields.get("currency", "").split("/")
+            if token.strip()
+        }
+        for record in records
+    ]
+    all_source_currencies = set().union(*source_currencies)
     prepared = []
-    for record in records:
+    for record, currencies in zip(records, source_currencies, strict=True):
         raw_issues = record.raw_parse_issues
-        if printed_conflicts and "currency" not in record.raw_invalid_fields:
-            raw_issues = [issue for issue in raw_issues if issue not in printed_conflicts]
         updates: dict[str, Any] = {}
-        if raw_issues is not record.raw_parse_issues:
-            updates["raw_parse_issues"] = raw_issues
         if extraction is not None:
             # Route document parse issues through the same per-row override checks.
             updates["raw_invalid_fields"] = (
                 extraction.raw_invalid_fields | record.raw_invalid_fields
             )
-            updates["raw_parse_issues"] = [
+            raw_issues = [
                 *raw_issues, *(issue for issue in document_issues if issue not in raw_issues)
             ]
+        if printed_conflicts:
+            other_currencies = all_source_currencies - currencies
+            raw_issues = [
+                issue
+                for issue in raw_issues
+                if issue not in printed_conflicts
+                or (currencies and issue.actual not in other_currencies)
+            ]
+        if raw_issues is not record.raw_parse_issues:
+            updates["raw_parse_issues"] = raw_issues
         prepared.append(_prepare_line(record.model_copy(update=updates) if updates else record))
 
     lines = [record for record, _, _ in prepared]
@@ -1202,11 +1217,8 @@ def _validate_document(
     alerts, excess, credit_only = (
         _reconcile_totals(lines, totals) if totals is not None else ([], {}, False)
     )
-    source_currency_conflicts = [
-        issue
-        for line in lines
-        for issue in line.raw_parse_issues
-        if _is_currency_conflict(issue)
+    source_currency_conflicts = printed_conflicts + [
+        issue for line in lines for issue in line.raw_parse_issues if _is_currency_conflict(issue)
     ]
     for _, _, line_alerts in prepared:
         alerts.extend(
@@ -1311,10 +1323,21 @@ def _validate_batch(
         use_missing_snapshots=on_document_error is None,
     ):
         recalculated_by_doc[doc_id].add(AlertCode.MULTI_SOURCE_BL_MISMATCH)
-    return [
-        _with_alerts(record, alerts, recalculated_by_doc[record.source_doc_id])
-        for record, alerts in zip(validated, alerts_by_line, strict=True)
-    ]
+    result = []
+    for record, alerts in zip(validated, alerts_by_line, strict=True):
+        checked = _with_alerts(record, alerts, recalculated_by_doc[record.source_doc_id])
+        checked.validation_alerts.sort(
+            key=lambda alert: (
+                alert.code.value,
+                alert.field or "",
+                alert.actual or "",
+                alert.message,
+                alert.expected or "",
+                alert.severity.value,
+            )
+        )
+        result.append(checked)
+    return result
 
 
 def validate_batch(
