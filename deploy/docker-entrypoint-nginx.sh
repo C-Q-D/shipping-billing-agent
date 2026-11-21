@@ -15,13 +15,17 @@ printf '%s\n' "$BASIC_AUTH_PASS" | htpasswd -i -m -c /etc/nginx/.htpasswd "$BASI
 chown root:nginx /etc/nginx/.htpasswd
 chmod 640 /etc/nginx/.htpasswd
 
-allowlist="/etc/nginx/allowlist.conf"
-: > "$allowlist"
-if [ -n "${ALLOWED_CIDRS:-}" ]; then
+write_cidr_file() {
+  csv="$1"
+  target="$2"
+  directive="$3"
+  trailer="$4"
+  : > "$target"
+  [ -n "$csv" ] || return 0
   set -f
   old_ifs="$IFS"
   IFS=','
-  set -- $ALLOWED_CIDRS
+  set -- $csv
   IFS="$old_ifs"
   has_entry=0
   for raw_cidr in "$@"; do
@@ -29,18 +33,23 @@ if [ -n "${ALLOWED_CIDRS:-}" ]; then
     [ -z "$cidr" ] && continue
     case "$cidr" in
       *[!0-9a-fA-F:./]*)
-        echo "ERROR: Invalid CIDR entry in ALLOWED_CIDRS: $cidr" >&2
+        echo "ERROR: Invalid CIDR entry ($cidr) for $target" >&2
         exit 1
         ;;
     esac
-    printf 'allow %s;\n' "$cidr" >> "$allowlist"
+    printf '%s %s;\n' "$directive" "$cidr" >> "$target"
     has_entry=1
   done
   set +f
-  if [ "$has_entry" -eq 1 ]; then
-    printf 'allow 127.0.0.1;\nallow ::1;\ndeny all;\n' >> "$allowlist"
+  if [ "$has_entry" -eq 1 ] && [ -n "$trailer" ]; then
+    printf '%s\n' "$trailer" >> "$target"
   fi
-fi
+}
+
+write_cidr_file "${ALLOWED_CIDRS:-}" /etc/nginx/allowlist.conf allow "allow 127.0.0.1;
+allow ::1;
+deny all;"
+write_cidr_file "${TRUSTED_PROXY_CIDRS:-}" /etc/nginx/realip.conf set_real_ip_from "real_ip_header X-Real-IP;"
 
 nginx -t
 exec nginx -g "daemon off;"

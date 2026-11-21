@@ -51,6 +51,7 @@ services:
       BASIC_AUTH_USER: "${BASIC_AUTH_USER:-reviewer}"
       BASIC_AUTH_PASS: "${BASIC_AUTH_PASS:?请先在 .env 中设置 BASIC_AUTH_PASS}"
       ALLOWED_CIDRS: "${ALLOWED_CIDRS:-}"
+      TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:-}"
     mem_limit: "128m"
     pids_limit: 64
     cap_drop:
