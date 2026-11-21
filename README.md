@@ -11,6 +11,7 @@
   - [方式 A：零密钥离线 CLI 体验](#方式-a零密钥离线-cli-体验)
   - [方式 B：启动 Web 复核工作台（完整交互体验）](#方式-b启动-web-复核工作台完整交互体验)
   - [方式 C：配置真实大模型与运行 Harness 评测](#方式-c配置真实大模型与运行-harness-评测)
+  - [方式 D：Docker Compose 一键隔离部署（含 Basic Auth 访问保护）](#方式-ddocker-compose-一键隔离部署含-basic-auth-访问保护)
 - [2. 真实样本浏览器实测结果（一眼看懂）](#2-真实样本浏览器实测结果一眼看懂)
   - [整批上传 4 份原题样本（`NEPTUNE SHIPPING LIMITED` 视角）](#整批上传-4-份原题样本neptune-shipping-limited-视角)
   - [跨记账主体视角切换验证（同一原件自动重算 AR/AP）](#跨记账主体视角切换验证同一原件自动重算-arap)
@@ -90,6 +91,42 @@ LLM_API_KEY=<YOUR_API_KEY>
 ```
 
 重启 `serve` 后健康接口 `"llm_configured"` 变为 `true`，工作台与 CLI 将自动启用「确定性规则基线 + LangGraph 大模型语义抽取与原文逐行接地核验」双路架构。若暂缺公网文件 URL 或公网中转，建议使用 `--ocr-mode REMOTE_WITH_LOCAL_FALLBACK` 自动回退至本地 `pdfplumber` + `RapidOCR` 多格式识别。
+
+### 方式 D：Docker Compose 一键隔离部署（含 Basic Auth 访问保护）
+
+适合在独立测试服务器上快速拉起面向面试官的临时在线工作台，服务与宿主机其余业务完全隔离（独立容器网络与持久化卷 `billing-data`），并由前置 Nginx 反向代理提供 HTTP Basic Auth 访问保护与 `/healthz` 健康探针：
+
+1. **准备环境配置文件**：复制 [deploy/deploy.env.example](deploy/deploy.env.example) 为仓库根目录 `.env`，填写大模型密钥与临时访客凭据（**切勿提交 `.env`**）：
+
+   ```bash
+   cp deploy/deploy.env.example .env
+   ```
+
+   重点检查 `.env` 中以下配置项：
+   - `DEPLOY_PORT`（默认 `8080`）、`BASIC_AUTH_USER`（默认 `reviewer`）与 `BASIC_AUTH_PASS`（**必填**，用于拦截公网未授权访问与刷额度风险）
+   - `LLM_PROVIDER` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`（填入真实大模型 API Key 后自动开启双路语义抽取与接地核验）
+   - `APP_ALLOWED_ORIGINS`（若服务器前侧还有独立 HTTPS 域名反代，需补充对应公网 Origin JSON 数组，满足 `OriginMiddleware` 同源校验）
+
+2. **构建并启动隔离双容器栈**（`app` + `proxy`）：
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+   若目标服务器无公网构建条件、改用预打包镜像包分发时，可先导入镜像再免构建启动：
+
+   ```bash
+   docker load -i shipping-billing-agent-images.tar.gz
+   docker compose up -d --no-build
+   ```
+
+3. **访问与下线清理**：
+   - 打开 `http://<SERVER_IP>:<DEPLOY_PORT>`，使用 `.env` 中配置的 `BASIC_AUTH_USER` / `BASIC_AUTH_PASS` 登录即可使用完整工作台。
+   - 面试评估结束后一键停止并回收数据卷与容器：
+
+     ```bash
+     docker compose down -v
+     ```
 
 ---
 

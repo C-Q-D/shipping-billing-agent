@@ -1,0 +1,43 @@
+services:
+  app:
+    image: shipping-billing-agent:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ALLOW_REMOTE_BIND: "true"
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      APP_DATA_DIR: "/app/data"
+      SQLITE_DB_PATH: "/app/data/shipping_billing.db"
+    volumes:
+      - billing-data:/app/data
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  proxy:
+    image: shipping-billing-proxy:latest
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.proxy
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "${DEPLOY_PORT:-8080}:80"
+    environment:
+      BASIC_AUTH_USER: "${BASIC_AUTH_USER:-reviewer}"
+      BASIC_AUTH_PASS: "${BASIC_AUTH_PASS:?请先在 .env 中设置 BASIC_AUTH_PASS}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  billing-data:
