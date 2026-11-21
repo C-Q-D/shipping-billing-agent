@@ -8186,6 +8186,48 @@ export async function runDecimalJsonTests(): Promise<void> {
         "rotate(0deg) scale(1)",
         "P38: 适应 and 右转 90° reset scale(1) and rotate(0deg)"
       );
+      const dockedPane = hostEnv.findNodes((n) =>
+        (n.attributes.class ?? "").split(/\s+/).includes("wb-docked-preview-pane")
+      )[0];
+      assertTrue(
+        Boolean(dockedPane) &&
+          !(dockedPane.attributes.class ?? "").split(/\s+/).includes("lumno-glass-panel"),
+        "P38: docked preview pane uses solid surface class without lumno-glass-panel"
+      );
+      const loadedImgNode = hostEnv.findNodes((n) => n.tagName === "IMG")[0];
+      const onImgLoad = hostEnv.getProps(loadedImgNode).onLoad as
+        | ((e: { currentTarget: { naturalWidth: number; naturalHeight: number } }) => void)
+        | undefined;
+      assertTrue(typeof onImgLoad === "function", "P38: preview <img> exposes onLoad handler");
+      await ReactMod.act(async () => {
+        onImgLoad!({ currentTarget: { naturalWidth: 800, naturalHeight: 1200 } });
+      });
+      await ui.clickButton("+");
+      await ui.clickButton("+");
+      await ui.clickButton("右转 90°");
+      const rotatedFrame = hostEnv.findNodes((n) =>
+        (n.attributes.class ?? "").split(/\s+/).includes("wb-preview-image-frame")
+      )[0];
+      const rotatedImg = hostEnv.findNodes((n) => n.tagName === "IMG")[0];
+      assertTrue(
+        Boolean(rotatedFrame) &&
+          rotatedFrame.attributes["data-rotated-quarter"] === "true" &&
+          Number.parseFloat(String(rotatedFrame.style?.width ?? "0")) >
+            Number.parseFloat(String(rotatedFrame.style?.height ?? "0")) &&
+          String(rotatedImg?.style?.transform ?? "") === "translate(-50%, -50%) rotate(90deg)",
+        "P38: measured portrait image swaps frame width > height immediately upon 90° rotation while zoomed"
+      );
+      await ui.clickButton("右转 90°");
+      const flippedFrame = hostEnv.findNodes((n) =>
+        (n.attributes.class ?? "").split(/\s+/).includes("wb-preview-image-frame")
+      )[0];
+      assertTrue(
+        Boolean(flippedFrame) &&
+          flippedFrame.attributes["data-rotated-quarter"] === "false" &&
+          Number.parseFloat(String(flippedFrame.style?.height ?? "0")) >
+            Number.parseFloat(String(flippedFrame.style?.width ?? "0")),
+        "P38: rotating another 90° (to 180°) restores frame height > width"
+      );
 
       // G. Inspect FAILED doc + verify text 404 fallback
       const failNode = fileNodes.find((n) => n.textContent.includes("scan_fail.pdf"))!;
@@ -8213,12 +8255,16 @@ export async function runDecimalJsonTests(): Promise<void> {
         "floating",
         "P38: 浮窗 toggle switches grid out of docked mode"
       );
+      const floatingCards = hostEnv.findNodes((n) =>
+        (n.attributes.class ?? "").includes("wb-floating-preview")
+      );
       assertTrue(
-        hostEnv.findNodes((n) =>
-          (n.attributes.class ?? "").includes("wb-floating-preview")
-        ).length === 1 &&
+        floatingCards.length === 1 &&
+          !(floatingCards[0].attributes.class ?? "")
+            .split(/\s+/)
+            .includes("lumno-glass-panel") &&
           hostEnv.findNodes((n) => n.attributes["data-resize-handle"] === "se").length === 1,
-        "P38: floating mode renders non-modal draggable/resizable glass card"
+        "P38: floating mode renders non-modal draggable/resizable solid card without lumno-glass-panel"
       );
 
       await ui.clickButton("导出可入账");

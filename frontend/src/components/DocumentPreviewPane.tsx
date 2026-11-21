@@ -483,6 +483,13 @@ export function DocumentPreviewPane({
   const [zoomPercent, setZoomPercent] = useState(100);
   const [rotationDeg, setRotationDeg] = useState(0);
   const [originalError, setOriginalError] = useState<string | null>(null);
+  const [naturalSize, setNaturalSize] = useState<{ w: number; h: number } | null>(
+    null
+  );
+  const [stageSize, setStageSize] = useState<{ w: number; h: number } | null>(
+    null
+  );
+  const imageStageRef = useRef<HTMLDivElement | null>(null);
 
   // Text preview fetch state (AbortController guarded)
   const [textLoading, setTextLoading] = useState(false);
@@ -501,7 +508,69 @@ export function DocumentPreviewPane({
     setZoomPercent(100);
     setRotationDeg(0);
     setOriginalError(null);
+    setNaturalSize(null);
   }, [batch.id, activeDoc.id, viewMode]);
+
+  useEffect(() => {
+    if (previewKind !== "image" || viewMode !== "original") {
+      return;
+    }
+    const el = imageStageRef.current;
+    if (!el) return;
+    const measure = () => {
+      const rect = el.getBoundingClientRect?.();
+      const w = (el as { clientWidth?: number }).clientWidth || rect?.width || 0;
+      const h = (el as { clientHeight?: number }).clientHeight || rect?.height || 0;
+      if (w > 0 && h > 0) {
+        setStageSize((prev) =>
+          prev && prev.w === w && prev.h === h ? prev : { w, h }
+        );
+      }
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [previewKind, viewMode, activeDoc.id, previewMode]);
+
+  const imageLayout = useMemo(() => {
+    const isQuarterTurn = Math.abs(rotationDeg) % 180 === 90;
+    const scale = zoomPercent / 100;
+    if (!naturalSize || naturalSize.w <= 0 || naturalSize.h <= 0) {
+      return {
+        isQuarterTurn,
+        hasMeasured: false,
+        unrotatedW: null as number | null,
+        unrotatedH: null as number | null,
+        frameW: null as number | null,
+        frameH: null as number | null,
+      };
+    }
+    const natW = naturalSize.w;
+    const natH = naturalSize.h;
+    const availW = Math.max(200, (stageSize?.w ?? 680) - 32);
+    const availH = Math.max(200, (stageSize?.h ?? 560) - 32);
+    const fitScale = fitMode
+      ? Math.min(
+          1,
+          availW / (isQuarterTurn ? natH : natW),
+          availH / (isQuarterTurn ? natW : natH)
+        )
+      : Math.min(1, availW / natW, availH / natH) * scale;
+    const unrotatedW = Math.max(1, Math.round(natW * fitScale));
+    const unrotatedH = Math.max(1, Math.round(natH * fitScale));
+    const frameW = isQuarterTurn ? unrotatedH : unrotatedW;
+    const frameH = isQuarterTurn ? unrotatedW : unrotatedH;
+    return {
+      isQuarterTurn,
+      hasMeasured: true,
+      unrotatedW,
+      unrotatedH,
+      frameW,
+      frameH,
+    };
+  }, [naturalSize, stageSize, fitMode, zoomPercent, rotationDeg]);
 
   useEffect(() => {
     if (previewMode !== "floating") return;
@@ -984,21 +1053,80 @@ export function DocumentPreviewPane({
             {renderFallbackActions(true)}
           </div>
         ) : (
-          <div className="wb-preview-image-stage">
-            <img
-              src={imageUrl}
-              alt={activeDoc.sanitized_filename}
-              className="wb-preview-image"
-              data-fit={fitMode ? "true" : "false"}
-              style={{
-                transform: `rotate(${rotationDeg}deg) scale(${zoomPercent / 100})`,
-              }}
-              onError={() =>
-                setOriginalError(
-                  "当前图片原件暂不可用或未保留本地原件，可尝试切换提取文本或下载原件。"
-                )
-              }
-            />
+          <div ref={imageStageRef} className="wb-preview-image-stage">
+            {imageLayout.hasMeasured &&
+            imageLayout.frameW !== null &&
+            imageLayout.frameH !== null &&
+            imageLayout.unrotatedW !== null &&
+            imageLayout.unrotatedH !== null ? (
+              <div
+                className="wb-preview-image-frame"
+                data-rotated-quarter={
+                  imageLayout.isQuarterTurn ? "true" : "false"
+                }
+                style={{
+                  width: `${imageLayout.frameW}px`,
+                  height: `${imageLayout.frameH}px`,
+                }}
+              >
+                <img
+                  src={imageUrl}
+                  alt={activeDoc.sanitized_filename}
+                  className="wb-preview-image wb-preview-image--framed"
+                  data-fit={fitMode ? "true" : "false"}
+                  style={{
+                    width: `${imageLayout.unrotatedW}px`,
+                    height: `${imageLayout.unrotatedH}px`,
+                    transform: `translate(-50%, -50%) rotate(${rotationDeg}deg)`,
+                  }}
+                  onLoad={(e) => {
+                    const img = e.currentTarget as HTMLImageElement;
+                    if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                      setNaturalSize({
+                        w: img.naturalWidth,
+                        h: img.naturalHeight,
+                      });
+                    }
+                  }}
+                  onError={() =>
+                    setOriginalError(
+                      "当前图片原件暂不可用或未保留本地原件，可尝试切换提取文本或下载原件。"
+                    )
+                  }
+                />
+              </div>
+            ) : (
+              <div
+                className="wb-preview-image-frame wb-preview-image-frame--unmeasured"
+                data-rotated-quarter={
+                  imageLayout.isQuarterTurn ? "true" : "false"
+                }
+              >
+                <img
+                  src={imageUrl}
+                  alt={activeDoc.sanitized_filename}
+                  className="wb-preview-image"
+                  data-fit={fitMode ? "true" : "false"}
+                  style={{
+                    transform: `rotate(${rotationDeg}deg) scale(${zoomPercent / 100})`,
+                  }}
+                  onLoad={(e) => {
+                    const img = e.currentTarget as HTMLImageElement;
+                    if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                      setNaturalSize({
+                        w: img.naturalWidth,
+                        h: img.naturalHeight,
+                      });
+                    }
+                  }}
+                  onError={() =>
+                    setOriginalError(
+                      "当前图片原件暂不可用或未保留本地原件，可尝试切换提取文本或下载原件。"
+                    )
+                  }
+                />
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1188,7 +1316,7 @@ export function DocumentPreviewPane({
   if (previewMode === "floating") {
     return (
       <aside
-        className="wb-floating-preview lumno-glass-panel"
+        className="wb-floating-preview"
         aria-label="原件对照预览"
         style={{
           left: `${floatRect.left}px`,

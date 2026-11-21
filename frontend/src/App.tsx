@@ -2097,7 +2097,7 @@ export default function App({
           {isDockedPreviewVisible && activeBatch && activePreviewDoc ? (
             <>
               <section
-                className="wb-pane wb-pane--preview lumno-glass-panel"
+                className="wb-pane wb-pane--preview wb-docked-preview-pane"
                 aria-label="原件对照预览"
                 data-mobile-active={mobileTab === "preview" ? "true" : "false"}
               >
