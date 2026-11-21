@@ -147,6 +147,8 @@ export interface UploadAndFileTreeProps {
   activeBatch: BatchDetail | null;
   activeDocFilterId: string | null;
   dirtyDocIds?: ReadonlySet<string>;
+  previewOpen?: boolean;
+  previewDocId?: string | null;
   submittingBatch: boolean;
   submittingDemo: boolean;
   retryingDocId: string | null;
@@ -168,6 +170,7 @@ export interface UploadAndFileTreeProps {
   }) => Promise<boolean>;
   onSelectDocFilter: (docId: string | null) => void;
   onInspectDoc: (docId: string) => void;
+  onPreviewDoc?: (docId: string) => void;
   onForceParseDoc: (docId: string) => void;
   onRetryOrReplaceDoc: (docId: string, file?: File) => void;
 }
@@ -178,6 +181,8 @@ export function UploadAndFileTree({
   activeBatch,
   activeDocFilterId,
   dirtyDocIds,
+  previewOpen = false,
+  previewDocId = null,
   submittingBatch,
   submittingDemo,
   retryingDocId,
@@ -188,6 +193,7 @@ export function UploadAndFileTree({
   onSubmitDemo,
   onSelectDocFilter,
   onInspectDoc,
+  onPreviewDoc,
   onForceParseDoc,
   onRetryOrReplaceDoc,
 }: UploadAndFileTreeProps) {
@@ -960,6 +966,22 @@ export function UploadAndFileTree({
                         >
                           {doc.status === "PARSED" ? "核对合计" : "查看"}
                         </LumnoButton>
+
+                        {onPreviewDoc ? (
+                          <LumnoButton
+                            variant={
+                              previewOpen && previewDocId === doc.id
+                                ? "secondary"
+                                : "ghost"
+                            }
+                            compact
+                            icon="ri-eye-line"
+                            aria-pressed={previewOpen && previewDocId === doc.id}
+                            onClick={() => onPreviewDoc(doc.id)}
+                          >
+                            查看原件
+                          </LumnoButton>
+                        ) : null}
                       </div>
                     </div>
 

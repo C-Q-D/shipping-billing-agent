@@ -5,6 +5,9 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
   ApiClientError,
@@ -15,6 +18,7 @@ import {
   type BatchSummary,
   type BillingRecordDetail,
   type ChargeDictionaryEntry,
+  type DocumentContentView,
   type EvalRunSummary,
   type HealthStatus,
   type OcrMode,
@@ -98,13 +102,19 @@ import {
   ManagementDrawer,
   type ManagementDrawerTab,
 } from "./components/ManagementDrawer.tsx";
+import {
+  DocumentPreviewPane,
+  getDefaultPreviewViewMode,
+  resolveInitialPreviewTarget,
+  type DocumentPreviewMode,
+} from "./components/DocumentPreviewPane.tsx";
 import { TopBar } from "./components/TopBar.tsx";
 import { UploadAndFileTree } from "./components/UploadAndFileTree.tsx";
 
 const LAST_BATCH_STORAGE_KEY = "wb_last_batch_id";
 const POLL_INTERVAL_MS = 500;
 
-type MobileViewTab = "upload" | "queue" | "detail";
+type MobileViewTab = "upload" | "queue" | "detail" | "preview";
 
 type PendingDraftGuardAction =
   | { kind: "switch_batch"; batchId: string }
@@ -222,6 +232,19 @@ export default function App({
     () => initialBatch?.records?.[0]?.id ?? null
   );
   const [inspectedDocId, setInspectedDocId] = useState<string | null>(null);
+
+  // Original Document Preview state
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewMode, setPreviewMode] = useState<DocumentPreviewMode>("docked");
+  const [previewDocId, setPreviewDocId] = useState<string | null>(null);
+  const [previewPage, setPreviewPage] = useState<number | null>(null);
+  const [previewJumpSeq, setPreviewJumpSeq] = useState(0);
+  const [previewLocked, setPreviewLocked] = useState(false);
+  const [previewViewMode, setPreviewViewMode] =
+    useState<DocumentContentView>("original");
+  const [inspectorWidthPx, setInspectorWidthPx] = useState<number>(488);
+  const [isDraggingSplitter, setIsDraggingSplitter] = useState(false);
+  const gridRef = useRef<HTMLElement | null>(null);
 
   // T02: Isolated Draft Store keyed by (batch_id, record_id) and (batch_id, doc_id)
   const [draftStore, setDraftStore] = useState<DraftStoreState>(
@@ -645,6 +668,23 @@ export default function App({
     [draftStore, activeBatch]
   );
 
+  const closePreview = useCallback(() => {
+    setPreviewOpen(false);
+    setPreviewMode("docked");
+    setPreviewDocId(null);
+    setPreviewPage(null);
+    setPreviewLocked(false);
+    setMobileTab((prev) => (prev === "preview" ? "detail" : prev));
+  }, []);
+
+  const prevActiveBatchIdRef = useRef<string | null>(activeBatchId);
+  useEffect(() => {
+    if (prevActiveBatchIdRef.current !== activeBatchId) {
+      prevActiveBatchIdRef.current = activeBatchId;
+      closePreview();
+    }
+  }, [activeBatchId, closePreview]);
+
   const executeSelectBatch = async (batchId: string) => {
     if (!batchId) return;
     const switchSeq = ++switchBatchSeqRef.current;
@@ -665,6 +705,7 @@ export default function App({
       setSearchQuery("");
       setEntityNotice(null);
       setMutationError(null);
+      closePreview();
       applyFreshBatchDetail(detail);
       setMobileTab("queue");
     } catch (err) {
@@ -740,6 +781,7 @@ export default function App({
     setSelectedRecordId(null);
     setActiveDocFilterId(null);
     setInspectedDocId(null);
+    closePreview();
     setFilterTab("all");
     setSearchQuery("");
     setEntityNotice(null);
@@ -1443,6 +1485,7 @@ export default function App({
       setBatchRevision(pollTrackerRef.current.batchRevision);
       setActiveDocFilterId(null);
       setInspectedDocId(null);
+      closePreview();
       setFilterTab("all");
       setSearchQuery("");
       applyFreshBatchDetail(imported);
@@ -1701,6 +1744,224 @@ export default function App({
     filterTab !== "all" ||
     searchQuery.trim().length > 0;
 
+  const activePreviewDoc = useMemo(() => {
+    if (!activeBatch || !previewDocId) return null;
+    return (
+      (activeBatch.documents ?? []).find((d) => d.id === previewDocId) ?? null
+    );
+  }, [activeBatch, previewDocId]);
+
+  useEffect(() => {
+    if (previewOpen && activeBatch && previewDocId && !activePreviewDoc) {
+      closePreview();
+    }
+  }, [previewOpen, activeBatch, previewDocId, activePreviewDoc, closePreview]);
+
+  const openPreviewForDoc = useCallback(
+    (docId: string, requestedPage?: number | null) => {
+      const docs = activeBatch?.documents ?? [];
+      const resolved = resolveInitialPreviewTarget(docs, docId, requestedPage);
+      if (!resolved) return;
+      setPreviewOpen(true);
+      setPreviewDocId(resolved.doc.id);
+      setPreviewPage(resolved.page);
+      setPreviewJumpSeq((seq) => seq + 1);
+      setPreviewViewMode(resolved.viewMode);
+      if (
+        typeof window !== "undefined" &&
+        window.innerWidth <= 959 &&
+        previewMode === "docked"
+      ) {
+        setMobileTab("preview");
+      }
+    },
+    [activeBatch?.documents, previewMode]
+  );
+
+  const handleSelectPreviewDoc = useCallback(
+    (docId: string) => {
+      const doc = (activeBatch?.documents ?? []).find((d) => d.id === docId);
+      if (!doc) return;
+      setPreviewDocId(doc.id);
+      setPreviewPage(null);
+      setPreviewViewMode(getDefaultPreviewViewMode(doc));
+    },
+    [activeBatch?.documents]
+  );
+
+  const prevAutoFollowRecordIdRef = useRef<string | null>(
+    selectedRecord?.id ?? null
+  );
+  useEffect(() => {
+    const currentId = selectedRecord?.id ?? null;
+    const prevId = prevAutoFollowRecordIdRef.current;
+    prevAutoFollowRecordIdRef.current = currentId;
+    if (!previewOpen || previewLocked || !selectedRecord) {
+      return;
+    }
+    if (currentId === prevId) {
+      return;
+    }
+    const docs = activeBatch?.documents ?? [];
+    const rawPage =
+      typeof selectedRecord.source_evidence?.page === "number" &&
+      Number.isFinite(selectedRecord.source_evidence.page) &&
+      selectedRecord.source_evidence.page >= 1
+        ? Math.floor(selectedRecord.source_evidence.page)
+        : null;
+    const resolved = resolveInitialPreviewTarget(
+      docs,
+      selectedRecord.source_doc_id,
+      rawPage
+    );
+    if (!resolved) return;
+    setPreviewDocId(resolved.doc.id);
+    setPreviewPage(resolved.page);
+    setPreviewViewMode(resolved.viewMode);
+  }, [selectedRecord, previewOpen, previewLocked, activeBatch?.documents]);
+
+  const selectedRecordIndex = useMemo(() => {
+    if (!selectedRecord) return -1;
+    return visibleRecords.findIndex((r) => r.id === selectedRecord.id);
+  }, [selectedRecord, visibleRecords]);
+
+  const handleStepPrevRecord = useCallback(() => {
+    if (selectedRecordIndex <= 0) return;
+    const target = visibleRecords[selectedRecordIndex - 1];
+    if (!target) return;
+    setSelectedRecordId(target.id);
+    setMutationError(null);
+  }, [selectedRecordIndex, visibleRecords]);
+
+  const handleStepNextRecord = useCallback(() => {
+    if (
+      selectedRecordIndex < 0 ||
+      selectedRecordIndex >= visibleRecords.length - 1
+    ) {
+      return;
+    }
+    const target = visibleRecords[selectedRecordIndex + 1];
+    if (!target) return;
+    setSelectedRecordId(target.id);
+    setMutationError(null);
+  }, [selectedRecordIndex, visibleRecords]);
+
+  const handleStepNextPendingFromInspector = useCallback(() => {
+    if (!activeBatch) return;
+    const isPending = (r: BillingRecordDetail) =>
+      r.review_status === "NEEDS_REVIEW" || r.operation === "PENDING_REVIEW";
+    const afterCurrent =
+      selectedRecordIndex >= 0
+        ? visibleRecords.slice(selectedRecordIndex + 1).find(isPending)
+        : undefined;
+    const wrappedCurrent =
+      afterCurrent ??
+      (selectedRecordIndex > 0
+        ? visibleRecords.slice(0, selectedRecordIndex).find(isPending)
+        : visibleRecords.find(isPending));
+    if (wrappedCurrent) {
+      setSelectedRecordId(wrappedCurrent.id);
+      setMutationError(null);
+      return;
+    }
+    const anywhere = (activeBatch.records ?? []).find(isPending);
+    if (anywhere) {
+      setActiveDocFilterId(null);
+      setSearchQuery("");
+      setFilterTab("pending_review");
+      setSelectedRecordId(anywhere.id);
+      setMutationError(null);
+    }
+  }, [activeBatch, selectedRecordIndex, visibleRecords]);
+
+  const clampInspectorWidth = useCallback((rawWidth: number): number => {
+    const gridWidth =
+      gridRef.current?.getBoundingClientRect?.().width ||
+      (typeof window !== "undefined" ? window.innerWidth - 24 : 1200);
+    const maxAllowed =
+      gridWidth > 0
+        ? Math.min(640, Math.max(420, gridWidth - 420 - 10))
+        : 640;
+    return Math.max(420, Math.min(Math.round(rawWidth), maxAllowed));
+  }, []);
+
+  const handleSplitterPointerDown = (
+    e: ReactPointerEvent<HTMLDivElement>
+  ) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = inspectorWidthPx;
+    setIsDraggingSplitter(true);
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const dx = moveEvent.clientX - startX;
+      setInspectorWidthPx(clampInspectorWidth(startWidth - dx));
+    };
+
+    const stopDrag = () => {
+      setIsDraggingSplitter(false);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", stopDrag);
+      window.removeEventListener("pointercancel", stopDrag);
+    };
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", stopDrag);
+    window.addEventListener("pointercancel", stopDrag);
+  };
+
+  const handleSplitterKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      setInspectorWidthPx((prev) => clampInspectorWidth(prev + 24));
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setInspectorWidthPx((prev) => clampInspectorWidth(prev - 24));
+    }
+  };
+
+  const handleTogglePreviewMode = useCallback(() => {
+    setPreviewMode((prev) => {
+      const next: DocumentPreviewMode = prev === "docked" ? "floating" : "docked";
+      if (
+        next === "docked" &&
+        typeof window !== "undefined" &&
+        window.innerWidth <= 959
+      ) {
+        setMobileTab("preview");
+      } else if (next === "floating") {
+        setMobileTab((curr) => (curr === "preview" ? "detail" : curr));
+      }
+      return next;
+    });
+  }, []);
+
+  const hasTopOverlayOpen =
+    exportModalOpen ||
+    importModalOpen ||
+    manualModalOpen ||
+    pendingDraftGuard !== null ||
+    drawerOpen;
+
+  const isDockedPreviewVisible =
+    previewOpen &&
+    previewMode === "docked" &&
+    Boolean(activeBatch) &&
+    Boolean(activePreviewDoc);
+
+  const mobileTabOptions = useMemo(() => {
+    const base: Array<{ value: MobileViewTab; label: string }> = [
+      { value: "upload", label: "投递与文件" },
+      { value: "queue", label: "账单列表" },
+      { value: "detail", label: "详情复核" },
+    ];
+    if (isDockedPreviewVisible) {
+      base.push({ value: "preview", label: "原件预览" });
+    }
+    return base;
+  }, [isDockedPreviewVisible]);
+
   return (
     <>
       <LumnoToastHost toasts={toasts} />
@@ -1733,22 +1994,32 @@ export default function App({
           onOpenExport={() => setExportModalOpen(true)}
         />
 
-        <div className="wb-mobile-bar">
-          <LumnoSegmentedControl
+        <div
+          className="wb-mobile-bar"
+          data-has-preview={isDockedPreviewVisible ? "true" : "false"}
+        >
+          <LumnoSegmentedControl<MobileViewTab>
             value={mobileTab}
             ariaLabel="移动端工作台视图切换"
-            options={[
-              { value: "upload", label: "投递与文件" },
-              { value: "queue", label: "账单列表" },
-              { value: "detail", label: "详情复核" },
-            ]}
+            options={mobileTabOptions}
             onChange={setMobileTab}
           />
         </div>
 
-        <main className="wb-grid">
+        <main
+          ref={gridRef}
+          className="wb-grid"
+          data-preview-mode={
+            previewOpen && activePreviewDoc ? previewMode : undefined
+          }
+          style={
+            isDockedPreviewVisible
+              ? ({ "--wb-inspector-width": `${inspectorWidthPx}px` } as CSSProperties)
+              : undefined
+          }
+        >
           <section
-            className="wb-pane lumno-glass-panel"
+            className="wb-pane wb-pane--left lumno-glass-panel"
             aria-label="单据上传与文件列表"
             data-mobile-active={mobileTab === "upload" ? "true" : "false"}
           >
@@ -1758,6 +2029,8 @@ export default function App({
               activeBatch={activeBatch}
               activeDocFilterId={activeDocFilterId}
               dirtyDocIds={dirtyDocIds}
+              previewOpen={previewOpen}
+              previewDocId={previewDocId}
               submittingBatch={submittingBatch}
               submittingDemo={submittingDemo}
               retryingDocId={retryingDocId}
@@ -1771,6 +2044,7 @@ export default function App({
                 setInspectedDocId(docId);
                 setMobileTab("detail");
               }}
+              onPreviewDoc={(docId) => openPreviewForDoc(docId, null)}
               onForceParseDoc={(docId) => void handleForceParseDoc(docId)}
               onRetryOrReplaceDoc={(docId, file) =>
                 void handleRetryDoc(docId, { file })
@@ -1779,7 +2053,7 @@ export default function App({
           </section>
 
           <section
-            className="wb-pane lumno-glass-panel"
+            className="wb-pane wb-pane--middle lumno-glass-panel"
             aria-label="账单待办队列"
             data-mobile-active={mobileTab === "queue" ? "true" : "false"}
           >
@@ -1820,8 +2094,52 @@ export default function App({
             />
           </section>
 
+          {isDockedPreviewVisible && activeBatch && activePreviewDoc ? (
+            <>
+              <section
+                className="wb-pane wb-pane--preview lumno-glass-panel"
+                aria-label="原件对照预览"
+                data-mobile-active={mobileTab === "preview" ? "true" : "false"}
+              >
+                <DocumentPreviewPane
+                  api={api}
+                  batch={activeBatch}
+                  activeDoc={activePreviewDoc}
+                  documents={activeBatch.documents ?? []}
+                  selectedRecord={selectedRecord}
+                  previewMode="docked"
+                  viewMode={previewViewMode}
+                  page={previewPage}
+                  jumpSeq={previewJumpSeq}
+                  locked={previewLocked}
+                  canCloseOnEscape={!hasTopOverlayOpen}
+                  isDraggingSplitter={isDraggingSplitter}
+                  onSelectDoc={handleSelectPreviewDoc}
+                  onToggleLocked={() => setPreviewLocked((v) => !v)}
+                  onToggleMode={handleTogglePreviewMode}
+                  onChangeViewMode={setPreviewViewMode}
+                  onClose={closePreview}
+                />
+              </section>
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="调整原件预览与费用核对宽度"
+                aria-valuemin={420}
+                aria-valuemax={640}
+                aria-valuenow={inspectorWidthPx}
+                tabIndex={0}
+                className="wb-splitter"
+                onPointerDown={handleSplitterPointerDown}
+                onKeyDown={handleSplitterKeyDown}
+              >
+                <span className="wb-splitter-grip" aria-hidden="true" />
+              </div>
+            </>
+          ) : null}
+
           <section
-            className="wb-pane lumno-glass-panel"
+            className="wb-pane wb-pane--inspector lumno-glass-panel"
             aria-label="右栏费用详情与核对"
             data-mobile-active={mobileTab === "detail" ? "true" : "false"}
           >
@@ -1830,6 +2148,12 @@ export default function App({
               selectedRecord={selectedRecord}
               inspectedDocId={inspectedDocId}
               hasActiveScopeFilter={hasActiveScopeFilter}
+              previewOpen={previewOpen && Boolean(activePreviewDoc)}
+              previewDocId={previewDocId}
+              previewPage={previewPage}
+              recordIndex={selectedRecordIndex}
+              totalVisibleRecords={visibleRecords.length}
+              pendingRecordCount={batchCounts.pending_review}
               draftStore={draftStore}
               dictionaryList={dictionaryList}
               savingRecord={savingRecord}
@@ -1843,6 +2167,11 @@ export default function App({
               onRefreshBatch={() => void handleRefreshActiveBatch()}
               onResetFilters={handleResetScopeFilters}
               onClearInspectedDoc={() => setInspectedDocId(null)}
+              onOpenPreview={openPreviewForDoc}
+              onClosePreview={closePreview}
+              onStepPrevRecord={handleStepPrevRecord}
+              onStepNextRecord={handleStepNextRecord}
+              onStepNextPendingRecord={handleStepNextPendingFromInspector}
               onUpdateRecordField={(record, field, value) => {
                 if (!activeBatch) return;
                 updateDraftStore((prev) =>
@@ -1893,6 +2222,30 @@ export default function App({
           </section>
         </main>
       </div>
+
+      {previewOpen &&
+      previewMode === "floating" &&
+      activeBatch &&
+      activePreviewDoc ? (
+        <DocumentPreviewPane
+          api={api}
+          batch={activeBatch}
+          activeDoc={activePreviewDoc}
+          documents={activeBatch.documents ?? []}
+          selectedRecord={selectedRecord}
+          previewMode="floating"
+          viewMode={previewViewMode}
+          page={previewPage}
+          jumpSeq={previewJumpSeq}
+          locked={previewLocked}
+          canCloseOnEscape={!hasTopOverlayOpen}
+          onSelectDoc={handleSelectPreviewDoc}
+          onToggleLocked={() => setPreviewLocked((v) => !v)}
+          onToggleMode={handleTogglePreviewMode}
+          onChangeViewMode={setPreviewViewMode}
+          onClose={closePreview}
+        />
+      ) : null}
 
       <ExportAndSyncModal
         open={exportModalOpen}

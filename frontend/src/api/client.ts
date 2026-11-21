@@ -70,7 +70,39 @@ export type SyncBaselineRequest = NonNullable<
 
 export type OcrMode = BatchSummary["ocr_mode"];
 export type ExportMode = ExportResponse["mode"];
+export type DocumentContentView = NonNullable<
+  NonNullable<operations["getDocumentContent"]["parameters"]["query"]>["view"]
+>;
 export type DecimalInput = string | number | RawDecimalLiteral;
+
+export interface DocumentContentUrlOptions {
+  view?: DocumentContentView;
+  download?: boolean;
+  page?: number | null;
+}
+
+export function buildDocumentContentUrl(
+  baseUrl: string,
+  batchId: string,
+  docId: string,
+  options: DocumentContentUrlOptions = {}
+): string {
+  const cleanBase = baseUrl.replace(/\/$/, "");
+  const view: DocumentContentView = options.view ?? "original";
+  const download = Boolean(options.download);
+  const params = new URLSearchParams();
+  params.set("view", view);
+  params.set("download", download ? "true" : "false");
+  const pageSuffix =
+    !download &&
+    view === "original" &&
+    typeof options.page === "number" &&
+    Number.isFinite(options.page) &&
+    options.page >= 1
+      ? `#page=${Math.floor(options.page)}`
+      : "";
+  return `${cleanBase}/api/v1/batches/${encodeURIComponent(batchId)}/documents/${encodeURIComponent(docId)}/content?${params.toString()}${pageSuffix}`;
+}
 
 export type RecordPatchInput = Omit<
   RecordPatchRequest,
@@ -1093,6 +1125,27 @@ export class BillingApiClient {
       { method: "POST" }
     );
     return normalizeBatchDetail(res);
+  }
+
+  getDocumentContentUrl(
+    batchId: string,
+    docId: string,
+    options: DocumentContentUrlOptions = {}
+  ): string {
+    return buildDocumentContentUrl(this.baseUrl, batchId, docId, options);
+  }
+
+  async getDocumentTextPreview(
+    batchId: string,
+    docId: string,
+    signal?: AbortSignal,
+    view: DocumentContentView = "text"
+  ): Promise<string> {
+    const { text } = await this.requestRaw(
+      `/api/v1/batches/${encodeURIComponent(batchId)}/documents/${encodeURIComponent(docId)}/content?view=${encodeURIComponent(view)}&download=false`,
+      { signal }
+    );
+    return text;
   }
 
   async addManualBillingRecord(

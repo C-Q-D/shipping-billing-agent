@@ -7243,6 +7243,1063 @@ export async function runDecimalJsonTests(): Promise<void> {
     "PASS 37: Live-test UI polish regression (non-billing label, clause subsumption, AR flowSummary with missing issuer, export dynamic scope & tools-menu height)"
   );
 
+  // PASS 38: In-workbench Original Document Preview (URL/text API, docked splitter & stepping, auto-follow, lock, EML tabs, image zoom/rotate, Excel snippet highlight, floating toggle, Esc & batch switch)
+  {
+    const {
+      splitTextForSnippetHighlight,
+      buildEmlFamilyTabs,
+      resolveInitialPreviewTarget,
+      clampFloatingRect,
+    } = (await viteServer.ssrLoadModule(
+      "/src/components/DocumentPreviewPane.tsx"
+    )) as {
+      splitTextForSnippetHighlight: (
+        text: string,
+        snippet: string
+      ) => Array<{ text: string; highlight: boolean }>;
+      buildEmlFamilyTabs: (
+        docs: ReadonlyArray<Record<string, unknown>>,
+        activeDocId: string
+      ) => {
+        rootDoc: Record<string, unknown> | null;
+        tabs: Array<{
+          doc: Record<string, unknown>;
+          label: string;
+          isBody: boolean;
+          isRoot: boolean;
+        }>;
+      };
+      resolveInitialPreviewTarget: (
+        docs: ReadonlyArray<Record<string, unknown>>,
+        requestedDocId: string,
+        requestedPage?: number | null
+      ) => {
+        doc: Record<string, unknown>;
+        page: number | null;
+        viewMode: "original" | "text";
+      } | null;
+      clampFloatingRect: (
+        rect: { left: number; top: number; width: number; height: number },
+        vw: number,
+        vh: number
+      ) => { left: number; top: number; width: number; height: number };
+    };
+
+    // 1. getDocumentContentUrl & getDocumentTextPreview
+    const relativeClient = new BillingApiClient();
+    assertEqual(
+      relativeClient.getDocumentContentUrl("b-1", "doc/a", {
+        view: "original",
+        download: false,
+        page: 2,
+      }),
+      "/api/v1/batches/b-1/documents/doc%2Fa/content?view=original&download=false#page=2",
+      "P38: getDocumentContentUrl encodes IDs and appends #page=2 for inline original"
+    );
+    assertEqual(
+      relativeClient.getDocumentContentUrl("b-1", "doc-1", {
+        view: "original",
+        download: true,
+        page: 2,
+      }),
+      "/api/v1/batches/b-1/documents/doc-1/content?view=original&download=true",
+      "P38: getDocumentContentUrl omits #page hash when download=true"
+    );
+
+    let capturedTextSignal: AbortSignal | undefined;
+    const previewApiClient = new BillingApiClient({
+      baseUrl: "http://127.0.0.1:8000/",
+      transport: async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        capturedTextSignal = init?.signal ?? undefined;
+        if (url.includes("/documents/doc-text-ok/content?view=text&download=false")) {
+          return new Response("LINE 1\nH/C 50.00 USD\nLINE 3", {
+            status: 200,
+            headers: { "Content-Type": "text/plain; charset=utf-8" },
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            code: "TEXT_PREVIEW_UNAVAILABLE",
+            message: "当前单据暂无可预览的提取文本",
+          }),
+          { status: 404, headers: { "Content-Type": "application/json" } }
+        );
+      },
+    });
+    assertEqual(
+      previewApiClient.getDocumentContentUrl("b-1", "doc-1", {
+        view: "text",
+        download: false,
+        page: 3,
+      }),
+      "http://127.0.0.1:8000/api/v1/batches/b-1/documents/doc-1/content?view=text&download=false",
+      "P38: getDocumentContentUrl trims baseUrl and omits #page on view=text"
+    );
+    const abortCtrl = new AbortController();
+    const fetchedText = await previewApiClient.getDocumentTextPreview(
+      "b-1",
+      "doc-text-ok",
+      abortCtrl.signal
+    );
+    assertEqual(
+      fetchedText,
+      "LINE 1\nH/C 50.00 USD\nLINE 3",
+      "P38: getDocumentTextPreview returns plain UTF-8 text"
+    );
+    assertTrue(
+      capturedTextSignal !== undefined,
+      "P38: getDocumentTextPreview forwards AbortSignal to transport"
+    );
+    const missingTextErr = await assertRejectsAsync(
+      previewApiClient.getDocumentTextPreview("b-1", "doc-missing"),
+      "404 TEXT_PREVIEW_UNAVAILABLE"
+    );
+    assertTrue(
+      missingTextErr instanceof ApiClientError &&
+        missingTextErr.status === 404 &&
+        missingTextErr.code === "TEXT_PREVIEW_UNAVAILABLE",
+      "P38: getDocumentTextPreview maps 404 JSON error to ApiClientError"
+    );
+
+    const preAbortedCtrl = new AbortController();
+    preAbortedCtrl.abort();
+    const abortedErr = await assertRejectsAsync(
+      previewApiClient.getDocumentTextPreview(
+        "b-1",
+        "doc-text-ok",
+        preAbortedCtrl.signal
+      ),
+      "pre-aborted text preview"
+    );
+    assertTrue(
+      abortedErr instanceof ApiClientError && abortedErr.code === "REQUEST_ABORTED",
+      "P38: getDocumentTextPreview honors aborted AbortSignal"
+    );
+
+    // 2. Safe React snippet highlighting & floating clamping
+    const xssSegs = splitTextForSnippetHighlight(
+      "Header\nH/C <script>alert(1)</script> 50.00 USD\nFooter",
+      "H/C <script>alert(1)</script> 50.00 USD"
+    );
+    assertTrue(
+      xssSegs.some(
+        (s) =>
+          s.highlight && s.text === "H/C <script>alert(1)</script> 50.00 USD"
+      ),
+      "P38: splitTextForSnippetHighlight highlights exact snippet safely without HTML parsing"
+    );
+    const clampedRect = clampFloatingRect(
+      { left: 9999, top: -50, width: 500, height: 400 },
+      1280,
+      800
+    );
+    assertTrue(
+      clampedRect.left === 1280 - 500 - 8 && clampedRect.top === 8,
+      "P38: clampFloatingRect keeps floating card clamped inside viewport"
+    );
+
+    // 3. EML family helper checks
+    const helperDocs = [
+      {
+        id: "doc-eml-p",
+        parent_doc_id: null,
+        original_filename: "notice.eml",
+        sanitized_filename: "notice.eml",
+        source_kind: "EML",
+        extraction_channel: "LOCAL_TEXT",
+        status: "PARSED",
+      },
+      {
+        id: "doc-eml-b",
+        parent_doc_id: "doc-eml-p",
+        original_filename: "body.txt",
+        sanitized_filename: "body.txt",
+        source_kind: "EML_BODY",
+        extraction_channel: "LOCAL_TEXT",
+        status: "PARSED",
+      },
+      {
+        id: "doc-eml-hbl",
+        parent_doc_id: "doc-eml-p",
+        original_filename: "4055331281 HBL.pdf",
+        sanitized_filename: "4055331281 HBL.pdf",
+        source_kind: "PDF",
+        extraction_channel: "REMOTE_OCR",
+        status: "PARSED",
+      },
+    ];
+    const resolvedEml = resolveInitialPreviewTarget(helperDocs, "doc-eml-p", null);
+    assertEqual(
+      resolvedEml?.doc.id,
+      "doc-eml-b",
+      "P38: opening parent EML auto-focuses EML_BODY child"
+    );
+    const emlTabs = buildEmlFamilyTabs(helperDocs, "doc-eml-b").tabs;
+    assertEqual(
+      emlTabs.map((t) => t.label).join("|"),
+      "邮件正文|4055331281 HBL.pdf|原始邮件 (notice.eml)",
+      "P38: buildEmlFamilyTabs renders body, attachments, and parent root in order"
+    );
+
+    // 4. Full Mounted App E2E for Original Document Preview
+    const hostEnv = installFakeDomHost();
+    const origCreateElement = hostEnv.doc.createElement!;
+    hostEnv.doc.createElement = (tag: string) => {
+      const el = origCreateElement(tag);
+      if (String(tag).toUpperCase() === "OPTION") {
+        let isSelected = false;
+        let explicitVal: string | null = null;
+        Object.defineProperty(el, "value", {
+          get() {
+            return explicitVal ?? el.attributes.value ?? el.textContent;
+          },
+          set(v: string) {
+            explicitVal = String(v);
+          },
+        });
+        Object.defineProperty(el, "selected", {
+          get() {
+            return isSelected;
+          },
+          set(v: boolean) {
+            isSelected = Boolean(v);
+            if (isSelected && el.parentNode && el.parentNode.tagName === "SELECT") {
+              for (const sibling of el.parentNode.childNodes) {
+                if (sibling !== el && sibling.tagName === "OPTION") {
+                  (sibling as unknown as { selected: boolean }).selected = false;
+                }
+              }
+            }
+          },
+        });
+      }
+      if (String(tag).toUpperCase() === "SELECT") {
+        Object.defineProperty(el, "options", {
+          get() {
+            return el.childNodes.filter((c) => c.tagName === "OPTION");
+          },
+        });
+        Object.defineProperty(el, "value", {
+          get() {
+            const selectedOpt = el.childNodes.find(
+              (c) =>
+                c.tagName === "OPTION" &&
+                Boolean((c as unknown as { selected?: boolean }).selected)
+            );
+            return selectedOpt
+              ? selectedOpt.value || selectedOpt.attributes.value || ""
+              : "";
+          },
+          set(val: string) {
+            for (const c of el.childNodes) {
+              if (c.tagName === "OPTION") {
+                const optVal = c.value || c.attributes.value || "";
+                (c as unknown as { selected?: boolean }).selected =
+                  optVal === val;
+              }
+            }
+          },
+        });
+      }
+      return el;
+    };
+    const winListeners = new Map<string, Set<(e: unknown) => void>>();
+    const winMutable = hostEnv.win as unknown as Record<string, unknown>;
+    winMutable.addEventListener = (type: string, cb: (e: unknown) => void) => {
+      let set = winListeners.get(type);
+      if (!set) {
+        set = new Set();
+        winListeners.set(type, set);
+      }
+      set.add(cb);
+    };
+    winMutable.removeEventListener = (
+      type: string,
+      cb: (e: unknown) => void
+    ) => {
+      winListeners.get(type)?.delete(cb);
+    };
+    const dispatchWinKeyDown = async (key: string) => {
+      const event = {
+        key,
+        defaultPrevented: false,
+        preventDefault() {
+          this.defaultPrevented = true;
+        },
+        stopPropagation() {},
+      };
+      const handlers = Array.from(winListeners.get("keydown") ?? []);
+      await ReactMod.act(async () => {
+        for (const h of handlers) {
+          h(event);
+        }
+      });
+      await flushActMicrotasks(4);
+    };
+
+    const p38Batch1Raw = stringifyLosslessJson({
+      id: "batch-p38-1",
+      version: 1,
+      short_code: "B-P38-01",
+      accounting_entity: "NEPTUNE SHIPPING LIMITED",
+      source_channel: "WEB",
+      status: "COMPLETED",
+      stage: "COMPLETED",
+      stage_message: "解析完成",
+      ocr_mode: "REMOTE_WITH_LOCAL_FALLBACK",
+      total_files: 8,
+      succeeded_files: 7,
+      failed_files: 1,
+      counts: {
+        create: 2,
+        update: 0,
+        no_change: 0,
+        pending_review: 2,
+        rejected: 0,
+      },
+      created_at: "2026-11-21T08:00:00Z",
+      updated_at: "2026-11-21T08:00:00Z",
+      documents: [
+        {
+          id: "doc-p38-pdf",
+          parent_doc_id: null,
+          original_filename: "invoice_main.pdf",
+          sanitized_filename: "invoice_main.pdf",
+          source_kind: "PDF",
+          extraction_channel: "REMOTE_OCR",
+          status: "PARSED",
+          affected_record_ids: ["rec-p38-1"],
+          total_amount: rawDecimal("245.00"),
+          total_currency: "USD",
+        },
+        {
+          id: "doc-p38-eml",
+          parent_doc_id: null,
+          original_filename: "order_notice.eml",
+          sanitized_filename: "order_notice.eml",
+          source_kind: "EML",
+          extraction_channel: "LOCAL_TEXT",
+          status: "PARSED",
+          affected_record_ids: ["rec-p38-2"],
+          total_amount: rawDecimal("50.00"),
+          total_currency: "USD",
+        },
+        {
+          id: "doc-p38-eml-body",
+          parent_doc_id: "doc-p38-eml",
+          original_filename: "email_body.txt",
+          sanitized_filename: "email_body.txt",
+          source_kind: "EML_BODY",
+          extraction_channel: "LOCAL_TEXT",
+          status: "PARSED",
+          affected_record_ids: [],
+        },
+        {
+          id: "doc-p38-hbl",
+          parent_doc_id: "doc-p38-eml",
+          original_filename: "4055331281 HBL.pdf",
+          sanitized_filename: "4055331281 HBL.pdf",
+          source_kind: "PDF",
+          extraction_channel: "REMOTE_OCR",
+          status: "PARSED",
+          affected_record_ids: ["rec-p38-4"],
+          total_amount: rawDecimal("45.00"),
+          total_currency: "USD",
+        },
+        {
+          id: "doc-p38-mbl",
+          parent_doc_id: "doc-p38-eml",
+          original_filename: "4055331281 MBL.pdf",
+          sanitized_filename: "4055331281 MBL.pdf",
+          source_kind: "PDF",
+          extraction_channel: "REMOTE_OCR",
+          status: "PARSED",
+          affected_record_ids: [],
+        },
+        {
+          id: "doc-p38-sig",
+          parent_doc_id: "doc-p38-eml",
+          original_filename: "logo.png",
+          sanitized_filename: "logo.png",
+          source_kind: "IMAGE",
+          extraction_channel: "LOCAL_OCR_FALLBACK",
+          status: "SKIPPED_NOISE",
+          affected_record_ids: [],
+        },
+        {
+          id: "doc-p38-xls",
+          parent_doc_id: null,
+          original_filename: "charges.xlsx",
+          sanitized_filename: "charges.xlsx",
+          source_kind: "EXCEL",
+          extraction_channel: "LOCAL_TEXT",
+          status: "PARSED",
+          affected_record_ids: ["rec-p38-3"],
+          total_amount: rawDecimal("320.00"),
+          total_currency: "USD",
+        },
+        {
+          id: "doc-p38-fail",
+          parent_doc_id: null,
+          original_filename: "scan_fail.pdf",
+          sanitized_filename: "scan_fail.pdf",
+          source_kind: "PDF",
+          extraction_channel: "REMOTE_OCR",
+          status: "FAILED",
+          error_message: "OCR 网关超时",
+          affected_record_ids: [],
+        },
+      ],
+      failed_documents: [
+        {
+          doc_id: "doc-p38-fail",
+          filename: "scan_fail.pdf",
+          error_message: "OCR 网关超时",
+          affected_record_ids: [],
+        },
+      ],
+      records: [
+        {
+          id: "rec-p38-1",
+          source_doc_id: "doc-p38-pdf",
+          source_line_index: 0,
+          operation: "PENDING_REVIEW",
+          review_status: "NEEDS_REVIEW",
+          match_level: "NONE",
+          inherited_fields: [],
+          document_info: {
+            document_type: "Invoice",
+            reference_no: "P38-PDF-01",
+            document_date: "2026-11-21",
+          },
+          transaction_party: {
+            issuer: "CMA CGM",
+            recipient: "NEPTUNE SHIPPING LIMITED",
+          },
+          charge_details: {
+            charge_item: "THC",
+            raw_charge_name: "THC",
+            quantity: null,
+            unit_price: null,
+            amount: rawDecimal("245.00"),
+            currency: "USD",
+            payment_term: "CC",
+          },
+          financial_attributes: {
+            accounting_entity: "NEPTUNE SHIPPING LIMITED",
+            posting_type: "AP",
+          },
+          source_evidence: {
+            source_file: "invoice_main.pdf",
+            page: 2,
+            snippet: "THC 245.00 USD",
+          },
+          ai_reasoning: ["待核对"],
+          human_overrides: {},
+          validation_alerts: [
+            {
+              code: "OCR_NUMERIC_CONFUSION",
+              severity: "WARNING",
+              field: "amount",
+              message: "请核对金额",
+            },
+          ],
+        },
+        {
+          id: "rec-p38-2",
+          source_doc_id: "doc-p38-eml",
+          source_line_index: 0,
+          operation: "CREATE",
+          review_status: "AUTO_READY",
+          match_level: "NONE",
+          inherited_fields: [],
+          document_info: {
+            document_type: "Debit Note",
+            reference_no: "P38-EML-02",
+            document_date: "2026-11-21",
+          },
+          transaction_party: {
+            issuer: "NEPTUNE SHIPPING LIMITED",
+            recipient: "CLIENT CO",
+          },
+          charge_details: {
+            charge_item: "Handling Charge",
+            raw_charge_name: "H/C",
+            quantity: null,
+            unit_price: null,
+            amount: rawDecimal("50.00"),
+            currency: "USD",
+            payment_term: "PP",
+          },
+          financial_attributes: {
+            accounting_entity: "NEPTUNE SHIPPING LIMITED",
+            posting_type: "AR",
+          },
+          source_evidence: {
+            source_file: "order_notice.eml",
+            snippet: "H/C <script>alert(1)</script> 50.00 USD",
+          },
+          ai_reasoning: ["正文提取"],
+          human_overrides: {},
+          validation_alerts: [],
+        },
+        {
+          id: "rec-p38-3",
+          source_doc_id: "doc-p38-xls",
+          source_line_index: 0,
+          operation: "PENDING_REVIEW",
+          review_status: "NEEDS_REVIEW",
+          match_level: "NONE",
+          inherited_fields: [],
+          document_info: {
+            document_type: "Invoice",
+            reference_no: "P38-XLS-03",
+            document_date: "2026-11-21",
+          },
+          transaction_party: {
+            issuer: "COSCO",
+            recipient: "NEPTUNE SHIPPING LIMITED",
+          },
+          charge_details: {
+            charge_item: "Ocean Freight",
+            raw_charge_name: "O/F",
+            quantity: null,
+            unit_price: null,
+            amount: rawDecimal("320.00"),
+            currency: "USD",
+            payment_term: "PP",
+          },
+          financial_attributes: {
+            accounting_entity: "NEPTUNE SHIPPING LIMITED",
+            posting_type: "AP",
+          },
+          source_evidence: {
+            source_file: "charges.xlsx",
+            sheet: "Sheet1",
+            line_number: 18,
+            snippet: "FREIGHT ROW 18 320.00 USD",
+          },
+          ai_reasoning: ["表格提取"],
+          human_overrides: {},
+          validation_alerts: [],
+        },
+        {
+          id: "rec-p38-4",
+          source_doc_id: "doc-p38-hbl",
+          source_line_index: 0,
+          operation: "CREATE",
+          review_status: "AUTO_READY",
+          match_level: "NONE",
+          inherited_fields: [],
+          document_info: {
+            document_type: "Bill of Lading",
+            reference_no: "4055331281",
+            document_date: "2026-11-21",
+          },
+          transaction_party: {
+            issuer: "OOCL",
+            recipient: "NEPTUNE SHIPPING LIMITED",
+          },
+          charge_details: {
+            charge_item: "Documentation Fee",
+            raw_charge_name: "DOC FEE",
+            quantity: null,
+            unit_price: null,
+            amount: rawDecimal("45.00"),
+            currency: "USD",
+            payment_term: "PP",
+          },
+          financial_attributes: {
+            accounting_entity: "NEPTUNE SHIPPING LIMITED",
+            posting_type: "AP",
+          },
+          source_evidence: {
+            source_file: "4055331281 HBL.pdf",
+            page: 3,
+            snippet: "HBL DOC FEE 45.00 USD",
+          },
+          ai_reasoning: ["附件提取"],
+          human_overrides: {},
+          validation_alerts: [],
+        },
+      ],
+    });
+    const p38Batch2Raw = stringifyLosslessJson({
+      id: "batch-p38-2",
+      version: 1,
+      short_code: "B-P38-02",
+      accounting_entity: "NEPTUNE SHIPPING LIMITED",
+      source_channel: "WEB",
+      status: "COMPLETED",
+      stage: "COMPLETED",
+      stage_message: "解析完成",
+      ocr_mode: "REMOTE_ONLY",
+      total_files: 1,
+      succeeded_files: 1,
+      failed_files: 0,
+      counts: {
+        create: 1,
+        update: 0,
+        no_change: 0,
+        pending_review: 0,
+        rejected: 0,
+      },
+      created_at: "2026-11-21T09:00:00Z",
+      updated_at: "2026-11-21T09:00:00Z",
+      documents: [
+        {
+          id: "doc-p38-b2-1",
+          parent_doc_id: null,
+          original_filename: "b2.pdf",
+          sanitized_filename: "b2.pdf",
+          source_kind: "PDF",
+          extraction_channel: "REMOTE_OCR",
+          status: "PARSED",
+          affected_record_ids: [],
+        },
+      ],
+      failed_documents: [],
+      records: [],
+    });
+
+    const p38Batch1 = ssrNormalizeBatchDetail(ssrParseLosslessJson(p38Batch1Raw));
+    const p38Batch2 = ssrNormalizeBatchDetail(ssrParseLosslessJson(p38Batch2Raw));
+
+    const p38Client = new SsrBillingApiClient({
+      transport: async (input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/documents/doc-p38-eml-body/content?view=text")) {
+          return new Response(
+            "From: ops@example.com\nH/C <script>alert(1)</script> 50.00 USD\nThanks",
+            { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" } }
+          );
+        }
+        if (url.includes("/documents/doc-p38-xls/content?view=text")) {
+          return new Response(
+            "Sheet1\nRow 18: FREIGHT ROW 18 320.00 USD\nTotal 320.00",
+            { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" } }
+          );
+        }
+        if (url.includes("/documents/doc-p38-pdf/content?view=text")) {
+          return new Response("Invoice Main\nPage 2: THC 245.00 USD", {
+            status: 200,
+            headers: { "Content-Type": "text/plain; charset=utf-8" },
+          });
+        }
+        if (url.includes("/documents/doc-p38-fail/content?view=text")) {
+          return new Response(
+            JSON.stringify({
+              code: "TEXT_PREVIEW_UNAVAILABLE",
+              message: "当前单据暂无可预览的提取文本",
+            }),
+            { status: 404, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        if (url.endsWith("/api/v1/batches/batch-p38-2")) {
+          return new Response(p38Batch2Raw, {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.includes("/api/v1/batches/batch-p38-1/export")) {
+          return new Response(
+            stringifyLosslessJson({
+              mode: "official",
+              included_count: 2,
+              excluded_pending_count: 2,
+              excluded_rejected_count: 0,
+              records: [],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        return new Response("[]", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+
+    const mountEl = hostEnv.doc.createElement!("div");
+    hostEnv.doc.body!.appendChild(mountEl);
+    const root = ReactDomClient.createRoot(mountEl as unknown as HTMLElement);
+    try {
+      await ReactMod.act(async () => {
+        root.render(
+          ReactMod.createElement(AppComponentRef, {
+            apiClient: p38Client,
+            initialBatch: p38Batch1,
+            initialBatches: [p38Batch1, p38Batch2],
+          })
+        );
+      });
+      await flushActMicrotasks(8);
+      const ui = createAppMountHelpers(hostEnv);
+
+      const assertPreviewFormIds = (stage: string) => {
+        const controls = hostEnv.findNodes(
+          (n) =>
+            n.tagName === "INPUT" ||
+            n.tagName === "TEXTAREA" ||
+            n.tagName === "SELECT"
+        );
+        for (const ctrl of controls) {
+          const props = hostEnv.getProps(ctrl);
+          const ctrlId = String(ctrl.attributes.id ?? props.id ?? "").trim();
+          const ctrlName = String(ctrl.attributes.name ?? props.name ?? "").trim();
+          assertTrue(
+            ctrlId.length > 0 && ctrlName.length > 0,
+            `${stage}: ${ctrl.tagName} must have non-empty id & name`
+          );
+        }
+      };
+
+      const getMainGrid = () =>
+        hostEnv.findNodes((n) => n.tagName === "MAIN")[0];
+
+      // A. Open docked preview from ReviewInspector (`对照原件 · 第 2 页`)
+      await ui.clickButton("对照原件 · 第 2 页");
+      assertEqual(
+        getMainGrid()?.attributes["data-preview-mode"],
+        "docked",
+        "P38: opening preview sets <main data-preview-mode='docked'>"
+      );
+      const splitterEl = hostEnv.findNodes((n) => n.attributes.role === "separator")[0];
+      assertTrue(
+        Boolean(splitterEl),
+        "P38: docked mode renders draggable role='separator' splitter"
+      );
+      await ReactMod.act(async () => {
+        (hostEnv.getProps(splitterEl!).onKeyDown as (e: unknown) => void)({
+          key: "ArrowLeft",
+          preventDefault() {},
+        });
+      });
+      await flushActMicrotasks(2);
+      assertEqual(
+        String(
+          getMainGrid()?.style?.["--wb-inspector-width"] ?? ""
+        ),
+        "512px",
+        "P38: splitter ArrowLeft widens inspector column safely within [420, 640]"
+      );
+      const pdfIframe = hostEnv.findNodes((n) => n.tagName === "IFRAME")[0];
+      assertEqual(
+        String(pdfIframe?.attributes.src ?? hostEnv.getProps(pdfIframe).src ?? ""),
+        "/api/v1/batches/batch-p38-1/documents/doc-p38-pdf/content?view=original&download=false#page=2",
+        "P38: PDF iframe loads #page=2 URL"
+      );
+      const inspectorPane = hostEnv.findNodes(
+        (n) =>
+          (n.attributes["aria-label"] ?? hostEnv.getProps(n)["aria-label"]) ===
+          "右栏费用详情与核对"
+      )[0];
+      assertTrue(
+        Boolean(inspectorPane) &&
+          inspectorPane.textContent.includes("收起原件") &&
+          inspectorPane.textContent.includes("第 1 / 4 条") &&
+          inspectorPane.textContent.includes("◀ 上一条") &&
+          inspectorPane.textContent.includes("下一条 ▶") &&
+          inspectorPane.textContent.includes("下一条待核"),
+        "P38: ReviewInspector stays visible with stepping strip and 收起原件 toggle"
+      );
+      assertPreviewFormIds("P38 docked preview open");
+
+      // B. Click `下一条 ▶` -> auto-follows to rec-p38-2 -> EML auto-focuses EML_BODY & highlights snippet safely
+      await ui.clickButton("下一条 ▶");
+      assertTrue(
+        inspectorPane.textContent.includes("第 2 / 4 条") &&
+          inspectorPane.textContent.includes("P38-EML-02"),
+        "P38: 下一条 ▶ advances to record 2/4"
+      );
+      const tabButtons = hostEnv.findNodes(
+        (n) => n.tagName === "BUTTON" && n.attributes.role === "tab"
+      );
+      assertEqual(
+        tabButtons.map((b) => b.textContent).join("|"),
+        "邮件正文|4055331281 HBL.pdf|4055331281 MBL.pdf|logo.png · 已忽略|原始邮件 (order_notice.eml)",
+        "P38: EML family renders horizontal attachment tab bar"
+      );
+      assertEqual(
+        tabButtons[0]?.attributes["aria-selected"],
+        "true",
+        "P38: opening EML auto-focuses 邮件正文 (EML_BODY) tab"
+      );
+      const marks = hostEnv.findNodes((n) => n.tagName === "MARK");
+      assertTrue(
+        marks.length === 1 &&
+          marks[0].textContent === "H/C <script>alert(1)</script> 50.00 USD" &&
+          hostEnv.findNodes((n) => n.tagName === "SCRIPT").length === 0,
+        "P38: EML text safely highlights XSS-containing snippet in <mark> without injecting <script>"
+      );
+
+      // C. 1-click EML attachment tab switch -> 4055331281 HBL.pdf
+      await ui.clickButton("4055331281 HBL.pdf");
+      const hblIframe = hostEnv.findNodes((n) => n.tagName === "IFRAME")[0];
+      assertTrue(
+        String(hblIframe?.attributes.src ?? hostEnv.getProps(hblIframe).src ?? "").includes(
+          "/documents/doc-p38-hbl/content?view=original&download=false"
+        ),
+        "P38: clicking HBL attachment tab switches preview to HBL.pdf iframe"
+      );
+
+      // D. Click `下一条 ▶` -> Excel record rec-p38-3 fetches view=text + highlights snippet + Download button
+      await ui.clickButton("下一条 ▶");
+      assertTrue(
+        inspectorPane.textContent.includes("第 3 / 4 条") &&
+          hostEnv.findNodes((n) => n.tagName === "MARK")[0]?.textContent ===
+            "FREIGHT ROW 18 320.00 USD",
+        "P38: stepping to Excel record fetches view=text and highlights snippet"
+      );
+      const xlsDownloadAnchor = hostEnv.findNodes(
+        (n) =>
+          n.tagName === "A" &&
+          n.textContent.includes("下载原件") &&
+          String(n.attributes.href ?? "").includes("download=true")
+      )[0];
+      assertTrue(
+        Boolean(xlsDownloadAnchor),
+        "P38: Excel text preview renders prominent 下载原件 link with download=true"
+      );
+
+      // E. Toggle `锁定原件` -> stepping to rec-p38-4 keeps preview locked on doc-p38-xls
+      await ui.clickButton("锁定原件");
+      const lockBtn = hostEnv.findNodes(
+        (n) => n.tagName === "BUTTON" && n.textContent.includes("锁定原件")
+      )[0];
+      assertEqual(
+        lockBtn?.attributes["aria-pressed"],
+        "true",
+        "P38: 锁定原件 sets aria-pressed='true'"
+      );
+      await ui.clickButton("下一条 ▶");
+      const docSelect = hostEnv.findNodes(
+        (n) => n.tagName === "SELECT" && n.attributes.id === "wb-preview-doc-select"
+      )[0];
+      assertEqual(
+        String(docSelect?.value ?? hostEnv.getProps(docSelect).value ?? ""),
+        "doc-p38-xls",
+        "P38: 锁定原件 prevents auto-follow when stepping to rec-p38-4"
+      );
+
+      // Unlock & step back -> re-stepping auto-follows to doc-p38-hbl#page=3
+      await ui.clickButton("锁定原件");
+      await ui.clickButton("◀ 上一条");
+      await ui.clickButton("下一条 ▶");
+      const rec4Iframe = hostEnv.findNodes((n) => n.tagName === "IFRAME")[0];
+      assertEqual(
+        String(rec4Iframe?.attributes.src ?? hostEnv.getProps(rec4Iframe).src ?? ""),
+        "/api/v1/batches/batch-p38-1/documents/doc-p38-hbl/content?view=original&download=false#page=3",
+        "P38: unlocked auto-follow navigates to HBL.pdf #page=3"
+      );
+
+      // Step via `下一条待核` (wraps from rec 4/4 to pending rec 1/4) -> auto-follows to doc-p38-pdf#page=2
+      await ui.clickButton("下一条待核");
+      assertTrue(
+        inspectorPane.textContent.includes("第 1 / 4 条") &&
+          inspectorPane.textContent.includes("P38-PDF-01"),
+        "P38: 下一条待核 steps to next pending record (1/4)"
+      );
+      const pendingPdfIframe = hostEnv.findNodes((n) => n.tagName === "IFRAME")[0];
+      assertEqual(
+        String(
+          pendingPdfIframe?.attributes.src ??
+            hostEnv.getProps(pendingPdfIframe).src ??
+            ""
+        ),
+        "/api/v1/batches/batch-p38-1/documents/doc-p38-pdf/content?view=original&download=false#page=2",
+        "P38: 下一条待核 auto-follows preview to invoice_main.pdf#page=2"
+      );
+
+      // Toggle 文本 on PDF, then click `第 2 页` jump link next to 原文凭据摘录 to jump back to PDF #page=2
+      await ui.clickButton("文本");
+      assertTrue(
+        hostEnv.doc.body!.textContent.includes("Page 2: THC 245.00 USD"),
+        "P38: switching PDF preview to 文本 fetches and renders extracted text"
+      );
+      const pageJumpBtn = hostEnv.findNodes(
+        (n) =>
+          n.tagName === "BUTTON" &&
+          (n.attributes.class ?? "").includes("wb-page-jump-btn") &&
+          n.textContent.includes("第 2 页")
+      )[0];
+      assertTrue(Boolean(pageJumpBtn), "P38: clickable 第 2 页 jump button rendered");
+      await ReactMod.act(async () => {
+        (hostEnv.getProps(pageJumpBtn!).onClick as () => void)();
+      });
+      await flushActMicrotasks(4);
+      const jumpedIframe = hostEnv.findNodes((n) => n.tagName === "IFRAME")[0];
+      assertEqual(
+        String(jumpedIframe?.attributes.src ?? hostEnv.getProps(jumpedIframe).src ?? ""),
+        "/api/v1/batches/batch-p38-1/documents/doc-p38-pdf/content?view=original&download=false#page=2",
+        "P38: clicking 第 2 页 jumps preview back to PDF original #page=2"
+      );
+
+      // F. Close preview (`收起原件`), then open from UploadAndFileTree `查看原件` on SKIPPED_NOISE image & FAILED doc
+      await ui.clickButton("收起原件");
+      assertEqual(
+        getMainGrid()?.attributes["data-preview-mode"],
+        undefined,
+        "P38: 收起原件 restores 3-column grid"
+      );
+
+      const fileNodes = hostEnv.findNodes((n) =>
+        (n.attributes.class ?? "").includes("wb-doc-node")
+      );
+      assertEqual(
+        fileNodes.length,
+        8,
+        "P38: all 8 batch docs rendered in UploadAndFileTree"
+      );
+      for (const node of fileNodes) {
+        assertTrue(
+          node.textContent.includes("查看原件"),
+          "P38: every doc node (including SKIPPED_NOISE and FAILED) exposes 查看原件 button"
+        );
+      }
+      const sigNode = fileNodes.find((n) => n.textContent.includes("logo.png"))!;
+      const sigPreviewBtn = hostEnv
+        .findNodes((n) => sigNode.contains(n) && n.tagName === "BUTTON" && n.textContent.includes("查看原件"))[0];
+      await ReactMod.act(async () => {
+        (hostEnv.getProps(sigPreviewBtn).onClick as () => void)();
+      });
+      await flushActMicrotasks(4);
+
+      const previewImg = hostEnv.findNodes((n) => n.tagName === "IMG")[0];
+      assertTrue(
+        Boolean(previewImg) &&
+          String(previewImg.attributes.src ?? "").includes("/documents/doc-p38-sig/content?view=original"),
+        "P38: clicking 查看原件 on SKIPPED_NOISE image renders <img> canvas"
+      );
+      await ui.clickButton("+");
+      await ui.clickButton("左转 90°");
+      assertEqual(
+        String(hostEnv.findNodes((n) => n.tagName === "IMG")[0]?.style?.transform ?? ""),
+        "rotate(-90deg) scale(1.25)",
+        "P38: Image zoom + and 90° left rotation apply rotate(-90deg) scale(1.25)"
+      );
+      await ui.clickButton("适应");
+      await ui.clickButton("右转 90°");
+      assertEqual(
+        String(hostEnv.findNodes((n) => n.tagName === "IMG")[0]?.style?.transform ?? ""),
+        "rotate(0deg) scale(1)",
+        "P38: 适应 and 右转 90° reset scale(1) and rotate(0deg)"
+      );
+
+      // G. Inspect FAILED doc + verify text 404 fallback
+      const failNode = fileNodes.find((n) => n.textContent.includes("scan_fail.pdf"))!;
+      const failPreviewBtn = hostEnv
+        .findNodes((n) => failNode.contains(n) && n.tagName === "BUTTON" && n.textContent.includes("查看原件"))[0];
+      await ReactMod.act(async () => {
+        (hostEnv.getProps(failPreviewBtn).onClick as () => void)();
+      });
+      await flushActMicrotasks(4);
+      assertTrue(
+        hostEnv.doc.body!.textContent.includes("该文件解析失败"),
+        "P38: clicking 查看原件 on FAILED doc shows failure banner"
+      );
+      await ui.clickButton("文本");
+      assertTrue(
+        hostEnv.doc.body!.textContent.includes("文本预览暂不可用") &&
+          hostEnv.doc.body!.textContent.includes("当前单据暂无可预览的提取文本"),
+        "P38: 404 text preview displays clear error and fallback download"
+      );
+
+      // H. Toggle `浮窗` <-> `停靠`, and verify Esc yields to open Export modal before closing preview
+      await ui.clickButton("浮窗");
+      assertEqual(
+        getMainGrid()?.attributes["data-preview-mode"],
+        "floating",
+        "P38: 浮窗 toggle switches grid out of docked mode"
+      );
+      assertTrue(
+        hostEnv.findNodes((n) =>
+          (n.attributes.class ?? "").includes("wb-floating-preview")
+        ).length === 1 &&
+          hostEnv.findNodes((n) => n.attributes["data-resize-handle"] === "se").length === 1,
+        "P38: floating mode renders non-modal draggable/resizable glass card"
+      );
+
+      await ui.clickButton("导出可入账");
+      assertTrue(
+        hostEnv.findNodes((n) =>
+          (n.attributes.class ?? "").includes("lumno-modal-backdrop")
+        ).length === 1,
+        "P38: Export modal opens on top of floating preview"
+      );
+      await dispatchWinKeyDown("Escape");
+      assertTrue(
+        hostEnv.findNodes((n) =>
+          (n.attributes.class ?? "").includes("lumno-modal-backdrop")
+        ).length === 0 &&
+          hostEnv.findNodes((n) =>
+            (n.attributes.class ?? "").includes("wb-floating-preview")
+          ).length === 1,
+        "P38: first Esc closes top Export modal while keeping floating preview open"
+      );
+      await dispatchWinKeyDown("Escape");
+      assertEqual(
+        hostEnv.findNodes((n) =>
+          (n.attributes.class ?? "").includes("wb-floating-preview")
+        ).length,
+        0,
+        "P38: second Esc with no top modal closes preview cleanly"
+      );
+
+      // I. Re-open preview, test 关闭 button, then toggle 浮窗 -> 停靠, then switch active batch -> preview closes cleanly
+      await ui.clickButton("对照原件");
+      const previewCloseBtn = hostEnv.findNodes(
+        (n) =>
+          n.tagName === "BUTTON" &&
+          (n.attributes["aria-label"] ?? hostEnv.getProps(n)["aria-label"]) ===
+            "关闭原件对照预览"
+      )[0];
+      assertTrue(Boolean(previewCloseBtn), "P38: preview 关闭 button present");
+      await ReactMod.act(async () => {
+        (hostEnv.getProps(previewCloseBtn!).onClick as () => void)();
+      });
+      await flushActMicrotasks(4);
+      assertEqual(
+        getMainGrid()?.attributes["data-preview-mode"],
+        undefined,
+        "P38: clicking preview 关闭 button closes preview cleanly"
+      );
+
+      await ui.clickButton("对照原件");
+      await ui.clickButton("浮窗");
+      await ui.clickButton("停靠");
+      assertEqual(
+        getMainGrid()?.attributes["data-preview-mode"],
+        "docked",
+        "P38: 停靠 button restores docked preview mode"
+      );
+      await ui.clickButton("B-P38-01");
+      await ui.clickButton("B-P38-02");
+      await flushActMicrotasks(8);
+      assertEqual(
+        hostEnv.findNodes((n) =>
+          (n.attributes.class ?? "").includes("wb-preview-container")
+        ).length,
+        0,
+        "P38: switching active batch closes preview cleanly"
+      );
+      assertEqual(
+        getMainGrid()?.attributes["data-preview-mode"],
+        undefined,
+        "P38: switching active batch clears data-preview-mode"
+      );
+    } finally {
+      await ReactMod.act(async () => {
+        root.unmount();
+      });
+      hostEnv.cleanup();
+    }
+  }
+  results.push(
+    "PASS 38: Original Document Preview (getDocumentContentUrl/getDocumentTextPreview, docked splitter & stepping, auto-follow & lock, EML tabs, image zoom/rotate, Excel snippet highlight, floating toggle, Esc & batch switch)"
+  );
+
   } finally {
     await viteServer.close();
   }

@@ -80,6 +80,12 @@ export interface ReviewInspectorProps {
   selectedRecord: BillingRecordDetail | null;
   inspectedDocId: string | null;
   hasActiveScopeFilter?: boolean;
+  previewOpen?: boolean;
+  previewDocId?: string | null;
+  previewPage?: number | null;
+  recordIndex?: number;
+  totalVisibleRecords?: number;
+  pendingRecordCount?: number;
   draftStore: DraftStoreState;
   dictionaryList: ReadonlyArray<ChargeDictionaryEntry>;
   savingRecord: boolean;
@@ -93,6 +99,11 @@ export interface ReviewInspectorProps {
   onRefreshBatch: () => void;
   onResetFilters?: () => void;
   onClearInspectedDoc: () => void;
+  onOpenPreview?: (docId: string, page?: number | null) => void;
+  onClosePreview?: () => void;
+  onStepPrevRecord?: () => void;
+  onStepNextRecord?: () => void;
+  onStepNextPendingRecord?: () => void;
   onUpdateRecordField: <K extends keyof RecordFormValues>(
     record: BillingRecordDetail,
     field: K,
@@ -248,6 +259,11 @@ export function ReviewInspector({
   selectedRecord,
   inspectedDocId,
   hasActiveScopeFilter = false,
+  previewOpen = false,
+  previewDocId = null,
+  recordIndex = -1,
+  totalVisibleRecords = 0,
+  pendingRecordCount = 0,
   draftStore,
   dictionaryList,
   savingRecord,
@@ -261,6 +277,11 @@ export function ReviewInspector({
   onRefreshBatch,
   onResetFilters,
   onClearInspectedDoc,
+  onOpenPreview,
+  onClosePreview,
+  onStepPrevRecord,
+  onStepNextRecord,
+  onStepNextPendingRecord,
   onUpdateRecordField,
   onConfirmRecordFields,
   onResetRecordDraft,
@@ -1121,26 +1142,114 @@ export function ReviewInspector({
       ? selectedRecord.source_evidence.snippet
       : "";
 
+  const evidencePage =
+    typeof selectedRecord?.source_evidence?.page === "number" &&
+    Number.isFinite(selectedRecord.source_evidence.page) &&
+    selectedRecord.source_evidence.page >= 1
+      ? Math.floor(selectedRecord.source_evidence.page)
+      : null;
+
+  const targetPreviewDocId =
+    selectedRecord?.source_doc_id ?? inspectedDoc?.id ?? null;
+  const targetPreviewDoc = targetPreviewDocId
+    ? (batch.documents ?? []).find((d) => d.id === targetPreviewDocId) ?? null
+    : null;
+  const activePreviewDoc = previewDocId
+    ? (batch.documents ?? []).find((d) => d.id === previewDocId) ?? null
+    : null;
+  const isPreviewOpenForTargetDoc = Boolean(
+    previewOpen &&
+      targetPreviewDocId &&
+      (previewDocId === targetPreviewDocId ||
+        (targetPreviewDoc?.source_kind.toUpperCase() === "EML" &&
+          activePreviewDoc?.parent_doc_id === targetPreviewDocId &&
+          activePreviewDoc.source_kind.toUpperCase() === "EML_BODY"))
+  );
+
+  const previewToggleLabel = isPreviewOpenForTargetDoc
+    ? "收起原件"
+    : selectedRecord && evidencePage !== null
+      ? `对照原件 · 第 ${evidencePage} 页`
+      : "对照原件";
+
+  const handleToggleTargetPreview = () => {
+    if (!targetPreviewDocId) return;
+    if (isPreviewOpenForTargetDoc) {
+      onClosePreview?.();
+    } else {
+      onOpenPreview?.(targetPreviewDocId, selectedRecord ? evidencePage : null);
+    }
+  };
+
+  const sourceFileLabel = selectedRecord
+    ? typeof selectedRecord.source_evidence?.source_file === "string"
+      ? selectedRecord.source_evidence.source_file
+      : recordSourceDoc?.sanitized_filename ?? null
+    : null;
+  const sourceSheetLabel =
+    selectedRecord && typeof selectedRecord.source_evidence?.sheet === "string"
+      ? `工作表：${selectedRecord.source_evidence.sheet}`
+      : null;
+  const sourceLineLabel =
+    selectedRecord &&
+    typeof selectedRecord.source_evidence?.line_number === "number"
+      ? `第 ${selectedRecord.source_evidence.line_number} 行`
+      : selectedRecord && typeof selectedRecord.source_evidence?.row === "number"
+        ? `第 ${selectedRecord.source_evidence.row} 行`
+        : null;
+
   const sourceLocationText = selectedRecord
     ? [
-        typeof selectedRecord.source_evidence?.source_file === "string"
-          ? selectedRecord.source_evidence.source_file
-          : recordSourceDoc?.sanitized_filename ?? null,
-        typeof selectedRecord.source_evidence?.page === "number"
-          ? `第 ${selectedRecord.source_evidence.page} 页`
-          : null,
-        typeof selectedRecord.source_evidence?.sheet === "string"
-          ? `工作表：${selectedRecord.source_evidence.sheet}`
-          : null,
-        typeof selectedRecord.source_evidence?.line_number === "number"
-          ? `第 ${selectedRecord.source_evidence.line_number} 行`
-          : typeof selectedRecord.source_evidence?.row === "number"
-            ? `第 ${selectedRecord.source_evidence.row} 行`
-            : null,
+        sourceFileLabel,
+        evidencePage !== null ? `第 ${evidencePage} 页` : null,
+        sourceSheetLabel,
+        sourceLineLabel,
       ]
         .filter(Boolean)
         .join(" · ")
     : "";
+
+  const renderSourceLocationNode = () => {
+    if (!selectedRecord) return null;
+    const parts: Array<{ key: string; node: React.ReactNode }> = [];
+    if (sourceFileLabel) {
+      parts.push({ key: "file", node: sourceFileLabel });
+    }
+    if (evidencePage !== null) {
+      parts.push({
+        key: "page",
+        node: onOpenPreview ? (
+          <button
+            type="button"
+            className="wb-page-jump-btn"
+            title={`跳转到原件第 ${evidencePage} 页`}
+            onClick={() => onOpenPreview(selectedRecord.source_doc_id, evidencePage)}
+          >
+            第 {evidencePage} 页
+          </button>
+        ) : (
+          `第 ${evidencePage} 页`
+        ),
+      });
+    }
+    if (sourceSheetLabel) {
+      parts.push({ key: "sheet", node: sourceSheetLabel });
+    }
+    if (sourceLineLabel) {
+      parts.push({ key: "line", node: sourceLineLabel });
+    }
+    if (parts.length === 0) return null;
+    return (
+      <>
+        {parts.map((part, idx) => (
+          <span key={part.key}>
+            {idx > 0 ? " · " : null}
+            {part.node}
+          </span>
+        ))}
+      </>
+    );
+  };
 
   const renderAlertCard = (alert: ValidationAlert, idx: number) => {
     if (!formValues) return null;
@@ -1231,30 +1340,85 @@ export function ReviewInspector({
 
   return (
     <>
-      <div className="wb-pane-header">
-        <h2 className="wb-pane-title">
-          <i className="ri-icon ri-file-search-line" aria-hidden="true" />
-          <span>费用详情与核对</span>
-        </h2>
-        <div style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-          {recordDirty ? (
-            <span className="wb-badge wb-badge--warn">有未保存修改</span>
-          ) : null}
-          {selectedRecord ? (
-            <span
-              className={`wb-badge ${
-                selectedRecord.review_status === "AUTO_READY" ||
-                selectedRecord.review_status === "APPROVED"
-                  ? "wb-badge--ok"
-                  : selectedRecord.review_status === "NEEDS_REVIEW"
-                    ? "wb-badge--warn"
-                    : "wb-badge--muted"
-              }`}
-            >
-              {getReviewStatusBadgeLabel(selectedRecord.review_status)}
-            </span>
-          ) : null}
+      <div
+        className={`wb-pane-header ${
+          previewOpen ? "wb-pane-header--stack" : ""
+        }`.trim()}
+      >
+        <div className="wb-pane-header-row">
+          <h2 className="wb-pane-title">
+            <i className="ri-icon ri-file-search-line" aria-hidden="true" />
+            <span>费用详情与核对</span>
+          </h2>
+          <div style={{ display: "inline-flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+            {onOpenPreview && targetPreviewDocId ? (
+              <LumnoButton
+                variant={isPreviewOpenForTargetDoc ? "secondary" : "ghost"}
+                compact
+                icon={isPreviewOpenForTargetDoc ? "ri-eye-off-line" : "ri-eye-line"}
+                onClick={handleToggleTargetPreview}
+              >
+                {previewToggleLabel}
+              </LumnoButton>
+            ) : null}
+            {recordDirty ? (
+              <span className="wb-badge wb-badge--warn">有未保存修改</span>
+            ) : null}
+            {selectedRecord ? (
+              <span
+                className={`wb-badge ${
+                  selectedRecord.review_status === "AUTO_READY" ||
+                  selectedRecord.review_status === "APPROVED"
+                    ? "wb-badge--ok"
+                    : selectedRecord.review_status === "NEEDS_REVIEW"
+                      ? "wb-badge--warn"
+                      : "wb-badge--muted"
+                }`}
+              >
+                {getReviewStatusBadgeLabel(selectedRecord.review_status)}
+              </span>
+            ) : null}
+          </div>
         </div>
+
+        {previewOpen && onStepPrevRecord && onStepNextRecord ? (
+          <div className="wb-inspector-step-bar" aria-label="记录对照步进栏">
+            <div className="wb-action-row">
+              <LumnoButton
+                variant="ghost"
+                compact
+                disabled={recordIndex <= 0}
+                onClick={onStepPrevRecord}
+              >
+                ◀ 上一条
+              </LumnoButton>
+              <span className="wb-badge wb-badge--muted wb-tabular">
+                第 {recordIndex >= 0 ? recordIndex + 1 : 0} / {totalVisibleRecords} 条
+              </span>
+              <LumnoButton
+                variant="ghost"
+                compact
+                disabled={
+                  recordIndex < 0 || recordIndex >= totalVisibleRecords - 1
+                }
+                onClick={onStepNextRecord}
+              >
+                下一条 ▶
+              </LumnoButton>
+            </div>
+            {onStepNextPendingRecord ? (
+              <LumnoButton
+                variant="secondary"
+                compact
+                icon="ri-focus-3-line"
+                disabled={pendingRecordCount <= 0}
+                onClick={onStepNextPendingRecord}
+              >
+                下一条待核
+              </LumnoButton>
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
       <div ref={scrollPaneRef} className="wb-pane-body">
@@ -1503,8 +1667,30 @@ export function ReviewInspector({
                 {(blockers.length > 0 || activeWarnings.length > 0) &&
                 sourceSnippet ? (
                   <div className="wb-inline-snippet">
-                    <div className="wb-helper-note">
-                      原文凭据摘录{sourceLocationText ? ` · ${sourceLocationText}` : ""}
+                    <div className="wb-inline-snippet-head">
+                      <div className="wb-helper-note">
+                        原文凭据摘录
+                        {sourceLocationText ? (
+                          <>
+                            {" · "}
+                            {renderSourceLocationNode()}
+                          </>
+                        ) : null}
+                      </div>
+                      {onOpenPreview && targetPreviewDocId ? (
+                        <LumnoButton
+                          variant="ghost"
+                          compact
+                          icon={
+                            isPreviewOpenForTargetDoc
+                              ? "ri-eye-off-line"
+                              : "ri-eye-line"
+                          }
+                          onClick={handleToggleTargetPreview}
+                        >
+                          {previewToggleLabel}
+                        </LumnoButton>
+                      ) : null}
                     </div>
                     <pre className="wb-evidence-pre wb-evidence-pre--compact">
                       {sourceSnippet}
@@ -2369,9 +2555,34 @@ export function ReviewInspector({
             <div className="wb-section-box" aria-label="原文凭据、判定说明与排除条款">
               <div className="wb-field-label wb-field-label--wrap">
                 <span style={{ flexShrink: 0 }}>原文凭据与判定说明</span>
-                <span className="wb-helper-note" style={{ overflowWrap: "anywhere" }}>
-                  {sourceLocationText || recordSourceDoc?.sanitized_filename || "来源文档"}
-                </span>
+                <div
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span className="wb-helper-note" style={{ overflowWrap: "anywhere" }}>
+                    {renderSourceLocationNode() ||
+                      recordSourceDoc?.sanitized_filename ||
+                      "来源文档"}
+                  </span>
+                  {onOpenPreview && targetPreviewDocId ? (
+                    <LumnoButton
+                      variant="ghost"
+                      compact
+                      icon={
+                        isPreviewOpenForTargetDoc
+                          ? "ri-eye-off-line"
+                          : "ri-eye-line"
+                      }
+                      onClick={handleToggleTargetPreview}
+                    >
+                      {previewToggleLabel}
+                    </LumnoButton>
+                  ) : null}
+                </div>
               </div>
 
               {Array.isArray(selectedRecord.source_evidence?.source_paths) ? (

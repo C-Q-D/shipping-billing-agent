@@ -280,6 +280,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/batches/{batch_id}/documents/{doc_id}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 安全内联预览或下载批次单据原件及提取文本 */
+        get: operations["getDocumentContent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/batches/{batch_id}/records": {
         parameters: {
             query?: never;
@@ -1375,6 +1392,43 @@ export interface operations {
             };
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+        };
+    };
+    getDocumentContent: {
+        parameters: {
+            query?: {
+                /** @default original */
+                view?: "original" | "text";
+                /** @default false */
+                download?: boolean;
+            };
+            header?: never;
+            path: {
+                batch_id: components["parameters"]["BatchId"];
+                doc_id: components["parameters"]["DocId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 返回单据原件内容或提取文本 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/pdf": string;
+                    "image/png": string;
+                    "image/jpeg": string;
+                    "image/gif": string;
+                    "image/webp": string;
+                    "text/plain": string;
+                    "message/rfc822": string;
+                    "application/octet-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
         };
     };
     addManualBillingRecord: {
