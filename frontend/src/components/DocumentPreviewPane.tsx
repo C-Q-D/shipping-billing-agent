@@ -265,6 +265,44 @@ export function resolveInitialPreviewTarget(
   };
 }
 
+const MAX_PREVIEW_SELECT_OPTION_CODEPOINTS = 52;
+
+/**
+ * Formats a compact single-line `<option>` label for the document switcher,
+ * preserving nesting/body prefixes and status hints while capping total code points.
+ */
+export function formatPreviewDocOptionLabel(
+  doc: SourceDocumentSummary,
+  depth: number
+): string {
+  const indentPrefix = depth > 0 ? "↳ " : "";
+  const kindPrefix =
+    doc.source_kind.toUpperCase() === "EML_BODY" ? "邮件正文 · " : "";
+  const statusHint =
+    doc.status === "FAILED"
+      ? " [失败]"
+      : doc.status === "SKIPPED_NOISE"
+        ? " [已忽略]"
+        : "";
+  const prefix = `${indentPrefix}${kindPrefix}`;
+  const fullLabel = `${prefix}${doc.sanitized_filename}${statusHint}`;
+  if (Array.from(fullLabel).length <= MAX_PREVIEW_SELECT_OPTION_CODEPOINTS) {
+    return fullLabel;
+  }
+  const prefixLen = Array.from(prefix).length;
+  const suffixLen = Array.from(statusHint).length;
+  const namePoints = Array.from(doc.sanitized_filename);
+  const nameBudget = Math.max(
+    8,
+    MAX_PREVIEW_SELECT_OPTION_CODEPOINTS - prefixLen - suffixLen - 1
+  );
+  const truncatedName =
+    namePoints.length > nameBudget
+      ? `${namePoints.slice(0, nameBudget).join("")}…`
+      : doc.sanitized_filename;
+  return `${prefix}${truncatedName}${statusHint}`;
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -1153,30 +1191,20 @@ export function DocumentPreviewPane({
             id="wb-preview-doc-select"
             name="preview_doc_id"
             aria-label="切换预览单据"
+            title={activeDoc.sanitized_filename}
             className="wb-preview-select"
             value={activeDoc.id}
             onChange={(e) => onSelectDoc(e.target.value)}
           >
-            {orderedDocs.map(({ doc, depth }) => {
-              const statusHint =
-                doc.status === "FAILED"
-                  ? " [失败]"
-                  : doc.status === "SKIPPED_NOISE"
-                    ? " [已忽略]"
-                    : "";
-              const kindPrefix =
-                doc.source_kind.toUpperCase() === "EML_BODY"
-                  ? "邮件正文 · "
-                  : "";
-              return (
-                <option key={doc.id} value={doc.id}>
-                  {depth > 0 ? "↳ " : ""}
-                  {kindPrefix}
-                  {doc.sanitized_filename}
-                  {statusHint}
-                </option>
-              );
-            })}
+            {orderedDocs.map(({ doc, depth }) => (
+              <option
+                key={doc.id}
+                value={doc.id}
+                title={doc.sanitized_filename}
+              >
+                {formatPreviewDocOptionLabel(doc, depth)}
+              </option>
+            ))}
           </select>
         </div>
 

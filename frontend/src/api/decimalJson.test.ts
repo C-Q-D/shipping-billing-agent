@@ -7250,6 +7250,7 @@ export async function runDecimalJsonTests(): Promise<void> {
       buildEmlFamilyTabs,
       resolveInitialPreviewTarget,
       clampFloatingRect,
+      formatPreviewDocOptionLabel,
     } = (await viteServer.ssrLoadModule(
       "/src/components/DocumentPreviewPane.tsx"
     )) as {
@@ -7283,6 +7284,10 @@ export async function runDecimalJsonTests(): Promise<void> {
         vw: number,
         vh: number
       ) => { left: number; top: number; width: number; height: number };
+      formatPreviewDocOptionLabel: (
+        doc: Record<string, unknown>,
+        depth: number
+      ) => string;
     };
 
     // 1. getDocumentContentUrl & getDocumentTextPreview
@@ -7440,6 +7445,66 @@ export async function runDecimalJsonTests(): Promise<void> {
       emlTabs.map((t) => t.label).join("|"),
       "邮件正文|4055331281 HBL.pdf|原始邮件 (notice.eml)",
       "P38: buildEmlFamilyTabs renders body, attachments, and parent root in order"
+    );
+
+    const longEmlBodyLabel = formatPreviewDocOptionLabel(
+      {
+        id: "doc-eml-long",
+        parent_doc_id: "doc-eml-p",
+        original_filename:
+          "深圳容宇_PRE-ALERT_SHANGHAI_TO_LONG_BEACH_4055331281_EXTRA_LONG_SUBJECT_LINE.eml",
+        sanitized_filename:
+          "深圳容宇_PRE-ALERT_SHANGHAI_TO_LONG_BEACH_4055331281_EXTRA_LONG_SUBJECT_LINE.eml",
+        source_kind: "EML_BODY",
+        extraction_channel: "LOCAL_TEXT",
+        status: "PARSED",
+      },
+      1
+    );
+    assertTrue(
+      longEmlBodyLabel.startsWith("↳ 邮件正文 · 深圳容宇_PRE-ALERT") &&
+        longEmlBodyLabel.endsWith("…") &&
+        Array.from(longEmlBodyLabel).length <= 52,
+      "P38: formatPreviewDocOptionLabel preserves prefix and truncates long filenames cleanly"
+    );
+    assertEqual(
+      formatPreviewDocOptionLabel(helperDocs[2], 1),
+      "↳ 4055331281 HBL.pdf",
+      "P38: formatPreviewDocOptionLabel leaves concise child attachment names intact"
+    );
+
+    const previewCssSource = fsPkg.readFileSync(
+      pathPkg.resolve(frontendRootDir, "src", "styles", "workbench.css"),
+      "utf8"
+    );
+    const selectRuleMatch = previewCssSource.match(/\.wb-preview-select\s*\{[^}]*\}/);
+    assertTrue(
+      Boolean(selectRuleMatch) &&
+        selectRuleMatch![0].includes("white-space: nowrap") &&
+        selectRuleMatch![0].includes("overflow: hidden") &&
+        selectRuleMatch![0].includes("text-overflow: ellipsis") &&
+        selectRuleMatch![0].includes("line-height: 20px") &&
+        selectRuleMatch![0].includes("min-height: 30px"),
+      "P38: .wb-preview-select enforces single-line ellipsis & >=30px height in CSS"
+    );
+    const fitTrueIdx = previewCssSource.indexOf('.wb-preview-image[data-fit="true"]');
+    const fitFalseIdx = previewCssSource.indexOf('.wb-preview-image[data-fit="false"]');
+    const framedSelector = ".wb-preview-image.wb-preview-image--framed";
+    const framedRuleIdx = previewCssSource.indexOf(framedSelector);
+    const framedRuleMatch = previewCssSource
+      .slice(Math.max(0, framedRuleIdx))
+      .match(/\{[^}]*\}/);
+    assertTrue(
+      fitTrueIdx >= 0 &&
+        fitFalseIdx >= 0 &&
+        framedRuleIdx > fitTrueIdx &&
+        framedRuleIdx > fitFalseIdx &&
+        previewCssSource.includes(".wb-preview-image.wb-preview-image--framed[data-fit]") &&
+        Boolean(framedRuleMatch) &&
+        framedRuleMatch![0].includes("max-width: none") &&
+        framedRuleMatch![0].includes("max-height: none") &&
+        framedRuleMatch![0].includes("object-fit: fill"),
+      "P38: .wb-preview-image--framed overrides [data-fit] specificity with object-fit: fill & max-*: none"
     );
 
     // 4. Full Mounted App E2E for Original Document Preview
@@ -8081,6 +8146,11 @@ export async function runDecimalJsonTests(): Promise<void> {
         String(docSelect?.value ?? hostEnv.getProps(docSelect).value ?? ""),
         "doc-p38-xls",
         "P38: 锁定原件 prevents auto-follow when stepping to rec-p38-4"
+      );
+      assertEqual(
+        String(docSelect?.attributes.title ?? hostEnv.getProps(docSelect).title ?? ""),
+        "charges.xlsx",
+        "P38: preview document <select> exposes full filename in title tooltip"
       );
 
       // Unlock & step back -> re-stepping auto-follows to doc-p38-hbl#page=3

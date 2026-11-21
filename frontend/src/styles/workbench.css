@@ -2603,12 +2603,17 @@ body[data-theme="dark"] .wb-drawer-panel {
   max-width: 100%;
   flex: 1 1 160px;
   height: 30px;
+  min-height: 30px;
   padding: 4px 8px;
   border-radius: var(--lumno-radius-md);
   border: 1px solid var(--lumno-color-control-border);
   background: var(--lumno-color-control-bg);
   color: var(--lumno-color-text);
   font-size: var(--lumno-font-size-sm);
+  line-height: 20px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   outline: none;
 }
 
@@ -2792,16 +2797,6 @@ body[data-theme="dark"] .wb-drawer-panel {
   transition: none;
 }
 
-.wb-preview-image--framed {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  margin: 0;
-  max-width: none;
-  max-height: none;
-  transform-origin: center center;
-}
-
 .wb-preview-image[data-fit="true"] {
   max-width: 100%;
   max-height: 100%;
@@ -2811,6 +2806,18 @@ body[data-theme="dark"] .wb-drawer-panel {
 .wb-preview-image[data-fit="false"] {
   max-width: none;
   max-height: none;
+}
+
+.wb-preview-image.wb-preview-image--framed,
+.wb-preview-image.wb-preview-image--framed[data-fit] {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  margin: 0;
+  max-width: none;
+  max-height: none;
+  object-fit: fill;
+  transform-origin: center center;
 }
 
 @media (max-width: 959px) {
