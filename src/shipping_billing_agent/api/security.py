@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import html
 import math
 import re
 import time
 from collections import deque
 from collections.abc import Iterable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from threading import Lock
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from pydantic import AliasChoices, Field
 from starlette.datastructures import Headers
-from starlette.responses import HTMLResponse, Response
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..config.settings import AppSettings
@@ -33,7 +37,16 @@ _HEAVY_POST_PATHS = (
     re.compile(r"^/api/v1/eval-runs/?$"),
 )
 _API_EXPIRED_PATHS = frozenset({"/docs", "/redoc", "/openapi.json"})
+_PUBLIC_BYPASS_PATHS = frozenset({"/api/v1/health", "/favicon.ico"})
+_LOGIN_PATH = "/_access/login"
+_LOGOUT_PATH = "/_access/logout"
+_COOKIE_NAME = "sb_access_session"
+_PLACEHOLDER_PASSCODE = "ChangeMe_StrongPass_2026"
+_MIN_PASSCODE_LENGTH = 8
 _WINDOW_SECONDS = 60.0
+_LOGIN_WINDOW_SECONDS = 900.0
+_LOGIN_MAX_FAILURES = 10
+_MAX_LOGIN_FORM_BYTES = 4096
 _MAX_TRACKED_IPS = 1024
 _EXPIRED_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -93,6 +106,29 @@ class ApiSettings(AppSettings):
         default=False,
         validation_alias=AliasChoices("APP_TRUST_PROXY_HEADERS", "trust_proxy_headers"),
     )
+    access_passcode: str = Field(
+        default="",
+        repr=False,
+        validation_alias=AliasChoices("APP_ACCESS_PASSCODE", "access_passcode"),
+    )
+    access_session_hours: int = Field(
+        default=24,
+        ge=1,
+        le=720,
+        validation_alias=AliasChoices("APP_ACCESS_SESSION_HOURS", "access_session_hours"),
+    )
+
+
+def validate_access_passcode(value: str) -> str:
+    """Validate optional web passcode, returning empty string when disabled."""
+    text = value.strip()
+    if not text:
+        return ""
+    if len(text) < _MIN_PASSCODE_LENGTH or text == _PLACEHOLDER_PASSCODE:
+        raise ValueError(
+            "APP_ACCESS_PASSCODE must be at least 8 characters and not use the example placeholder"
+        )
+    return text
 
 
 def parse_access_expires_at(value: str) -> datetime | None:
@@ -173,8 +209,146 @@ def _is_heavy_request(method: str, path: str) -> bool:
     return method == "POST" and any(pattern.fullmatch(path) for pattern in _HEAVY_POST_PATHS)
 
 
+def _safe_next_path(raw: str | None) -> str:
+    if not raw:
+        return "/"
+    text = raw.strip()
+    if (
+        not text
+        or not text.startswith("/")
+        or text.startswith(("//", "/\\"))
+        or text.startswith("/_access/")
+        or any(ord(ch) < 32 or ch == "\x7f" for ch in text)
+    ):
+        return "/"
+    return text
+
+
+async def _read_limited_body(receive: Receive, limit: int = _MAX_LOGIN_FORM_BYTES) -> bytes | None:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        message = await receive()
+        msg_type = message.get("type")
+        if msg_type == "http.disconnect":
+            return None
+        if msg_type != "http.request":
+            continue
+        chunk = message.get("body", b"")
+        if chunk:
+            total += len(chunk)
+            if total > limit:
+                return None
+            chunks.append(chunk)
+        if not message.get("more_body", False):
+            return b"".join(chunks)
+
+
+def _render_login_html(
+    *,
+    next_path: str,
+    error_message: str | None = None,
+    expires_at: datetime | None = None,
+) -> str:
+    escaped_next = html.escape(next_path, quote=True)
+    error_block = (
+        f'<div class="err" role="alert">{html.escape(error_message)}</div>'
+        if error_message
+        else ""
+    )
+    expiry_block = (
+        f'<p class="meta">临时访问有效期至 '
+        f"{html.escape(expires_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M UTC'))}</p>"
+        if expires_at is not None
+        else ""
+    )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex, nofollow, noarchive" />
+  <title>临时访客口令验证 · 航运智能账单复核工作台</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: #f1f5f9; color: #0f172a;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Microsoft YaHei", sans-serif;
+      padding: 20px;
+    }}
+    .card {{
+      width: 100%; max-width: 420px; background: #ffffff; border: 1px solid #e2e8f0;
+      border-radius: 14px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08); padding: 28px 26px;
+    }}
+    .badge {{
+      display: inline-block; font-size: 12px; font-weight: 600; color: #1e3a8a;
+      background: #dbeafe; padding: 3px 10px; border-radius: 999px; margin-bottom: 12px;
+    }}
+    h1 {{ font-size: 20px; margin: 0 0 8px; color: #0f172a; }}
+    .desc {{ font-size: 14px; line-height: 1.6; color: #475569; margin: 0 0 18px; }}
+    .meta {{ font-size: 12px; color: #64748b; margin: 0 0 18px; }}
+    .err {{
+      background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c;
+      font-size: 13px; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px;
+    }}
+    label {{ display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }}
+    .input-wrap {{ position: relative; display: flex; align-items: center; margin-bottom: 18px; }}
+    input[type="password"], input[type="text"] {{
+      width: 100%; height: 42px; padding: 0 64px 0 12px; border: 1px solid #cbd5e1;
+      border-radius: 8px; font-size: 15px; color: #0f172a; outline: none;
+    }}
+    input:focus {{ border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14); }}
+    .toggle {{
+      position: absolute; right: 8px; border: none; background: transparent; color: #475569;
+      font-size: 12px; cursor: pointer; padding: 6px 8px; border-radius: 6px;
+    }}
+    .toggle:hover {{ background: #f1f5f9; color: #0f172a; }}
+    .submit {{
+      width: 100%; height: 42px; border: none; border-radius: 8px; background: #1e293b;
+      color: #ffffff; font-size: 15px; font-weight: 600; cursor: pointer;
+    }}
+    .submit:hover {{ background: #0f172a; }}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <span class="badge">临时评估访问</span>
+    <h1>航运智能账单复核工作台</h1>
+    <p class="desc">请输入临时访问口令后进入工作台。</p>
+    {expiry_block}
+    {error_block}
+    <form method="post" action="/_access/login">
+      <input type="hidden" name="next" value="{escaped_next}" />
+      <label for="passcode">访问口令</label>
+      <div class="input-wrap">
+        <input id="passcode" name="passcode" type="password" required autofocus
+          autocomplete="current-password" placeholder="请输入临时访问口令" />
+        <button id="toggleBtn" class="toggle" type="button"
+          aria-label="显示或隐藏口令">显示</button>
+      </div>
+      <button class="submit" type="submit">进入工作台</button>
+    </form>
+  </main>
+  <script>
+    (function () {{
+      var input = document.getElementById("passcode");
+      var btn = document.getElementById("toggleBtn");
+      if (!input || !btn) return;
+      btn.addEventListener("click", function () {{
+        var hidden = input.type === "password";
+        input.type = hidden ? "text" : "password";
+        btn.textContent = hidden ? "隐藏" : "显示";
+      }});
+    }})();
+  </script>
+</body>
+</html>"""
+
+
 class AccessGuardMiddleware:
-    """Enforce optional expiration, IP rate limits, daily heavy quota, and concurrency caps."""
+    """Enforce optional passcode login, expiration, rate limits, heavy quota, and concurrency."""
 
     def __init__(
         self,
@@ -186,6 +360,8 @@ class AccessGuardMiddleware:
         max_concurrent_heavy: int = 0,
         expires_at: datetime | None = None,
         trust_proxy_headers: bool = False,
+        access_passcode: str = "",
+        access_session_hours: int = 24,
     ) -> None:
         self.app = app
         self.rate_limit_per_minute = rate_limit_per_minute
@@ -194,9 +370,17 @@ class AccessGuardMiddleware:
         self.max_concurrent_heavy = max_concurrent_heavy
         self.expires_at = expires_at
         self.trust_proxy_headers = trust_proxy_headers
+        self.access_passcode = validate_access_passcode(access_passcode)
+        self.access_session_hours = access_session_hours
+        self._signing_key = (
+            hashlib.sha256(f"shipping-billing-access-v1:{self.access_passcode}".encode()).digest()
+            if self.access_passcode
+            else b""
+        )
         self._lock = Lock()
         self._general_hits: dict[str, deque[float]] = {}
         self._heavy_hits: dict[str, deque[float]] = {}
+        self._login_failures: dict[str, deque[float]] = {}
         self._quota_day: date | None = None
         self._daily_heavy_count = 0
         self._active_heavy = 0
@@ -211,6 +395,43 @@ class AccessGuardMiddleware:
         if isinstance(client, tuple | list) and client and isinstance(client[0], str) and client[0]:
             return client[0]
         return "unknown"
+
+    def _is_https(self, scope: Scope) -> bool:
+        if scope.get("scheme") == "https":
+            return True
+        if not self.trust_proxy_headers:
+            return False
+        proto = (Headers(scope=scope).get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+        return proto == "https"
+
+    def _verify_session_token(self, token: str | None, now: datetime) -> bool:
+        if not token or not self._signing_key:
+            return False
+        exp_str, sep, sig_hex = token.partition(".")
+        if not sep or not exp_str.isdigit() or not sig_hex:
+            return False
+        if int(exp_str) <= int(now.timestamp()):
+            return False
+        expected = hmac.new(self._signing_key, exp_str.encode("ascii"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig_hex, expected)
+
+    def _issue_session_token(self, now: datetime) -> tuple[str, int]:
+        exp_dt = now + timedelta(hours=self.access_session_hours)
+        if self.expires_at is not None and self.expires_at < exp_dt:
+            exp_dt = self.expires_at
+        max_age = max(1, int((exp_dt - now).total_seconds()))
+        exp_str = str(int(exp_dt.timestamp()))
+        sig = hmac.new(self._signing_key, exp_str.encode("ascii"), hashlib.sha256).hexdigest()
+        return f"{exp_str}.{sig}", max_age
+
+    @staticmethod
+    def _security_page_headers(*extra: tuple[str, str]) -> dict[str, str]:
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Robots-Tag": "noindex, nofollow, noarchive",
+        }
+        headers.update(extra)
+        return headers
 
     @staticmethod
     def _prune_bucket(
@@ -243,6 +464,139 @@ class AccessGuardMiddleware:
         return HTMLResponse(
             _EXPIRED_HTML,
             status_code=403,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Robots-Tag": "noindex, nofollow, noarchive",
+            },
+        )
+
+    def _login_page_response(
+        self,
+        *,
+        next_path: str,
+        status_code: int = 200,
+        error_message: str | None = None,
+        retry_after: int | None = None,
+    ) -> HTMLResponse:
+        extra = (("Retry-After", str(retry_after)),) if retry_after is not None else ()
+        return HTMLResponse(
+            _render_login_html(
+                next_path=next_path,
+                error_message=error_message,
+                expires_at=self.expires_at,
+            ),
+            status_code=status_code,
+            headers=self._security_page_headers(*extra),
+        )
+
+    def _handle_login_get(self, scope: Scope, now: datetime) -> Response:
+        raw_qs = scope.get("query_string", b"").decode("latin-1")
+        next_param = parse_qs(raw_qs).get("next", [""])[0]
+        next_path = _safe_next_path(next_param)
+        token = Request(scope).cookies.get(_COOKIE_NAME)
+        if self._verify_session_token(token, now):
+            return RedirectResponse(
+                url=next_path, status_code=303, headers=self._security_page_headers()
+            )
+        return self._login_page_response(next_path=next_path)
+
+    async def _handle_login_post(self, scope: Scope, receive: Receive, now: datetime) -> Response:
+        client_ip = self._client_ip(scope)
+        now_mono = _monotonic()
+        cutoff = now_mono - _LOGIN_WINDOW_SECONDS
+
+        with self._lock:
+            failures = self._prune_bucket(self._login_failures, client_ip, cutoff)
+            if len(self._login_failures) > _MAX_TRACKED_IPS:
+                self._sweep_stale_keys(self._login_failures, cutoff)
+            if failures is not None and len(failures) >= _LOGIN_MAX_FAILURES:
+                retry_after = max(1, math.ceil(failures[0] + _LOGIN_WINDOW_SECONDS - now_mono))
+                return self._login_page_response(
+                    next_path="/",
+                    status_code=429,
+                    error_message="口令错误次数过多，请 15 分钟后再试",
+                    retry_after=retry_after,
+                )
+
+        body = await _read_limited_body(receive)
+        if body is None:
+            return self._login_page_response(
+                next_path="/", status_code=400, error_message="请求体格式无效或超出大小限制"
+            )
+        form = parse_qs(body.decode("utf-8", errors="ignore"), keep_blank_values=True)
+        passcode = form.get("passcode", [""])[0].strip()
+        next_path = _safe_next_path(form.get("next", [""])[0])
+
+        matched = bool(passcode) and hmac.compare_digest(
+            passcode.encode("utf-8"), self.access_passcode.encode("utf-8")
+        )
+        if not matched:
+            fail_now = _monotonic()
+            with self._lock:
+                self._prune_bucket(
+                    self._login_failures, client_ip, fail_now - _LOGIN_WINDOW_SECONDS
+                )
+                self._login_failures.setdefault(client_ip, deque()).append(fail_now)
+            return self._login_page_response(
+                next_path=next_path,
+                status_code=401,
+                error_message="访问口令不正确，请确认后重新输入",
+            )
+
+        with self._lock:
+            self._login_failures.pop(client_ip, None)
+
+        token, max_age = self._issue_session_token(now)
+        response = RedirectResponse(
+            url=next_path, status_code=303, headers=self._security_page_headers()
+        )
+        response.set_cookie(
+            key=_COOKIE_NAME,
+            value=token,
+            max_age=max_age,
+            path="/",
+            secure=self._is_https(scope),
+            httponly=True,
+            samesite="lax",
+        )
+        return response
+
+    def _handle_logout_post(self, scope: Scope) -> Response:
+        response = RedirectResponse(
+            url=_LOGIN_PATH, status_code=303, headers=self._security_page_headers()
+        )
+        response.delete_cookie(
+            key=_COOKIE_NAME,
+            path="/",
+            secure=self._is_https(scope),
+            httponly=True,
+            samesite="lax",
+        )
+        return response
+
+    @staticmethod
+    def _unauthenticated_response(scope: Scope, path: str) -> Response:
+        if (
+            path.startswith(("/api/", "/assets/"))
+            or path in _API_EXPIRED_PATHS
+        ):
+            return error_response(
+                401,
+                "AUTH_REQUIRED",
+                "请先输入临时访问口令后再访问工作台",
+                headers={"Cache-Control": "no-store"},
+            )
+        raw_qs = scope.get("query_string", b"").decode("latin-1")
+        target = f"{path}?{raw_qs}" if raw_qs else path
+        next_path = _safe_next_path(target)
+        login_url = (
+            _LOGIN_PATH
+            if next_path == "/"
+            else f"{_LOGIN_PATH}?{urlencode({'next': next_path})}"
+        )
+        return RedirectResponse(
+            url=login_url,
+            status_code=303,
             headers={
                 "Cache-Control": "no-store",
                 "X-Robots-Tag": "noindex, nofollow, noarchive",
@@ -345,14 +699,41 @@ class AccessGuardMiddleware:
             return
 
         path = scope.get("path", "")
-        if path == "/api/v1/health":
+        if path in _PUBLIC_BYPASS_PATHS:
             await self.app(scope, receive, send)
             return
 
-        if self.expires_at is not None and _utc_now() >= self.expires_at:
+        now = _utc_now()
+        if self.expires_at is not None and now >= self.expires_at:
             response = self._expired_response(path)
             await response(scope, receive, send)
             return
+
+        if self.access_passcode:
+            method = scope["method"]
+            if path == _LOGIN_PATH:
+                if method in {"GET", "HEAD"}:
+                    response = self._handle_login_get(scope, now)
+                elif method == "POST":
+                    response = await self._handle_login_post(scope, receive, now)
+                else:
+                    response = error_response(405, "METHOD_NOT_ALLOWED", "不支持该请求方法")
+                await response(scope, receive, send)
+                return
+
+            if path == _LOGOUT_PATH:
+                if method == "POST":
+                    response = self._handle_logout_post(scope)
+                else:
+                    response = error_response(405, "METHOD_NOT_ALLOWED", "不支持该请求方法")
+                await response(scope, receive, send)
+                return
+
+            token = Request(scope).cookies.get(_COOKIE_NAME)
+            if not self._verify_session_token(token, now):
+                response = self._unauthenticated_response(scope, path)
+                await response(scope, receive, send)
+                return
 
         has_limits = bool(
             self.rate_limit_per_minute

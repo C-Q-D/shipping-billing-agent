@@ -11,7 +11,7 @@
   - [方式 A：零密钥离线 CLI 体验](#方式-a零密钥离线-cli-体验)
   - [方式 B：启动 Web 复核工作台（完整交互体验）](#方式-b启动-web-复核工作台完整交互体验)
   - [方式 C：配置真实大模型与运行 Harness 评测](#方式-c配置真实大模型与运行-harness-评测)
-  - [方式 D：Docker Compose 一键隔离部署（含 Basic Auth 访问保护）](#方式-ddocker-compose-一键隔离部署含-basic-auth-访问保护)
+  - [方式 D：Docker Compose 一键隔离部署（含访问口令与限流防护）](#方式-ddocker-compose-一键隔离部署含访问口令与限流防护)
 - [2. 真实样本浏览器实测结果（一眼看懂）](#2-真实样本浏览器实测结果一眼看懂)
   - [整批上传 4 份原题样本（`NEPTUNE SHIPPING LIMITED` 视角）](#整批上传-4-份原题样本neptune-shipping-limited-视角)
   - [跨记账主体视角切换验证（同一原件自动重算 AR/AP）](#跨记账主体视角切换验证同一原件自动重算-arap)
@@ -92,27 +92,28 @@ LLM_API_KEY=<YOUR_API_KEY>
 
 重启 `serve` 后健康接口 `"llm_configured"` 变为 `true`，工作台与 CLI 将自动启用「确定性规则基线 + LangGraph 大模型语义抽取与原文逐行接地核验」双路架构。若暂缺公网文件 URL 或公网中转，建议使用 `--ocr-mode REMOTE_WITH_LOCAL_FALLBACK` 自动回退至本地 `pdfplumber` + `RapidOCR` 多格式识别。
 
-### 方式 D：Docker Compose 一键隔离部署（含 Basic Auth 访问保护）
+### 方式 D：Docker Compose 一键隔离部署（含访问口令与限流防护）
 
-适合在独立测试服务器上快速拉起面向面试官的临时在线工作台，服务与宿主机其余业务完全隔离（独立容器网络与持久化卷 `billing-data`），并由前置 Nginx 反向代理提供 HTTP Basic Auth 访问保护与 `/healthz` 健康探针：
+适合在独立测试服务器上快速拉起面向面试官的临时在线工作台，服务与宿主机其余业务完全隔离（独立容器网络与持久化卷 `billing-data`），默认启用工作台内置「网页版访问口令页」（HttpOnly 签名 Cookie 会话，兼容桌面浏览器与微信/飞书/IDE 内置浏览器），同时可选前置 Nginx Basic Auth 与 `/healthz` 健康探针：
 
-1. **准备环境配置文件**：复制 [deploy/deploy.env.example](deploy/deploy.env.example) 为仓库根目录 `.env`，填写大模型密钥与临时访客凭据（**切勿提交 `.env`**）：
+1. **准备环境配置文件**：复制 [deploy/deploy.env.example](deploy/deploy.env.example) 为仓库根目录 `.env`，填写大模型密钥与临时访客口令（**切勿提交 `.env`**）：
 
    ```bash
    cp deploy/deploy.env.example .env
    ```
 
    重点检查 `.env` 中以下配置项：
-   - `DEPLOY_PORT`（默认 `8080`）、`BASIC_AUTH_USER`（默认 `reviewer`）与 `BASIC_AUTH_PASS`（**必填**且长度至少 8 位，入口脚本会拒绝默认示例占位符）
-   - `ALLOWED_CIDRS`（可选，逗号分隔 IP/CIDR 白名单；留空则仅依赖 Basic Auth，配置后自动叠加 IP 白名单拦截）
+   - `DEPLOY_PORT`（默认 `8080`）、`APP_ACCESS_PASSCODE`（推荐填写至少 8 位访客口令，开启网页版口令登录页；默认会话有效期 `APP_ACCESS_SESSION_HOURS=24`）
+   - `BASIC_AUTH_USER` / `BASIC_AUTH_PASS`（可选，留空时不弹原生浏览器认证框，直接展示工作台口令页；若填写则同步启用 Nginx 层 Basic Auth 且拒绝占位符与不足 8 位密码）
+   - `ALLOWED_CIDRS`（可选，逗号分隔 IP/CIDR 白名单；配置后自动叠加 IP 白名单拦截）
    - `APP_RATE_LIMIT_PER_MINUTE` / `APP_HEAVY_RATE_LIMIT_PER_MINUTE` / `APP_DAILY_HEAVY_QUOTA` / `APP_MAX_CONCURRENT_HEAVY`（默认分别 `180` / `6` / `60` / `2`，防止公网刷爆模型额度或并发打满）
-   - `APP_DISABLE_LIVE_EVAL`（默认 `true`，临时演示环境关闭在线大模型批量评测，保留单据实传与离线评测）与 `APP_ACCESS_EXPIRES_AT`（可选 ISO-8601 到期时间，到期后除 `/api/v1/health` 外自动返回 `403`）
+   - `APP_DISABLE_LIVE_EVAL`（默认 `true`，临时演示环境关闭在线大模型批量评测，保留单据实传与离线评测）与 `APP_ACCESS_EXPIRES_AT`（可选 ISO-8601 到期时间，到期后除 `/api/v1/health` 与 `/favicon.ico` 外全站自动返回 `403`）
    - `LLM_PROVIDER` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`（填入真实大模型 API Key 后自动开启双路语义抽取与接地核验）
    - `APP_ALLOWED_ORIGINS`（若服务器前侧还有独立 HTTPS 域名反代，需补充对应公网 Origin JSON 数组，满足 `OriginMiddleware` 同源校验）
 
    **内置安全与限流防护机制**（适合面试官临时访问）：
-   - **边缘防护（Nginx）**：HTTP Basic Auth、可选 `ALLOWED_CIDRS` IP 白名单、单 IP 请求与重接口 `POST` 双层限流（触发返回 `429 RATE_LIMITED` + `Retry-After`）、单 IP 最大 20 并发连接、请求体上限 `32m`、非必要 HTTP 方法与隐藏文件探测拦截、`X-Robots-Tag: noindex, nofollow, noarchive` 与安全响应头。
-   - **应用与预算硬顶（FastAPI）**：`OriginMiddleware` 跨站写入校验、每分钟接口限流、`60 次/日` 重解析全局额度上限、最多 `2` 路并发解析保护、高耗能在线批量评测开关（`APP_DISABLE_LIVE_EVAL`）及按时间自动失效锁闭（`APP_ACCESS_EXPIRES_AT`）。
+   - **边缘防护（Nginx）**：`/_access/login` 登录防爆破限流（`5r/m`）、可选前置 HTTP Basic Auth、可选 `ALLOWED_CIDRS` IP 白名单、单 IP 请求与重接口 `POST` 双层限流（触发返回 `429 RATE_LIMITED` + `Retry-After`）、单 IP 最大 20 并发连接、请求体上限 `32m`、非必要 HTTP 方法与隐藏文件探测拦截、`X-Robots-Tag: noindex, nofollow, noarchive` 与安全响应头。
+   - **应用与预算硬顶（FastAPI）**：网页访问口令 + HMAC-SHA256 `HttpOnly` 会话 + `15 分钟内最多 10 次失败` 锁定、`OriginMiddleware` 跨站写入校验、每分钟接口限流、`60 次/日` 重解析全局额度上限、最多 `2` 路并发解析保护、高耗能在线批量评测开关（`APP_DISABLE_LIVE_EVAL`）及按时间自动失效锁闭（`APP_ACCESS_EXPIRES_AT`）。
    - **容器最小权限隔离**：独立容器网络与命名卷 `billing-data`、`cap_drop: [ALL]`、`no-new-privileges:true`、内存/PID 上限与日志轮转（`10m × 3`）。
 
 2. **构建并启动隔离双容器栈**（`app` + `proxy`）：
@@ -129,7 +130,7 @@ LLM_API_KEY=<YOUR_API_KEY>
    ```
 
 3. **访问与下线清理**：
-   - 打开 `http://<SERVER_IP>:<DEPLOY_PORT>`，使用 `.env` 中配置的 `BASIC_AUTH_USER` / `BASIC_AUTH_PASS` 登录即可使用完整工作台。
+   - 打开 `http://<SERVER_IP>:<DEPLOY_PORT>`，在「临时访客口令验证」页面输入 `.env` 中设置的 `APP_ACCESS_PASSCODE` 即可进入完整工作台（如同时启用了 Nginx Basic Auth，需先通过浏览器弹窗认证）。
    - 面试评估结束后一键停止并回收数据卷与容器：
 
      ```bash

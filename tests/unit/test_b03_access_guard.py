@@ -45,6 +45,8 @@ def _api_settings(tmp_path: Path, **overrides: object) -> ApiSettings:
         "disable_live_eval": False,
         "access_expires_at": "",
         "trust_proxy_headers": False,
+        "access_passcode": "",
+        "access_session_hours": 24,
     }
     defaults.update(overrides)
     return ApiSettings(**defaults)
@@ -368,3 +370,158 @@ def test_trust_proxy_headers_controls_x_real_ip_bucketing(
             )
     finally:
         untrusted_service.close()
+
+
+def test_passcode_validation_rejects_short_or_placeholder(tmp_path: Path) -> None:
+    for bad_passcode in ("short", "ChangeMe_StrongPass_2026"):
+        bad = _api_settings(tmp_path, access_passcode=bad_passcode)
+        try:
+            create_app(settings=bad)
+        except ValueError as exc:
+            assert "APP_ACCESS_PASSCODE" in str(exc)
+        else:
+            raise AssertionError(f"Expected ValueError for {bad_passcode}")
+
+
+def test_passcode_redirects_unauth_blocks_api_and_sanitizes_next(tmp_path: Path) -> None:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<title>Workbench</title>", encoding="utf-8")
+
+    settings = _api_settings(tmp_path, access_passcode="StrongPass2026")
+    service = _make_service(tmp_path, settings)
+    try:
+        app = create_app(settings=settings, batch_service=service, frontend_dir=dist)
+        with TestClient(app) as client:
+            assert client.get(f"{API}/health").status_code == 200
+            assert client.get("/favicon.ico").status_code == 200
+
+            root = client.get("/?batch=B-1", follow_redirects=False)
+            assert root.status_code == 303
+            assert root.headers["location"].startswith("/_access/login?next=%2F%3Fbatch%3DB-1")
+
+            login_page = client.get("/_access/login?next=//evil.com", follow_redirects=False)
+            assert login_page.status_code == 200
+            assert "临时访客口令验证" in login_page.text
+            assert 'name="next" value="/"' in login_page.text
+
+            for protected_json in (
+                f"{API}/batches",
+                "/openapi.json",
+                "/docs",
+                "/redoc",
+                "/assets/app.js",
+            ):
+                blocked = client.get(protected_json, follow_redirects=False)
+                assert blocked.status_code == 401
+                assert blocked.json()["code"] == "AUTH_REQUIRED"
+                assert blocked.headers["cache-control"] == "no-store"
+    finally:
+        service.close()
+
+
+def test_passcode_wrong_attempts_rate_limit_and_no_cookie(tmp_path: Path, monkeypatch) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(security, "_monotonic", lambda: clock[0])
+
+    settings = _api_settings(tmp_path, access_passcode="StrongPass2026")
+    service = _make_service(tmp_path, settings)
+    try:
+        with TestClient(create_app(settings=settings, batch_service=service)) as client:
+            for idx in range(10):
+                wrong = client.post(
+                    "/_access/login",
+                    data={"passcode": f"wrong-{idx}", "next": "//evil.com"},
+                    follow_redirects=False,
+                )
+                assert wrong.status_code == 401
+                assert "访问口令不正确" in wrong.text
+                assert "set-cookie" not in wrong.headers
+                assert 'name="next" value="/"' in wrong.text
+
+            locked = client.post(
+                "/_access/login",
+                data={"passcode": "StrongPass2026", "next": "/"},
+                follow_redirects=False,
+            )
+            assert locked.status_code == 429
+            assert "口令错误次数过多" in locked.text
+            assert int(locked.headers["retry-after"]) >= 1
+    finally:
+        service.close()
+
+
+def test_passcode_cookie_lifecycle_secure_flag_logout_and_expiry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    now = [datetime(2026, 11, 21, 10, 0, tzinfo=UTC)]
+    monkeypatch.setattr(security, "_utc_now", lambda: now[0])
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<title>Workbench</title>", encoding="utf-8")
+
+    settings = _api_settings(
+        tmp_path,
+        access_passcode="StrongPass2026",
+        access_session_hours=2,
+        access_expires_at="2026-11-21T15:00:00Z",
+        trust_proxy_headers=True,
+    )
+    service = _make_service(tmp_path, settings)
+    try:
+        app = create_app(settings=settings, batch_service=service, frontend_dir=dist)
+        with TestClient(app) as client:
+            login_http = client.post(
+                "/_access/login",
+                data={"passcode": "StrongPass2026", "next": "/?tab=review"},
+                follow_redirects=False,
+            )
+            assert login_http.status_code == 303
+            assert login_http.headers["location"] == "/?tab=review"
+            raw_cookie_http = login_http.headers["set-cookie"]
+            assert "HttpOnly" in raw_cookie_http
+            assert "SameSite=lax" in raw_cookie_http or "SameSite=Lax" in raw_cookie_http
+            assert "Secure" not in raw_cookie_http
+
+            assert client.get("/", follow_redirects=False).status_code == 200
+            assert client.get(f"{API}/batches").status_code == 200
+            assert client.get("/_access/login?next=/foo", follow_redirects=False).status_code == 303
+
+            now[0] = datetime(2026, 11, 21, 12, 1, tzinfo=UTC)
+            assert client.get(f"{API}/batches").status_code == 401
+            client.cookies.clear()
+
+            login_https = client.post(
+                "/_access/login",
+                data={"passcode": "StrongPass2026", "next": "/"},
+                headers={"X-Forwarded-Proto": "https"},
+                follow_redirects=False,
+            )
+            assert login_https.status_code == 303
+            assert "Secure" in login_https.headers["set-cookie"]
+
+            tampered = dict(client.cookies)
+            token_val = tampered["sb_access_session"]
+            exp_part, _, sig_part = token_val.partition(".")
+            client.cookies.set(
+                "sb_access_session",
+                f"{exp_part}.{('0' if sig_part[0] != '0' else '1')}{sig_part[1:]}",
+            )
+            assert client.get(f"{API}/batches").status_code == 401
+
+            client.cookies.set("sb_access_session", token_val)
+            assert client.get(f"{API}/batches").status_code == 200
+
+            now[0] = datetime(2026, 11, 21, 15, 0, tzinfo=UTC)
+            expired_resp = client.get(f"{API}/batches")
+            assert expired_resp.status_code == 403
+            assert expired_resp.json()["code"] == "ACCESS_EXPIRED"
+
+            now[0] = datetime(2026, 11, 21, 12, 30, tzinfo=UTC)
+            logout_resp = client.post("/_access/logout", follow_redirects=False)
+            assert logout_resp.status_code == 303
+            assert logout_resp.headers["location"] == "/_access/login"
+            assert "Max-Age=0" in logout_resp.headers["set-cookie"]
+    finally:
+        service.close()

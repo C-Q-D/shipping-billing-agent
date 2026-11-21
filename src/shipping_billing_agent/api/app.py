@@ -38,6 +38,7 @@ from .security import (
     OriginMiddleware,
     allowed_origin_tuples,
     parse_access_expires_at,
+    validate_access_passcode,
 )
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -173,6 +174,7 @@ def create_app(
     )
     origins = allowed_origin_tuples((*origin_settings.allowed_origins, *allowed_origins))
     expires_at = parse_access_expires_at(origin_settings.access_expires_at)
+    access_passcode = validate_access_passcode(origin_settings.access_passcode)
     service = batch_service
     service_lock = Lock()
 
@@ -215,7 +217,7 @@ def create_app(
     fastapi_app.state.resolve_batch_service = resolve_batch_service
     fastapi_app.state.resolve_eval_runner = resolve_eval_runner
     fastapi_app.state.disable_live_eval = origin_settings.disable_live_eval
-    if expires_at is not None or any(
+    if access_passcode or expires_at is not None or any(
         (
             origin_settings.rate_limit_per_minute,
             origin_settings.heavy_rate_limit_per_minute,
@@ -231,6 +233,8 @@ def create_app(
             max_concurrent_heavy=origin_settings.max_concurrent_heavy,
             expires_at=expires_at,
             trust_proxy_headers=origin_settings.trust_proxy_headers,
+            access_passcode=access_passcode,
+            access_session_hours=origin_settings.access_session_hours,
         )
     fastapi_app.add_middleware(OriginMiddleware, allowed_origins=origins)
     _register_error_handlers(fastapi_app)

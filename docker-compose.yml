@@ -20,6 +20,8 @@ services:
       APP_MAX_CONCURRENT_HEAVY: "${APP_MAX_CONCURRENT_HEAVY:-2}"
       APP_DISABLE_LIVE_EVAL: "${APP_DISABLE_LIVE_EVAL:-true}"
       APP_ACCESS_EXPIRES_AT: "${APP_ACCESS_EXPIRES_AT:-}"
+      APP_ACCESS_PASSCODE: "${APP_ACCESS_PASSCODE:-}"
+      APP_ACCESS_SESSION_HOURS: "${APP_ACCESS_SESSION_HOURS:-24}"
     volumes:
       - billing-data:/app/data
     expose:
@@ -49,7 +51,7 @@ services:
       - "${DEPLOY_BIND_IP:-0.0.0.0}:${DEPLOY_PORT:-8080}:80"
     environment:
       BASIC_AUTH_USER: "${BASIC_AUTH_USER:-reviewer}"
-      BASIC_AUTH_PASS: "${BASIC_AUTH_PASS:?请先在 .env 中设置 BASIC_AUTH_PASS}"
+      BASIC_AUTH_PASS: "${BASIC_AUTH_PASS:-}"
       ALLOWED_CIDRS: "${ALLOWED_CIDRS:-}"
       TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:-}"
     mem_limit: "128m"

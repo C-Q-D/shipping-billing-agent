@@ -1,19 +1,22 @@
 #!/bin/sh
 set -eu
 
-if [ -z "${BASIC_AUTH_USER:-}" ] || [ -z "${BASIC_AUTH_PASS:-}" ]; then
-  echo "ERROR: BASIC_AUTH_USER and BASIC_AUTH_PASS must be set" >&2
-  exit 1
+if [ -n "${BASIC_AUTH_PASS:-}" ]; then
+  if [ -z "${BASIC_AUTH_USER:-}" ]; then
+    echo "ERROR: BASIC_AUTH_USER must be set when BASIC_AUTH_PASS is provided" >&2
+    exit 1
+  fi
+  if [ "${#BASIC_AUTH_PASS}" -lt 8 ] || [ "$BASIC_AUTH_PASS" = "ChangeMe_StrongPass_2026" ]; then
+    echo "ERROR: BASIC_AUTH_PASS must be at least 8 characters and not use the example placeholder" >&2
+    exit 1
+  fi
+  printf '%s\n' "$BASIC_AUTH_PASS" | htpasswd -i -m -c /etc/nginx/.htpasswd "$BASIC_AUTH_USER"
+  chown root:nginx /etc/nginx/.htpasswd
+  chmod 640 /etc/nginx/.htpasswd
+  printf 'auth_basic "Shipping Billing Workbench";\nauth_basic_user_file /etc/nginx/.htpasswd;\n' > /etc/nginx/auth.conf
+else
+  printf '# basic auth disabled; using app-level passcode auth\n' > /etc/nginx/auth.conf
 fi
-
-if [ "${#BASIC_AUTH_PASS}" -lt 8 ] || [ "$BASIC_AUTH_PASS" = "ChangeMe_StrongPass_2026" ]; then
-  echo "ERROR: BASIC_AUTH_PASS must be at least 8 characters and not use the example placeholder" >&2
-  exit 1
-fi
-
-printf '%s\n' "$BASIC_AUTH_PASS" | htpasswd -i -m -c /etc/nginx/.htpasswd "$BASIC_AUTH_USER"
-chown root:nginx /etc/nginx/.htpasswd
-chmod 640 /etc/nginx/.htpasswd
 
 write_cidr_file() {
   csv="$1"
