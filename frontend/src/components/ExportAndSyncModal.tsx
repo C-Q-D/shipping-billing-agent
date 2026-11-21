@@ -51,6 +51,12 @@ const MODE_LABELS: Record<ExportMode, string> = {
   audit: "完整审计留痕",
 };
 
+export const MODE_SCOPE_LABELS: Record<ExportMode, string> = {
+  official: "导出范围为整批可入账/已批准记录",
+  full_standard: "导出范围为整批含待复核的非驳回记录",
+  audit: "导出范围为整批全部状态记录与完整审计留痕",
+};
+
 function getExportOpLabel(op: string): string {
   switch (op) {
     case "CREATE":
@@ -414,7 +420,7 @@ export function ExportAndSyncModal({
         {batch ? (
           <div className="wb-helper-note">
             当前批次：{batch.short_code} · 记账公司：{batch.accounting_entity}
-            （导出范围为整批已确认记录）
+            （{MODE_SCOPE_LABELS[activeMode]}）
           </div>
         ) : null}
 

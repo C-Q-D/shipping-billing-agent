@@ -3060,8 +3060,24 @@ export function normalizeExcludedClauseReason(
   if (/\bclause\b/.test(lower)) {
     return "条件收费或违约条款";
   }
+  if (
+    /(?:non[\s_-]*billing|non[\s_-]*billable|informational|disclaimer|notice|\bother\b|\bmisc\b)/.test(
+      lower
+    ) ||
+    /^[a-z0-9\s/_.,:-]+$/i.test(trimmed)
+  ) {
+    return "其他非计费说明";
+  }
   return trimmed;
 }
+
+const normClauseSubKey = (text: string): string =>
+  text
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 
 export function groupExcludedClauses(
   clauses:
@@ -3069,15 +3085,16 @@ export function groupExcludedClauses(
     | undefined
 ): ExcludedClauseGroup[] {
   if (!clauses || clauses.length === 0) return [];
-  const globalByNormKey = new Map<
-    string,
-    {
-      text: string;
-      reason: string;
-      hasChineseReason: boolean;
-      pages: Set<number>;
-    }
-  >();
+  interface ClauseDedupEntry {
+    order: number;
+    text: string;
+    normSub: string;
+    reason: string;
+    hasChineseReason: boolean;
+    pages: Set<number>;
+  }
+  const globalByNormKey = new Map<string, ClauseDedupEntry>();
+  let nextOrder = 0;
 
   for (const clause of clauses) {
     const text = clause.text?.trim() ?? "";
@@ -3092,7 +3109,9 @@ export function groupExcludedClauses(
     let entry = globalByNormKey.get(normKey);
     if (!entry) {
       entry = {
+        order: nextOrder++,
         text,
+        normSub: normClauseSubKey(text),
         reason: normalizedReason,
         hasChineseReason: isStandardOrChinese,
         pages: new Set<number>(),
@@ -3108,31 +3127,65 @@ export function groupExcludedClauses(
     }
   }
 
-  const groupMap = new Map<
-    string,
-    {
-      reason: string;
-      totalCount: number;
-      items: ExcludedClauseItemSummary[];
-    }
-  >();
+  const entriesByReason = new Map<string, ClauseDedupEntry[]>();
   for (const entry of globalByNormKey.values()) {
-    const count = entry.pages.size > 0 ? entry.pages.size : 1;
-    const pages = Array.from(entry.pages).sort((a, b) => a - b);
-    let group = groupMap.get(entry.reason);
-    if (!group) {
-      group = { reason: entry.reason, totalCount: 0, items: [] };
-      groupMap.set(entry.reason, group);
+    let list = entriesByReason.get(entry.reason);
+    if (!list) {
+      list = [];
+      entriesByReason.set(entry.reason, list);
     }
-    group.totalCount += count;
-    group.items.push({
-      text: entry.text,
-      count,
-      pages,
-    });
+    list.push(entry);
   }
 
-  return Array.from(groupMap.values());
+  const groups: ExcludedClauseGroup[] = [];
+  for (const [reason, entries] of entriesByReason.entries()) {
+    // Subsumption: fold redundant shorter snippet inside the same reason when a longer clause already covers it on the same pages.
+    const byLengthDesc = [...entries].sort(
+      (a, b) => b.normSub.length - a.normSub.length || a.order - b.order
+    );
+    const kept: ClauseDedupEntry[] = [];
+    for (const candidate of byLengthDesc) {
+      const candidatePages = Array.from(candidate.pages);
+      const subsumer =
+        candidate.normSub.length >= 12
+          ? kept.find((longer) => {
+              if (!longer.normSub.includes(candidate.normSub)) return false;
+              return (
+                candidatePages.length === 0 ||
+                longer.pages.size === 0 ||
+                candidatePages.every((p) => longer.pages.has(p))
+              );
+            })
+          : undefined;
+      if (subsumer) {
+        if (subsumer.pages.size === 0 && candidate.pages.size > 0) {
+          for (const p of candidate.pages) {
+            subsumer.pages.add(p);
+          }
+        }
+        continue;
+      }
+      kept.push(candidate);
+    }
+
+    kept.sort((a, b) => a.order - b.order);
+
+    let totalCount = 0;
+    const items: ExcludedClauseItemSummary[] = kept.map((entry) => {
+      const count = entry.pages.size > 0 ? entry.pages.size : 1;
+      const pages = Array.from(entry.pages).sort((a, b) => a - b);
+      totalCount += count;
+      return {
+        text: entry.text,
+        count,
+        pages,
+      };
+    });
+
+    groups.push({ reason, totalCount, items });
+  }
+
+  return groups;
 }
 
 export interface RecordPartyDisplayMeta {
@@ -3185,8 +3238,8 @@ export function getRecordPartyDisplayMeta(
     const sameIssuer =
       Boolean(accountingEntity && issuer) &&
       normParty(issuer) === normParty(accountingEntity);
-    if (accountingEntity && issuer && !sameIssuer) {
-      flowSummary = `${payerSide} → ${accountingEntity}（款付给我方 · 签发：${issuerLabel}）`;
+    if (accountingEntity && !sameIssuer) {
+      flowSummary = `${payerSide} → ${accountingEntity}（款付给我方${issuer ? ` · 签发：${issuerLabel}` : ""}）`;
     } else {
       flowSummary = `${payerSide} → ${issuerLabel}（款付给我方）`;
     }

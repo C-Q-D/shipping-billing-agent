@@ -6943,6 +6943,22 @@ export async function runDecimalJsonTests(): Promise<void> {
         hostEnv.doc.body!.textContent.includes("付款方待确认"),
         "W15 P0-2: Export modal displays missing-counterparty 付款方待确认 note"
       );
+      assertTrue(
+        hostEnv.doc.body!.textContent.includes("导出范围为整批可入账/已批准记录"),
+        "UI Polish #3: Export modal defaults to 可入账/已批准记录 scope subtitle"
+      );
+      await ui.clickButton("含待复核全量");
+      await flushActMicrotasks(2);
+      assertTrue(
+        hostEnv.doc.body!.textContent.includes("导出范围为整批含待复核的非驳回记录"),
+        "UI Polish #3: Switching to 含待复核全量 updates scope subtitle dynamically"
+      );
+      await ui.clickButton("完整审计留痕");
+      await flushActMicrotasks(2);
+      assertTrue(
+        hostEnv.doc.body!.textContent.includes("导出范围为整批全部状态记录与完整审计留痕"),
+        "UI Polish #3: Switching to 完整审计留痕 updates scope subtitle dynamically"
+      );
       await ui.clickButton("关闭");
 
       // P0-3: Upload entity temporary override does not mutate TopBar & auto-resets after submit
@@ -7089,6 +7105,142 @@ export async function runDecimalJsonTests(): Promise<void> {
   }
   results.push(
     "PASS 36: Wave 15 UX Overhaul E2E (doc-filter/inspector sync, missing-party clarity, entity override reset, alert priority, search/jump, eval group wording & form id/name completeness)"
+  );
+
+  // PASS 37: Live-test UI polish regression checks (non-billing label, clause subsumption, AR flowSummary with missing issuer, CSS tools menu height)
+  {
+    assertEqual(
+      normalizeExcludedClauseReason("non-billing"),
+      "其他非计费说明",
+      "UI Polish #1: normalizeExcludedClauseReason maps 'non-billing' -> 其他非计费说明"
+    );
+    assertEqual(
+      normalizeExcludedClauseReason("bank-account/remittance instruction"),
+      "银行汇款信息",
+      "UI Polish #1: normalizeExcludedClauseReason maps 'bank-account/remittance instruction' -> 银行汇款信息"
+    );
+
+    const realPdf1Like = groupExcludedClauses([
+      {
+        text: "EFFECTIVE ON JUNE 1st 2016, IF CMA CGM (AMERICA) LLC ARRANGES AN I.T. (IN-BOND) FOR CARGO MANIFESTED TO MOVE INLAND AND THE MERCHANT REQUESTS THE I.T. TO BE CANCELLED, A SERVICE FEE OF $25.00 PER CANCELLED I.T. WILL BE ASSESSED.",
+        reason: "conditional penalty",
+        page: 1,
+      },
+      {
+        text: "EFFECTIVE ON JUNE 1st 2016, IF CMA CGM (AMERICA) LLC ARRANGES AN I.T. (IN-BOND) FOR CARGO MANIFESTED TO MOVE INLAND AND THE MERCHANT REQUESTS THE I.T. TO BE CANCELLED, A SERVICE FEE OF $25.00 PER CANCELLED I.T. WILL BE ASSESSED. PLEASE ENSURE ALL REQUESTS TO “CLEAR AT THE PORT OF DISCHARGE”",
+        reason: "条件收费或违约条款",
+        page: 1,
+      },
+      {
+        text: "EFFECTIVE ON JUNE 1st 2016, IF CMA CGM (AMERICA) LLC ARRANGES AN I.T. (IN-BOND) FOR CARGO MANIFESTED TO MOVE INLAND AND THE MERCHANT REQUESTS THE I.T. TO BE CANCELLED, A SERVICE FEE OF $25.00 PER CANCELLED I.T. WILL BE ASSESSED. PLEASE ENSURE ALL REQUESTS TO “CLEAR AT THE PORT OF DISCHARGE”",
+        reason: "条件收费或违约条款",
+        page: 2,
+      },
+      {
+        text: "In the event that an empty SOC container is mistakenly returned to CMA CGM, the merchant will be held responsible for all costs including, but not limited to, a misuse fee of $1100.",
+        reason: "conditional penalty",
+        page: 2,
+      },
+      {
+        text: "Shipper owned empty containers (SOC) are the complete responsibility of the containers’ owner. In the event that an empty SOC container is mistakenly returned to CMA CGM, the merchant will be held responsible for all costs including, but not limited to, a misuse fee of $1100.",
+        reason: "条件收费或违约条款",
+        page: 2,
+      },
+      {
+        text: "After expiration of 1 hour, the merchant will be billed $150 per hour or any part thereof.",
+        reason: "conditional penalty",
+        page: 2,
+      },
+      {
+        text: "hour of free driver wait time will be provided. After expiration of 1 hour, the merchant will be billed $150 per hour or any part thereof.",
+        reason: "条件收费或违约条款",
+        page: 2,
+      },
+      {
+        text: "For electronic bank transfers remit to ABA # [REDACTED_BANK_ACCT] ACH: [REDACTED_BANK_ACCT]",
+        reason: "银行汇款信息",
+        page: 2,
+      },
+      {
+        text: "ACH: [REDACTED_BANK_ACCT]",
+        reason: "银行汇款信息",
+        page: 3,
+      },
+      {
+        text: "Equipment Demurrage charges incurred are payable to CMA CGM and do not include rail storage.",
+        reason: "non-billing",
+        page: 2,
+      },
+    ]);
+    assertEqual(
+      realPdf1Like.map((g) => g.reason).join("|"),
+      "条件收费或违约条款|银行汇款信息|其他非计费说明",
+      "UI Polish #1: Excluded clause categories consolidate cleanly without raw English 'non-billing'"
+    );
+    const pdf1Cond = realPdf1Like.find((g) => g.reason === "条件收费或违约条款")!;
+    assertEqual(
+      pdf1Cond.items.length,
+      3,
+      "UI Polish #2: Same-page overlapping $25, $1100, and $150 clauses subsume into 3 full bullets"
+    );
+    assertTrue(
+      pdf1Cond.items.every((item) => item.text.length >= 115),
+      "UI Polish #2: Retained bullets are the longer complete clauses"
+    );
+    const pdf1Bank = realPdf1Like.find((g) => g.reason === "银行汇款信息")!;
+    assertEqual(
+      pdf1Bank.items.length,
+      2,
+      "UI Polish #2: Cross-page snippet on page 3 stays separate from page-2 line"
+    );
+
+    const realPdf2Like = groupExcludedClauses([
+      { text: "PAID AMOUNT 0.00", reason: "non-billing", page: 1 },
+      { text: "PAID AMOUNT 0.00", reason: "已付金额", page: 1 },
+      { text: "BENEFICIARY : NEPTUNE SHIPPING LIMITED", reason: "银行汇款信息", page: 1 },
+      { text: "BANK ACCOUNT : BANK OF AMERICA", reason: "银行汇款信息", page: 1 },
+      { text: "BOA ACCOUNT #: [REDACTED_BANK_ACCT]", reason: "银行汇款信息", page: 1 },
+      { text: "ROUTING NUMBER ACH : [REDACTED_BANK_ACCT]", reason: "银行汇款信息", page: 1 },
+      {
+        text: "BENEFICIARY : NEPTUNE SHIPPING LIMITED BANK ACCOUNT : BANK OF AMERICA BOA ACCOUNT #: [REDACTED_BANK_ACCT] ROUTING NUMBER ACH : [REDACTED_BANK_ACCT] ROUTING NUMBER WIRE : [REDACTED_BANK_ACCT]",
+        reason: "银行汇款信息",
+        page: 1,
+      },
+    ]);
+    assertEqual(
+      realPdf2Like.find((g) => g.reason === "已付金额")?.items.length,
+      1,
+      "UI Polish #1+#2: Duplicate PAID AMOUNT 0.00 upgrades non-billing to 已付金额"
+    );
+    assertEqual(
+      realPdf2Like.find((g) => g.reason === "银行汇款信息")?.items.length,
+      1,
+      "UI Polish #2: Overlapping page-1 bank fragments fold into 1 full remittance entry"
+    );
+
+    assertEqual(
+      getRecordPartyDisplayMeta({
+        transaction_party: { issuer: null, recipient: null },
+        financial_attributes: {
+          accounting_entity: "TARGETING A INC",
+          posting_type: "AR",
+        },
+      }).flowSummary,
+      "付款方待确认 → TARGETING A INC（款付给我方）",
+      "UI Polish #5: AR record with null issuer uses accounting_entity instead of 未识别签发方"
+    );
+
+    const cssSource = fsPkg.readFileSync(
+      pathPkg.resolve(frontendRootDir, "src", "styles", "workbench.css"),
+      "utf-8"
+    );
+    assertTrue(
+      cssSource.includes("max-height: min(480px, calc(100vh - 80px));"),
+      "UI Polish #4: .wb-tools-menu overrides 320px dropdown max-height to prevent 6th item clipping"
+    );
+  }
+  results.push(
+    "PASS 37: Live-test UI polish regression (non-billing label, clause subsumption, AR flowSummary with missing issuer, export dynamic scope & tools-menu height)"
   );
 
   } finally {

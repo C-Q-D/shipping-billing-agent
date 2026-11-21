@@ -1087,7 +1087,8 @@ body[data-theme="dark"] .lumno-modal-panel {
 }
 
 .wb-tools-menu {
-  min-width: 268px;
+  min-width: 276px;
+  max-height: min(480px, calc(100vh - 80px));
 }
 
 .wb-menu-item-row {
