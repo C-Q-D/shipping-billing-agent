@@ -7,21 +7,36 @@ import json
 from collections.abc import Iterator
 from copy import deepcopy
 from decimal import Decimal
+from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 from sqlite3 import IntegrityError
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import pytest
 import yaml
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from jsonschema import Draft202012Validator
+from PIL import Image
 
 from shipping_billing_agent.api.app import create_app
 from shipping_billing_agent.config.settings import AppSettings
 from shipping_billing_agent.domain import ExistingBillRecord, dumps_decimal_json, loads_decimal_json
-from shipping_billing_agent.domain.models import OcrStructuredPayload
-from shipping_billing_agent.services import BatchService, export_review_bundle
+from shipping_billing_agent.domain.models import (
+    DocumentStatus,
+    ExtractionChannel,
+    OcrStructuredPayload,
+    ParsedDocument,
+    SourceKind,
+)
+from shipping_billing_agent.services import (
+    BatchService,
+    ResourceNotFoundError,
+    export_review_bundle,
+)
+from shipping_billing_agent.services.batch_service import DocumentContentPayload
 from shipping_billing_agent.storage import BillingRepository
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -131,8 +146,8 @@ def test_registered_operations_and_served_openapi_match_contract(api, contract) 
         for method, operation in operations.items()
         if method in methods
     }
-    assert len(contract["paths"]) == 24
-    assert len(expected) == 29
+    assert len(contract["paths"]) == 25
+    assert len(expected) == 30
     actual = {
         (method, route.path): route.operation_id
         for route in _http_routes(client.app.routes)
@@ -315,6 +330,7 @@ def test_cross_batch_document_and_record_ids_are_rejected(api, contract) -> None
         client.patch(f"{path}/documents/{doc_id}", json={"total_amount": 2}),
         client.post(f"{path}/documents/{doc_id}/retry"),
         client.post(f"{path}/documents/{doc_id}/force-parse"),
+        client.get(f"{path}/documents/{doc_id}/content"),
         client.post(
             f"{path}/records",
             json={"source_doc_id": doc_id, "charge_item": "H/D", "amount": 2, "currency": "USD"},
@@ -741,3 +757,407 @@ def test_bundle_service_does_not_import_fastapi_or_harness() -> None:
             else:
                 continue
             assert all(not {"fastapi", "harness"}.intersection(name.split(".")) for name in imports)
+
+
+def _seed_doc(
+    service: BatchService,
+    batch_id: str,
+    *,
+    doc_id: str,
+    filename: str,
+    source_kind: SourceKind,
+    raw_bytes: bytes | None,
+    media_type: str | None = None,
+    raw_text: str = "",
+    status: DocumentStatus = DocumentStatus.PARSED,
+    stored_path_override: Path | None = None,
+    sha256_override: str | None = None,
+) -> str:
+    stored_path = stored_path_override
+    if stored_path is None and raw_bytes is not None:
+        stored_path = service._write_original(batch_id, filename, raw_bytes, [])
+    digest = sha256_override
+    if digest is None and raw_bytes is not None:
+        digest = sha256(raw_bytes).hexdigest()
+    doc = ParsedDocument(
+        doc_id=doc_id,
+        original_filename=filename,
+        sanitized_filename=filename.replace(" ", "_"),
+        media_type=media_type,
+        source_kind=source_kind,
+        content_sha256=digest,
+        public_url="https://8.8.8.8/remote.pdf" if source_kind is SourceKind.URL else None,
+        extraction_channel=(
+            ExtractionChannel.FAILED
+            if status is DocumentStatus.FAILED
+            else ExtractionChannel.PLTPLT_OCR
+        ),
+        status=status,
+        raw_text=raw_text,
+    )
+    service.repository.upsert_source_documents(
+        batch_id, [doc], stored_paths={doc_id: stored_path}
+    )
+    return doc_id
+
+
+def _png_bytes() -> bytes:
+    buf = BytesIO()
+    Image.new("RGB", (4, 4), color=(10, 20, 30)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _tiff_bytes(*, multipage: bool = True) -> bytes:
+    first = Image.new("RGB", (6, 4), color=(255, 0, 0))
+    second = Image.new("RGB", (6, 4), color=(0, 255, 0))
+    buf = BytesIO()
+    if multipage:
+        first.save(buf, format="TIFF", save_all=True, append_images=[second])
+    else:
+        first.save(buf, format="TIFF")
+    return buf.getvalue()
+
+
+def test_document_content_serves_safe_inline_previews_and_downloads(api, contract) -> None:
+    client, service = api
+    batch = _create(client)
+    batch_id = batch["id"]
+    base = f"{API}/batches/{batch_id}/documents"
+
+    pdf_bytes = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n"
+    pdf_id = _seed_doc(
+        service,
+        batch_id,
+        doc_id="doc-pdf-cn",
+        filename="PDF示例账单1.pdf",
+        source_kind=SourceKind.PDF,
+        raw_bytes=pdf_bytes,
+        media_type="application/octet-stream",
+        raw_text="Waybill CMDUCHN4053601 245.00 USD",
+    )
+    payload = service.get_document_content(batch_id, pdf_id)
+    assert isinstance(payload, DocumentContentPayload)
+    assert payload.content == pdf_bytes
+    assert payload.media_type == "application/pdf"
+    assert payload.filename == "PDF示例账单1.pdf"
+
+    pdf_inline = client.get(f"{base}/{pdf_id}/content")
+    assert pdf_inline.status_code == 200
+    assert pdf_inline.content == pdf_bytes
+    assert pdf_inline.headers["content-type"] == "application/pdf"
+    assert pdf_inline.headers["x-content-type-options"] == "nosniff"
+    assert pdf_inline.headers["cache-control"] == "private, no-store"
+    assert pdf_inline.headers["content-security-policy"] == (
+        "frame-ancestors 'self'; object-src 'self'"
+    )
+    assert "sandbox" not in pdf_inline.headers["content-security-policy"]
+    cd_inline = pdf_inline.headers["content-disposition"]
+    assert cd_inline.startswith("inline; ")
+    assert 'filename="PDF_1.pdf"' in cd_inline
+    assert f"filename*=UTF-8''{quote('PDF示例账单1.pdf', safe='')}" in cd_inline
+
+    pdf_download = client.get(f"{base}/{pdf_id}/content", params={"download": "true"})
+    assert pdf_download.status_code == 200
+    assert pdf_download.headers["content-disposition"].startswith("attachment; ")
+
+    text_inline = client.get(f"{base}/{pdf_id}/content", params={"view": "text"})
+    assert text_inline.status_code == 200
+    assert text_inline.headers["content-type"] == "text/plain; charset=utf-8"
+    assert text_inline.text == "Waybill CMDUCHN4053601 245.00 USD"
+    assert text_inline.headers["content-disposition"].startswith("inline; ")
+    assert text_inline.headers["content-security-policy"] == (
+        "default-src 'none'; frame-ancestors 'self'"
+    )
+
+    text_download = client.get(
+        f"{base}/{pdf_id}/content", params={"view": "text", "download": "true"}
+    )
+    assert text_download.status_code == 200
+    assert text_download.headers["content-disposition"].startswith("attachment; ")
+
+    png_bytes = _png_bytes()
+    jpeg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    gif_bytes = (
+        b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff"
+        b"!\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+    )
+    webp_bytes = b"RIFF\x18\x00\x00\x00WEBPVP8 \x0c\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00"
+    for suffix, magic_bytes, expected_mime in (
+        ("图片示例.png", png_bytes, "image/png"),
+        ("scan.jpg", jpeg_bytes, "image/jpeg"),
+        ("badge.gif", gif_bytes, "image/gif"),
+        ("photo.webp", webp_bytes, "image/webp"),
+    ):
+        img_id = _seed_doc(
+            service,
+            batch_id,
+            doc_id=f"img-{suffix}",
+            filename=suffix,
+            source_kind=SourceKind.IMAGE,
+            raw_bytes=magic_bytes,
+            media_type="application/octet-stream",
+        )
+        res = client.get(f"{base}/{img_id}/content")
+        assert res.status_code == 200
+        assert res.headers["content-type"] == expected_mime
+        assert res.content == magic_bytes
+        assert res.headers["content-disposition"].startswith("inline; ")
+        assert res.headers["content-security-policy"] == (
+            "default-src 'none'; frame-ancestors 'self'"
+        )
+        dl = client.get(f"{base}/{img_id}/content", params={"download": "true"})
+        assert dl.headers["content-disposition"].startswith("attachment; ")
+
+    tiff_raw = _tiff_bytes(multipage=True)
+    tiff_id = _seed_doc(
+        service,
+        batch_id,
+        doc_id="doc-tiff",
+        filename="multipage.tiff",
+        source_kind=SourceKind.IMAGE,
+        raw_bytes=tiff_raw,
+        media_type="image/tiff",
+    )
+    tiff_inline = client.get(f"{base}/{tiff_id}/content")
+    assert tiff_inline.status_code == 200
+    assert tiff_inline.headers["content-type"] == "image/png"
+    assert tiff_inline.content.startswith(b"\x89PNG\r\n\x1a\n")
+    assert tiff_inline.headers["content-disposition"].startswith("inline; ")
+    with Image.open(BytesIO(tiff_inline.content)) as converted:
+        assert converted.getpixel((0, 0))[:3] == (255, 0, 0)
+    tiff_dl = client.get(f"{base}/{tiff_id}/content", params={"download": "true"})
+    assert tiff_dl.status_code == 200
+    assert tiff_dl.headers["content-type"] == "image/tiff"
+    assert tiff_dl.content == tiff_raw
+    assert tiff_dl.headers["content-disposition"].startswith("attachment; ")
+
+    bad_tiff_id = _seed_doc(
+        service,
+        batch_id,
+        doc_id="doc-bad-tiff",
+        filename="corrupt.tif",
+        source_kind=SourceKind.IMAGE,
+        raw_bytes=b"II*\x00broken-tiff-data",
+        media_type="image/tiff",
+    )
+    bad_tiff = client.get(f"{base}/{bad_tiff_id}/content")
+    assert bad_tiff.status_code == 200
+    assert bad_tiff.headers["content-type"] == "application/octet-stream"
+    assert bad_tiff.headers["content-disposition"].startswith("attachment; ")
+    assert bad_tiff.headers["content-security-policy"] == "default-src 'none'; sandbox"
+
+    body_id = _seed_doc(
+        service,
+        batch_id,
+        doc_id="doc-eml-body",
+        filename="mail.body.txt",
+        source_kind=SourceKind.EML_BODY,
+        raw_bytes="邮件正文费用：USD 50.00".encode(),
+        media_type="text/html",
+        raw_text="邮件正文费用：USD 50.00",
+    )
+    body_res = client.get(f"{base}/{body_id}/content")
+    assert body_res.status_code == 200
+    assert body_res.headers["content-type"] == "text/plain; charset=utf-8"
+    assert body_res.text == "邮件正文费用：USD 50.00"
+    assert body_res.headers["content-disposition"].startswith("inline; ")
+
+    eml_wire = b"From: a@example.com\r\nSubject: Test\r\n\r\nBody text"
+    eml_with_text = _seed_doc(
+        service,
+        batch_id,
+        doc_id="doc-eml-text",
+        filename="alert.eml",
+        source_kind=SourceKind.EML,
+        raw_bytes=eml_wire,
+        media_type="message/rfc822",
+        raw_text="Extracted EML summary",
+    )
+    eml_inline = client.get(f"{base}/{eml_with_text}/content")
+    assert eml_inline.status_code == 200
+    assert eml_inline.headers["content-type"] == "text/plain; charset=utf-8"
+    assert eml_inline.text == "Extracted EML summary"
+    assert eml_inline.headers["content-disposition"].startswith("inline; ")
+    eml_dl = client.get(f"{base}/{eml_with_text}/content", params={"download": "true"})
+    assert eml_dl.status_code == 200
+    assert eml_dl.headers["content-type"] == "message/rfc822"
+    assert eml_dl.content == eml_wire
+    assert eml_dl.headers["content-disposition"].startswith("attachment; ")
+
+    eml_no_text = _seed_doc(
+        service,
+        batch_id,
+        doc_id="doc-eml-raw",
+        filename="raw.eml",
+        source_kind=SourceKind.EML,
+        raw_bytes=eml_wire,
+        media_type="message/rfc822",
+        raw_text="",
+    )
+    assert client.get(f"{base}/{eml_no_text}/content").text == eml_wire.decode("utf-8")
+
+
+def test_document_content_blocks_xss_forces_office_attachment_and_handles_404s(
+    api, contract, tmp_path: Path
+) -> None:
+    client, service = api
+    batch = _create(client)
+    batch_id = batch["id"]
+    base = f"{API}/batches/{batch_id}/documents"
+
+    dangerous_cases = [
+        (
+            "page.html",
+            SourceKind.EML_ATTACHMENT,
+            b"<html><script>alert(1)</script></html>",
+            "text/html",
+        ),
+        (
+            "polyglot.html",
+            SourceKind.EML_ATTACHMENT,
+            b"%PDF-1.7\n<html><script>alert(1)</script>",
+            "application/pdf",
+        ),
+        ("icon.svg", SourceKind.EML_ATTACHMENT, b"<svg onload='alert(1)'/>", "image/svg+xml"),
+        ("app.js", SourceKind.EML_ATTACHMENT, b"alert(1)", "application/javascript"),
+        (
+            "page.xhtml",
+            SourceKind.EML_ATTACHMENT,
+            b"<?xml version='1.0'?><html xmlns='http://www.w3.org/1999/xhtml'/>",
+            "application/xhtml+xml",
+        ),
+        ("fake.png", SourceKind.IMAGE, b"<svg onload=alert(1)>", "image/png"),
+        (
+            "fake2.png",
+            SourceKind.IMAGE,
+            b"  <!doctype html><script>alert(1)</script>",
+            "image/png",
+        ),
+        (
+            "fake.pdf",
+            SourceKind.PDF,
+            b"<!DOCTYPE html><script>alert(1)</script>",
+            "application/pdf",
+        ),
+        (
+            "sheet.xlsx",
+            SourceKind.EXCEL,
+            b"PK\x03\x04dummy-xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+        ("legacy.xls", SourceKind.EXCEL, b"\xd0\xcf\x11\xe0dummy-xls", "application/vnd.ms-excel"),
+        (
+            "letter.docx",
+            SourceKind.WORD,
+            b"PK\x03\x04dummy-docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        ("letter.doc", SourceKind.WORD, b"\xd0\xcf\x11\xe0dummy-doc", "application/msword"),
+        ("blob.bin", SourceKind.EML_ATTACHMENT, b"opaque binary", "text/html"),
+    ]
+    for index, (filename, kind, raw_bytes, db_mime) in enumerate(dangerous_cases):
+        doc_id = _seed_doc(
+            service,
+            batch_id,
+            doc_id=f"unsafe-{index}",
+            filename=filename,
+            source_kind=kind,
+            raw_bytes=raw_bytes,
+            media_type=db_mime,
+            raw_text="",
+        )
+        res = client.get(f"{base}/{doc_id}/content")
+        assert res.status_code == 200, (filename, res.text)
+        assert res.headers["content-disposition"].startswith("attachment; "), filename
+        assert res.headers["x-content-type-options"] == "nosniff"
+        assert res.headers["cache-control"] == "private, no-store"
+        assert res.headers["content-security-policy"] == "default-src 'none'; sandbox"
+        assert "html" not in res.headers["content-type"]
+        assert "svg" not in res.headers["content-type"]
+        assert "javascript" not in res.headers["content-type"]
+
+    with pytest.raises(ResourceNotFoundError, match="未找到该批次"):
+        service.get_document_content("missing-batch", "any-doc")
+    missing_batch = client.get(f"{API}/batches/missing-batch/documents/any-doc/content")
+    assert missing_batch.status_code == 404
+    _assert_schema(contract, "ErrorResponse", missing_batch.json())
+
+    with pytest.raises(ResourceNotFoundError, match="未找到该单据"):
+        service.get_document_content(batch_id, "missing-doc")
+    missing_doc = client.get(f"{base}/missing-doc/content")
+    assert missing_doc.status_code == 404
+    _assert_schema(contract, "ErrorResponse", missing_doc.json())
+
+    url_doc = _seed_doc(
+        service,
+        batch_id,
+        doc_id="doc-url-only",
+        filename="remote.pdf",
+        source_kind=SourceKind.URL,
+        raw_bytes=None,
+        raw_text="   \n ",
+    )
+    no_orig = client.get(f"{base}/{url_doc}/content")
+    assert (no_orig.status_code, no_orig.json()["code"]) == (404, "ORIGINAL_FILE_UNAVAILABLE")
+    assert no_orig.json()["message"] == "当前单据未保留本地原件文件，请切换查看提取文本。"
+    no_text = client.get(f"{base}/{url_doc}/content", params={"view": "text"})
+    assert (no_text.status_code, no_text.json()["code"]) == (404, "TEXT_PREVIEW_UNAVAILABLE")
+    assert no_text.json()["message"] == "当前单据暂无可预览的提取文本"
+
+    outside = tmp_path / "outside-secret.pdf"
+    outside.write_bytes(b"%PDF-1.7\nsecret")
+    traversal_doc = _seed_doc(
+        service,
+        batch_id,
+        doc_id="doc-traversal",
+        filename="escape.pdf",
+        source_kind=SourceKind.PDF,
+        raw_bytes=b"%PDF-1.7\nsecret",
+        stored_path_override=outside,
+    )
+    traversal_res = client.get(f"{base}/{traversal_doc}/content")
+    assert (traversal_res.status_code, traversal_res.json()["code"]) == (
+        404,
+        "ORIGINAL_FILE_UNAVAILABLE",
+    )
+
+    tampered_doc = _seed_doc(
+        service,
+        batch_id,
+        doc_id="doc-tampered",
+        filename="tampered.pdf",
+        source_kind=SourceKind.PDF,
+        raw_bytes=b"%PDF-1.7\nreal",
+        sha256_override="0" * 64,
+    )
+    tampered_res = client.get(f"{base}/{tampered_doc}/content")
+    assert (tampered_res.status_code, tampered_res.json()["code"]) == (
+        404,
+        "ORIGINAL_FILE_UNAVAILABLE",
+    )
+    retry_tampered = client.post(f"{base}/{tampered_doc}/retry")
+    assert (retry_tampered.status_code, retry_tampered.json()["code"]) == (
+        400,
+        "ORIGINAL_FILE_UNAVAILABLE",
+    )
+
+    missing_file_path = service._upload_dir(batch_id) / "gone.pdf"
+    deleted_doc = _seed_doc(
+        service,
+        batch_id,
+        doc_id="doc-deleted",
+        filename="gone.pdf",
+        source_kind=SourceKind.PDF,
+        raw_bytes=b"%PDF-1.7\ngone",
+        stored_path_override=missing_file_path,
+    )
+    deleted_res = client.get(f"{base}/{deleted_doc}/content")
+    assert (deleted_res.status_code, deleted_res.json()["code"]) == (
+        404,
+        "ORIGINAL_FILE_UNAVAILABLE",
+    )
+
+    doc_zero = batch["documents"][0]["id"]
+    bad_view = client.get(f"{base}/{doc_zero}/content", params={"view": "html"})
+    assert (bad_view.status_code, bad_view.json()["code"]) == (400, "INVALID_REQUEST")
+

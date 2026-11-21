@@ -655,6 +655,84 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
 
+  /api/v1/batches/{batch_id}/documents/{doc_id}/content:
+    get:
+      tags: [Batches]
+      operationId: getDocumentContent
+      summary: 安全内联预览或下载单据保留原件及提取文本
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+        - $ref: "#/components/parameters/DocId"
+        - name: view
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [original, text]
+            default: original
+        - name: download
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: 返回原件字节流或 UTF-8 提取文本（带安全 Content-Disposition 与 CSP 响应头）
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+            X-Content-Type-Options:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+            Content-Security-Policy:
+              schema:
+                type: string
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/gif:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+            image/tiff:
+              schema:
+                type: string
+                format: binary
+            text/plain:
+              schema:
+                type: string
+            message/rfc822:
+              schema:
+                type: string
+                format: binary
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /api/v1/batches/{batch_id}/records:
     post:
       tags: [Records]

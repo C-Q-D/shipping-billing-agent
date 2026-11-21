@@ -16,6 +16,7 @@ from pathlib import Path
 from threading import Event
 from time import monotonic, sleep
 from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
@@ -26,6 +27,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from jsonschema import Draft202012Validator
 from openpyxl import Workbook
+from PIL import Image
 from starlette.concurrency import run_in_threadpool
 from typer.testing import CliRunner
 
@@ -413,7 +415,7 @@ def test_all_contract_operations_are_mounted_and_browser_writes_are_guarded(
         for method in route.methods
         if route.path.startswith(f"{API}/")
     }
-    assert len(contract["paths"]) == 24 and len(expected) == 29
+    assert len(contract["paths"]) == 25 and len(expected) == 30
     assert registered == expected
     assert _body(client.get("/openapi.json")) == contract
     for path in (
@@ -2450,3 +2452,204 @@ def test_cli_bundle_import_preserves_decimal_values_and_keeps_both_baselines_iso
         billing_schema.validate(items)
         _assert_decimal_tokens(downloaded.content)
         _assert_decimal_fields(items[0]["charge_details"])
+
+
+def test_document_content_endpoint_previews_real_samples_across_reopen(
+    settings: AppSettings, real_samples: tuple[Path, Path, Path, Path]
+) -> None:
+    image, first_pdf, second_pdf, email = real_samples
+    with (
+        BatchService(settings, local_ocr=RapidOcrFallback(), extractor_mode="rule_only") as service,
+        TestClient(create_app(batch_service=service)) as client,
+    ):
+        batch = _body(
+            _upload(
+                client,
+                *((sample.name, sample.read_bytes()) for sample in real_samples),
+                entity=ZIM,
+            ),
+            201,
+        )
+
+    batch_id = batch["id"]
+    docs = {doc["sanitized_filename"]: doc for doc in batch["documents"]}
+    docs_by_orig = {doc["original_filename"]: doc for doc in batch["documents"]}
+    with TestClient(create_app(settings=settings)) as reopened:
+        base = f"{BATCHES}/{batch_id}/documents"
+
+        pdf1_id = docs_by_orig[first_pdf.name]["id"]
+        pdf1_res = reopened.get(f"{base}/{pdf1_id}/content")
+        assert pdf1_res.status_code == 200
+        assert pdf1_res.content == first_pdf.read_bytes()
+        assert pdf1_res.headers["content-type"] == "application/pdf"
+        assert pdf1_res.headers["content-disposition"].startswith("inline; ")
+        assert f"filename*=UTF-8''{quote(first_pdf.name, safe='')}" in (
+            pdf1_res.headers["content-disposition"]
+        )
+        assert pdf1_res.headers["content-security-policy"] == (
+            "frame-ancestors 'self'; object-src 'self'"
+        )
+        pdf1_text = reopened.get(f"{base}/{pdf1_id}/content", params={"view": "text"})
+        assert pdf1_text.status_code == 200
+        assert pdf1_text.headers["content-type"] == "text/plain; charset=utf-8"
+        assert "245" in pdf1_text.text
+
+        pdf2_id = docs_by_orig[second_pdf.name]["id"]
+        pdf2_res = reopened.get(f"{base}/{pdf2_id}/content")
+        assert pdf2_res.status_code == 200
+        assert pdf2_res.content == second_pdf.read_bytes()
+
+        img_id = docs_by_orig[image.name]["id"]
+        img_res = reopened.get(f"{base}/{img_id}/content")
+        assert img_res.status_code == 200
+        assert img_res.headers["content-type"] == "image/png"
+        assert img_res.content == image.read_bytes()
+        assert f"filename*=UTF-8''{quote(image.name, safe='')}" in (
+            img_res.headers["content-disposition"]
+        )
+
+        # EML PDF attachments are commonly labeled application/octet-stream in MIME parts.
+        for att_name in ("4055331281_MBL.pdf", "4055331281_HBL.pdf"):
+            att_id = docs[att_name]["id"]
+            att_res = reopened.get(f"{base}/{att_id}/content")
+            assert att_res.status_code == 200
+            assert att_res.headers["content-type"] == "application/pdf"
+            assert att_res.content.startswith(b"%PDF-")
+            assert att_res.headers["content-disposition"].startswith("inline; ")
+            assert att_res.headers["content-security-policy"] == (
+                "frame-ancestors 'self'; object-src 'self'"
+            )
+
+        sig_id = docs["InsertPic_C25B.jpg"]["id"]
+        sig_res = reopened.get(f"{base}/{sig_id}/content")
+        assert sig_res.status_code == 200
+        assert sig_res.headers["content-type"] == "image/jpeg"
+        assert sig_res.headers["content-disposition"].startswith("inline; ")
+        sig_text = reopened.get(f"{base}/{sig_id}/content", params={"view": "text"})
+        assert _body(sig_text, 404)["code"] == "TEXT_PREVIEW_UNAVAILABLE"
+
+        body_doc = next(doc for doc in batch["documents"] if doc["source_kind"] == "EML_BODY")
+        body_res = reopened.get(f"{base}/{body_doc['id']}/content")
+        assert body_res.status_code == 200
+        assert body_res.headers["content-type"] == "text/plain; charset=utf-8"
+        assert "MBL" in body_res.text
+
+        eml_id = docs_by_orig[email.name]["id"]
+        eml_inline = reopened.get(f"{base}/{eml_id}/content")
+        assert eml_inline.status_code == 200
+        assert eml_inline.headers["content-type"] == "text/plain; charset=utf-8"
+        assert eml_inline.headers["content-disposition"].startswith("inline; ")
+        eml_dl = reopened.get(f"{base}/{eml_id}/content", params={"download": "true"})
+        assert eml_dl.status_code == 200
+        assert eml_dl.headers["content-type"] == "message/rfc822"
+        assert eml_dl.content == email.read_bytes()
+        assert eml_dl.headers["content-disposition"].startswith("attachment; ")
+
+
+def test_document_content_handles_eml_xss_tiff_excel_tamper_and_review_bundles(
+    settings: AppSettings,
+) -> None:
+    tiff_buf = BytesIO()
+    Image.new("CMYK", (8, 8), color=(0, 128, 255, 0)).save(tiff_buf, format="TIFF")
+    tiff_bytes = tiff_buf.getvalue()
+
+    msg = EmailMessage()
+    msg["From"] = "billing@neptune.example"
+    msg["To"] = "client@targeting.example"
+    msg["Subject"] = "Invoice INV-SAFE-1"
+    msg.set_content(
+        "Invoice No. INV-SAFE-1\nDate: 2026-10-01\nIssuer: "
+        f"{NEPTUNE}\nBill To: {TARGETING}\nHandling Charge 100.00 USD\nTotal USD 100.00"
+    )
+    msg.add_attachment(
+        b"<html><script>alert(1)</script></html>",
+        maintype="text",
+        subtype="html",
+        filename="xss.html",
+    )
+    msg.add_attachment(
+        b"<svg onload='alert(1)'/>",
+        maintype="image",
+        subtype="svg+xml",
+        filename="vector.svg",
+    )
+    msg.add_attachment(
+        b"<svg onload='alert(2)'/>",
+        maintype="image",
+        subtype="png",
+        filename="fake_image.png",
+    )
+    msg.add_attachment(
+        tiff_bytes,
+        maintype="image",
+        subtype="tiff",
+        filename="scan.tif",
+    )
+
+    xlsx_name, xlsx_bytes = _invoice("INV-XLSX-1")
+
+    with TestClient(create_app(settings=settings)) as client:
+        batch = _body(
+            _upload(client, ("bundle.eml", msg.as_bytes()), (xlsx_name, xlsx_bytes)),
+            201,
+        )
+        batch_id = batch["id"]
+        base = f"{BATCHES}/{batch_id}/documents"
+        by_name = {doc["sanitized_filename"]: doc for doc in batch["documents"]}
+
+        xlsx_res = client.get(f"{base}/{by_name[xlsx_name]['id']}/content")
+        assert xlsx_res.status_code == 200
+        assert xlsx_res.headers["content-disposition"].startswith("attachment; ")
+        assert xlsx_res.headers["content-security-policy"] == "default-src 'none'; sandbox"
+        assert xlsx_res.content == xlsx_bytes
+        xlsx_text = client.get(
+            f"{base}/{by_name[xlsx_name]['id']}/content", params={"view": "text"}
+        )
+        assert xlsx_text.status_code == 200
+        assert "INV-XLSX-1" in xlsx_text.text
+
+        for unsafe_name in ("xss.html", "vector.svg", "fake_image.png"):
+            unsafe_res = client.get(f"{base}/{by_name[unsafe_name]['id']}/content")
+            assert unsafe_res.status_code == 200
+            assert unsafe_res.headers["content-type"] == "application/octet-stream"
+            assert unsafe_res.headers["content-disposition"].startswith("attachment; ")
+            assert unsafe_res.headers["x-content-type-options"] == "nosniff"
+            assert unsafe_res.headers["content-security-policy"] == "default-src 'none'; sandbox"
+
+        tif_id = by_name["scan.tif"]["id"]
+        tif_inline = client.get(f"{base}/{tif_id}/content")
+        assert tif_inline.status_code == 200
+        assert tif_inline.headers["content-type"] == "image/png"
+        assert tif_inline.content.startswith(b"\x89PNG\r\n\x1a\n")
+        assert tif_inline.headers["content-disposition"].startswith("inline; ")
+        tif_dl = client.get(f"{base}/{tif_id}/content", params={"download": "true"})
+        assert tif_dl.status_code == 200
+        assert tif_dl.headers["content-type"] == "image/tiff"
+        assert tif_dl.content == tiff_bytes
+        assert tif_dl.headers["content-disposition"].startswith("attachment; ")
+
+        # Tamper stored Excel file on disk -> content returns 404, retry keeps 400 contract,
+        # while extracted text view remains readable.
+        repository = _open_repository(settings.sqlite_db_path)
+        stored_xlsx = repository.get_document(batch_id, by_name[xlsx_name]["id"])
+        Path(stored_xlsx["stored_path"]).write_bytes(b"corrupted")
+        tampered_get = client.get(f"{base}/{by_name[xlsx_name]['id']}/content")
+        assert _body(tampered_get, 404)["code"] == "ORIGINAL_FILE_UNAVAILABLE"
+        assert "INV-XLSX-1" in client.get(
+            f"{base}/{by_name[xlsx_name]['id']}/content", params={"view": "text"}
+        ).text
+        tampered_retry = client.post(f"{base}/{by_name[xlsx_name]['id']}/retry")
+        assert _body(tampered_retry, 400)["code"] == "ORIGINAL_FILE_UNAVAILABLE"
+
+        # Exported/imported review bundle omits stored_path and raw_text -> 404 on both.
+        exported_bundle = export_review_bundle(repository, batch_id)
+        imported = _import_bundle(client, exported_bundle)
+        imp_xlsx = next(
+            doc for doc in imported["documents"] if doc["sanitized_filename"] == xlsx_name
+        )
+        imp_base = f"{BATCHES}/{imported['id']}/documents/{imp_xlsx['id']}/content"
+        assert _body(client.get(imp_base), 404)["code"] == "ORIGINAL_FILE_UNAVAILABLE"
+        assert _body(client.get(imp_base, params={"view": "text"}), 404)["code"] == (
+            "TEXT_PREVIEW_UNAVAILABLE"
+        )
+

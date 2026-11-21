@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ntpath
 import os
+import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
@@ -14,8 +16,10 @@ from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from typing import Any, BinaryIO, Literal, Self
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
+
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from ..agent.graph import BillingGraphInput, _BillingNodes, _BillingState, _package_id
 from ..config.limits import ResourceLimits
@@ -119,12 +123,275 @@ class _StaleBatchWorker(RuntimeError):
     """The worker no longer owns the processing version it is about to write."""
 
 
+_UNSAFE_ACTIVE_SUFFIXES = frozenset({
+    ".html",
+    ".htm",
+    ".xhtml",
+    ".xht",
+    ".svg",
+    ".svgz",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".xml",
+    ".xsl",
+    ".xslt",
+    ".mht",
+    ".mhtml",
+})
+_ACTIVE_MARKUP_PREFIXES = (
+    b"<!doctype",
+    b"<html",
+    b"<svg",
+    b"<script",
+    b"<xhtml",
+    b"<head",
+    b"<body",
+    b"<iframe",
+    b"<object",
+    b"<embed",
+    b"<?xml",
+)
+_OFFICE_MIME_TYPES = {
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+}
+_INLINE_CSP = "default-src 'none'; frame-ancestors 'self'"
+_PDF_CSP = "frame-ancestors 'self'; object-src 'self'"
+_ATTACHMENT_CSP = "default-src 'none'; sandbox"
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentContentPayload:
+    """Resolved document bytes, MIME type, filename, and safe preview/download headers."""
+
+    content: bytes
+    media_type: str
+    filename: str
+    headers: dict[str, str]
+
+
 @dataclass(frozen=True, slots=True)
 class _BatchScope:
     profiles: list[AccountingEntityProfile]
     entity_profile: AccountingEntityProfile | None
     existing_bills: list[ExistingBillRecord]
     charge_dictionary: list[ChargeDictionaryItem]
+
+
+def _safe_display_filename(row: Mapping[str, Any]) -> str:
+    raw = row.get("original_filename") or row.get("sanitized_filename") or "document"
+    if not isinstance(raw, str):
+        raw = "document"
+    cleaned = sanitize_source_path(raw) or ""
+    if cleaned.lstrip().lower().startswith(("http://", "https://")):
+        cleaned = unquote(urlsplit(cleaned).path)
+    candidate = ntpath.basename(cleaned)
+    if not candidate:
+        fallback = row.get("sanitized_filename")
+        candidate = ntpath.basename(fallback) if isinstance(fallback, str) else ""
+    candidate = (
+        "".join(ch for ch in candidate if ord(ch) >= 32 and ord(ch) != 127)
+        .replace("/", "_")
+        .replace("\\", "_")
+        .strip()
+        .rstrip(".")
+    )
+    if not candidate or candidate in {".", ".."}:
+        return "document"
+    return candidate
+
+
+def _ascii_filename_fallback(filename: str) -> str:
+    stem, suffix = ntpath.splitext(filename)
+    safe_suffix = re.sub(r"[^A-Za-z0-9._-]", "", suffix).rstrip(".")
+    if safe_suffix and not safe_suffix.startswith("."):
+        safe_suffix = f".{safe_suffix}"
+    if safe_suffix == ".":
+        safe_suffix = ""
+    safe_stem = re.sub(r"[^A-Za-z0-9._ -]+", "_", stem).strip(" ._")
+    if not safe_stem:
+        safe_stem = "document"
+    return f"{safe_stem}{safe_suffix}"[:180]
+
+
+def _content_disposition(disposition: Literal["inline", "attachment"], filename: str) -> str:
+    fallback = _ascii_filename_fallback(filename)
+    encoded = quote(filename, safe="")
+    return f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
+
+
+def _content_headers(
+    *,
+    disposition: Literal["inline", "attachment"],
+    filename: str,
+    csp: str,
+) -> dict[str, str]:
+    return {
+        "Content-Disposition": _content_disposition(disposition, filename),
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, no-store",
+        "Content-Security-Policy": csp,
+    }
+
+
+def _has_active_markup(content: bytes) -> bool:
+    head = content[:256]
+    for bom in (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff"):
+        if head.startswith(bom):
+            head = head[len(bom) :]
+            break
+    normalized = head.replace(b"\x00", b"").lstrip(b" \t\r\n").lower()
+    return normalized.startswith(_ACTIVE_MARKUP_PREFIXES)
+
+
+def _detect_image_magic(content: bytes) -> str | None:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _tiff_first_frame_to_png(content: bytes) -> bytes | None:
+    try:
+        with Image.open(BytesIO(content)) as img:
+            img.seek(0)
+            has_orientation = bool(img.info.get("exif") or 274 in getattr(img, "tag_v2", {}))
+            converted = ImageOps.exif_transpose(img) if has_orientation else img
+            try:
+                if converted.mode not in {"RGB", "RGBA", "L", "LA"}:
+                    if converted.mode == "F" or converted.mode.startswith("I"):
+                        next_image = converted.convert("L")
+                    else:
+                        next_image = converted.convert(
+                            "RGBA" if "A" in converted.getbands() else "RGB"
+                        )
+                    if converted is not img:
+                        converted.close()
+                    converted = next_image
+                out = BytesIO()
+                converted.save(out, format="PNG")
+                return out.getvalue()
+            finally:
+                if converted is not img:
+                    converted.close()
+    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
+        return None
+
+
+def _resolve_original_payload(
+    row: Mapping[str, Any],
+    content: bytes,
+    display_filename: str,
+    *,
+    download: bool,
+) -> DocumentContentPayload:
+    suffix = ntpath.splitext(display_filename)[1].lower()
+    source_kind = str(row.get("source_kind") or "")
+
+    def forced_attachment(media_type: str = "application/octet-stream") -> DocumentContentPayload:
+        return DocumentContentPayload(
+            content=content,
+            media_type=media_type,
+            filename=display_filename,
+            headers=_content_headers(
+                disposition="attachment",
+                filename=display_filename,
+                csp=_ATTACHMENT_CSP,
+            ),
+        )
+
+    if suffix in _UNSAFE_ACTIVE_SUFFIXES:
+        return forced_attachment()
+
+    if image_mime := _detect_image_magic(content):
+        return DocumentContentPayload(
+            content=content,
+            media_type=image_mime,
+            filename=display_filename,
+            headers=_content_headers(
+                disposition="attachment" if download else "inline",
+                filename=display_filename,
+                csp=_INLINE_CSP,
+            ),
+        )
+
+    if source_kind == SourceKind.EML_BODY or suffix == ".txt":
+        return DocumentContentPayload(
+            content=content,
+            media_type="text/plain; charset=utf-8",
+            filename=display_filename,
+            headers=_content_headers(
+                disposition="attachment" if download else "inline",
+                filename=display_filename,
+                csp=_INLINE_CSP,
+            ),
+        )
+
+    if source_kind == SourceKind.EML or suffix == ".eml":
+        if download:
+            return forced_attachment("message/rfc822")
+        raw_text = row.get("raw_text")
+        text = (
+            raw_text
+            if isinstance(raw_text, str) and raw_text.strip()
+            else content.decode("utf-8", errors="replace")
+        )
+        return DocumentContentPayload(
+            content=text.encode("utf-8"),
+            media_type="text/plain; charset=utf-8",
+            filename=display_filename,
+            headers=_content_headers(
+                disposition="inline",
+                filename=display_filename,
+                csp=_INLINE_CSP,
+            ),
+        )
+
+    is_pdf_magic = content.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"%PDF-")
+    is_tiff_magic = content.startswith((b"II*\x00", b"MM\x00*"))
+    if not is_pdf_magic and not is_tiff_magic and _has_active_markup(content):
+        return forced_attachment()
+
+    if is_pdf_magic or suffix == ".pdf" or source_kind == SourceKind.PDF:
+        return DocumentContentPayload(
+            content=content,
+            media_type="application/pdf",
+            filename=display_filename,
+            headers=_content_headers(
+                disposition="attachment" if download else "inline",
+                filename=display_filename,
+                csp=_PDF_CSP,
+            ),
+        )
+
+    if is_tiff_magic or suffix in {".tif", ".tiff"}:
+        if download:
+            return forced_attachment("image/tiff")
+        png_bytes = _tiff_first_frame_to_png(content)
+        if png_bytes is not None:
+            stem = ntpath.splitext(display_filename)[0] or "document"
+            png_name = f"{stem}.png"
+            return DocumentContentPayload(
+                content=png_bytes,
+                media_type="image/png",
+                filename=png_name,
+                headers=_content_headers(
+                    disposition="inline",
+                    filename=png_name,
+                    csp=_INLINE_CSP,
+                ),
+            )
+        return forced_attachment()
+
+    return forced_attachment(_OFFICE_MIME_TYPES.get(suffix, "application/octet-stream"))
 
 
 def _require_batch(repository: BillingRepository, batch_id: str) -> dict[str, Any]:
@@ -639,6 +906,64 @@ class BatchService:
                 "当前库没有可用的原件。请在重试时重新上传文件或提供公网文件 URL。",
             ) from exc
         return content
+
+    def get_document_content(
+        self,
+        batch_id: str,
+        doc_id: str,
+        *,
+        view: Literal["original", "text"] = "original",
+        download: bool = False,
+    ) -> DocumentContentPayload:
+        """Resolve persisted original bytes or extracted text with safe preview headers."""
+        if view not in {"original", "text"}:
+            raise ServiceValidationError("INVALID_REQUEST", "view 须为 original 或 text")
+        if self.repository.get_batch(batch_id) is None:
+            raise ResourceNotFoundError("未找到该批次")
+        row = self.repository.get_document(batch_id, doc_id)
+        if row is None:
+            raise ResourceNotFoundError("未找到该单据")
+
+        display_filename = _safe_display_filename(row)
+        if view == "text":
+            raw_text = row.get("raw_text")
+            if not isinstance(raw_text, str) or not raw_text.strip():
+                raise ServiceValidationError(
+                    "TEXT_PREVIEW_UNAVAILABLE",
+                    "当前单据暂无可预览的提取文本",
+                    status_code=404,
+                )
+            target_name = (
+                display_filename
+                if not download or display_filename.lower().endswith(".txt")
+                else f"{display_filename}.txt"
+            )
+            return DocumentContentPayload(
+                content=raw_text.encode("utf-8"),
+                media_type="text/plain; charset=utf-8",
+                filename=target_name,
+                headers=_content_headers(
+                    disposition="attachment" if download else "inline",
+                    filename=target_name,
+                    csp=_INLINE_CSP,
+                ),
+            )
+
+        if not row.get("stored_path"):
+            raise ServiceValidationError(
+                "ORIGINAL_FILE_UNAVAILABLE",
+                "当前单据未保留本地原件文件，请切换查看提取文本。",
+                status_code=404,
+            )
+        try:
+            content = self._read_original(batch_id, row)
+        except ServiceValidationError as exc:
+            raise ServiceValidationError(
+                "ORIGINAL_FILE_UNAVAILABLE",
+                "当前单据未保留本地原件文件，请切换查看提取文本。",
+                status_code=404,
+            ) from exc
+        return _resolve_original_payload(row, content, display_filename, download=download)
 
     def create_batch(
         self,

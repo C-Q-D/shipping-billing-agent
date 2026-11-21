@@ -1,15 +1,17 @@
 """Adapt record and document review requests to the existing review service."""
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
+from starlette.responses import Response
 
 from ...domain.models import OcrMode
 from ...services import ServiceValidationError
 from .http import (
+    BatchDependency,
     DecimalJsonResponse,
     ReviewDependency,
     extract_expected_version,
@@ -124,6 +126,28 @@ def force_parse_document(
             doc_id,
             expected_version=extract_expected_version(request),
         )
+    )
+
+
+@router.get("/documents/{doc_id}/content", tags=["Batches"], operation_id="getDocumentContent")
+async def get_document_content(
+    batch_id: str,
+    doc_id: str,
+    service: BatchDependency,
+    view: Literal["original", "text"] = "original",
+    download: bool = False,
+) -> Response:
+    payload = await run_in_threadpool(
+        service.get_document_content,
+        batch_id,
+        doc_id,
+        view=view,
+        download=download,
+    )
+    return Response(
+        content=payload.content,
+        media_type=payload.media_type,
+        headers=payload.headers,
     )
 
 
