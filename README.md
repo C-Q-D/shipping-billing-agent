@@ -103,9 +103,17 @@ LLM_API_KEY=<YOUR_API_KEY>
    ```
 
    重点检查 `.env` 中以下配置项：
-   - `DEPLOY_PORT`（默认 `8080`）、`BASIC_AUTH_USER`（默认 `reviewer`）与 `BASIC_AUTH_PASS`（**必填**，用于拦截公网未授权访问与刷额度风险）
+   - `DEPLOY_PORT`（默认 `8080`）、`BASIC_AUTH_USER`（默认 `reviewer`）与 `BASIC_AUTH_PASS`（**必填**且长度至少 8 位，入口脚本会拒绝默认示例占位符）
+   - `ALLOWED_CIDRS`（可选，逗号分隔 IP/CIDR 白名单；留空则仅依赖 Basic Auth，配置后自动叠加 IP 白名单拦截）
+   - `APP_RATE_LIMIT_PER_MINUTE` / `APP_HEAVY_RATE_LIMIT_PER_MINUTE` / `APP_DAILY_HEAVY_QUOTA` / `APP_MAX_CONCURRENT_HEAVY`（默认分别 `180` / `6` / `60` / `2`，防止公网刷爆模型额度或并发打满）
+   - `APP_DISABLE_LIVE_EVAL`（默认 `true`，临时演示环境关闭在线大模型批量评测，保留单据实传与离线评测）与 `APP_ACCESS_EXPIRES_AT`（可选 ISO-8601 到期时间，到期后除 `/api/v1/health` 外自动返回 `403`）
    - `LLM_PROVIDER` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`（填入真实大模型 API Key 后自动开启双路语义抽取与接地核验）
    - `APP_ALLOWED_ORIGINS`（若服务器前侧还有独立 HTTPS 域名反代，需补充对应公网 Origin JSON 数组，满足 `OriginMiddleware` 同源校验）
+
+   **内置安全与限流防护机制**（适合面试官临时访问）：
+   - **边缘防护（Nginx）**：HTTP Basic Auth、可选 `ALLOWED_CIDRS` IP 白名单、单 IP 请求与重接口 `POST` 双层限流（触发返回 `429 RATE_LIMITED` + `Retry-After`）、单 IP 最大 20 并发连接、请求体上限 `32m`、非必要 HTTP 方法与隐藏文件探测拦截、`X-Robots-Tag: noindex, nofollow, noarchive` 与安全响应头。
+   - **应用与预算硬顶（FastAPI）**：`OriginMiddleware` 跨站写入校验、每分钟接口限流、`60 次/日` 重解析全局额度上限、最多 `2` 路并发解析保护、高耗能在线批量评测开关（`APP_DISABLE_LIVE_EVAL`）及按时间自动失效锁闭（`APP_ACCESS_EXPIRES_AT`）。
+   - **容器最小权限隔离**：独立容器网络与命名卷 `billing-data`、`cap_drop: [ALL]`、`no-new-privileges:true`、内存/PID 上限与日志轮转（`10m × 3`）。
 
 2. **构建并启动隔离双容器栈**（`app` + `proxy`）：
 

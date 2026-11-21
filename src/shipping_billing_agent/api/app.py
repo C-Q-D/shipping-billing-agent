@@ -32,7 +32,13 @@ from ..services import (
 from .routers import batches, evaluation, exports, master_data, review
 from .routers.evaluation import EvalRunner
 from .routers.http import DecimalJsonResponse, error_response
-from .security import ApiSettings, OriginMiddleware, allowed_origin_tuples
+from .security import (
+    AccessGuardMiddleware,
+    ApiSettings,
+    OriginMiddleware,
+    allowed_origin_tuples,
+    parse_access_expires_at,
+)
 
 _ROOT = Path(__file__).resolve().parents[3]
 _CONTRACT = _ROOT / "docs/workflow/contracts/openapi.yaml"
@@ -166,6 +172,7 @@ def create_app(
         )
     )
     origins = allowed_origin_tuples((*origin_settings.allowed_origins, *allowed_origins))
+    expires_at = parse_access_expires_at(origin_settings.access_expires_at)
     service = batch_service
     service_lock = Lock()
 
@@ -207,6 +214,24 @@ def create_app(
     )
     fastapi_app.state.resolve_batch_service = resolve_batch_service
     fastapi_app.state.resolve_eval_runner = resolve_eval_runner
+    fastapi_app.state.disable_live_eval = origin_settings.disable_live_eval
+    if expires_at is not None or any(
+        (
+            origin_settings.rate_limit_per_minute,
+            origin_settings.heavy_rate_limit_per_minute,
+            origin_settings.daily_heavy_quota,
+            origin_settings.max_concurrent_heavy,
+        )
+    ):
+        fastapi_app.add_middleware(
+            AccessGuardMiddleware,
+            rate_limit_per_minute=origin_settings.rate_limit_per_minute,
+            heavy_rate_limit_per_minute=origin_settings.heavy_rate_limit_per_minute,
+            daily_heavy_quota=origin_settings.daily_heavy_quota,
+            max_concurrent_heavy=origin_settings.max_concurrent_heavy,
+            expires_at=expires_at,
+            trust_proxy_headers=origin_settings.trust_proxy_headers,
+        )
     fastapi_app.add_middleware(OriginMiddleware, allowed_origins=origins)
     _register_error_handlers(fastapi_app)
 

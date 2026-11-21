@@ -122,6 +122,15 @@ async def trigger_eval_run(request: Request, service: BatchDependency) -> Decima
             "INVALID_REQUEST", "k_trials 须为 1–10 的整数", status_code=422
         )
     fields = validate_body(_EvalRequest, payload, status_code=422)
+    if getattr(request.app.state, "disable_live_eval", False) and fields.run_mode in {
+        "LIVE_LLM",
+        "LIVE_E2E",
+    }:
+        raise ServiceValidationError(
+            "LIVE_EVAL_DISABLED",
+            "当前临时演示环境已关闭在线大模型批量评测，请使用离线评测或直接上传单据体验真实模型解析",
+            status_code=403,
+        )
     options = fields.model_dump()
     output = await run_in_threadpool(
         _call_eval_runner, request.app.state.resolve_eval_runner, options, service.settings
