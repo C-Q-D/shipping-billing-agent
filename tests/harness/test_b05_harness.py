@@ -619,7 +619,7 @@ def test_live_e2e_requires_real_gateway_response_and_uses_live_injection_baselin
     assert published == (
         [("图片示例.png", live_settings.relay_presign_ttl_seconds)] if via_relay else []
     )
-    assert _checks(result, PNG.case_id)["远端 OCR 来源"]["actual"] == "PLTPLT_OCR"
+    assert _checks(result, PNG.case_id)["远端 OCR 来源"]["actual"] == "REMOTE_OCR"
     assert _checks(result, ATTACK_CASE_ID)["实际 HTTP 请求正文脱敏隔离"]["passed"]
     assert "harness-test-ticket" not in render_json(result)
 
@@ -642,7 +642,7 @@ def test_live_e2e_cannot_pass_without_valid_remote_charge_rows(live_settings, wi
     assert result.status == "FAILED"
     assert result.report_json["executed_cases"] == result.report_json["llm_calls"] == 0
     assert result.report_json["ocr_calls"] == 1
-    assert "PLTPLT_OCR" in result.error_message
+    assert "REMOTE_OCR" in result.error_message
     _assert_unscored(result)
 
 

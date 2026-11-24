@@ -19,12 +19,4 @@ dist/
 data/
 frontend/node_modules/
 frontend/dist/
-AGENTS.md
-笔试题AIAGENT/
-AI_agent_*.md
-docs/workflow/features/
-docs/workflow/prototypes/
-docs/workflow/INDEX.md
-docs/workflow/backlog.md
-docs/workflow/product-spec.md
-docs/workflow/arch-contract.md
+local_samples/

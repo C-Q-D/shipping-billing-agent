@@ -281,7 +281,7 @@ def test_ocr_post_contract_preserves_charges_and_document_fields() -> None:
         return httpx.Response(200, json=ocr_response)
 
     settings = _ocr_settings(ocr_task="test-task")
-    client = ocr_client.PltPltOcrClient(settings, transport=httpx.MockTransport(gateway))
+    client = ocr_client.RemoteOcrClient(settings, transport=httpx.MockTransport(gateway))
 
     result = client.recognize_url(f" {PUBLIC_FILE} ")
 
@@ -322,7 +322,7 @@ async def test_ocr_async_preserves_metadata_without_inventing_charges() -> None:
             200, json={"success": True, "data": {"list": [{"mblNumber": "MBL-42"}]}}
         )
 
-    client = ocr_client.PltPltOcrClient(
+    client = ocr_client.RemoteOcrClient(
         _ocr_settings(), async_transport=httpx.MockTransport(gateway)
     )
 
@@ -345,7 +345,7 @@ async def test_ocr_preserves_remote_json_decimal_in_response_and_formatted_text(
         b'"chargeList":[{"amount":9007199254740991.01,"currency":"USD"}]}]}}'
     )
     transport = httpx.MockTransport(lambda _: httpx.Response(200, content=body))
-    client = ocr_client.PltPltOcrClient(
+    client = ocr_client.RemoteOcrClient(
         _ocr_settings(), transport=transport, async_transport=transport
     )
 
@@ -367,7 +367,7 @@ async def test_ocr_preserves_remote_json_decimal_in_response_and_formatted_text(
 @pytest.mark.parametrize("body", [b"<html>not JSON</html>", b'{"amount":NaN}'])
 def test_ocr_reports_non_json_and_nonfinite_json_as_gateway_errors(body: bytes) -> None:
     transport = httpx.MockTransport(lambda _: httpx.Response(200, content=body))
-    client = ocr_client.PltPltOcrClient(_ocr_settings(), transport=transport)
+    client = ocr_client.RemoteOcrClient(_ocr_settings(), transport=transport)
     with pytest.raises(ocr_client.OcrGatewayError, match="不是有效 JSON"):
         client.recognize_url(PUBLIC_FILE)
 
@@ -388,7 +388,7 @@ def test_ocr_reports_non_json_and_nonfinite_json_as_gateway_errors(body: bytes) 
 )
 def test_ocr_raises_on_failure_or_missing_content(status, response, expected_error) -> None:
     transport = httpx.MockTransport(lambda _: httpx.Response(status, json=response))
-    client = ocr_client.PltPltOcrClient(_ocr_settings(), transport=transport)
+    client = ocr_client.RemoteOcrClient(_ocr_settings(), transport=transport)
 
     with pytest.raises(ocr_client.OcrGatewayError, match=expected_error):
         client.recognize_url(PUBLIC_FILE)
@@ -413,7 +413,7 @@ def test_ocr_accepts_extra_text_payload_and_extracts_charges() -> None:
         },
     }
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json=body))
-    client = ocr_client.PltPltOcrClient(_ocr_settings(), transport=transport)
+    client = ocr_client.RemoteOcrClient(_ocr_settings(), transport=transport)
     ocr_result = client.recognize_url(PUBLIC_FILE)
 
     assert ocr_result.payload.has_metadata is True
@@ -427,7 +427,7 @@ def test_ocr_accepts_extra_text_payload_and_extracts_charges() -> None:
         media_type="image/png",
         source_kind="IMAGE",
         content_sha256="a" * 64,
-        extraction_channel="PLTPLT_OCR",
+        extraction_channel="REMOTE_OCR",
         status="PARSED",
         raw_text=ocr_result.formatted_text,
         ocr_payload=ocr_result.payload,
@@ -445,7 +445,7 @@ def test_ocr_rejects_blocked_file_before_gateway_post() -> None:
     def unexpected_request(_request: httpx.Request) -> httpx.Response:
         pytest.fail("A blocked file URL reached the OCR gateway")
 
-    client = ocr_client.PltPltOcrClient(
+    client = ocr_client.RemoteOcrClient(
         _ocr_settings(), transport=httpx.MockTransport(unexpected_request)
     )
 
@@ -458,7 +458,7 @@ def test_batch_and_ocr_reject_url_credentials_with_the_same_code(query: str) -> 
     from shipping_billing_agent.parsers.dispatcher import validate_batch_inputs
 
     url = f"http://user:pass@example.com/a.pdf{query}"
-    client = ocr_client.PltPltOcrClient(
+    client = ocr_client.RemoteOcrClient(
         _ocr_settings(), transport=httpx.MockTransport(lambda _: pytest.fail("Unexpected POST"))
     )
 
@@ -478,7 +478,7 @@ def test_ocr_masks_presigned_query_in_request_errors() -> None:
     def fail(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout(f"Timed out while processing {PUBLIC_FILE}", request=request)
 
-    client = ocr_client.PltPltOcrClient(_ocr_settings(), transport=httpx.MockTransport(fail))
+    client = ocr_client.RemoteOcrClient(_ocr_settings(), transport=httpx.MockTransport(fail))
 
     with pytest.raises(ocr_client.OcrGatewayError, match="ReadTimeout") as error:
         client.recognize_url(PUBLIC_FILE)
@@ -664,7 +664,7 @@ async def test_ocr_bypasses_bad_env_proxy_and_injects_real_transport_timeouts(
 
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", record_sync)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", record_async)
-    client = ocr_client.PltPltOcrClient(
+    client = ocr_client.RemoteOcrClient(
         _ocr_settings(
             ocr_gateway_url=f"{origin}/ai/process",
             ocr_connect_timeout_seconds=0.75,
@@ -700,8 +700,8 @@ async def test_ocr_keeps_token_on_wire_but_masks_it_in_http_debug_logs(
     caplog.set_level(logging.DEBUG)
     settings = _ocr_settings(ocr_gateway_url=origin + target)
 
-    ocr_client.PltPltOcrClient(settings).recognize_url(PUBLIC_FILE)
-    await ocr_client.PltPltOcrClient(settings).arecognize_url(PUBLIC_FILE)
+    ocr_client.RemoteOcrClient(settings).recognize_url(PUBLIC_FILE)
+    await ocr_client.RemoteOcrClient(settings).arecognize_url(PUBLIC_FILE)
 
     assert [path for path, _, _ in requests] == [target, target]
     assert caplog.text.count(f"{origin}/ai/process?[REDACTED]") == 2
@@ -845,7 +845,7 @@ async def test_billing_graph_reservation_allows_only_one_http_post_without_retry
         original_filename="bill.pdf",
         sanitized_filename="bill.pdf",
         source_kind="PDF",
-        extraction_channel="PLTPLT_OCR",
+        extraction_channel="REMOTE_OCR",
         status="PARSED",
         content_sha256="a" * 64,
         raw_text="Invoice INV-1\nIssuer: Vendor\nHandling Charge 30 USD",
@@ -932,7 +932,7 @@ async def test_ocr_formatted_invoice_is_sanitized_at_both_llm_receivers(loopback
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
     origin, requests = loopback_gateway
-    ocr = ocr_client.PltPltOcrClient(_ocr_settings(ocr_gateway_url=f"{origin}/ocr-bank-fields"))
+    ocr = ocr_client.RemoteOcrClient(_ocr_settings(ocr_gateway_url=f"{origin}/ocr-bank-fields"))
     dispatcher = DocumentParserDispatcher(remote_ocr=ocr, url_validator=validate_public_url)
     (document,) = dispatcher.parse_batch([], [PUBLIC_FILE])
     assert json.loads(document.raw_text) == {

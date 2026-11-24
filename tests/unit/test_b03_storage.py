@@ -94,7 +94,7 @@ def _document(doc_id: str, **overrides: Any) -> ParsedDocument:
             "sanitized_filename": f"{doc_id}.pdf",
             "source_kind": SourceKind.PDF,
             "content_sha256": "a" * 64,
-            "extraction_channel": ExtractionChannel.PLTPLT_OCR,
+            "extraction_channel": ExtractionChannel.REMOTE_OCR,
             "status": DocumentStatus.PARSED,
             **overrides,
         }
@@ -209,7 +209,7 @@ def test_unversioned_contract_upgrades_without_losing_existing_rows(tmp_path: Pa
                (id, batch_id, original_filename, sanitized_filename, source_kind,
                 content_sha256, extraction_channel, status, created_at)
                VALUES ('doc', 'batch', 'doc.pdf', 'doc.pdf', 'PDF', ?,
-                       'PLTPLT_OCR', 'PARSED', ?)""",
+                       'REMOTE_OCR', 'PARSED', ?)""",
             ("a" * 64, timestamp),
         )
         connection.execute(

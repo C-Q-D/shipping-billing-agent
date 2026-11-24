@@ -1,6 +1,6 @@
 # 航运账单 Agent 的 Harness 设计
 
-对应原题 §8.8。Harness 是一套用固定样本、预期结果和计分规则反复检验账单流水线的程序。离线回归覆盖真实文件解析、确定性账务规则与三种导出，联机模式另测模型与指定 OCR 网关。
+Harness 是一套用固定样本、预期结果和计分规则反复检验账单流水线的程序。离线回归覆盖真实文件解析、确定性账务规则与三种导出，联机模式另测模型与外部 OCR 网关。
 
 ## 为什么单轮 Prompt 无法保障入账
 
@@ -51,7 +51,7 @@ EML 解析 `multipart`、邮件头、正文和附件，按实际文件格式递�
 
 ### 5. 13 组、16 项真值与对抗回归
 
-每个用例同时保存预期结果、费用行数、状态、告警和场景专属证据。C01–C04 使用原题文件，C05–C12 用受控材料构造边界，C13 复用随源码交付的 Office 测试夹具。 [数据集](../src/shipping_billing_agent/harness/dataset.py) · [评测测试](../tests/harness/test_b05_harness.py)
+每个用例同时保存预期结果、费用行数、状态、告警和场景专属证据。C01–C04 使用本地多格式演示样本，C05–C12 用受控材料构造边界，C13 复用随源码交付的 Office 测试夹具。 [数据集](../src/shipping_billing_agent/harness/dataset.py) · [评测测试](../tests/harness/test_b05_harness.py)
 
 | 组 | 设计意图与断言重点 |
 | --- | --- |
@@ -93,7 +93,7 @@ EML 解析 `multipart`、邮件头、正文和附件，按实际文件格式递�
 一次全对要求行数、核心字段、操作与复核状态、必需告警、误拦检查及该用例的额外断言均通过。单用例三轮为 `[False, True, False]` 时，单独计算得到 `pass@3=1.0`、`pass^3=0.0`。财务自动处理不能依靠偶尔答对。离线确定性回归以 `pass^k=1.0` 保证规则门禁与解析零波动；联机真实模型同步暴露真实随机波动以便针对性加固提示词与原文接地守卫。
 
 - 离线 `k=3` 报告：`avg_latency_ms = 632.96`，`llm_calls = 15`（离线队列替身），`ocr_calls = 3`（本地 RapidOCR），`failing_cases = []`；同期全量 `uv run pytest -p no:cacheprovider -q` 结果为 **1897 passed, 0 failed, 0 skipped (1040.68s)**。
-- 联机 `LIVE_LLM k=3`（`deepseek-flash`）报告：`avg_latency_ms = 25777.60`，`llm_calls = 115`，`ocr_calls = 3`。**全部 4 份原题真实文件用例（`C01`–`C04`）、`C05`、`C07`–`C12` 以及 `C13/xls`、`C13/xlsx` 均实现 `3/3 (100%)` 稳定全对**，冲突与对抗拦截 `conflict_recall = 1.0 (21/21)`。其余 3 项差异原因明确且无静默放错账：
+- 联机 `LIVE_LLM k=3`（`deepseek-flash`）报告：`avg_latency_ms = 25777.60`，`llm_calls = 115`，`ocr_calls = 3`。**全部 4 份本地真实样本用例（`C01`–`C04`）、`C05`、`C07`–`C12` 以及 `C13/xls`、`C13/xlsx` 均实现 `3/3 (100%)` 稳定全对**，冲突与对抗拦截 `conflict_recall = 1.0 (21/21)`。其余 3 项差异原因明确且无静默放错账：
   1. `C06_SUPPLIER_CREDIT_NOTE_AP`（2/3 通过，`pass@3 = 1.0`）：第 3 轮在合成 `Credit Card Invoice` 上因名称含 `Credit` 而模型返回 `CREDIT` 借贷方向，被确定性防误冲减门禁如期拦入待复核（贡献 1 次 `false_positive` 与 1 次 `alert_precision` 差异）；
   2. `C13_OFFICE_FORMATS/doc`（0/3）：夹具 `b01_empty_columns.doc` 原文首行存在 `Reference\tBill 081`，真实模型提取出 `Bill 081` 而确定性表基线期望为 `null`；
   3. `C13_OFFICE_FORMATS/docx`（0/3）：夹具 `b01_interleaved.docx` 实际含第二张无表头表格 `Filing\t310.42`，真实模型将该行一并抽出而基线仅计主表首行 `65.25`。
@@ -106,14 +106,14 @@ EML 解析 `multipart`、邮件头、正文和附件，按实际文件格式递�
 
 | 模式 | 启动前置与实际验证范围 |
 | --- | --- |
-| `OFFLINE_DETERMINISTIC` | 原题四份文件与测试夹具齐备。真实本地解析器、规则和确定性模型队列，不需要 API Key 或公网中转。 |
-| `LIVE_LLM` | 原题与夹具齐备，`is_llm_configured()` 通过。合法的 OpenAI 兼容端点和真实密钥可用，以本地解析输入核对真实模型响应、接地校验和实际 HTTP 请求脱敏。 |
-| `LIVE_E2E` | 满足 `LIVE_LLM` 条件，再提供 OCR 可读的 `图片示例.png` 公网 URL，或同时设置受控中转基址并注入 `relay_publisher`。检查 `PLTPLT_OCR` 来源、非空有效费用行和真实提取结果。 |
+| `OFFLINE_DETERMINISTIC` | 四份本地演示样本与测试夹具齐备。真实本地解析器、规则和确定性模型队列，不需要 API Key 或公网中转。 |
+| `LIVE_LLM` | 四份本地演示样本与夹具齐备，`is_llm_configured()` 通过。合法的 OpenAI 兼容端点和真实密钥可用，以本地解析输入核对真实模型响应、接地校验和实际 HTTP 请求脱敏。 |
+| `LIVE_E2E` | 满足 `LIVE_LLM` 条件，再提供 OCR 可读的 `图片示例.png` 公网 URL，或同时设置受控中转基址并注入 `relay_publisher`。检查 `REMOTE_OCR` 来源、非空有效费用行和真实提取结果。 |
 
 | 结果 | 持久化与退出约定 |
 | --- | --- |
 | 启动前缺联机条件 | `UNVERIFIED`，`actual_trials=0`、`executed_cases=0`，错误原因可查，CLI 非零退出。 |
-| 执行中遇到基础故障 | `FAILED`，如限流、超时、缺原题文件或非预期网关失败卡。保留已完成的轮次与用例数、调用次数、失败位置和原因，CLI 非零退出。 |
+| 执行中遇到基础故障 | `FAILED`，如限流、超时、缺本地样本文件或非预期网关失败卡。保留已完成的轮次与用例数、调用次数、失败位置和原因，CLI 非零退出。 |
 | 完成但答错 | `COMPLETED`，漏行、错账或误拦拉低相应指标，保留 `expected` 与 `actual` 差异。有失败用例或 `pass^k < 1.0` 时 CLI 非零退出。 |
 | C12 如期命中业务失败卡 | 只有总计时，精确核对单据及「无费用明细」原因，C12 该断言通过。此处放行的是评测断言，业务单据仍无正式账单。 |
 
@@ -121,9 +121,9 @@ EML 解析 `multipart`、邮件头、正文和附件，按实际文件格式递�
 
 ## 联机复验
 
-当前本机已完成真实 `DEEPSEEK_API_KEY`（`deepseek-flash`）的 `LIVE_LLM`（`k=3`）48 项次全套件评测与真实 Chrome 工作台端到端实测；因未配置 `PUBLIC_RELAY_BASE_URL` 公开中转且未向公网发布文件，`LIVE_E2E`（远端 `gateway.pltplt.com` URL 识别）与 `self_repair_evidence` 当前仍为 **`UNVERIFIED`**（本地 RapidOCR 与 PDF 文本解析链路已全覆盖）。配置方式见 [README](../README.md)。
+当前本机已完成真实 `DEEPSEEK_API_KEY`（`deepseek-flash`）的 `LIVE_LLM`（`k=3`）48 项次全套件评测与真实 Chrome 工作台端到端实测；因未配置 `PUBLIC_RELAY_BASE_URL` 公开中转且未向公网发布文件，`LIVE_E2E`（远端 OCR 网关 URL 识别）与 `self_repair_evidence` 当前仍为 **`UNVERIFIED`**（本地 RapidOCR 与 PDF 文本解析链路已全覆盖）。配置方式见 [README](../README.md)。
 
-准备好四份原题样本和真实 LLM 配置后，执行第一条命令。联机端到端再将 `SHIPPING_BILLING_OCR_SAMPLE_URL` 设为经授权、网关可访问的 `图片示例.png` 地址后，执行第二条。检查运行状态、`pass^k`、实际 OCR 来源和费用行。自修复证据须另按上面的第二轮条件判定。
+准备好四份本地演示样本和真实 LLM 配置后，执行第一条命令。联机端到端再将 `SHIPPING_BILLING_OCR_SAMPLE_URL` 设为经授权、网关可访问的 `图片示例.png` 地址后，执行第二条。检查运行状态、`pass^k`、实际 OCR 来源和费用行。自修复证据须另按上面的第二轮条件判定。
 
 ```sh
 uv run shipping-billing-agent eval --mode LIVE_LLM --k-trials 3 --out live-llm-k3.json

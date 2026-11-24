@@ -52,7 +52,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_default_fixture_loop_scope = "function"
 markers = [
-  "live_ocr: calls external pltplt OCR gateway",
+  "live_ocr: calls configured remote OCR gateway",
   "live_llm: calls live LLM API",
   "browser: runs isolated Playwright browser tests",
 ]

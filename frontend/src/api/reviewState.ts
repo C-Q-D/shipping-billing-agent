@@ -3374,7 +3374,6 @@ export function formatOcrChannelLabel(channel: string | null | undefined): strin
     case "EML_TEXT_PARSER":
       return "邮件正文解析";
     case "REMOTE_OCR":
-    case "PLTPLT_OCR":
       return "远端 OCR 识别";
     case "SKIPPED_SIGNATURE":
       return "已跳过签名图片";

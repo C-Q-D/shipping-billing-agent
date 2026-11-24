@@ -465,7 +465,7 @@ class DocumentParserDispatcher:
         text = result.formatted_text
         doc.ocr_payload = payload
         doc.raw_text = text
-        doc.extraction_channel = ExtractionChannel.PLTPLT_OCR
+        doc.extraction_channel = ExtractionChannel.REMOTE_OCR
         doc.status = DocumentStatus.PARSED if payload.has_charges else DocumentStatus.METADATA_ONLY
 
     def _parse_pdf_or_image(self, doc: ParsedDocument, data: bytes) -> None:

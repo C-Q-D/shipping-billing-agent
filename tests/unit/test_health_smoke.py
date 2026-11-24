@@ -53,7 +53,7 @@ def test_health_endpoint_contract(health_client: TestClient) -> None:
     assert payload["status"] == "ok"
     assert payload["llm_configured"] is False
     assert payload["llm_model"] == "deepseek-flash"
-    assert payload["ocr_gateway_url"] == "https://gateway.pltplt.com/ai/process"
+    assert payload["ocr_gateway_url"] == "https://ocr.example.com/ai/process"
     assert payload["ocr_direct_mode"] is True
     assert payload["public_relay_configured"] is False
 
@@ -150,10 +150,10 @@ def test_health_masks_ocr_gateway_query(
     health_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(
-        "OCR_GATEWAY_URL", "https://gateway.pltplt.com/ai/process?token=synthetic-gateway-token"
+        "OCR_GATEWAY_URL", "https://ocr.example.com/ai/process?token=synthetic-gateway-token"
     )
 
     response = health_client.get("/api/v1/health")
 
-    assert response.json()["ocr_gateway_url"] == "https://gateway.pltplt.com/ai/process?[REDACTED]"
+    assert response.json()["ocr_gateway_url"] == "https://ocr.example.com/ai/process?[REDACTED]"
     assert "synthetic-gateway-token" not in response.text

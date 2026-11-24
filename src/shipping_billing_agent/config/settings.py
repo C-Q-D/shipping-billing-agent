@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_LLM_MODEL = "deepseek-flash"
-DEFAULT_OCR_GATEWAY_URL = "https://gateway.pltplt.com/ai/process"
+DEFAULT_OCR_GATEWAY_URL = "https://ocr.example.com/ai/process"
 _DEEPSEEK_ENDPOINT = ("https", "api.deepseek.com")
 _HTTP_URL = TypeAdapter(AnyHttpUrl)
 

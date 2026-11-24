@@ -1,4 +1,4 @@
-"""Send validated file URLs to PltPlt and interpret its OCR response."""
+"""Send validated file URLs to the configured remote OCR gateway and interpret its response."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ class OcrRecognitionResult:
     raw_payload: dict[str, Any]
 
 
-class PltPltOcrClient:
+class RemoteOcrClient:
     def __init__(
         self,
         settings: AppSettings,

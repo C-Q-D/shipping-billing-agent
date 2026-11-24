@@ -1,3 +1,4 @@
+import os
 import re
 from email import message_from_bytes, policy
 from hashlib import sha256
@@ -14,7 +15,12 @@ from shipping_billing_agent.domain.models import (
 from shipping_billing_agent.gateways.local_ocr import RapidOcrFallback
 from shipping_billing_agent.gateways.text_sanitizer import sanitize_for_llm
 
-SAMPLES = Path(__file__).resolve().parents[2] / "笔试题AIAGENT"
+SAMPLES = Path(
+    os.environ.get(
+        "SHIPPING_BILLING_REAL_SAMPLES_DIR",
+        str(Path(__file__).resolve().parents[2] / "local_samples"),
+    )
+)
 
 
 @pytest.fixture(scope="module")
@@ -22,7 +28,7 @@ def dispatcher():
     from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
     if not SAMPLES.is_dir():
-        pytest.skip("当前检出未提供笔试题AIAGENT原题目录")
+        pytest.skip("当前检出未提供本地演示样本目录")
     return DocumentParserDispatcher(
         ocr_mode=OcrMode.REMOTE_WITH_LOCAL_FALLBACK,
         local_ocr=RapidOcrFallback(),

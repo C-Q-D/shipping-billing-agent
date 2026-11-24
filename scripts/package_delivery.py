@@ -72,7 +72,7 @@ EXCLUDED_NAMES = {
     "__pycache__",
     ".env",
     "data",
-    "笔试题aiagent",
+    "local_samples",
     "agents.md",
 }
 SECRET_PATTERN = re.compile(

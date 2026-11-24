@@ -236,7 +236,7 @@ def test_decimal_database_text_refuses_non_finite_decimal(domain_models) -> None
         ("SourceKind", "EML EML_BODY EML_ATTACHMENT PDF IMAGE EXCEL WORD URL"),
         (
             "ExtractionChannel",
-            "PLTPLT_OCR LOCAL_PDF_TEXT_FALLBACK LOCAL_RAPIDOCR_FALLBACK EXCEL_PARSER WORD_PARSER "
+            "REMOTE_OCR LOCAL_PDF_TEXT_FALLBACK LOCAL_RAPIDOCR_FALLBACK EXCEL_PARSER WORD_PARSER "
             "EML_TEXT_PARSER SKIPPED_SIGNATURE FAILED",
         ),
         ("DocumentStatus", "PARSED SKIPPED_NOISE METADATA_ONLY FAILED"),
@@ -305,7 +305,7 @@ def test_public_url_document_supports_null_content_hash(domain_models) -> None:
         source_kind="URL",
         content_sha256=None,
         public_url="https://files.example.com/invoice.pdf",
-        extraction_channel="PLTPLT_OCR",
+        extraction_channel="REMOTE_OCR",
         status="PARSED",
     )
 
@@ -325,7 +325,7 @@ def test_document_hash_matches_source_kind(
             sanitized_filename="invoice.pdf",
             source_kind=source_kind,
             content_sha256=content_sha256,
-            extraction_channel="PLTPLT_OCR",
+            extraction_channel="REMOTE_OCR",
             status="PARSED",
         )
 

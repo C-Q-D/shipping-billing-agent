@@ -51,7 +51,7 @@ paths:
                     status: ok
                     llm_configured: true
                     llm_model: deepseek-flash
-                    ocr_gateway_url: https://gateway.pltplt.com/ai/process
+                    ocr_gateway_url: https://ocr.example.com/ai/process
                     ocr_direct_mode: true
                     public_relay_configured: false
         "400":
@@ -356,7 +356,7 @@ paths:
     post:
       tags: [Batches]
       operationId: createDemoBatch
-      summary: 一键载入笔试内置 4 份真实样本并启动解析（默认 REMOTE_ONLY，需显式开启本地兜底）
+      summary: 一键载入本地 4 份演示样本并启动解析（默认 REMOTE_ONLY，需显式开启本地兜底）
       parameters:
         - name: wait
           in: query

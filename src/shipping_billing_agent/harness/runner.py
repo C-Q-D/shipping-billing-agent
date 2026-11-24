@@ -55,8 +55,8 @@ from shipping_billing_agent.gateways.local_ocr import RapidOcrFallback
 from shipping_billing_agent.gateways.ocr_client import (
     OcrGatewayError,
     OcrRecognitionResult,
-    PltPltOcrClient,
     PresignedRelayPublisher,
+    RemoteOcrClient,
 )
 from shipping_billing_agent.gateways.text_sanitizer import sanitize_for_llm
 from shipping_billing_agent.gateways.url_guard import (
@@ -336,7 +336,7 @@ class _ObservedLocalOcr(RapidOcrFallback):
         return super().recognize_pil_image(image, page)
 
 
-class _ObservedRemoteOcr(PltPltOcrClient):
+class _ObservedRemoteOcr(RemoteOcrClient):
     def __init__(self, settings: AppSettings, transport: httpx.BaseTransport | None):
         super().__init__(settings, transport=transport)
         self.calls = 0
@@ -507,7 +507,7 @@ class _CaseExecution:
     def sample_documents(self) -> list[ParsedDocument]:
         path = self.sample_path
         if path is None:
-            raise _ExecutionFailure("用例没有声明原题文件")
+            raise _ExecutionFailure("用例没有声明样本文件")
         if self.mode != "LIVE_E2E" or not self.case.remote_ocr:
             return self.parse([(path.name, path.read_bytes())])
 
@@ -527,7 +527,7 @@ class _CaseExecution:
         if (
             requested_remote
             and doc.status is DocumentStatus.PARSED
-            and doc.extraction_channel is ExtractionChannel.PLTPLT_OCR
+            and doc.extraction_channel is ExtractionChannel.REMOTE_OCR
             and doc.ocr_payload is not None
         ):
             if doc.ocr_payload.has_charges and any(
@@ -539,8 +539,8 @@ class _CaseExecution:
                 )
         if not checked_rows:
             raise _ExecutionFailure(
-                "PLTPLT_OCR 未返回可用费用明细",
-                expected={"channel": "PLTPLT_OCR", "valid_charge_rows": "至少 1 条"},
+                "REMOTE_OCR 未返回可用费用明细",
+                expected={"channel": "REMOTE_OCR", "valid_charge_rows": "至少 1 条"},
                 actual={
                     "channel": doc.extraction_channel,
                     "valid_charge_rows": checked_rows,
@@ -548,7 +548,7 @@ class _CaseExecution:
                     "gateway_called": requested_remote,
                 },
             )
-        self.check("远端 OCR 来源", "PLTPLT_OCR", doc.extraction_channel)
+        self.check("远端 OCR 来源", "REMOTE_OCR", doc.extraction_channel)
         self.check("远端 OCR 有有效费用明细", True, checked_rows > 0)
         return [doc]
 

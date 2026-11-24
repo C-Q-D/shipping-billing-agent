@@ -153,7 +153,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 一键载入笔试内置 4 份真实样本并启动解析（默认 REMOTE_ONLY，需显式开启本地兜底） */
+        /** 一键载入本地 4 份演示样本并启动解析（默认 REMOTE_ONLY，需显式开启本地兜底） */
         post: operations["createDemoBatch"];
         delete?: never;
         options?: never;

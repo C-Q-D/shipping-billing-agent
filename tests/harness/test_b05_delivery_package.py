@@ -111,7 +111,7 @@ def test_delivery_zip_is_clean_and_complete(delivery_zip: Path) -> None:
         "__pycache__",
         ".env",
         "data",
-        "笔试题aiagent",
+        "local_samples",
         "agents.md",
     }
     forbidden_workflow_entries = {
@@ -147,14 +147,21 @@ def test_delivery_zip_is_clean_and_complete(delivery_zip: Path) -> None:
             assert SECRET_PATTERN.search(archive.read(entry)) is None, name
 
 
-def test_delivery_documents_cover_evidence_and_submission(delivery_zip: Path) -> None:
+def test_delivery_documents_cover_evidence(delivery_zip: Path) -> None:
     with ZipFile(delivery_zip) as archive:
         readme = archive.read("README.md").decode("utf-8")
         harness = archive.read("docs/harness-design.md").decode("utf-8")
         thinking = archive.read("docs/deep-thinking.md").decode("utf-8")
 
-    for text in ("LUKA@PLTPLT.COM", "pan@pltplt.com", "应聘渠道+姓名+应聘岗位"):
-        assert text in readme
+    for doc_name, doc_text in (
+        ("README.md", readme),
+        ("docs/harness-design.md", harness),
+        ("docs/deep-thinking.md", thinking),
+    ):
+        assert re.search(
+            r"[A-Za-z0-9._%+-]+@(?!example\.com\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            doc_text,
+        ) is None, f"{doc_name} contains a non-example email address"
     for text in ("pass@k", "pass^k", "1.0", "150/150", "16/16", "0/69"):
         assert text in harness
     for doc in (readme, harness):

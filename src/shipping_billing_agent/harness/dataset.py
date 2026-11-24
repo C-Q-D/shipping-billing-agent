@@ -133,12 +133,12 @@ def resolve_real_sample(case: EvalCase, samples_dir: Path | None = None) -> Path
     directory = (
         samples_dir
         if samples_dir is not None
-        else (Path(configured) if configured else ROOT / "笔试题AIAGENT")
+        else (Path(configured) if configured else ROOT / "local_samples")
     )
     matches = [path for path in directory.glob(case.sample_pattern) if path.is_file()]
     if len(matches) != 1:
         raise FileNotFoundError(
-            f"{case.case_id} 需要恰好一份原题文件 {case.sample_pattern!r}，"
+            f"{case.case_id} 需要恰好一份本地样本文件 {case.sample_pattern!r}，"
             f"在 {directory} 找到 {len(matches)} 份。请设置 {SAMPLES_ENV} 或传入 samples_dir。"
         )
     return matches[0]

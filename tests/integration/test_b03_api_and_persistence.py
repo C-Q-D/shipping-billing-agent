@@ -110,7 +110,7 @@ def billing_schema() -> Draft202012Validator:
 @pytest.fixture
 def real_samples() -> tuple[Path, Path, Path, Path]:
     directory = Path(
-        os.environ.get("SHIPPING_BILLING_REAL_SAMPLES_DIR", str(ROOT / "笔试题AIAGENT"))
+        os.environ.get("SHIPPING_BILLING_REAL_SAMPLES_DIR", str(ROOT / "local_samples"))
     )
     email_matches = sorted(directory.glob("深圳容宇 PRE-ALERT*.eml"))
     assert len(email_matches) == 1, f"Expected one original PRE-ALERT email in {directory}"

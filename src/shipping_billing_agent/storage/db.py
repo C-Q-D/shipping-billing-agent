@@ -423,7 +423,7 @@ CREATE TABLE IF NOT EXISTS source_documents (
     public_url TEXT,
     extraction_channel TEXT NOT NULL CHECK (
         extraction_channel IN (
-            'PLTPLT_OCR',
+            'REMOTE_OCR',
             'LOCAL_PDF_TEXT_FALLBACK',
             'LOCAL_RAPIDOCR_FALLBACK',
             'EXCEL_PARSER',

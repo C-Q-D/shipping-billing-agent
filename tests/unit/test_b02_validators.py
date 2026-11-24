@@ -83,7 +83,7 @@ def _bundle(
             if source_kind == "URL"
             else digest or sha256(doc_id.encode()).hexdigest(),
             public_url=public_url,
-            extraction_channel="PLTPLT_OCR",
+            extraction_channel="REMOTE_OCR",
             status="PARSED",
             ocr_payload=ocr_payload,
         ),

@@ -1,8 +1,8 @@
-"""Run B02 against synthetic inputs and the four original assessment files.
+"""Run B02 against synthetic inputs and local multi-format sample files.
 
-For a standalone checkout, obtain the original assessment attachments from the
-assessment provider and place them in 笔试题AIAGENT/ at the repository root.
-Use the original filenames for 图片示例.png, PDF示例账单1.pdf, PDF 示例账单2.pdf,
+For a standalone checkout, place the four sample attachments in local_samples/
+at the repository root (or set SHIPPING_BILLING_REAL_SAMPLES_DIR).
+Use the filenames 图片示例.png, PDF示例账单1.pdf, PDF 示例账单2.pdf,
 and the single 深圳容宇 PRE-ALERT*.eml with its embedded attachments intact.
 """
 
@@ -69,15 +69,16 @@ from shipping_billing_agent.gateways.llm_client import (
     StructuredLlmResponse,
 )
 from shipping_billing_agent.gateways.local_ocr import RapidOcrFallback
-from shipping_billing_agent.gateways.ocr_client import PltPltOcrClient
+from shipping_billing_agent.gateways.ocr_client import RemoteOcrClient
 from shipping_billing_agent.gateways.url_guard import validate_public_url
 from shipping_billing_agent.parsers import dispatcher as parser_dispatcher
 from shipping_billing_agent.parsers.dispatcher import DocumentParserDispatcher
 
 ROOT = Path(__file__).resolve().parents[2]
-SAMPLES = ROOT / "笔试题AIAGENT"
+SAMPLES = Path(os.environ.get("SHIPPING_BILLING_REAL_SAMPLES_DIR", str(ROOT / "local_samples")))
 SAMPLE_INSTRUCTIONS = (
-    "请从笔试题发放方取得原题四份附件，保留原文件名放入仓库根目录的 笔试题AIAGENT/，"
+    "请将四份本地演示样本放入仓库根目录的 local_samples/"
+    "（或设置 SHIPPING_BILLING_REAL_SAMPLES_DIR），"
     "文件为 图片示例.png、PDF示例账单1.pdf、PDF 示例账单2.pdf 和 深圳容宇 PRE-ALERT*.eml。"
 )
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -148,7 +149,7 @@ def _sample_path(pattern: str) -> Path:
     matches = [path for path in SAMPLES.glob(pattern) if path.is_file()]
     if len(matches) == 1:
         return matches[0]
-    message = f"{SAMPLES / pattern} 应匹配恰好一份原题文件。{SAMPLE_INSTRUCTIONS}"
+    message = f"{SAMPLES / pattern} 应匹配恰好一份样本文件。{SAMPLE_INSTRUCTIONS}"
     if not matches and os.environ.get("SHIPPING_ALLOW_MISSING_REAL_SAMPLES") == "1":
         pytest.skip(message)
     pytest.fail(message)
@@ -3506,13 +3507,13 @@ def _parse_mock_ocr(payload: bytes, file_url: str) -> ParsedDocument:
         ocr_trust_env=False,
         ocr_proxy_url="",
     )
-    ocr = PltPltOcrClient(settings, transport=httpx.MockTransport(respond))
+    ocr = RemoteOcrClient(settings, transport=httpx.MockTransport(respond))
     dispatcher = DocumentParserDispatcher(remote_ocr=ocr, url_validator=validate_public_url)
     (document,) = dispatcher.parse_batch([], public_urls=[file_url])
     (request,) = requests
     assert request.method == "POST" and json.loads(request.content)["file"] == file_url
     assert document.status is DocumentStatus.PARSED
-    assert document.extraction_channel is ExtractionChannel.PLTPLT_OCR
+    assert document.extraction_channel is ExtractionChannel.REMOTE_OCR
     return document
 
 

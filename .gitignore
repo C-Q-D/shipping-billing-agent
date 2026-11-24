@@ -10,6 +10,7 @@ dist/
 build/
 .env
 data/
+local_samples/
 *.db
 *.sqlite3
 frontend/node_modules/

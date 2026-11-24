@@ -51,7 +51,7 @@ from ..domain.models import (
 from ..domain.serializer import _json_values
 from ..gateways.llm_client import OpenAICompatibleLlmClient, StructuredLlmClient
 from ..gateways.local_ocr import RapidOcrFallback
-from ..gateways.ocr_client import PltPltOcrClient
+from ..gateways.ocr_client import RemoteOcrClient
 from ..gateways.url_guard import redact_url_queries_in_text, validate_public_url
 from ..parsers.dispatcher import (
     DocumentParserDispatcher,
@@ -781,7 +781,7 @@ class BatchService:
         )
         self.limits = limits
         self._app_data_dir = self.settings.app_data_dir.resolve()
-        self._remote_ocr = remote_ocr if remote_ocr is not None else PltPltOcrClient(self.settings)
+        self._remote_ocr = remote_ocr if remote_ocr is not None else RemoteOcrClient(self.settings)
         self._local_ocr = local_ocr if local_ocr is not None else RapidOcrFallback()
         self._url_validator = url_validator
         self._relay_publisher = relay_publisher
@@ -1076,9 +1076,9 @@ class BatchService:
             directory = Path(override)
         else:
             repo_root = Path(__file__).resolve().parents[3]
-            directory = repo_root / "笔试题AIAGENT"
+            directory = repo_root / "local_samples"
             if not directory.is_dir() and repo_root.parent.name == ".worktree":
-                directory = repo_root.parent.parent / "笔试题AIAGENT"
+                directory = repo_root.parent.parent / "local_samples"
         samples = [
             directory / name for name in ("图片示例.png", "PDF示例账单1.pdf", "PDF 示例账单2.pdf")
         ]
@@ -1086,7 +1086,7 @@ class BatchService:
         if len(emails) != 1 or not all(path.is_file() for path in [*samples, *emails]):
             raise ServiceValidationError(
                 "DEMO_SAMPLES_MISSING",
-                "演示需四份原题样本。请将原件放入笔试题AIAGENT，"
+                "演示需四份本地样本。请将样本文件放入 local_samples/，"
                 "或将 SHIPPING_BILLING_REAL_SAMPLES_DIR 指向样本目录。",
             )
         with ExitStack() as stack:

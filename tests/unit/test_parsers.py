@@ -1431,7 +1431,7 @@ def test_remote_with_ready_relay_preserves_the_local_file_hash():
     (document,) = dispatcher.parse_batch([("../invoice.pdf", data)])
 
     assert document.status is DocumentStatus.METADATA_ONLY, document.error_message
-    assert document.extraction_channel is ExtractionChannel.PLTPLT_OCR
+    assert document.extraction_channel is ExtractionChannel.REMOTE_OCR
     assert document.original_filename == "../invoice.pdf"
     assert document.sanitized_filename == "invoice.pdf"
     assert document.content_sha256 == sha256(data).hexdigest()
@@ -1506,7 +1506,7 @@ def test_public_url_metadata_only_keeps_no_content_hash():
     assert remote.urls == [url]
     assert document.source_kind is SourceKind.URL
     assert document.status is DocumentStatus.METADATA_ONLY
-    assert document.extraction_channel is ExtractionChannel.PLTPLT_OCR
+    assert document.extraction_channel is ExtractionChannel.REMOTE_OCR
     assert document.content_sha256 is None
     assert document.public_url == url
     assert document.raw_text == "BL001"

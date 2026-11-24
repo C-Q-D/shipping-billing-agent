@@ -790,7 +790,7 @@ def _seed_doc(
         extraction_channel=(
             ExtractionChannel.FAILED
             if status is DocumentStatus.FAILED
-            else ExtractionChannel.PLTPLT_OCR
+            else ExtractionChannel.REMOTE_OCR
         ),
         status=status,
         raw_text=raw_text,

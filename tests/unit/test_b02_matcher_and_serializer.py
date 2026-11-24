@@ -753,7 +753,7 @@ def test_three_export_modes_pass_the_real_schema_and_keep_exact_json_numbers(
         reference_no="notice",
         amount="40.00",
         shipment_refs=ShipmentRefs(booking_no="B-1"),
-        source_evidence=SourceEvidence(source_file="notice.pdf", extraction_channel="PLTPLT_OCR"),
+        source_evidence=SourceEvidence(source_file="notice.pdf", extraction_channel="REMOTE_OCR"),
         validation_alerts=[
             ValidationAlert(
                 code=AlertCode.OCR_SUSPICIOUS_FLAG, severity="RESOLVED", message="已核对 OCR 文本"
@@ -847,7 +847,7 @@ def test_three_export_modes_pass_the_real_schema_and_keep_exact_json_numbers(
         assert trail["match_level"] == "L1_DOC_CHARGE"
         assert trail["matched_existing_bill_id"] == "old"
         assert trail["shipment_refs"]["booking_no"] == "B-1"
-        assert trail["source_evidence"]["extraction_channel"] == "PLTPLT_OCR"
+        assert trail["source_evidence"]["extraction_channel"] == "REMOTE_OCR"
         assert trail["field_diffs"] == [
             {
                 "field": "amount",

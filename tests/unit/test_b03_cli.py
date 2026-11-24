@@ -23,7 +23,7 @@ from shipping_billing_agent.config.settings import AppSettings
 from shipping_billing_agent.domain import ExistingBillRecord, dumps_decimal_json, loads_decimal_json
 from shipping_billing_agent.domain.models import OcrStructuredPayload
 from shipping_billing_agent.gateways.local_ocr import LocalOcrError, RapidOcrFallback
-from shipping_billing_agent.gateways.ocr_client import OcrRecognitionResult, PltPltOcrClient
+from shipping_billing_agent.gateways.ocr_client import OcrRecognitionResult, RemoteOcrClient
 from shipping_billing_agent.services import export_review_bundle
 from shipping_billing_agent.storage import BillingRepository, DatabaseManager
 
@@ -182,7 +182,7 @@ def test_parse_accepts_repeated_public_urls_and_local_files(
     urls = ["https://93.184.216.34/INV-101.pdf", "https://93.184.216.34/INV-102.pdf"]
     called = []
 
-    def recognize(_client: PltPltOcrClient, url: str) -> OcrRecognitionResult:
+    def recognize(_client: RemoteOcrClient, url: str) -> OcrRecognitionResult:
         called.append(url)
         return OcrRecognitionResult(
             payload=OcrStructuredPayload(items=[], has_charges=True, has_metadata=True),
@@ -191,7 +191,7 @@ def test_parse_accepts_repeated_public_urls_and_local_files(
             raw_payload={},
         )
 
-    monkeypatch.setattr(PltPltOcrClient, "recognize_url", recognize)
+    monkeypatch.setattr(RemoteOcrClient, "recognize_url", recognize)
     result = runner.invoke(app, [*_parse_args(source), "--url", urls[0], "--url", urls[1]])
     assert result.exit_code == 0, result.stderr
     assert sorted(called) == urls
@@ -201,8 +201,8 @@ def test_parse_accepts_repeated_public_urls_and_local_files(
         "INV-101",
         "INV-102",
     }
-    assert "INV-101.pdf [PLTPLT_OCR]" in result.stderr
-    assert "INV-102.pdf [PLTPLT_OCR]" in result.stderr
+    assert "INV-101.pdf [REMOTE_OCR]" in result.stderr
+    assert "INV-102.pdf [REMOTE_OCR]" in result.stderr
 
 
 @pytest.mark.parametrize(
